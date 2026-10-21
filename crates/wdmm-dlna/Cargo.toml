@@ -6,8 +6,15 @@ edition      = { workspace = true }
 publish      = { workspace = true }
 
 [dependencies]
-wdmm-core = { workspace = true }
-tokio     = { workspace = true }
-thiserror = { workspace = true }
-serde     = { workspace = true }
-bytes     = { workspace = true }
+wdmm-core  = { workspace = true }
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+bytes      = { workspace = true }
+axum       = { workspace = true }
+tracing    = { workspace = true }
+rand       = { workspace = true }
+
+[dev-dependencies]
+reqwest    = { workspace = true }
