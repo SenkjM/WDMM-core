@@ -14,3 +14,4 @@ thiserror    = { workspace = true }
 serde        = { workspace = true }
 futures      = { workspace = true }
 chrono       = { workspace = true }
+rand         = { workspace = true }
