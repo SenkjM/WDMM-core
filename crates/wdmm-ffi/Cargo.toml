@@ -11,4 +11,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 wdmm-core    = { workspace = true }
 wdmm-openapi = { workspace = true }
+wdmm-queue   = { workspace = true }
+wdmm-storage = { workspace = true }
 tokio        = { workspace = true }
+serde_json   = { workspace = true }
+uuid         = { workspace = true }
