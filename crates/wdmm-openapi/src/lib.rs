@@ -6,9 +6,8 @@
 
 use axum::{
     extract::State,
-    http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -72,12 +71,17 @@ struct AppState {
     config: Arc<ServerConfig>,
 }
 
+impl AppState {
+    fn port(&self) -> u16 { self.config.port }
+}
+
 /// Health check endpoint.
-async fn health() -> impl IntoResponse {
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "service": "wdmm-openapi",
         "version": env!("CARGO_PKG_VERSION"),
+        "port": state.port(),
     }))
 }
 

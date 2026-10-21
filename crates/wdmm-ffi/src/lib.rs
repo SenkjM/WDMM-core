@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::c_char;
 
 /// FFI-safe string buffer result.
