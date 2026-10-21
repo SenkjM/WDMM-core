@@ -1,0 +1,13 @@
+[package]
+name        = "wdmm-dlna"
+description  = "DLNA/UPnP SSDP discovery + AVTransport SOAP — optional feature; owns local proxy"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+wdmm-core = { workspace = true }
+tokio     = { workspace = true }
+thiserror = { workspace = true }
+serde     = { workspace = true }
+bytes     = { workspace = true }

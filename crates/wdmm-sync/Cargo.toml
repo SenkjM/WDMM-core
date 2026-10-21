@@ -1,0 +1,16 @@
+[package]
+name        = "wdmm-sync"
+description  = "Incremental sync engine (credentials / playlists / library / manga) + backup"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+wdmm-core    = { workspace = true }
+wdmm-drivers = { workspace = true }
+wdmm-storage = { workspace = true }
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+thiserror    = { workspace = true }
+serde        = { workspace = true }
+futures      = { workspace = true }

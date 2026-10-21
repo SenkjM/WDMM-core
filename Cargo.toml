@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wdmm-core",
+    "crates/wdmm-crypto",
+    "crates/wdmm-drivers",
+    "crates/wdmm-storage",
+    "crates/wdmm-queue",
+    "crates/wdmm-sync",
+    "crates/wdmm-dlna",
+    "crates/wdmm-platform",
+    "crates/wdmm-openapi",
+    "crates/wdmm-ffi",
+]
+
+[workspace.package]
+version  = "0.1.0"
+edition  = "2021"
+publish  = false   # NO crates.io — see docs/CONSTRAINTS.md §5
+
+[workspace.dependencies]
+# ── internal ──────────────────────────────────────────────────────────────────
+wdmm-core     = { path = "crates/wdmm-core"     }
+wdmm-crypto   = { path = "crates/wdmm-crypto"   }
+wdmm-drivers  = { path = "crates/wdmm-drivers"  }
+wdmm-storage  = { path = "crates/wdmm-storage"  }
+wdmm-queue    = { path = "crates/wdmm-queue"    }
+wdmm-sync     = { path = "crates/wdmm-sync"     }
+wdmm-dlna     = { path = "crates/wdmm-dlna"     }
+wdmm-platform = { path = "crates/wdmm-platform" }
+wdmm-openapi  = { path = "crates/wdmm-openapi"  }
+
+# ── async ──────────────────────────────────────────────────────────────────────
+tokio   = { version = "1",    features = ["full"] }
+futures = { version = "0.3" }
+
+# ── HTTP client ────────────────────────────────────────────────────────────────
+reqwest = { version = "=0.12.9", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# ── serialisation ──────────────────────────────────────────────────────────────
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
+# ── errors ────────────────────────────────────────────────────────────────────
+thiserror = { version = "1" }
+anyhow    = { version = "1" }
+
+# ── logging ───────────────────────────────────────────────────────────────────
+tracing            = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── database ──────────────────────────────────────────────────────────────────
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# ── HTTP server (openapi crate only) ─────────────────────────────────────────
+axum         = { version = "0.7" }
+tower        = { version = "0.4" }
+tower-http   = { version = "0.5", features = ["trace", "cors"] }
+
+# ── crypto ────────────────────────────────────────────────────────────────────
+aes-gcm  = { version = "0.10" }
+pbkdf2   = { version = "0.12" }
+hmac     = { version = "0.12" }
+sha1     = { version = "0.10" }
+sha2     = { version = "0.10" }
+rand     = { version = "0.8"  }
+base64   = { version = "0.22" }
+hex      = { version = "0.4"  }
+zeroize  = { version = "1"    }
+
+# ── XML (WebDAV PROPFIND) ─────────────────────────────────────────────────────
+quick-xml = { version = "0.36" }
+
+# ── misc ──────────────────────────────────────────────────────────────────────
+chrono      = { version = "0.4",  features = ["serde"] }
+uuid        = { version = "=1.11.0",    features = ["v4", "serde"] }
+url         = { version = "=2.5.0"  }
+async-trait = { version = "0.1" }
+bytes       = { version = "1"   }
+
+[profile.release]
+opt-level = "z"
+lto       = true
+strip     = true

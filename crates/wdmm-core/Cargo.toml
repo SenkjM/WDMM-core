@@ -1,0 +1,15 @@
+[package]
+name        = "wdmm-core"
+description  = "WDMM core: pure data models, track identity, rev-clock, codecs — zero platform deps"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+chrono     = { workspace = true }
+uuid       = { workspace = true }
+sha1       = { workspace = true }
+hex        = { workspace = true }

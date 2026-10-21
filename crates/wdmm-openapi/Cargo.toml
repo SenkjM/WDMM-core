@@ -1,0 +1,22 @@
+[package]
+name        = "wdmm-openapi"
+description  = "Toggleable axum HTTP server; exposes core services as OpenAPI 3.1 (/v1/…)"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+wdmm-core    = { workspace = true }
+wdmm-drivers = { workspace = true }
+wdmm-storage = { workspace = true }
+wdmm-queue   = { workspace = true }
+wdmm-sync    = { workspace = true }
+tokio        = { workspace = true }
+axum         = { workspace = true }
+tower        = { workspace = true }
+tower-http   = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+futures      = { workspace = true }
+uuid         = { workspace = true }

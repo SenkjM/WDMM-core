@@ -1,0 +1,10 @@
+[package]
+name        = "wdmm-platform"
+description  = "Platform adapter traits (keychain / notification / FS / background task) + std default impl"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+wdmm-core = { workspace = true }
+thiserror = { workspace = true }

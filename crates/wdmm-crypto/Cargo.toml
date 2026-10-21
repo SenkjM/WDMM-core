@@ -1,0 +1,18 @@
+[package]
+name        = "wdmm-crypto"
+description  = "Credential vault (AES-256-GCM + PBKDF2) and backup envelope — aligns openlist_crypt format"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+wdmm-core = { workspace = true }
+aes-gcm   = { workspace = true }
+pbkdf2    = { workspace = true }
+hmac      = { workspace = true }
+sha2      = { workspace = true }
+rand      = { workspace = true }
+base64    = { workspace = true }
+zeroize   = { workspace = true }
+thiserror = { workspace = true }
+serde     = { workspace = true }

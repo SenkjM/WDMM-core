@@ -1,0 +1,13 @@
+[package]
+name        = "wdmm-storage"
+description  = "rusqlite-backed library DB + cache index (schema v1, aligns WDMM library direction)"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+wdmm-core = { workspace = true }
+rusqlite  = { workspace = true }
+thiserror = { workspace = true }
+chrono    = { workspace = true }
+serde     = { workspace = true }
