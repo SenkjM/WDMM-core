@@ -5,6 +5,10 @@ version      = { workspace = true }
 edition      = { workspace = true }
 publish      = { workspace = true }
 
+[[bin]]
+name = "wdmm-server"
+path = "src/bin/wdmm-server.rs"
+
 [dependencies]
 wdmm-core    = { workspace = true }
 wdmm-drivers = { workspace = true }
@@ -20,3 +24,9 @@ serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 futures      = { workspace = true }
 uuid         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono       = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
