@@ -52,10 +52,11 @@ pub struct UserFolder {
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
     Pending,
-    Running,
-    Paused,
+    Active,
     Completed,
     Failed,
+    Cancelled,
+    Partial, // partial failure for batch tasks
 }
 
 /// Task kind enumeration — aligns with Dart `TaskKind` (9 types).
@@ -84,4 +85,9 @@ pub struct QueueTask {
     pub transferred_bytes: u64,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
+    pub attempts: u32,       // retry attempts
+    pub error: Option<String>, // last error message
+    pub remote_path: Option<String>, // source path
+    pub local_path: Option<String>,  // destination path
 }
+
