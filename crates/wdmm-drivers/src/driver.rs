@@ -74,4 +74,26 @@ pub trait CloudDriver: Send + Sync {
 
     /// Delete a file or directory.
     async fn remove(&self, path: &str) -> Result<()>;
+
+    /// Write bytes to a remote file path (used by sync engines for metadata).
+    ///
+    /// This is **not** the cut user-upload path (see drivers guide §8): it
+    /// exists so sync engines can push small JSON/metadata files to remote
+    /// storage. Default impl returns `Err(Unsupported)`.
+    async fn put_content(&self, path: &str, data: &[u8]) -> Result<()> {
+        let _ = (path, data);
+        Err(DriverError::Other(
+            "put_content not supported by this driver".into(),
+        ))
+    }
+
+    /// Fetch the full raw bytes of a remote file.
+    ///
+    /// Default impl returns `Err(Unsupported)`. WebDAV implements via HTTP GET.
+    async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
+        let _ = path;
+        Err(DriverError::Other(
+            "get_content not supported by this driver".into(),
+        ))
+    }
 }

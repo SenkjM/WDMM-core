@@ -15,6 +15,9 @@ bytes      = { workspace = true }
 axum       = { workspace = true }
 tracing    = { workspace = true }
 rand       = { workspace = true }
+reqwest    = { workspace = true }
+quick-xml  = { workspace = true }
+url        = { workspace = true }
 
 [dev-dependencies]
 reqwest    = { workspace = true }

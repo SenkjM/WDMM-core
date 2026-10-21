@@ -1756,6 +1756,7 @@ dependencies = [
  "pbkdf2",
  "rand 0.8.8",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "wdmm-core",
@@ -1768,6 +1769,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "quick-xml",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -1775,6 +1777,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "wdmm-core",
 ]
 
@@ -1803,13 +1806,18 @@ dependencies = [
 name = "wdmm-ffi"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde_json",
  "tokio",
  "uuid",
  "wdmm-core",
+ "wdmm-crypto",
+ "wdmm-dlna",
+ "wdmm-drivers",
  "wdmm-openapi",
  "wdmm-queue",
  "wdmm-storage",
+ "wdmm-sync",
 ]
 
 [[package]]
@@ -1875,11 +1883,16 @@ name = "wdmm-sync"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
+ "chrono",
  "futures",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "wdmm-core",
+ "wdmm-crypto",
  "wdmm-drivers",
  "wdmm-storage",
 ]

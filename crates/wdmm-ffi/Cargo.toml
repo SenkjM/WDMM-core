@@ -10,9 +10,14 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 wdmm-core    = { workspace = true }
+wdmm-crypto  = { workspace = true }
+wdmm-drivers = { workspace = true }
+wdmm-dlna    = { workspace = true }
 wdmm-openapi = { workspace = true }
 wdmm-queue   = { workspace = true }
 wdmm-storage = { workspace = true }
+wdmm-sync    = { workspace = true }
 tokio        = { workspace = true }
 serde_json   = { workspace = true }
 uuid         = { workspace = true }
+base64       = { workspace = true }

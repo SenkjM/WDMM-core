@@ -4,13 +4,14 @@
 //! Per constraints §3 the Rust core owns:
 //! - SSDP renderer discovery ([`SsdpDiscovery`])
 //! - the unified local proxy used for casting and streaming ([`proxy`])
-//! - AVTransport SOAP control (stub until round 4)
+//! - AVTransport SOAP control ([`avtransport::AvTransportClient`])
 //!
 //! Platform frontends own playback stacks, media sessions and FGS lifetime;
 //! they only ask the core for a proxy URL.
 
 #![forbid(unsafe_code)]
 
+pub mod avtransport;
 pub mod proxy;
 
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
+pub use avtransport::AvTransportClient;
 pub use proxy::ProxyHandle;
 
 #[derive(Debug, Error)]
@@ -144,9 +146,16 @@ impl DlnaCastService {
         self.discovery.discover(timeout).await
     }
 
-    /// Cast a proxy URL to a renderer. AVTransport SOAP lands in round 4.
-    pub async fn cast(&self, _renderer: &DlnaRenderer, _url: &str) -> DlnaResult<()> {
-        Err(DlnaError::Unsupported)
+    /// Cast a proxy URL to a renderer using AVTransport SOAP.
+    ///
+    /// Flow: fetch device description → resolve AVTransport control URL →
+    /// SetAVTransportURI → Play(Speed=1).
+    pub async fn cast(&self, renderer: &DlnaRenderer, url: &str) -> DlnaResult<()> {
+        let client = AvTransportClient::from_renderer(renderer).await?;
+        client.set_uri(0, url).await?;
+        client.play(0, 1).await?;
+        info!("cast to {} url={url}", renderer.usn);
+        Ok(())
     }
 }
 

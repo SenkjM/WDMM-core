@@ -1,12 +1,15 @@
 //! `wdmm-drivers` — CloudDriver trait + implementations.
 //!
-//! Implemented drivers:
-//! - `WebDavDriver` — WebDAV `list()` fully working (refs WDMM webdav_source.dart)
+//! Implemented drivers (production paths):
+//! - `WebDavDriver` — WebDAV `list`/`get`/`mkdir`/`rename`(MOVE)/`remove`/`put_content`/`get_content`
 //! - `CtFileDriver` — CtFile (城通网盘) `list()` + `get()` download_url ported from
 //!   Dart ctfile_driver.dart using official API patterns.
 //!
-//! Stubbed drivers (TODO, Round 3+): baidu, aliyundrive, 115, terabox,
-//! netease_music, 123_open.
+//! Stubbed drivers (Round 4): each has a clear `CloudDriver` method surface
+//! (list/get/mkdir/rename/remove + default put_content/get_content) matching
+//! the Dart ports list in docs/11-CLOUD-DRIVER-PORTING.md §10–12. Methods
+//! return a loud `TODO` error so callers fail rather than silently no-op'ing:
+//! - baidu_netdisk, aliyundrive_open, open115, terabox, netease_music, 123_open.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]

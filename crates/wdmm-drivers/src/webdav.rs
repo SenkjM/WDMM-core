@@ -189,8 +189,21 @@ impl CloudDriver for WebDavDriver {
         }
     }
 
-    async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-        Err(DriverError::Other("WebDAV MOVE not yet implemented".into()))
+    async fn rename(&self, old: &str, new_path: &str) -> Result<()> {
+        let old_url = self.join_path(old);
+        let new_url = self.join_path(new_path);
+        let resp = self
+            .client
+            .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &old_url)
+            .header("Destination", &new_url)
+            .header("Overwrite", "T")
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(DriverError::Network(format!("MOVE failed: {}", resp.status())))
+        }
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
@@ -201,6 +214,37 @@ impl CloudDriver for WebDavDriver {
         } else {
             Err(DriverError::Network(format!("DELETE failed: {}", resp.status())))
         }
+    }
+
+    async fn put_content(&self, path: &str, data: &[u8]) -> Result<()> {
+        let url = self.join_path(path);
+        let resp = self
+            .client
+            .put(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(DriverError::Network(format!("PUT failed: {}", resp.status())))
+        }
+    }
+
+    async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
+        let url = self.join_path(path);
+        let resp = self.client.get(&url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(DriverError::NotFound(path.to_string()));
+        }
+        if !resp.status().is_success() {
+            return Err(DriverError::Network(format!(
+                "GET failed: {}",
+                resp.status()
+            )));
+        }
+        Ok(resp.bytes().await?.to_vec())
     }
 }
 
@@ -375,6 +419,102 @@ mod tests {
         assert_eq!(song.size, 12345);
         assert!(!song.is_dir);
         assert!(song.raw_url.as_ref().unwrap().contains("/dav/Music/song.mp3"));
+    }
+
+    // ── put_content / get_content round-trip over mock HTTP ───────────────────
+    //
+    // Spins up a two-request mock: first PUT → 201, then GET → 200 + body.
+    // Verifies both new CloudDriver methods work end-to-end.
+
+    async fn start_mock_put_get_server(payload: Vec<u8>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            // Serve exactly two requests (PUT then GET) then exit.
+            for _ in 0..2u8 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let is_put = req.starts_with("PUT ");
+                let resp = if is_put {
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    // GET — reply with the stored payload
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                if !is_put {
+                    let _ = sock.write_all(&payload).await;
+                }
+                let _ = sock.flush().await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn put_content_and_get_content_over_mock_http() {
+        let data = b"hello from wdmm sync".to_vec();
+        let port = start_mock_put_get_server(data.clone()).await;
+        tokio::task::yield_now().await;
+
+        let base = format!("http://127.0.0.1:{}/dav/", port);
+        let driver = WebDavDriver::new(&base, "", "").unwrap();
+
+        // PUT → should succeed (201)
+        driver
+            .put_content("/sync/meta.json", &data)
+            .await
+            .expect("put_content should succeed");
+
+        // GET → should return the same bytes
+        let fetched = driver
+            .get_content("/sync/meta.json")
+            .await
+            .expect("get_content should succeed");
+        assert_eq!(fetched, data);
+    }
+
+    // ── rename via MOVE mock ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rename_via_move_over_mock_http() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with("MOVE "), "expected MOVE, got: {req}");
+                assert!(
+                    req.to_ascii_lowercase().contains("destination:"),
+                    "missing Destination header"
+                );
+                let _ = sock
+                    .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let base = format!("http://127.0.0.1:{}/dav/", port);
+        let driver = WebDavDriver::new(&base, "", "").unwrap();
+        driver
+            .rename("/old.mp3", "/new.mp3")
+            .await
+            .expect("rename should succeed");
     }
 }
 

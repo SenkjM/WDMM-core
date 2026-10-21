@@ -9,8 +9,13 @@ publish      = { workspace = true }
 wdmm-core    = { workspace = true }
 wdmm-drivers = { workspace = true }
 wdmm-storage = { workspace = true }
+wdmm-crypto  = { workspace = true }
 tokio        = { workspace = true }
 async-trait  = { workspace = true }
 thiserror    = { workspace = true }
 serde        = { workspace = true }
+serde_json   = { workspace = true }
 futures      = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+base64       = { workspace = true }

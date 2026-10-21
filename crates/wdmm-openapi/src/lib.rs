@@ -83,13 +83,55 @@ impl Default for ServerConfig {
     }
 }
 
-// ── Shared state ─────────────────────────────────────────────────────────────
+/// Key used in the KV store for the OpenAPI bearer token.
+pub const TOKEN_KV_KEY: &str = "openapi_token";
+
+/// Load the persisted token from DB or generate and save a fresh one.
+fn resolve_token(db: &LibraryDatabase) -> String {
+    if let Ok(Some(tok)) = db.load_kv(TOKEN_KV_KEY) {
+        if !tok.is_empty() {
+            return tok;
+        }
+    }
+    let tok = uuid::Uuid::new_v4().to_string();
+    let _ = db.save_kv(TOKEN_KV_KEY, &tok);
+    tok
+}
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<ServerConfig>,
     db: Arc<LibraryDatabase>,
     queue: Arc<TaskQueue>,
+    /// Current bearer token — updated in-place on rotate.
+    token: Arc<tokio::sync::RwLock<String>>,
+}
+
+impl AppState {
+    fn new(
+        config: Arc<ServerConfig>,
+        db: Arc<LibraryDatabase>,
+        queue: Arc<TaskQueue>,
+        token: String,
+    ) -> Self {
+        Self {
+            config,
+            db,
+            queue,
+            token: Arc::new(tokio::sync::RwLock::new(token)),
+        }
+    }
+
+    async fn rotate_token(&self) -> String {
+        let tok = uuid::Uuid::new_v4().to_string();
+        let _ = self.db.save_kv(TOKEN_KV_KEY, &tok);
+        *self.token.write().await = tok.clone();
+        tok
+    }
+
+    async fn current_token(&self) -> String {
+        self.token.read().await.clone()
+    }
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -99,14 +141,15 @@ async fn require_token(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let token = req
+    let header_token = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
 
-    match token {
-        Some(t) if t == state.config.token => Ok(next.run(req).await),
+    match header_token {
+        Some(t) if t == state.current_token().await => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
@@ -258,6 +301,26 @@ async fn get_task(
     }
 }
 
+/// POST /v1/token/rotate — generate a new bearer token, persist it, return it.
+///
+/// Native/FFI callers can call `wdmm_token_rotate()` to invalidate any
+/// previously issued tokens. The new token is also saved in the KV store so
+/// it survives server restarts.
+async fn rotate_token(State(state): State<AppState>) -> impl IntoResponse {
+    let new_tok = state.rotate_token().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "token": new_tok })),
+    )
+}
+
+/// GET /v1/token — return the current bearer token (native/same-machine only;
+/// the endpoint itself is behind auth so a valid token is required).
+async fn get_token(State(state): State<AppState>) -> impl IntoResponse {
+    let tok = state.current_token().await;
+    Json(serde_json::json!({ "token": tok }))
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 fn build_router(state: AppState) -> Router {
@@ -267,6 +330,8 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/tasks", get(list_tasks))
         .route("/v1/tasks/:id", get(get_task))
         .route("/v1/tasks/:id/cancel", post(cancel_task))
+        .route("/v1/token", get(get_token))
+        .route("/v1/token/rotate", post(rotate_token))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -282,11 +347,18 @@ pub struct ApiServer {
     config: Arc<ServerConfig>,
     bound_port: u16,
     shutdown: Arc<RwLock<Option<oneshot::Sender<()>>>>,
+    /// Shared live token — same `Arc<RwLock<String>>` as the AppState's token.
+    live_token: Arc<tokio::sync::RwLock<String>>,
 }
 
 impl ApiServer {
     /// Create and start the server. `config.port = 0` assigns an ephemeral port
     /// (read the assigned port back via [`ApiServer::port`]).
+    ///
+    /// Token persistence (Round 4): if the DB already holds a token under
+    /// [`TOKEN_KV_KEY`] it is reused; otherwise the `config.token` is persisted.
+    /// Callers may pass any non-empty token in `config.token` to seed the first
+    /// value, or leave it empty to auto-generate.
     pub async fn start(
         config: ServerConfig,
         db: Arc<LibraryDatabase>,
@@ -302,11 +374,31 @@ impl ApiServer {
             .map_err(|e| ApiError::Bind(e.to_string()))?;
         let bound_port = listener.local_addr().map_err(|e| ApiError::Bind(e.to_string()))?.port();
 
-        let state = AppState {
-            config: Arc::new(config.clone()),
+        // Resolve the persisted token: reuse if present, else seed from config
+        // (or generate if config.token is empty), then persist.
+        let token = if let Some(loaded) = db.load_kv(TOKEN_KV_KEY).ok().flatten() {
+            if !loaded.is_empty() {
+                loaded
+            } else if !config.token.is_empty() {
+                let _ = db.save_kv(TOKEN_KV_KEY, &config.token);
+                config.token.clone()
+            } else {
+                resolve_token(&db)
+            }
+        } else if !config.token.is_empty() {
+            let _ = db.save_kv(TOKEN_KV_KEY, &config.token);
+            config.token.clone()
+        } else {
+            resolve_token(&db)
+        };
+
+        let state = AppState::new(
+            Arc::new(ServerConfig { token: token.clone(), ..config.clone() }),
             db,
             queue,
-        };
+            token.clone(),
+        );
+        let live_token = Arc::clone(&state.token);
         let app = build_router(state);
 
         let (tx, rx) = oneshot::channel::<()>();
@@ -320,6 +412,7 @@ impl ApiServer {
             config: Arc::new(config),
             bound_port,
             shutdown: Arc::new(RwLock::new(Some(tx))),
+            live_token,
         })
     }
 
@@ -327,8 +420,22 @@ impl ApiServer {
         self.bound_port
     }
 
+    /// The token the server was started with. For the **current** token (which
+    /// may differ after a rotate), use [`ApiServer::current_token`].
     pub fn token(&self) -> &str {
         &self.config.token
+    }
+
+    /// The live bearer token (reflects rotations). Async because the token is
+    /// behind a read-write lock shared with the HTTP handlers.
+    pub async fn current_token(&self) -> String {
+        self.live_token.read().await.clone()
+    }
+
+    /// Expose the raw token `Arc<RwLock>` so FFI can update it directly when
+    /// the rotate endpoint is not reachable via HTTP (same-process).
+    pub fn live_token_arc(&self) -> Arc<tokio::sync::RwLock<String>> {
+        Arc::clone(&self.live_token)
     }
 
     pub async fn stop(&self) {
@@ -489,6 +596,103 @@ mod tests {
                 .send().await.unwrap().status(),
             204
         );
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn token_persists_across_restart() {
+        // First server: pass a known token, which must be persisted to the DB.
+        let db = Arc::new(LibraryDatabase::open(Path::new(":memory:")).unwrap());
+        let queue = Arc::new(TaskQueue::new());
+        let config = ServerConfig {
+            bind_mode: BindMode::Local,
+            port: 0,
+            token: "persist-me-123".into(),
+        };
+        let server = ApiServer::start(config, Arc::clone(&db), Arc::clone(&queue))
+            .await
+            .unwrap();
+        server.stop().await;
+
+        // DB must now hold the token.
+        assert_eq!(
+            db.load_kv(TOKEN_KV_KEY).unwrap(),
+            Some("persist-me-123".into())
+        );
+
+        // Second server with an *empty* config token must reuse the persisted one.
+        let config2 = ServerConfig {
+            bind_mode: BindMode::Local,
+            port: 0,
+            token: String::new(),
+        };
+        let server2 = ApiServer::start(config2, db, queue).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", server2.port());
+        let client = reqwest::Client::new();
+
+        // Old token must still work.
+        assert_eq!(
+            client.get(format!("{base}/v1/accounts"))
+                .bearer_auth("persist-me-123")
+                .send().await.unwrap().status(),
+            200
+        );
+        server2.stop().await;
+    }
+
+    #[tokio::test]
+    async fn token_rotate_invalidates_old_token() {
+        let db = Arc::new(LibraryDatabase::open(Path::new(":memory:")).unwrap());
+        let queue = Arc::new(TaskQueue::new());
+        let config = ServerConfig {
+            bind_mode: BindMode::Local,
+            port: 0,
+            token: "old-tok".into(),
+        };
+        let server = ApiServer::start(config, db, queue).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", server.port());
+        let client = reqwest::Client::new();
+
+        // Rotate.
+        let resp = client
+            .post(format!("{base}/v1/token/rotate"))
+            .bearer_auth("old-tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let new_tok = body["token"].as_str().unwrap().to_string();
+        assert!(!new_tok.is_empty());
+        assert_ne!(new_tok, "old-tok");
+
+        // Old token now fails.
+        assert_eq!(
+            client.get(format!("{base}/v1/accounts"))
+                .bearer_auth("old-tok")
+                .send().await.unwrap().status(),
+            401
+        );
+        // New token works.
+        assert_eq!(
+            client.get(format!("{base}/v1/accounts"))
+                .bearer_auth(&new_tok)
+                .send().await.unwrap().status(),
+            200
+        );
+
+        // GET /v1/token returns the current token.
+        let got: serde_json::Value = client
+            .get(format!("{base}/v1/token"))
+            .bearer_auth(&new_tok)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["token"], new_tok);
 
         server.stop().await;
     }

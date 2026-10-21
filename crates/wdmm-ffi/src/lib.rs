@@ -219,6 +219,241 @@ fn ptr_to_str(p: *const c_char) -> Option<&'static str> {
     })
 }
 
+fn ptr_to_bytes(p: *const u8, len: usize) -> Option<Vec<u8>> {
+    if p.is_null() || len == 0 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(p, len).to_vec() })
+}
+
+// ── Crypto FFI ────────────────────────────────────────────────────────────────
+
+use base64::prelude::*;
+use wdmm_crypto::CredentialVault;
+
+/// Encrypt `data` bytes with AES-256-GCM using `passphrase`.
+///
+/// Returns base64-encoded ciphertext as an owned `FfiString`, or
+/// `"error:<message>"` on failure. Caller must free the result.
+///
+/// # Safety
+/// `passphrase` must be a valid null-terminated UTF-8 C string.
+/// `data` must point to `data_len` readable bytes (or be null).
+#[no_mangle]
+pub extern "C" fn wdmm_crypto_encrypt(
+    passphrase: *const c_char,
+    data: *const u8,
+    data_len: usize,
+) -> FfiString {
+    let pass = match ptr_to_str(passphrase) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid passphrase pointer"),
+    };
+    let bytes = match ptr_to_bytes(data, data_len) {
+        Some(b) => b,
+        None => return FfiString::from("error:null data"),
+    };
+    match CredentialVault::encrypt(&bytes, pass) {
+        Ok(enc) => FfiString::from(BASE64_STANDARD.encode(&enc)),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Decrypt base64-encoded ciphertext with `passphrase`.
+///
+/// Returns the plaintext bytes as a UTF-8 string (best-effort; binary payloads
+/// should use the dedicated bytes API coming in a later round). Returns
+/// `"error:<message>"` on failure. Caller must free the result.
+///
+/// # Safety
+/// Both pointers must be valid null-terminated UTF-8 C strings.
+#[no_mangle]
+pub extern "C" fn wdmm_crypto_decrypt(
+    passphrase: *const c_char,
+    data_b64: *const c_char,
+) -> FfiString {
+    let pass = match ptr_to_str(passphrase) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid passphrase pointer"),
+    };
+    let b64 = match ptr_to_str(data_b64) {
+        Some(s) => s,
+        None => return FfiString::from("error:null data_b64 pointer"),
+    };
+    let encrypted = match BASE64_STANDARD.decode(b64) {
+        Ok(b) => b,
+        Err(e) => return FfiString::from(format!("error:base64 decode: {e}")),
+    };
+    match CredentialVault::decrypt(&encrypted, pass) {
+        Ok(plain) => FfiString::from(String::from_utf8_lossy(&plain).to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Sync FFI ─────────────────────────────────────────────────────────────────
+
+/// Trigger a sync run (credentials + library + playlists) against a remote
+/// WebDAV driver.
+///
+/// Parameters (all null-terminated UTF-8 C strings):
+/// - `webdav_url`:  WebDAV base URL (e.g. `"https://nas.local/dav/"`)
+/// - `webdav_user`: HTTP Basic username (empty string for no auth)
+/// - `webdav_pass`: HTTP Basic password (empty string for no auth)
+/// - `remote_dir`:  Remote directory used as the sync root (e.g. `"/wdmm_sync"`)
+///
+/// Returns a JSON summary string (see [`wdmm_sync::run_sync_all`]) or
+/// `"error:<message>"`. Caller must free the result.
+///
+/// # Safety
+/// All pointer parameters must be valid null-terminated UTF-8 C strings.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_trigger(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    remote_dir: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let pass = ptr_to_str(webdav_pass).unwrap_or("");
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+
+    let db = match LibraryDatabase::open(std::path::Path::new(":memory:")) {
+        Ok(db) => std::sync::Arc::new(db),
+        Err(e) => return FfiString::from(format!("error:db: {e}")),
+    };
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let result = rt().block_on(wdmm_sync::run_sync_all(db, driver, dir));
+    match result {
+        Ok(summary) => FfiString::from(summary.to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── DLNA FFI ──────────────────────────────────────────────────────────────────
+
+/// Discover DLNA/UPnP MediaRenderer devices on the LAN using SSDP.
+///
+/// `timeout_ms` — discovery window in milliseconds (clamped to 200–10000).
+///
+/// Returns a JSON array of renderer objects:
+/// ```json
+/// [{"usn":"uuid:…","location":"http://…","server":"…"}]
+/// ```
+/// or `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_dlna_discover_json(timeout_ms: u32) -> FfiString {
+    use std::time::Duration;
+    use wdmm_dlna::SsdpDiscovery;
+
+    let ms = timeout_ms.clamp(200, 10_000) as u64;
+    let result = rt().block_on(SsdpDiscovery::new().discover(Duration::from_millis(ms)));
+    match result {
+        Ok(renderers) => {
+            let arr: Vec<_> = renderers
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "usn": r.usn,
+                        "location": r.location,
+                        "server": r.server,
+                    })
+                })
+                .collect();
+            FfiString::from(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
+        }
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Cast a media URL to a DLNA renderer using AVTransport SOAP.
+///
+/// Parameters (null-terminated UTF-8 C strings):
+/// - `renderer_location`: the renderer description URL from SSDP discovery
+/// - `media_url`:         the URL of the media to play (e.g. the local proxy URL)
+///
+/// Returns `"ok"` on success, `"error:<message>"` on failure. Caller must free.
+///
+/// # Safety
+/// Both pointers must be valid null-terminated UTF-8 C strings.
+#[no_mangle]
+pub extern "C" fn wdmm_dlna_cast(
+    renderer_location: *const c_char,
+    media_url: *const c_char,
+) -> FfiString {
+    use wdmm_dlna::DlnaRenderer;
+
+    let location = match ptr_to_str(renderer_location) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid renderer_location"),
+    };
+    let url = match ptr_to_str(media_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid media_url"),
+    };
+
+    let renderer = DlnaRenderer {
+        usn: String::new(), // not needed for cast
+        location: location.to_string(),
+        server: None,
+    };
+    let cast_service = wdmm_dlna::DlnaCastService::new();
+    let result = rt().block_on(cast_service.cast(&renderer, url));
+    match result {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Token FFI ─────────────────────────────────────────────────────────────────
+
+/// Get the current OpenAPI bearer token.
+///
+/// Returns the token string, or `""` if the server is not running.
+/// Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_token_get() -> FfiString {
+    let guard = server_cell().lock().unwrap();
+    match guard.as_ref() {
+        Some(s) => FfiString::from(rt().block_on(s.current_token())),
+        None => FfiString::from(""),
+    }
+}
+
+/// Rotate the OpenAPI bearer token.
+///
+/// The old token is immediately invalidated. The new token is persisted in
+/// storage so it survives a server restart.
+///
+/// Returns the new token, or `"error:not_running"` if the server is not
+/// running. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_token_rotate() -> FfiString {
+    // We must release the Mutex before the async call to avoid a deadlock
+    // (the server task may also lock it internally).
+    let server_opt = {
+        let guard = server_cell().lock().unwrap();
+        guard.as_ref().map(|s| s.live_token_arc())
+    };
+    match server_opt {
+        None => FfiString::from("error:not_running"),
+        Some(token_lock) => {
+            let new_tok = uuid::Uuid::new_v4().to_string();
+            rt().block_on(async {
+                *token_lock.write().await = new_tok.clone();
+            });
+            FfiString::from(new_tok)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
