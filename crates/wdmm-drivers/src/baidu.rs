@@ -5,7 +5,7 @@
 //! Write ops (mkdir/rename/remove) are TODO stubs.
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
 
