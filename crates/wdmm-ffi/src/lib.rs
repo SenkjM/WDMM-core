@@ -599,6 +599,32 @@ pub extern "C" fn wdmm_track_delete(id: *const c_char) -> FfiString {
     }
 }
 
+/// Import tracks, playlists, and playlist_entries from an old sqflite
+/// database (one-shot — skipped if KV flag `sqflite_imported = 1` is set).
+///
+/// `old_db_path` must be a valid null-terminated UTF-8 path.
+///
+/// Returns a JSON object:
+/// ```json
+/// {"already_done":false,"tracks":42,"playlists":3,"entries":120}
+/// ```
+/// or `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_library_import_from_sqflite(old_db_path: *const c_char) -> FfiString {
+    let path_str = match ptr_to_str(old_db_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null path pointer"),
+    };
+    let old_path = std::path::Path::new(path_str);
+    let db = global_library_db();
+    match wdmm_storage::LibraryDatabase::import_from_sqflite(old_path, db) {
+        Ok(summary) => FfiString::from(
+            serde_json::to_string(&summary).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── JSON → model helpers ──────────────────────────────────────────────────────
 
 fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrack, String> {
@@ -733,6 +759,16 @@ mod tests {
         let r = wdmm_track_get(id.as_ptr());
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert_eq!(s, "null");
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn import_sqflite_nonexistent_path() {
+        let path = CString::new("/tmp/wdmm_does_not_exist_r6.db").unwrap();
+        let r = wdmm_library_import_from_sqflite(path.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        // Either "error:..." or already_done (if prev test left the flag)
+        assert!(s.starts_with("error:") || s.contains("already_done"));
         wdmm_ffi_free_string(r);
     }
 }

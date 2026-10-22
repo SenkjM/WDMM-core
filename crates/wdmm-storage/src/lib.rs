@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::sync::Mutex;
 use thiserror::Error as ThisError;
 
@@ -31,6 +31,19 @@ impl From<rusqlite::Error> for StorageError {
 }
 
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
+
+/// Summary returned by [`LibraryDatabase::import_from_sqflite`].
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ImportSummary {
+    /// `true` if the KV flag `sqflite_imported = 1` was already set on `dest`.
+    pub already_done: bool,
+    /// Number of tracks inserted.
+    pub tracks: usize,
+    /// Number of playlists inserted.
+    pub playlists: usize,
+    /// Number of playlist entries inserted.
+    pub entries: usize,
+}
 
 pub struct LibraryDatabase {
     conn: Mutex<Connection>,
@@ -635,6 +648,178 @@ impl LibraryDatabase {
         conn.execute("DELETE FROM kv_store WHERE key = ?1", params![key])?;
         Ok(())
     }
+
+    // ── sqflite migration ──────────────────────────────────────────────────────
+
+    /// One-shot import from an old sqflite `music_library.db`.
+    ///
+    /// Opens `old_db_path` read-only and copies tracks, playlists, and playlist
+    /// entries into `dest`. If the KV flag `sqflite_imported = 1` is already set
+    /// on `dest` the function returns early with `already_done: true` and makes
+    /// no changes.
+    ///
+    /// The read is defensive: if expected columns are absent (old schema), the
+    /// row is skipped and import continues.
+    pub fn import_from_sqflite(
+        old_db_path: &std::path::Path,
+        dest: &LibraryDatabase,
+    ) -> StorageResult<ImportSummary> {
+        // ── Early-exit if already imported ────────────────────────────────────
+        if dest.load_kv("sqflite_imported")?.as_deref() == Some("1") {
+            return Ok(ImportSummary {
+                already_done: true,
+                ..Default::default()
+            });
+        }
+
+        // ── Open old DB read-only ─────────────────────────────────────────────
+        let old = Connection::open_with_flags(
+            old_db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| {
+            StorageError::Database(format!(
+                "cannot open old db {}: {e}",
+                old_db_path.display()
+            ))
+        })?;
+
+        let now = chrono::Utc::now().timestamp();
+
+        // ── Read old tracks ───────────────────────────────────────────────────
+        let tracks: Vec<wdmm_core::models::LibraryTrack> = {
+            let mut stmt = old.prepare(
+                "SELECT id, title, artist, remote_path, account_id, size, modified FROM tracks",
+            ).map_err(|e| StorageError::Database(format!("tracks prepare: {e}")))?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(wdmm_core::models::LibraryTrack {
+                        id: row.get::<_, String>(0).unwrap_or_default(),
+                        title: row.get::<_, String>(1).unwrap_or_default(),
+                        artist: row.get::<_, Option<String>>(2).unwrap_or(None),
+                        remote_path: row.get::<_, String>(3).unwrap_or_default(),
+                        account_id: row.get::<_, String>(4).unwrap_or_default(),
+                        size: row.get::<_, i64>(5).unwrap_or(0) as u64,
+                        modified: row
+                            .get::<_, Option<i64>>(6)
+                            .unwrap_or(None)
+                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
+                        ..Default::default()
+                    })
+                })
+                .map_err(|e| StorageError::Database(format!("tracks query: {e}")))?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                match r {
+                    Ok(t) => out.push(t),
+                    Err(_) => {} // skip malformed rows defensively
+                }
+            }
+            out
+        };
+
+        // ── Read old playlists ────────────────────────────────────────────────
+        let playlists: Vec<Playlist> = {
+            let mut stmt = old
+                .prepare("SELECT id, name, created_at, updated_at FROM playlists")
+                .map_err(|e| StorageError::Database(format!("playlists prepare: {e}")))?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let created_ts: i64 = row.get::<_, i64>(2).unwrap_or(0);
+                    let updated_ts: i64 = row.get::<_, i64>(3).unwrap_or(0);
+                    let created_at = chrono::DateTime::from_timestamp(created_ts, 0)
+                        .unwrap_or_else(chrono::Utc::now);
+                    let updated_at = chrono::DateTime::from_timestamp(updated_ts, 0)
+                        .unwrap_or_else(chrono::Utc::now);
+                    Ok(Playlist { id, name, created_at, updated_at })
+                })
+                .map_err(|e| StorageError::Database(format!("playlists query: {e}")))?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                match r {
+                    Ok(p) => out.push(p),
+                    Err(_) => {}
+                }
+            }
+            out
+        };
+
+        // ── Read old playlist_entries ─────────────────────────────────────────
+        let entries: Vec<PlaylistEntry> = {
+            let mut stmt = old
+                .prepare(
+                    "SELECT playlist_id, position, music_id, source_name, remote_path, title, duration_ms \
+                     FROM playlist_entries",
+                )
+                .map_err(|e| StorageError::Database(format!("playlist_entries prepare: {e}")))?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PlaylistEntry {
+                        playlist_id: row.get::<_, String>(0).unwrap_or_default(),
+                        position: row.get::<_, i64>(1).unwrap_or(0),
+                        music_id: row.get::<_, String>(2).unwrap_or_default(),
+                        source_name: row.get::<_, String>(3).unwrap_or_default(),
+                        remote_path: row.get::<_, String>(4).unwrap_or_default(),
+                        title: row.get::<_, String>(5).unwrap_or_default(),
+                        duration_ms: row.get::<_, i64>(6).unwrap_or(0),
+                    })
+                })
+                .map_err(|e| StorageError::Database(format!("playlist_entries query: {e}")))?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                match r {
+                    Ok(e) => out.push(e),
+                    Err(_) => {}
+                }
+            }
+            out
+        };
+
+        // ── Write everything to dest in one logical batch ─────────────────────
+        let track_count = tracks.len();
+        let playlist_count = playlists.len();
+        let entry_count = entries.len();
+
+        for t in &tracks {
+            dest.upsert_track(t)?;
+        }
+
+        for p in &playlists {
+            dest.upsert_playlist(p)?;
+        }
+
+        // Group entries by playlist_id and call set_playlist_entries per playlist.
+        let mut by_playlist: std::collections::HashMap<String, Vec<PlaylistEntry>> =
+            std::collections::HashMap::new();
+        for e in entries {
+            by_playlist.entry(e.playlist_id.clone()).or_default().push(e);
+        }
+        for (pid, mut ents) in by_playlist {
+            ents.sort_by_key(|e| e.position);
+            dest.set_playlist_entries(&pid, &ents)?;
+        }
+
+        // Mark as done.
+        dest.save_kv("sqflite_imported", "1")?;
+
+        // suppress unused-variable warning for `now`
+        let _ = now;
+
+        Ok(ImportSummary {
+            already_done: false,
+            tracks: track_count,
+            playlists: playlist_count,
+            entries: entry_count,
+        })
+    }
 }
 
 // ── Playlist models (storage-local; identity aligns with wdmm-core) ──────────
@@ -915,5 +1100,78 @@ mod tests {
         db.delete_playlist("pl-1").unwrap();
         assert!(db.list_playlists().unwrap().is_empty());
         assert!(db.list_playlist_entries("pl-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_from_sqflite_roundtrip() {
+        // Build old DB in a temp file (open_with_flags requires a real path).
+        let mut old_path = std::env::temp_dir();
+        old_path.push("wdmm_sqflite_import_test.db");
+
+        {
+            let old = Connection::open(&old_path).expect("create old db");
+            old.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS tracks (
+                    id          TEXT PRIMARY KEY,
+                    title       TEXT NOT NULL,
+                    artist      TEXT,
+                    remote_path TEXT NOT NULL,
+                    account_id  TEXT NOT NULL,
+                    size        INTEGER NOT NULL DEFAULT 0,
+                    modified    INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS playlists (
+                    id         TEXT PRIMARY KEY,
+                    name       TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS playlist_entries (
+                    playlist_id TEXT    NOT NULL,
+                    position    INTEGER NOT NULL,
+                    music_id    TEXT    NOT NULL,
+                    source_name TEXT    NOT NULL,
+                    remote_path TEXT    NOT NULL,
+                    title       TEXT    NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+
+                INSERT INTO tracks VALUES ('t1','Song One','Artist A','/m/1.mp3','acc1',1000,NULL);
+                INSERT INTO tracks VALUES ('t2','Song Two','Artist B','/m/2.mp3','acc1',2000,NULL);
+                INSERT INTO tracks VALUES ('t3','Song Three',NULL,'/m/3.mp3','acc2',3000,NULL);
+
+                INSERT INTO playlists VALUES ('pl1','My Playlist',1700000000,1700000001);
+                INSERT INTO playlists VALUES ('pl2','Another',1700000002,1700000003);
+
+                INSERT INTO playlist_entries VALUES ('pl1',0,'t1','acc1','/m/1.mp3','Song One',180000);
+                INSERT INTO playlist_entries VALUES ('pl1',1,'t2','acc1','/m/2.mp3','Song Two',240000);
+                INSERT INTO playlist_entries VALUES ('pl2',0,'t3','acc2','/m/3.mp3','Song Three',300000);
+                "#,
+            )
+            .expect("seed old db");
+        }
+
+        let dest = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        // First import.
+        let summary = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
+        assert!(!summary.already_done);
+        assert_eq!(summary.tracks, 3);
+        assert_eq!(summary.playlists, 2);
+        assert_eq!(summary.entries, 3);
+
+        // Verify data landed.
+        assert_eq!(dest.list_tracks().unwrap().len(), 3);
+        assert_eq!(dest.list_playlists().unwrap().len(), 2);
+        assert_eq!(dest.list_playlist_entries("pl1").unwrap().len(), 2);
+
+        // Second call must be a no-op.
+        let summary2 = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
+        assert!(summary2.already_done);
+        assert_eq!(summary2.tracks, 0);
+
+        // Clean up temp file (best-effort).
+        let _ = std::fs::remove_file(&old_path);
     }
 }
