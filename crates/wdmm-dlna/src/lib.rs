@@ -1,10 +1,11 @@
-//! `wdmm-dlna` — DLNA/UPnP SSDP discovery + unified local HTTP range proxy.
+//! `wdmm-dlna` — DLNA/UPnP SSDP discovery + AVTransport SOAP control.
 //!
 //! ## Ownership
 //! Per constraints §3 the Rust core owns:
 //! - SSDP renderer discovery ([`SsdpDiscovery`])
-//! - the unified local proxy used for casting and streaming ([`proxy`])
 //! - AVTransport SOAP control ([`avtransport::AvTransportClient`])
+//! - the unified local proxy, now in the dedicated [`wdmm_proxy`] crate
+//!   (re-exported here as [`ProxyHandle`] for convenience).
 //!
 //! Platform frontends own playback stacks, media sessions and FGS lifetime;
 //! they only ask the core for a proxy URL.
@@ -12,7 +13,6 @@
 #![forbid(unsafe_code)]
 
 pub mod avtransport;
-pub mod proxy;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -21,7 +21,10 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
 pub use avtransport::AvTransportClient;
-pub use proxy::ProxyHandle;
+// The unified local proxy now lives in `wdmm-proxy`. DLNA cast callers still
+// get a `ProxyHandle` through this crate for convenience; new code should depend
+// on `wdmm-proxy` directly.
+pub use wdmm_proxy::ProxyHandle;
 
 #[derive(Debug, Error)]
 pub enum DlnaError {
@@ -168,7 +171,7 @@ impl Default for DlnaCastService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::resolve_range;
+    use wdmm_proxy::resolve_range;
 
     const RESP: &str = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nLocation: http://192.168.1.20:49152/desc.xml\r\nSERVER: Linux UPnP/1.0 TV/1.0\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nUSN: uuid:tv-1::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
 
@@ -221,8 +224,10 @@ mod tests {
         let data: Vec<u8> = (0..=255u8).collect();
         std::fs::write(&path, &data).unwrap();
 
-        let proxy = ProxyHandle::start(([127, 0, 0, 1], 0).into()).await.unwrap();
-        let url = proxy.register(&path);
+        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let reg = proxy.register_file(&path, None).await.unwrap();
+        let addr = proxy.addr().unwrap();
+        let url = format!("http://{addr}{}", reg.path_template);
         let client = reqwest::Client::new();
 
         let full = client.get(&url).send().await.unwrap();
@@ -237,14 +242,16 @@ mod tests {
         let bad = client.get(&url).header("Range", "bytes=300-").send().await.unwrap();
         assert_eq!(bad.status(), 416);
 
-        // Unregistered tokens and raw paths are never served.
-        let base = format!("http://{}", proxy.addr());
-        let raw = client.get(format!("{base}/stream/deadbeef")).send().await.unwrap();
+        // Unknown token → 404
+        let raw = client
+            .get(format!("http://{addr}/s/deadbeef00deadbeef00deadbeef0000"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(raw.status(), 404);
-        let traversal = client.get(format!("{base}/file/etc/passwd")).send().await.unwrap();
-        assert_eq!(traversal.status(), 404);
 
-        proxy.unregister(&url);
+        // Unregister → 404
+        proxy.unregister(&reg.token);
         assert_eq!(client.get(&url).send().await.unwrap().status(), 404);
 
         proxy.stop();

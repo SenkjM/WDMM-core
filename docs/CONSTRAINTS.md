@@ -41,7 +41,7 @@
 - Sync/backup encoding
 - Crypto
 - **DLNA**
-- **Unified local proxy** (all local HTTP proxy capabilities maintained in Rust)
+- **Unified local proxy** — extracted to `wdmm-proxy` crate (post Round 8); re-exported from `wdmm-dlna` for backward compat. `wdmm-ffi` exposes `wdmm_proxy_start/stop/register_file/unregister`.
 
 **留 platform / Kotlin·C# adapters**:
 - Playback stack (media_kit etc.)

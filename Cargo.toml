@@ -8,6 +8,7 @@ members = [
     "crates/wdmm-queue",
     "crates/wdmm-sync",
     "crates/wdmm-dlna",
+    "crates/wdmm-proxy",
     "crates/wdmm-platform",
     "crates/wdmm-openapi",
     "crates/wdmm-ffi",
@@ -27,6 +28,7 @@ wdmm-storage  = { path = "crates/wdmm-storage"  }
 wdmm-queue    = { path = "crates/wdmm-queue"    }
 wdmm-sync     = { path = "crates/wdmm-sync"     }
 wdmm-dlna     = { path = "crates/wdmm-dlna"     }
+wdmm-proxy    = { path = "crates/wdmm-proxy"    }
 wdmm-platform = { path = "crates/wdmm-platform" }
 wdmm-openapi  = { path = "crates/wdmm-openapi"  }
 

@@ -132,6 +132,38 @@ Returns `"ok"` or `"error:<message>"`.
 
 ---
 
+## Local HTTP proxy
+
+Process-global proxy singleton (backed by `wdmm_proxy::ProxyHandle`). Starts
+lazily, has an idle TTL, and restarts transparently on the next register. The
+proxy never returns a full URL — callers compose
+`http://{bind_host}:{port}{path_template}` themselves.
+
+### `extern "C" fn wdmm_proxy_start(port: u16) -> FfiString`
+Start the proxy on `127.0.0.1:<port>` (port 0 = ephemeral). Returns the assigned
+port as a decimal string, or `"error:<message>"`. No-op if already running
+(returns existing port). Caller must free.
+
+### `extern "C" fn wdmm_proxy_stop() -> FfiString`
+Stop the proxy. No-op if not running. Returns `"ok"`.
+
+### `extern "C" fn wdmm_proxy_port() -> i32`
+Bound port, or `-1` if not running.
+
+### `extern "C" fn wdmm_proxy_register_file(file_path: *const c_char, name: *const c_char) -> FfiString`
+Register a local file. `name` (may be `NULL`) is decorative — used only for
+Content-Type guessing. Returns JSON:
+```json
+{"token":"3f7a…","path_template":"/s/3f7a…","port":43221}
+```
+The caller builds the URL as `http://127.0.0.1:{port}{path_template}`.
+Returns `"error:proxy not started …"` if `wdmm_proxy_start` was not called.
+
+### `extern "C" fn wdmm_proxy_unregister(token: *const c_char) -> FfiString`
+Revoke a token. Returns `"ok"`.
+
+---
+
 ## Library database
 
 ### `extern "C" fn wdmm_library_init(path: *const c_char) -> FfiString`

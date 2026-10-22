@@ -2,7 +2,7 @@
 
 **WebDAV Media Manager** front/back split: all business logic, optional OpenAPI server, DLNA/UPnP cast, unified local proxy.
 
-This is a **Cargo workspace** with 10 crates. Source-level coupling to platform repos (Android Flutter via `flutter_rust_bridge`, Windows C# via `csbindgen`). **Not published to crates.io** — see `docs/CONSTRAINTS.md §5` for rationale.
+This is a **Cargo workspace** with 11 crates. Source-level coupling to platform repos (Android Flutter via `flutter_rust_bridge`, Windows C# via `csbindgen`). **Not published to crates.io** — see `docs/CONSTRAINTS.md §5` for rationale.
 
 ---
 
@@ -16,7 +16,8 @@ This is a **Cargo workspace** with 10 crates. Source-level coupling to platform 
 | `wdmm-storage` | rusqlite library DB (schema v1 skeleton, aligns WDMM library direction) |
 | `wdmm-queue` | Task-queue FIFO state machine + resumable download stub |
 | `wdmm-sync` | Incremental sync engine (credentials / playlists / library / manga) stub |
-| `wdmm-dlna` | DLNA/UPnP SSDP discovery + AVTransport SOAP stub; owns local proxy |
+| `wdmm-proxy` | Unified local HTTP range proxy — token-keyed, idle-TTL, local file + driver back-source |
+| `wdmm-dlna` | DLNA/UPnP SSDP discovery + AVTransport SOAP; proxy re-exported from `wdmm-proxy` |
 | `wdmm-platform` | Adapter traits (keychain / notification / FS / wakelock) + std default impl |
 | `wdmm-openapi` | Toggleable axum HTTP server (/v1/ routes, bind modes, token auth) |
 | `wdmm-ffi` | C ABI surface (`cdylib`/`staticlib`) for FRB (Android) / csbindgen (Windows) |
@@ -114,7 +115,7 @@ Access:
 - **Pure logic / zero platform deps**: `wdmm-core` never imports `std::fs`. All I/O goes through `wdmm-platform` adapter traits.
 - **Drivers — official API only**: WebDAV works. baidu / aliyundrive / 115 / ctfile / terabox / netease are stubbed (TODO per architecture report §4.3 phasing). OAuth keys are **user-supplied** (not embedded).
 - **DB migration**: `wdmm-storage` uses rusqlite; migration from Dart `sqflite` is **one-shot** (no long-term dual-write window).
-- **DLNA + local proxy**: owned by Rust; Android/Windows delegates cast operations via FFI.
+- **DLNA + local proxy**: DLNA owned by Rust; unified proxy extracted to `wdmm-proxy` (re-exported from `wdmm-dlna` for backward compat). Android/Windows delegates cast/stream operations via FFI.
 - **Publish = false**: Workspace default. See `docs/CONSTRAINTS.md §5` (service ToS, key leakage risk, attack surface).
 
 ---

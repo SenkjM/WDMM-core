@@ -1767,18 +1767,15 @@ dependencies = [
 name = "wdmm-dlna"
 version = "0.1.0"
 dependencies = [
- "axum",
- "bytes",
  "quick-xml",
- "rand 0.8.8",
  "reqwest",
  "serde",
  "thiserror 1.0.69",
  "tokio",
- "tokio-util",
  "tracing",
  "url",
  "wdmm-core",
+ "wdmm-proxy",
 ]
 
 [[package]]
@@ -1816,6 +1813,7 @@ dependencies = [
  "wdmm-dlna",
  "wdmm-drivers",
  "wdmm-openapi",
+ "wdmm-proxy",
  "wdmm-queue",
  "wdmm-storage",
  "wdmm-sync",
@@ -1851,6 +1849,23 @@ version = "0.1.0"
 dependencies = [
  "thiserror 1.0.69",
  "wdmm-core",
+]
+
+[[package]]
+name = "wdmm-proxy"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures",
+ "futures-core",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -404,6 +404,149 @@ pub extern "C" fn wdmm_sync_trigger(
     }
 }
 
+// ── Proxy FFI ─────────────────────────────────────────────────────────────────
+//
+// The proxy is a process-global singleton, like the OpenAPI server. It starts
+// lazily on the first `wdmm_proxy_start` call and stops on `wdmm_proxy_stop`
+// (or on Drop / process exit). The idle-TTL inside ProxyHandle also stops it
+// automatically after inactivity; the next `wdmm_proxy_register_file` call
+// will restart it transparently.
+
+use wdmm_proxy::ProxyHandle;
+
+fn proxy_cell() -> &'static std::sync::Mutex<Option<ProxyHandle>> {
+    static P: OnceLock<std::sync::Mutex<Option<ProxyHandle>>> = OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Start the local HTTP proxy bound to `127.0.0.1` on the given port.
+/// Use `port = 0` to let the OS assign a free port.
+///
+/// Returns the assigned port as a decimal string, or `"error:<message>"`.
+/// Idempotent — if the proxy is already running this is a no-op and returns
+/// the existing port. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_start(port: u16) -> FfiString {
+    let mut guard = proxy_cell().lock().unwrap();
+    // If already running, return the existing port.
+    if let Some(ref h) = *guard {
+        if let Some(addr) = h.addr() {
+            return FfiString::from(addr.port().to_string());
+        }
+    }
+    let bind: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let handle = ProxyHandle::new(bind);
+    // Trigger the lazy server start with an ephemeral temp file.
+    // We call register_file on a temp path just to ensure the server starts
+    // and we can read back the port. The file registration is immediately
+    // discarded (unregistered).
+    let result = rt().block_on(async {
+        let tmp = std::env::temp_dir()
+            .join(format!("wdmm-proxy-init-{}.tmp", std::process::id()));
+        std::fs::write(&tmp, b"").ok();
+        let reg = handle.register_file(&tmp, None).await;
+        if let Ok(r) = &reg {
+            handle.unregister(&r.token);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        handle.addr()
+    });
+    *guard = Some(handle);
+    match result {
+        Some(addr) => FfiString::from(addr.port().to_string()),
+        None => FfiString::from("error:server failed to bind"),
+    }
+}
+
+/// Stop the local HTTP proxy. No-op if not running. Returns `"ok"`.
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_stop() -> FfiString {
+    if let Some(h) = proxy_cell().lock().unwrap().take() {
+        h.stop();
+    }
+    FfiString::ok()
+}
+
+/// Returns the bound port of the proxy, or `-1` if not running.
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_port() -> i32 {
+    proxy_cell()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|h| h.addr())
+        .map(|a| a.port() as i32)
+        .unwrap_or(-1)
+}
+
+/// Register a local file with the proxy.
+///
+/// Parameters (null-terminated UTF-8 C strings):
+/// - `file_path`: absolute path to the local file.
+/// - `name`: optional display name used for Content-Type guessing (e.g.
+///   `"movie.mp4"`). Pass `NULL` to omit.
+///
+/// Returns a JSON object:
+/// ```json
+/// {"token":"3f7a…","path_template":"/s/3f7a…","port":43221}
+/// ```
+/// or `"error:<message>"` on failure. Caller must free the result.
+///
+/// The caller builds the URL as `http://127.0.0.1:{port}{path_template}`.
+///
+/// # Safety
+/// `file_path` must be a valid null-terminated UTF-8 C string.
+/// `name` may be `NULL` (treated as no name).
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_register_file(
+    file_path: *const std::os::raw::c_char,
+    name: *const std::os::raw::c_char,
+) -> FfiString {
+    let path_str = match ptr_to_str(file_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid file_path"),
+    };
+    let name_opt: Option<String> = ptr_to_str(name).map(|s| s.to_string());
+
+    let guard = proxy_cell().lock().unwrap();
+    let handle = match guard.as_ref() {
+        Some(h) => h,
+        None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
+    };
+    let path = std::path::Path::new(path_str);
+    let reg = rt().block_on(handle.register_file(path, name_opt));
+    match reg {
+        Ok(r) => {
+            let port = handle.addr().map(|a| a.port()).unwrap_or(0);
+            FfiString::from(
+                serde_json::json!({
+                    "token":         r.token,
+                    "path_template": r.path_template,
+                    "port":          port,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Unregister a token previously returned by `wdmm_proxy_register_file`.
+///
+/// `token` must be a valid null-terminated UTF-8 C string.
+/// Returns `"ok"`.
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_unregister(token: *const std::os::raw::c_char) -> FfiString {
+    let tok = match ptr_to_str(token) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid token"),
+    };
+    if let Some(h) = proxy_cell().lock().unwrap().as_ref() {
+        h.unregister(tok);
+    }
+    FfiString::ok()
+}
+
 // ── DLNA FFI ──────────────────────────────────────────────────────────────────
 
 /// Discover DLNA/UPnP MediaRenderer devices on the LAN using SSDP.
@@ -869,5 +1012,50 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert_eq!(s, "ok");
         wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn proxy_start_register_stop() {
+        // Start on an OS-assigned port.
+        let port_str = wdmm_proxy_start(0);
+        let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(port_str);
+        let port: u16 = port_s.parse().expect("proxy_start returns a port");
+
+        // Proxy is running and reports the same port.
+        assert_eq!(wdmm_proxy_port(), port as i32);
+
+        // Register a temp file and expect a JSON {token,path_template,port}.
+        let tmp = std::env::temp_dir().join(format!(
+            "wdmm-ffi-proxy-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, b"hello-proxy").unwrap();
+        let path = CString::new(tmp.to_string_lossy().to_string()).unwrap();
+        let name = CString::new("audio.mp3").unwrap();
+        let r = wdmm_proxy_register_file(path.as_ptr(), name.as_ptr());
+        let body = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("register returns JSON");
+        assert!(v["token"].is_string(), "body: {body}");
+        assert!(v["path_template"].as_str().unwrap().starts_with("/s/"));
+        assert_eq!(v["port"], port);
+        let token = v["token"].as_str().unwrap().to_string();
+
+        // Unregister.
+        let tok = CString::new(token).unwrap();
+        let r = wdmm_proxy_unregister(tok.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Stop.
+        let r = wdmm_proxy_stop();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_proxy_port(), -1);
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

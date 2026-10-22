@@ -1,23 +1,20 @@
 [package]
 name        = "wdmm-dlna"
-description  = "DLNA/UPnP SSDP discovery + AVTransport SOAP — optional feature; owns local proxy"
+description  = "DLNA/UPnP SSDP discovery + AVTransport SOAP; local proxy lives in wdmm-proxy"
 version      = { workspace = true }
 edition      = { workspace = true }
 publish      = { workspace = true }
 
 [dependencies]
-wdmm-core  = { workspace = true }
-tokio      = { workspace = true }
-tokio-util = { workspace = true }
-thiserror  = { workspace = true }
-serde      = { workspace = true }
-bytes      = { workspace = true }
-axum       = { workspace = true }
-tracing    = { workspace = true }
-rand       = { workspace = true }
-reqwest    = { workspace = true }
-quick-xml  = { workspace = true }
-url        = { workspace = true }
+wdmm-core   = { workspace = true }
+wdmm-proxy  = { workspace = true }
+tokio       = { workspace = true }
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+tracing     = { workspace = true }
+reqwest     = { workspace = true }
+quick-xml   = { workspace = true }
+url         = { workspace = true }
 
 [dev-dependencies]
 reqwest    = { workspace = true }

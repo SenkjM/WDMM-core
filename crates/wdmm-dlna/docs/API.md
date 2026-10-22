@@ -1,6 +1,11 @@
 # wdmm-dlna — Public API
 
-DLNA/UPnP SSDP discovery, unified local HTTP range proxy, and AVTransport SOAP control.
+DLNA/UPnP SSDP discovery and AVTransport SOAP control.
+
+The unified local HTTP range proxy has been extracted to its own crate,
+**`wdmm-proxy`** (see `crates/wdmm-proxy/docs/API.md`). For backward
+convenience, `wdmm_dlna::ProxyHandle` is re-exported from `wdmm_proxy`; new
+code should depend on `wdmm-proxy` directly.
 
 ---
 
@@ -78,22 +83,6 @@ Fetch device description, parse AVTransport `controlURL`, build client.
 
 ---
 
-## Local HTTP proxy (`wdmm_dlna::ProxyHandle`)
+## Local HTTP proxy
 
-Serves registered local files over HTTP with `Range` support.
-Only token-addressed URLs are served; raw filesystem paths are never exposed.
-
-### `async fn ProxyHandle::start(bind: SocketAddr) -> DlnaResult<Self>`
-Start the proxy. Use port 0 for an ephemeral port.
-
-### `fn ProxyHandle::addr(&self) -> SocketAddr`
-The bound address (useful when port was 0).
-
-### `fn ProxyHandle::register(&self, path: impl Into<PathBuf>) -> String`
-Register a local file; returns an unguessable `http://<addr>/stream/<token>` URL.
-
-### `fn ProxyHandle::unregister(&self, url: &str)`
-Revoke a previously registered URL. The token is extracted from the URL path.
-
-### `fn ProxyHandle::stop(self)`
-Send graceful shutdown signal. Also triggered on `Drop`.
+`ProxyHandle` is re-exported from `wdmm_proxy` — see `crates/wdmm-proxy/docs/API.md` for the full API.

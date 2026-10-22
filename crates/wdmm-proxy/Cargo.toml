@@ -1,0 +1,21 @@
+[package]
+name        = "wdmm-proxy"
+description  = "Unified local HTTP range proxy — token-keyed, idle-TTL, local file + driver back-source"
+version      = { workspace = true }
+edition      = { workspace = true }
+publish      = { workspace = true }
+
+[dependencies]
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+futures-core = "0.3"
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+bytes      = { workspace = true }
+axum       = { workspace = true }
+tracing    = { workspace = true }
+rand       = { workspace = true }
+
+[dev-dependencies]
+reqwest    = { workspace = true }
+futures    = { workspace = true }
