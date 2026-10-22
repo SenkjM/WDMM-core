@@ -77,9 +77,9 @@ pub trait CloudDriver: Send + Sync {
 
     /// Write bytes to a remote file path (used by sync engines for metadata).
     ///
-    /// This is **not** the cut user-upload path (see drivers guide §8): it
-    /// exists so sync engines can push small JSON/metadata files to remote
-    /// storage. Default impl returns `Err(Unsupported)`.
+    /// This is **not** the user-upload path (see drivers guide §8): it exists so
+    /// sync engines can push small JSON/metadata files to remote storage.
+    /// Default impl returns `Err(Unsupported)`.
     async fn put_content(&self, path: &str, data: &[u8]) -> Result<()> {
         let _ = (path, data);
         Err(DriverError::Other(
@@ -95,5 +95,25 @@ pub trait CloudDriver: Send + Sync {
         Err(DriverError::Other(
             "get_content not supported by this driver".into(),
         ))
+    }
+
+    /// Fetch a byte range of a remote file (resumable / partial-content download).
+    ///
+    /// `start` is inclusive, `end` is inclusive (same semantics as HTTP
+    /// `Range: bytes=start-end`). Pass `end = None` to fetch from `start` to
+    /// end-of-file.
+    ///
+    /// Default impl falls back to [`CloudDriver::get_content`] and slices in
+    /// memory, which is correct but wasteful for large files. Drivers that
+    /// support HTTP Range (WebDAV, CtFile after redirect) should override this.
+    async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
+        // Fallback: full download + slice. Only suitable for small files.
+        let full = self.get_content(path).await?;
+        let s = start as usize;
+        if s >= full.len() {
+            return Ok(Vec::new());
+        }
+        let e = end.map(|e| (e as usize + 1).min(full.len())).unwrap_or(full.len());
+        Ok(full[s..e].to_vec())
     }
 }

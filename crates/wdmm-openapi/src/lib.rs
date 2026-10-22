@@ -10,7 +10,7 @@
 #![forbid(unsafe_code)]
 
 use axum::{
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{oneshot, RwLock};
-use wdmm_core::models::CloudAccount;
+use wdmm_core::models::{CloudAccount, LibraryTrack};
 use wdmm_queue::TaskQueue;
-use wdmm_storage::LibraryDatabase;
+use wdmm_storage::{LibraryDatabase, Playlist, PlaylistEntry};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -321,6 +321,242 @@ async fn get_token(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({ "token": tok }))
 }
 
+// ── Library: tracks ──────────────────────────────────────────────────────────
+
+/// `GET /v1/library/tracks?q=<query>` — list all tracks, or search if `q` is set.
+#[derive(Debug, Deserialize)]
+struct TrackListQuery {
+    q: Option<String>,
+}
+
+async fn list_library_tracks(
+    State(state): State<AppState>,
+    Query(q): Query<TrackListQuery>,
+) -> impl IntoResponse {
+    let result = match &q.q {
+        Some(query) if !query.is_empty() => state.db.search_tracks(query),
+        _ => state.db.list_tracks(),
+    };
+    match result {
+        Ok(tracks) => Json(serde_json::json!({ "tracks": tracks })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/library/tracks/:id`
+async fn get_library_track(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.get_track(&id) {
+        Ok(Some(t)) => Json(t).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /v1/library/tracks/:id` — upsert a track.
+async fn upsert_library_track(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(mut payload): Json<LibraryTrack>,
+) -> impl IntoResponse {
+    payload.id = id.clone();
+    match state.db.upsert_track(&payload) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "id": id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /v1/library/tracks/:id`
+async fn delete_library_track(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.delete_track(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// ── Library: playlists ────────────────────────────────────────────────────────
+
+/// `GET /v1/playlists` — list all playlists.
+async fn list_playlists(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.list_playlists() {
+        Ok(playlists) => Json(serde_json::json!({ "playlists": playlists })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatePlaylistRequest {
+    id: Option<String>,
+    name: String,
+}
+
+/// `POST /v1/playlists` — create a playlist.
+async fn create_playlist(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePlaylistRequest>,
+) -> impl IntoResponse {
+    let now = chrono::Utc::now();
+    let id = payload.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let pl = Playlist {
+        id: id.clone(),
+        name: payload.name,
+        created_at: now,
+        updated_at: now,
+    };
+    match state.db.upsert_playlist(&pl) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/playlists/:id`
+async fn get_playlist(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.get_playlist(&id) {
+        Ok(Some(p)) => Json(p).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /v1/playlists/:id` — rename a playlist.
+async fn update_playlist(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let now = chrono::Utc::now();
+    let name = payload["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing 'name'" })),
+        )
+            .into_response();
+    }
+    // Preserve created_at if the playlist exists.
+    let existing = state.db.get_playlist(&id).ok().flatten();
+    let created = existing.map(|p| p.created_at).unwrap_or(now);
+    let pl = Playlist {
+        id: id.clone(),
+        name,
+        created_at: created,
+        updated_at: now,
+    };
+    match state.db.upsert_playlist(&pl) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "id": id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /v1/playlists/:id` — cascades entries.
+async fn delete_playlist(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.delete_playlist(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/playlists/:id/entries`
+async fn list_playlist_entries(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.list_playlist_entries(&id) {
+        Ok(entries) => Json(serde_json::json!({ "entries": entries })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /v1/playlists/:id/entries` — replace all entries in one shot.
+async fn set_playlist_entries(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Vec<PlaylistEntry>>,
+) -> impl IntoResponse {
+    let entries: Vec<PlaylistEntry> = payload
+        .into_iter()
+        .map(|mut e| {
+            e.playlist_id = id.clone();
+            e
+        })
+        .collect();
+    match state.db.set_playlist_entries(&id, &entries) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "count": entries.len() })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 fn build_router(state: AppState) -> Router {
@@ -332,6 +568,13 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/tasks/:id/cancel", post(cancel_task))
         .route("/v1/token", get(get_token))
         .route("/v1/token/rotate", post(rotate_token))
+        // ── Library: tracks ───────────────────────────────────────────────────
+        .route("/v1/library/tracks", get(list_library_tracks))
+        .route("/v1/library/tracks/:id", get(get_library_track).put(upsert_library_track).delete(delete_library_track))
+        // ── Library: playlists ───────────────────────────────────────────────
+        .route("/v1/playlists", get(list_playlists).post(create_playlist))
+        .route("/v1/playlists/:id", get(get_playlist).put(update_playlist).delete(delete_playlist))
+        .route("/v1/playlists/:id/entries", get(list_playlist_entries).put(set_playlist_entries))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()

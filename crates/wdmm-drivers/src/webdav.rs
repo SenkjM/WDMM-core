@@ -246,6 +246,31 @@ impl CloudDriver for WebDavDriver {
         }
         Ok(resp.bytes().await?.to_vec())
     }
+
+    async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
+        let url = self.join_path(path);
+        let range_value = match end {
+            Some(e) => format!("bytes={}-{}", start, e),
+            None => format!("bytes={}-", start),
+        };
+        let resp = self
+            .client
+            .get(&url)
+            .header(reqwest::header::RANGE, &range_value)
+            .send()
+            .await?;
+        // 206 Partial Content or 200 OK (server that ignores Range)
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(DriverError::NotFound(path.to_string()));
+        }
+        if !resp.status().is_success() {
+            return Err(DriverError::Network(format!(
+                "GET range failed: {}",
+                resp.status()
+            )));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
 }
 
 #[cfg(test)]
