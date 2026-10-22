@@ -353,6 +353,244 @@ impl Default for TaskQueue {
     }
 }
 
+// ── Serial pump (single-worker FIFO) ──────────────────────────────────────────
+//
+// Product note: the Dart `TaskQueueService._pump` processes exactly one task at
+// a time. WDMM must match — no concurrent download workers. `SerialPump` drives
+// the [`TaskQueue`] state machine with a [`TaskExecutor`], guaranteeing at most
+// one Active task at any instant. Concurrency is fixed at 1 and cannot be
+// raised through this API (there is no `concurrency` knob on purpose).
+
+/// Maximum automatic retries before a task is left in the Failed state.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// A single-worker FIFO pump over a [`TaskQueue`].
+///
+/// Created from a shared queue + an executor. [`SerialPump::pump_once`] picks
+/// the next Pending task, runs it to completion (Completed/Failed/Cancelled),
+/// then returns. Repeated calls drain the queue. Because the pump holds an
+/// executor handle and processes one task at a time, there is never more than
+/// one Active task.
+pub struct SerialPump {
+    queue: Arc<TaskQueue>,
+    executor: Arc<dyn TaskExecutor>,
+    max_retries: u32,
+}
+
+impl SerialPump {
+    /// Construct a serial pump. Concurrency is implicitly 1.
+    pub fn new(queue: Arc<TaskQueue>, executor: Arc<dyn TaskExecutor>) -> Self {
+        Self {
+            queue,
+            executor,
+            max_retries: DEFAULT_MAX_RETRIES,
+        }
+    }
+
+    /// Override the auto-retry limit (default [`DEFAULT_MAX_RETRIES`]).
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Process a single Pending task if one exists. Returns `Ok(true)` if a
+    /// task was run, `Ok(false)` if the queue had no pending work.
+    ///
+    /// This blocks until the task finishes (Completed/Failed/Cancelled). The
+    /// pump guarantees no other task is started concurrently — it is the only
+    /// caller of [`TaskQueue::start_task`] for its queue.
+    pub async fn pump_once(&self) -> QueueResult<bool> {
+        let next = match self.queue.next_pending().await {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        let _token = self.queue.start_task(&next.id).await?;
+        let (progress_tx, mut progress_rx) = broadcast::channel::<ProgressEvent>(32);
+
+        // Spawn the executor and drive progress updates serially.
+        let exec = Arc::clone(&self.executor);
+        let task = next.clone();
+        let handle = tokio::spawn(async move {
+            exec.execute(&task, progress_tx).await
+        });
+
+        // Forward progress events to the queue while the task runs.
+        while let Ok(ev) = progress_rx.recv().await {
+            let _ = self
+                .queue
+                .update_progress(&ev.task_id, ev.transferred, ev.total)
+                .await;
+            if handle.is_finished() {
+                break;
+            }
+        }
+
+        let outcome = handle.await.map_err(|e| QueueError::Other(e.to_string()))?;
+        match outcome {
+            Ok(()) => {
+                self.queue.mark_completed(&next.id).await?;
+            }
+            Err(QueueError::Cancelled) => {
+                self.queue.cancel(&next.id).await?;
+            }
+            Err(e) => {
+                let is_cancel = e.to_string().to_lowercase().contains("cancel");
+                let task = self
+                    .queue
+                    .list()
+                    .await
+                    .into_iter()
+                    .find(|t| t.id == next.id);
+                let should_retry = !is_cancel
+                    && task
+                        .as_ref()
+                        .map(|t| TaskQueue::should_auto_retry(t, self.max_retries))
+                        .unwrap_or(false);
+                self.queue
+                    .mark_failed(&next.id, e.to_string())
+                    .await?;
+                if should_retry {
+                    // Exponential backoff, then reset to Pending for the next pump.
+                    let delay = TaskQueue::retry_delay(next.attempts);
+                    tokio::time::sleep(delay).await;
+                    self.queue.retry(&next.id).await?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Drain the queue serially: run `pump_once` until no pending work remains.
+    pub async fn drain(&self) -> QueueResult<()> {
+        while self.pump_once().await? {}
+        Ok(())
+    }
+
+    /// The number of tasks currently in the Active state. For a serial pump
+    /// driven correctly this is always 0 or 1 — exposed for assertions/tests.
+    pub async fn active_count(&self) -> usize {
+        self.queue.list_by_status(TaskStatus::Active).await.len()
+    }
+}
+
+#[cfg(test)]
+mod serial_pump_tests {
+    use super::*;
+    use chrono::Utc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use wdmm_core::models::TaskKind;
+
+    /// Executor that records how many instances are running concurrently.
+    struct CountingExecutor {
+        in_flight: Arc<AtomicUsize>,
+        max_concurrent: Arc<AtomicUsize>,
+        duration_ms: u64,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for CountingExecutor {
+        async fn execute(
+            &self,
+            task: &QueueTask,
+            _progress_tx: broadcast::Sender<ProgressEvent>,
+        ) -> QueueResult<()> {
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_concurrent.fetch_max(cur, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(self.duration_ms)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let _ = task;
+            Ok(())
+        }
+    }
+
+    fn make_task(id: &str) -> QueueTask {
+        QueueTask {
+            id: id.into(),
+            kind: TaskKind::DownloadTrack,
+            status: TaskStatus::Pending,
+            progress: 0.0,
+            total_bytes: 1000,
+            transferred_bytes: 0,
+            created: Utc::now(),
+            updated: Utc::now(),
+            attempts: 0,
+            error: None,
+            remote_path: Some(format!("/m/{id}.mp3")),
+            local_path: None,
+        }
+    }
+
+    /// The core invariant: even with many tasks, only one runs at a time.
+    #[tokio::test]
+    async fn serial_only_one_active_at_a_time() {
+        let queue = Arc::new(TaskQueue::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let executor = Arc::new(CountingExecutor {
+            in_flight: Arc::clone(&in_flight),
+            max_concurrent: Arc::clone(&max_concurrent),
+            duration_ms: 30,
+        });
+
+        for i in 0..5 {
+            queue.enqueue(make_task(&format!("t{i}"))).await.unwrap();
+        }
+
+        let pump = SerialPump::new(Arc::clone(&queue), executor);
+        pump.drain().await.unwrap();
+
+        assert_eq!(max_concurrent.load(Ordering::SeqCst), 1, "never more than one");
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "all finished");
+        let done = queue.list().await;
+        assert_eq!(done.len(), 5);
+        assert!(done.iter().all(|t| t.status == TaskStatus::Completed));
+    }
+
+    /// active_count never exceeds 1 while the pump runs.
+    #[tokio::test]
+    async fn active_count_never_exceeds_one() {
+        let queue = Arc::new(TaskQueue::new());
+        let executor = Arc::new(CountingExecutor {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+            duration_ms: 40,
+        });
+        for i in 0..3 {
+            queue.enqueue(make_task(&format!("a{i}"))).await.unwrap();
+        }
+        let pump = SerialPump::new(Arc::clone(&queue), executor);
+
+        let observer = Arc::clone(&queue);
+        let obs = tokio::spawn(async move {
+            let mut max_active = 0usize;
+            for _ in 0..50 {
+                max_active = max_active.max(observer.list_by_status(TaskStatus::Active).await.len());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            max_active
+        });
+
+        pump.drain().await.unwrap();
+        let max_active = obs.await.unwrap();
+        assert!(max_active <= 1, "active_count peaked at {max_active}");
+    }
+
+    /// pump_once returns false when idle.
+    #[tokio::test]
+    async fn pump_once_idle() {
+        let queue = Arc::new(TaskQueue::new());
+        let executor = Arc::new(CountingExecutor {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+            duration_ms: 1,
+        });
+        let pump = SerialPump::new(queue, executor);
+        assert!(!pump.pump_once().await.unwrap());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
