@@ -7,14 +7,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A library track (music/video file).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A library track (music/video file). Schema v2: extended with library fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LibraryTrack {
     /// SHA-1 identity hash of normalised remote path.
     pub id: String,
     /// Display title.
     pub title: String,
-    /// Artist name (optional).
+    /// Primary artist name (optional; denormalised for display).
     pub artist: Option<String>,
     /// Remote path on the source account (before normalisation).
     pub remote_path: String,
@@ -24,6 +24,55 @@ pub struct LibraryTrack {
     pub size: u64,
     /// Last modified timestamp.
     pub modified: Option<DateTime<Utc>>,
+    // ── v2 fields ─────────────────────────────────────────────────────────────
+    /// FK to albums.id (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_id: Option<String>,
+    /// FK to artists.id (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist_id: Option<String>,
+    /// Duration in milliseconds (0 = unknown).
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    /// 1-based track number within the album.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_number: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disc_number: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<i32>,
+    /// MIME type (e.g. "audio/mpeg").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+/// An album in the music library. Schema v2.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LibraryAlbum {
+    pub id: String,
+    pub title: String,
+    /// FK to artists.id (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<i32>,
+    /// Remote URL to album art (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub art_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// An artist in the music library. Schema v2.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LibraryArtist {
+    pub id: String,
+    pub name: String,
+    /// Sort name (e.g. "Beatles, The").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_name: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// A cloud account (WebDAV or driver-backed).

@@ -1,8 +1,10 @@
-//! `wdmm-storage` — rusqlite library DB (schema v1, minimal tables skeleton).
+//! `wdmm-storage` — rusqlite library DB (schema v2, music library essentials).
 //!
 //! Aligns with WDMM `music_library.db` direction (schema v18 from architecture
-//! report). This is a **minimal bootstrap** — full table set per brief: tracks,
-//! cue, manga, user_folders, deleted. Schema version comments document alignment.
+//! report). Schema v2 (Round 5) adds artists/albums tables, extends `tracks`
+//! with library metadata columns, and adds search + delete. Manga tables are
+//! skeleton stubs (Round 6 for full parity). Migrations are one-shot additive:
+//! each `open()` runs the full DDL with `IF NOT EXISTS`, then a version bump.
 
 #![forbid(unsafe_code)]
 
@@ -11,7 +13,7 @@ use rusqlite::{params, Connection};
 use std::sync::Mutex;
 use thiserror::Error as ThisError;
 
-use wdmm_core::models::{CloudAccount, LibraryTrack};
+use wdmm_core::models::{CloudAccount, LibraryAlbum, LibraryArtist, LibraryTrack};
 
 #[derive(Debug, ThisError)]
 pub enum StorageError {
@@ -35,7 +37,11 @@ pub struct LibraryDatabase {
 }
 
 impl LibraryDatabase {
-    /// Open or create the library database. Schema v1 (skeleton).
+    /// Open or create the library database.
+    ///
+    /// Schema v1 (Round 4): base tables.
+    /// Schema v2 (Round 5): artists, albums, extended tracks columns, manga stubs.
+    /// Migrations are additive one-shot: all DDL uses `IF NOT EXISTS` / `IF NOT EXISTS`.
     pub fn open(path: &std::path::Path) -> StorageResult<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
@@ -43,47 +49,12 @@ impl LibraryDatabase {
             PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
 
-            -- Schema version tracking (aligns WDMM library schema v18 direction)
+            -- ── Schema version ────────────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS _schema_version (
                 version INTEGER PRIMARY KEY
             );
-            INSERT OR IGNORE INTO _schema_version (version) VALUES (1);
 
-            -- Tracks table (minimal subset)
-            CREATE TABLE IF NOT EXISTS tracks (
-                id           TEXT PRIMARY KEY,  -- SHA-1 identity
-                title        TEXT NOT NULL,
-                artist       TEXT,
-                remote_path  TEXT NOT NULL,
-                account_id   TEXT NOT NULL,
-                size         INTEGER NOT NULL DEFAULT 0,
-                modified     INTEGER,           -- Unix timestamp (seconds)
-                created_at   INTEGER NOT NULL   -- Unix timestamp
-            );
-
-            -- User folders (stub)
-            CREATE TABLE IF NOT EXISTS user_folders (
-                id         TEXT PRIMARY KEY,
-                name       TEXT NOT NULL,
-                parent_id  TEXT,
-                created    INTEGER NOT NULL
-            );
-
-            -- Deleted items tombstone (stub)
-            CREATE TABLE IF NOT EXISTS deleted (
-                id         TEXT PRIMARY KEY,
-                deleted_at INTEGER NOT NULL
-            );
-
-            -- Queue tasks (stub)
-            CREATE TABLE IF NOT EXISTS queue_tasks (
-                id         TEXT PRIMARY KEY,
-                kind       TEXT NOT NULL,
-                status     TEXT NOT NULL,
-                created    INTEGER NOT NULL
-            );
-
-            -- Cloud accounts
+            -- ── Cloud accounts ────────────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS accounts (
                 id                    TEXT PRIMARY KEY,
                 provider_type         TEXT NOT NULL,
@@ -94,34 +65,131 @@ impl LibraryDatabase {
                 updated_at            INTEGER NOT NULL
             );
 
-            -- Playlists (Round 4: full CRUD per docs/10-PLAYLIST-FORMAT.md essentials)
-            CREATE TABLE IF NOT EXISTS playlists (
-                id          TEXT PRIMARY KEY,
-                name        TEXT NOT NULL,
-                created_at  INTEGER NOT NULL,
-                updated_at  INTEGER NOT NULL
+            -- ── Artists (schema v2) ───────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS artists (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                sort_name  TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_artists_name ON artists (name COLLATE NOCASE);
+
+            -- ── Albums (schema v2) ────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS albums (
+                id         TEXT PRIMARY KEY,
+                title      TEXT NOT NULL,
+                artist_id  TEXT,
+                year       INTEGER,
+                art_url    TEXT,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_albums_artist ON albums (artist_id);
+
+            -- ── Tracks (v1 columns + v2 columns all in one DDL) ───────────────
+            --  The v2 extra columns have defaults so old rows stay valid.
+            CREATE TABLE IF NOT EXISTS tracks (
+                id            TEXT PRIMARY KEY,   -- SHA-1 identity
+                title         TEXT NOT NULL,
+                artist        TEXT,               -- denormalised display artist
+                remote_path   TEXT NOT NULL,
+                account_id    TEXT NOT NULL,
+                size          INTEGER NOT NULL DEFAULT 0,
+                modified      INTEGER,            -- Unix timestamp (s)
+                created_at    INTEGER NOT NULL,   -- Unix timestamp (s)
+                -- v2 columns ──────────────────────────────────────────────────
+                album_id      TEXT,
+                artist_id     TEXT,
+                duration_ms   INTEGER NOT NULL DEFAULT 0,
+                genre         TEXT,
+                track_number  INTEGER,
+                disc_number   INTEGER,
+                year          INTEGER,
+                mime_type     TEXT,
+                FOREIGN KEY (album_id)  REFERENCES albums(id)  ON DELETE SET NULL,
+                FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tracks_account  ON tracks (account_id);
+            CREATE INDEX IF NOT EXISTS idx_tracks_album    ON tracks (album_id);
+            CREATE INDEX IF NOT EXISTS idx_tracks_artist   ON tracks (artist_id);
+            CREATE INDEX IF NOT EXISTS idx_tracks_title    ON tracks (title COLLATE NOCASE);
+
+            -- ── User folders ──────────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS user_folders (
+                id        TEXT PRIMARY KEY,
+                name      TEXT NOT NULL,
+                parent_id TEXT,
+                created   INTEGER NOT NULL
             );
 
-            -- Playlist entries (references to tracks, per §4.2 ENTRIES semantics)
+            -- ── Deleted items tombstone ───────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS deleted (
+                id         TEXT PRIMARY KEY,
+                deleted_at INTEGER NOT NULL
+            );
+
+            -- ── Queue tasks (stub — state managed in-process by wdmm-queue) ───
+            CREATE TABLE IF NOT EXISTS queue_tasks (
+                id      TEXT PRIMARY KEY,
+                kind    TEXT NOT NULL,
+                status  TEXT NOT NULL,
+                created INTEGER NOT NULL
+            );
+
+            -- ── Playlists (Round 4) ───────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS playlists (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- ── Playlist entries ──────────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS playlist_entries (
-                playlist_id  TEXT NOT NULL,
-                position     INTEGER NOT NULL,
-                music_id     TEXT NOT NULL,
-                source_name  TEXT NOT NULL,
-                remote_path  TEXT NOT NULL,
-                title        TEXT NOT NULL,
-                duration_ms  INTEGER NOT NULL DEFAULT 0,
+                playlist_id TEXT    NOT NULL,
+                position    INTEGER NOT NULL,
+                music_id    TEXT    NOT NULL,
+                source_name TEXT    NOT NULL,
+                remote_path TEXT    NOT NULL,
+                title       TEXT    NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (playlist_id, position),
                 FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
             );
 
-            -- Key-value store (Round 4: OpenAPI token persistence + misc settings)
+            -- ── KV store (Round 4: OpenAPI token persistence) ─────────────────
             CREATE TABLE IF NOT EXISTS kv_store (
                 key        TEXT PRIMARY KEY,
                 value      TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            -- ── Manga stubs (skeleton — Round 6 for full parity) ─────────────
+            CREATE TABLE IF NOT EXISTS manga_series (
+                id          TEXT PRIMARY KEY,
+                title       TEXT NOT NULL,
+                source_name TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS manga_chapters (
+                id          TEXT PRIMARY KEY,
+                series_id   TEXT NOT NULL,
+                title       TEXT,
+                remote_path TEXT NOT NULL,
+                page_count  INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL,
+                FOREIGN KEY (series_id) REFERENCES manga_series(id) ON DELETE CASCADE
+            );
             "#,
+        )?;
+
+        // Bump schema version to 2 (idempotent).
+        conn.execute("INSERT OR IGNORE INTO _schema_version (version) VALUES (1)", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO _schema_version (version) VALUES (2)",
+            [],
         )?;
 
         Ok(Self {
@@ -129,13 +197,27 @@ impl LibraryDatabase {
         })
     }
 
-    pub fn insert_track(&self, track: &LibraryTrack) -> StorageResult<()> {
+    pub fn schema_version(&self) -> StorageResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT MAX(version) FROM _schema_version",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    // ── Tracks ────────────────────────────────────────────────────────────────
+
+    /// Upsert a track (insert or replace all columns).
+    pub fn upsert_track(&self, track: &LibraryTrack) -> StorageResult<()> {
         let now = Utc::now().timestamp();
         let modified_ts = track.modified.map(|dt| dt.timestamp());
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO tracks (id, title, artist, remote_path, account_id, size, modified, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO tracks
+             (id, title, artist, remote_path, account_id, size, modified, created_at,
+              album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 &track.id,
                 &track.title,
@@ -145,39 +227,58 @@ impl LibraryDatabase {
                 track.size as i64,
                 modified_ts,
                 now,
+                &track.album_id,
+                &track.artist_id,
+                track.duration_ms,
+                &track.genre,
+                &track.track_number,
+                &track.disc_number,
+                &track.year,
+                &track.mime_type,
             ],
         )?;
         Ok(())
     }
 
+    /// Backward-compat alias.
+    pub fn insert_track(&self, track: &LibraryTrack) -> StorageResult<()> {
+        self.upsert_track(track)
+    }
+
     pub fn get_track(&self, id: &str) -> StorageResult<Option<LibraryTrack>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, title, artist, remote_path, account_id, size, modified FROM tracks WHERE id = ?1",
+            "SELECT id, title, artist, remote_path, account_id, size, modified,
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type
+             FROM tracks WHERE id = ?1",
         )?;
-
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
-            let modified_ts: Option<i64> = row.get(6)?;
-            let modified = modified_ts.map(|ts| DateTime::from_timestamp(ts, 0).unwrap().with_timezone(&Utc));
-
-            Ok(Some(LibraryTrack {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                artist: row.get(2)?,
-                remote_path: row.get(3)?,
-                account_id: row.get(4)?,
-                size: row.get::<_, i64>(5)? as u64,
-                modified,
-            }))
+            Ok(Some(row_to_track(row)?))
         } else {
             Ok(None)
         }
     }
 
-    pub fn schema_version(&self) -> StorageResult<i64> {
+    pub fn delete_track(&self, id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.query_row("SELECT version FROM _schema_version", [], |row| row.get(0))?)
+        conn.execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Search tracks by title or artist (case-insensitive LIKE).
+    pub fn search_tracks(&self, query: &str) -> StorageResult<Vec<LibraryTrack>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist, remote_path, account_id, size, modified,
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type
+             FROM tracks
+             WHERE title LIKE ?1 ESCAPE '\\' OR artist LIKE ?1 ESCAPE '\\'
+             ORDER BY title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![pattern], row_to_track)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
     }
 
     // ── Accounts ──────────────────────────────────────────────────────────────
@@ -250,34 +351,141 @@ impl LibraryDatabase {
         Ok(())
     }
 
-    // ── Playlists ─────────────────────────────────────────────────────────────
+    // ── Tracks listing ─────────────────────────────────────────────────────────
 
     pub fn list_tracks(&self) -> StorageResult<Vec<LibraryTrack>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, title, artist, remote_path, account_id, size, modified FROM tracks",
+            "SELECT id, title, artist, remote_path, account_id, size, modified,
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type
+             FROM tracks ORDER BY title COLLATE NOCASE",
         )?;
+        let rows = stmt.query_map([], row_to_track)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
 
-        let rows = stmt.query_map([], |row| {
-            let modified_ts: Option<i64> = row.get(6)?;
-            let modified = modified_ts.map(|ts| DateTime::from_timestamp(ts, 0).unwrap().with_timezone(&Utc));
+    // ── Artists (schema v2) ──────────────────────────────────────────────────────
 
-            Ok(LibraryTrack {
+    pub fn upsert_artist(&self, artist: &LibraryArtist) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO artists (id, name, sort_name, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &artist.id,
+                &artist.name,
+                &artist.sort_name,
+                artist.created_at.timestamp(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_artist(&self, id: &str) -> StorageResult<Option<LibraryArtist>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, name, sort_name, created_at FROM artists WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(LibraryArtist {
                 id: row.get(0)?,
-                title: row.get(1)?,
-                artist: row.get(2)?,
-                remote_path: row.get(3)?,
-                account_id: row.get(4)?,
-                size: row.get::<_, i64>(5)? as u64,
-                modified,
+                name: row.get(1)?,
+                sort_name: row.get(2)?,
+                created_at: ts_to_dt(row.get(3)?)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_artists(&self) -> StorageResult<Vec<LibraryArtist>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, name, sort_name, created_at FROM artists ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(LibraryArtist {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                sort_name: row.get(2)?,
+                created_at: ts_to_dt(row.get(3)?).unwrap_or_else(|_| Utc::now()),
             })
         })?;
-
-        let mut tracks = Vec::new();
-        for track in rows {
-            tracks.push(track?);
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
         }
-        Ok(tracks)
+        Ok(out)
+    }
+
+    pub fn delete_artist(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM artists WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ── Albums (schema v2) ──────────────────────────────────────────────────────
+
+    pub fn upsert_album(&self, album: &LibraryAlbum) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO albums (id, title, artist_id, year, art_url, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &album.id,
+                &album.title,
+                &album.artist_id,
+                &album.year,
+                &album.art_url,
+                album.created_at.timestamp(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_album(&self, id: &str) -> StorageResult<Option<LibraryAlbum>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, title, artist_id, year, art_url, created_at FROM albums WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(LibraryAlbum {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                artist_id: row.get(2)?,
+                year: row.get(3)?,
+                art_url: row.get(4)?,
+                created_at: ts_to_dt(row.get(5)?)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_albums(&self) -> StorageResult<Vec<LibraryAlbum>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, title, artist_id, year, art_url, created_at FROM albums ORDER BY title")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(LibraryAlbum {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                artist_id: row.get(2)?,
+                year: row.get(3)?,
+                art_url: row.get(4)?,
+                created_at: ts_to_dt(row.get(5)?).unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_album(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM albums WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     // ── Playlists (Round 4: full CRUD + entries per docs/10-PLAYLIST-FORMAT.md) ─
@@ -463,14 +671,42 @@ fn ts_to_dt(ts: i64) -> StorageResult<DateTime<Utc>> {
         .ok_or_else(|| StorageError::Database(format!("invalid timestamp {ts}")))
 }
 
+/// Map a rusqlite `Row` (in the v2 column order) to a `LibraryTrack`.
+fn row_to_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryTrack> {
+    let modified_ts: Option<i64> = row.get(6)?;
+    let modified = modified_ts.and_then(|ts| DateTime::from_timestamp(ts, 0));
+    Ok(LibraryTrack {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        artist: row.get(2)?,
+        remote_path: row.get(3)?,
+        account_id: row.get(4)?,
+        size: row.get::<_, i64>(5)? as u64,
+        modified,
+        album_id: row.get(7)?,
+        artist_id: row.get(8)?,
+        duration_ms: row.get(9)?,
+        genre: row.get(10)?,
+        track_number: row.get(11)?,
+        disc_number: row.get(12)?,
+        year: row.get(13)?,
+        mime_type: row.get(14)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn schema_v2() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+    }
+
+    #[test]
     fn create_and_query() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
 
         let track = LibraryTrack {
             id: "test-id".into(),
@@ -480,11 +716,137 @@ mod tests {
             account_id: "acc1".into(),
             size: 12345,
             modified: None,
+            ..Default::default()
         };
         db.insert_track(&track).unwrap();
 
         let loaded = db.get_track("test-id").unwrap().unwrap();
         assert_eq!(loaded.title, "Test Track");
+    }
+
+    #[test]
+    fn track_crud_v2_fields() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now();
+
+        // Parents must exist before the track (FK constraints are enforced).
+        db.upsert_artist(&LibraryArtist {
+            id: "art1".into(),
+            name: "Artist".into(),
+            sort_name: None,
+            created_at: now,
+        })
+        .unwrap();
+        db.upsert_album(&LibraryAlbum {
+            id: "alb1".into(),
+            title: "Album".into(),
+            artist_id: Some("art1".into()),
+            year: Some(2024),
+            art_url: None,
+            created_at: now,
+        })
+        .unwrap();
+
+        let track = LibraryTrack {
+            id: "t1".into(),
+            title: "Song".into(),
+            artist: Some("Artist".into()),
+            remote_path: "/music/song.mp3".into(),
+            account_id: "acc1".into(),
+            size: 5000,
+            modified: None,
+            album_id: Some("alb1".into()),
+            artist_id: Some("art1".into()),
+            duration_ms: 210_000,
+            genre: Some("Rock".into()),
+            track_number: Some(3),
+            disc_number: Some(1),
+            year: Some(2024),
+            mime_type: Some("audio/mpeg".into()),
+        };
+        db.upsert_track(&track).unwrap();
+
+        let loaded = db.get_track("t1").unwrap().unwrap();
+        assert_eq!(loaded.album_id.as_deref(), Some("alb1"));
+        assert_eq!(loaded.duration_ms, 210_000);
+        assert_eq!(loaded.genre.as_deref(), Some("Rock"));
+        assert_eq!(loaded.track_number, Some(3));
+        assert_eq!(loaded.mime_type.as_deref(), Some("audio/mpeg"));
+
+        // Delete
+        db.delete_track("t1").unwrap();
+        assert!(db.get_track("t1").unwrap().is_none());
+    }
+
+    #[test]
+    fn search_tracks() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        let tracks = [
+            ("a", "Yesterday", Some("The Beatles")),
+            ("b", "Tomorrow", Some("Silver Sun")),
+            ("c", "Daydream", Some("Beatles Solo")),
+        ];
+        for (id, title, artist) in tracks {
+            db.upsert_track(&LibraryTrack {
+                id: id.into(),
+                title: title.into(),
+                artist: artist.map(Into::into),
+                remote_path: format!("/m/{id}.mp3"),
+                account_id: "acc".into(),
+                size: 1,
+                modified: None,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        // Title match
+        let r = db.search_tracks("day").unwrap();
+        assert_eq!(r.len(), 2, "title 'Day' + 'daydream'");
+
+        // Artist match (case-insensitive)
+        let r = db.search_tracks("beatles").unwrap();
+        assert_eq!(r.len(), 2, "two beatles artists");
+
+        // No match
+        assert!(db.search_tracks("zzz").unwrap().is_empty());
+    }
+
+    #[test]
+    fn artists_and_albums_crud() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now();
+
+        let artist = LibraryArtist {
+            id: "art1".into(),
+            name: "The Beatles".into(),
+            sort_name: Some("Beatles, The".into()),
+            created_at: now,
+        };
+        db.upsert_artist(&artist).unwrap();
+        assert_eq!(db.list_artists().unwrap().len(), 1);
+        assert_eq!(
+            db.get_artist("art1").unwrap().unwrap().sort_name.as_deref(),
+            Some("Beatles, The")
+        );
+
+        let album = LibraryAlbum {
+            id: "alb1".into(),
+            title: "Abbey Road".into(),
+            artist_id: Some("art1".into()),
+            year: Some(1969),
+            art_url: None,
+            created_at: now,
+        };
+        db.upsert_album(&album).unwrap();
+        assert_eq!(db.list_albums().unwrap().len(), 1);
+        assert_eq!(db.get_album("alb1").unwrap().unwrap().year, Some(1969));
+
+        db.delete_album("alb1").unwrap();
+        db.delete_artist("art1").unwrap();
+        assert!(db.list_albums().unwrap().is_empty());
+        assert!(db.list_artists().unwrap().is_empty());
     }
 
     #[test]
