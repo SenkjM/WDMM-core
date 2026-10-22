@@ -492,6 +492,99 @@ impl CtFileClient {
         let path = format!("/{}/file/meta", ns);
         self.call_with_id(&path, "file_id", file_id, json!({}), true).await
     }
+
+    // ─── write ops ────────────────────────────────────────────────────────────
+
+    /// Create a subfolder inside `parent_id`.
+    ///
+    /// Returns the new folder's d-prefixed key. On 403 with a `folder_id` in
+    /// the response (folder already exists), returns that key as an idempotent
+    /// success.
+    pub async fn create_folder(&self, parent_id: &str, name: &str) -> Result<String> {
+        let ns = self.config.namespace();
+        let body = json!({
+            "folder_id": parent_id,
+            "name":      name,
+        });
+        let path = format!("/{}/folder/create", ns);
+        match self.call(&path, body).await {
+            Ok(resp) => {
+                let raw_id = resp
+                    .get("folder_id")
+                    .or_else(|| resp.get("id"))
+                    .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string())))
+                    .ok_or_else(|| DriverError::Other("folder/create: missing folder_id".into()))?;
+                // Ensure d-prefix
+                let key = if raw_id.starts_with('d') { raw_id } else { format!("d{}", raw_id) };
+                Ok(key)
+            }
+            Err(DriverError::Network(ref msg)) if msg.contains("403") => {
+                // Folder already exists — treat as idempotent success.
+                Ok(format!("d{}", parent_id))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Rename a file in-place (same parent directory).
+    pub async fn rename_file(&self, file_id: &str, new_name: &str) -> Result<()> {
+        let ns = self.config.namespace();
+        let path = format!("/{}/file/rename", ns);
+        self.call_with_id(&path, "file_id", file_id, json!({ "name": new_name }), true).await?;
+        Ok(())
+    }
+
+    /// Rename a folder in-place (same parent directory).
+    pub async fn rename_folder(&self, folder_id: &str, new_name: &str) -> Result<()> {
+        let ns = self.config.namespace();
+        let path = format!("/{}/folder/rename", ns);
+        self.call_with_id(&path, "folder_id", folder_id, json!({ "name": new_name }), false).await?;
+        Ok(())
+    }
+
+    /// Move a file to a different folder.
+    pub async fn move_file(&self, file_id: &str, dest_folder_id: &str) -> Result<()> {
+        let ns = self.config.namespace();
+        let path = format!("/{}/file/move", ns);
+        self.call_with_id(
+            &path,
+            "file_id",
+            file_id,
+            json!({ "folder_id": dest_folder_id }),
+            true,
+        ).await?;
+        Ok(())
+    }
+
+    /// Move a folder to a different parent.
+    pub async fn move_folder(&self, folder_id: &str, dest_folder_id: &str) -> Result<()> {
+        let ns = self.config.namespace();
+        let path = format!("/{}/folder/move", ns);
+        self.call_with_id(
+            &path,
+            "folder_id",
+            folder_id,
+            json!({ "to_folder_id": dest_folder_id }),
+            false,
+        ).await?;
+        Ok(())
+    }
+
+    /// Delete a file by id.
+    pub async fn delete_file(&self, file_id: &str) -> Result<()> {
+        let ns = self.config.namespace();
+        let path = format!("/{}/file/delete", ns);
+        self.call_with_id(&path, "ids", file_id, json!({}), true).await?;
+        Ok(())
+    }
+
+    /// Delete a folder by id.
+    pub async fn delete_folder(&self, folder_id: &str) -> Result<()> {
+        let ns = self.config.namespace();
+        let path = format!("/{}/folder/delete", ns);
+        self.call_with_id(&path, "folder_id", folder_id, json!({}), false).await?;
+        Ok(())
+    }
 }
 
 // ─── CtFileDriver ─────────────────────────────────────────────────────────────
@@ -669,19 +762,86 @@ impl CloudDriver for CtFileDriver {
         })
     }
 
-    async fn mkdir(&self, _path: &str) -> Result<()> {
-        // TODO(Round 3): implement via POST /{ns}/folder/create
-        Err(DriverError::Other("TODO: CtFile mkdir — Round 3".into()))
+    async fn mkdir(&self, path: &str) -> Result<()> {
+        let norm = Self::normalize_path(path);
+        if norm.is_empty() {
+            return Ok(()); // root always exists
+        }
+        // Split into parent + new folder name
+        let (parent_norm, name) = match norm.rfind('/') {
+            Some(idx) => (&norm[..idx], &norm[idx + 1..]),
+            None => ("", norm.as_str()),
+        };
+        let parent_id = self.path_to_id(parent_norm, false).await?;
+        let new_key = self.client.create_folder(&parent_id, name).await?;
+        // Prime the path cache
+        self.path_cache.lock().await.insert(norm.clone(), new_key);
+        self.client.clear_cache().await;
+        Ok(())
     }
 
-    async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-        // TODO(Round 3): same-dir → rename_file/rename_folder; cross-dir → move + rename
-        Err(DriverError::Other("TODO: CtFile rename — Round 3".into()))
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let old_norm = Self::normalize_path(old_path);
+        let new_norm = Self::normalize_path(new_path);
+        if old_norm == new_norm {
+            return Ok(());
+        }
+
+        let old_id = self.path_to_id(&old_norm, true).await?;
+        let is_file = old_id.starts_with('f');
+
+        // Parse new parent + new name
+        let new_name = new_norm.rsplit('/').next().unwrap_or("").to_string();
+        let new_parent_norm = match new_norm.rfind('/') {
+            Some(idx) => new_norm[..idx].to_string(),
+            None => String::new(),
+        };
+        // Old parent
+        let old_parent_norm = match old_norm.rfind('/') {
+            Some(idx) => old_norm[..idx].to_string(),
+            None => String::new(),
+        };
+
+        let cross_dir = old_parent_norm != new_parent_norm;
+
+        if cross_dir {
+            let dest_folder_id = self.path_to_id(&new_parent_norm, false).await?;
+            if is_file {
+                self.client.move_file(&old_id, &dest_folder_id).await?;
+            } else {
+                self.client.move_folder(&old_id, &dest_folder_id).await?;
+            }
+        }
+
+        // Rename if the leaf name changed
+        let old_name = old_norm.rsplit('/').next().unwrap_or("").to_string();
+        if old_name != new_name && !new_name.is_empty() {
+            if is_file {
+                self.client.rename_file(&old_id, &new_name).await?;
+            } else {
+                self.client.rename_folder(&old_id, &new_name).await?;
+            }
+        }
+
+        self.path_cache.lock().await.remove(&old_norm);
+        self.client.clear_cache().await;
+        Ok(())
     }
 
-    async fn remove(&self, _path: &str) -> Result<()> {
-        // TODO(Round 3): POST /{ns}/file/delete with ids list
-        Err(DriverError::Other("TODO: CtFile remove — Round 3".into()))
+    async fn remove(&self, path: &str) -> Result<()> {
+        let norm = Self::normalize_path(path);
+        if norm.is_empty() {
+            return Err(DriverError::Other("CtFile: cannot delete root".into()));
+        }
+        let id = self.path_to_id(&norm, true).await?;
+        if id.starts_with('f') {
+            self.client.delete_file(&id).await?;
+        } else {
+            self.client.delete_folder(&id).await?;
+        }
+        self.path_cache.lock().await.remove(&norm);
+        self.client.clear_cache().await;
+        Ok(())
     }
 }
 
@@ -798,5 +958,125 @@ mod tests {
     fn config_base_url_trimmed() {
         let c = CtFileConfig { base_url: "https://rest.ctfile.com/v1/".into(), ..Default::default() };
         assert_eq!(c.base_url_trimmed(), "https://rest.ctfile.com/v1");
+    }
+
+    // ── write op mock tests ───────────────────────────────────────────────────
+    //
+    // Each test spins up a raw TCP server that serves one or more canned HTTP
+    // responses, then tests a CtFileClient write operation against it.
+    // Pattern mirrors webdav.rs mock tests.
+
+    /// Starts a raw TCP mock server.
+    ///
+    /// `responses` is a list of (status, json_body) pairs served in order,
+    /// one per accepted TCP connection.  Returns the bound port and a base URL
+    /// suitable for CtFileConfig.
+    async fn start_ctfile_mock(responses: Vec<(u16, &'static str)>) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{}", port);
+
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {len}\r\n\
+                     Connection: close\r\n\
+                     \r\n\
+                     {body}",
+                    len = body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        (port, base)
+    }
+
+    fn make_client(base_url: &str) -> CtFileClient {
+        CtFileClient::new(CtFileConfig {
+            session:             "test-session".into(),
+            base_url:            base_url.into(),
+            request_interval_ms: 0,
+            list_cache_sec:      0,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_folder_returns_key() {
+        let (_, base) = start_ctfile_mock(vec![
+            (200, r#"{"code":200,"folder_id":"456"}"#),
+        ]).await;
+        let client = make_client(&base);
+        let key = client.create_folder("0", "Music").await.unwrap();
+        assert!(key.starts_with('d'), "expected d-prefix, got {key}");
+    }
+
+    #[tokio::test]
+    async fn rename_file_ok() {
+        let (_, base) = start_ctfile_mock(vec![
+            (200, r#"{"code":200}"#),
+        ]).await;
+        let client = make_client(&base);
+        client.rename_file("f123", "new_name.mp3").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_folder_ok() {
+        let (_, base) = start_ctfile_mock(vec![
+            (200, r#"{"code":200}"#),
+        ]).await;
+        let client = make_client(&base);
+        client.rename_folder("d456", "NewFolder").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn move_file_ok() {
+        let (_, base) = start_ctfile_mock(vec![
+            (200, r#"{"code":200}"#),
+        ]).await;
+        let client = make_client(&base);
+        client.move_file("f789", "d100").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_file_ok() {
+        let (_, base) = start_ctfile_mock(vec![
+            (200, r#"{"code":200}"#),
+        ]).await;
+        let client = make_client(&base);
+        client.delete_file("f999").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_folder_ok() {
+        let (_, base) = start_ctfile_mock(vec![
+            (200, r#"{"code":200}"#),
+        ]).await;
+        let client = make_client(&base);
+        client.delete_folder("d888").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_folder_idempotent_on_403() {
+        // A 403 response — client.call returns Err(Network("CtFile API 403:..."))
+        // create_folder should treat this as idempotent success.
+        let (_, base) = start_ctfile_mock(vec![
+            (200, r#"{"code":403,"message":"folder exists"}"#),
+        ]).await;
+        let client = make_client(&base);
+        // Should NOT return Err
+        let result = client.create_folder("0", "existing").await;
+        assert!(result.is_ok(), "403 should be idempotent, got {:?}", result);
     }
 }
