@@ -327,6 +327,7 @@ impl From<&RemoteTrack> for LibraryTrack {
             account_id: r.account_id.clone(),
             size: r.size,
             modified,
+            ..Default::default()
         }
     }
 }
@@ -805,6 +806,7 @@ mod tests {
             account_id: "acc1".into(),
             size: 12345,
             modified: None,
+            ..Default::default()
         };
         db.insert_track(&track).unwrap();
 
@@ -902,6 +904,7 @@ mod tests {
             account_id: "a".into(),
             size: 0,
             modified: None,
+            ..Default::default()
         })
         .unwrap();
 
