@@ -5,25 +5,31 @@
 //! - `CtFileDriver`    — CtFile (城通网盘) list/get + write ops
 //! - `BaiduDriver`     — Baidu NetDisk list/get (write ops TODO)
 //! - `Pan123Driver`    — 123 Pan list/get (write ops TODO)
+//! - `AliyunDriver`    — Aliyun Drive list/get (write ops TODO)
+//! - `Open115Driver`   — 115 Network list/get (write ops TODO)
 //!
 //! Stubbed drivers (Round 3+): each returns a loud TODO error.
-//! - aliyundrive, open115, terabox, netease_music.
+//! - terabox, netease_music.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod aliyun;
 pub mod baidu;
 pub mod ctfile;
 pub mod driver;
+pub mod open115;
 pub mod pan123;
 pub mod stubs;
 pub mod webdav;
 
+pub use aliyun::{AliyunConfig, AliyunDriver};
 pub use baidu::{BaiduConfig, BaiduDriver};
 pub use ctfile::{CtFileConfig, CtFileDriver};
 pub use driver::{CloudDriver, CloudFileItem, DriverError, Result};
+pub use open115::{Open115Config, Open115Driver};
 pub use pan123::{Pan123Config, Pan123Driver};
-pub use stubs::{AliyunDriveDriver, NeteaseMusicDriver, Open115Driver, TeraboxDriver};
+pub use stubs::{NeteaseMusicDriver, TeraboxDriver};
 pub use webdav::WebDavDriver;
 
 /// Driver registry — instantiates a `CloudDriver` from a provider type + config JSON.
@@ -76,8 +82,25 @@ impl DriverRegistry {
                 if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
                 Ok(Box::new(Pan123Driver::new(cfg)?))
             }
-            "aliyundrive" | "aliyun" => Ok(Box::new(AliyunDriveDriver)),
-            "115" | "open115" => Ok(Box::new(Open115Driver)),
+            "aliyundrive" | "aliyun" => {
+                let token = config["access_token"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::Config("aliyun: missing access_token".into()))?;
+                let drive_id = config["drive_id"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::Config("aliyun: missing drive_id".into()))?;
+                let mut cfg = AliyunConfig::new(token, drive_id);
+                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                Ok(Box::new(AliyunDriver::new(cfg)?))
+            }
+            "115" | "open115" => {
+                let token = config["access_token"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::Config("115: missing access_token".into()))?;
+                let mut cfg = Open115Config::new(token);
+                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                Ok(Box::new(Open115Driver::new(cfg)?))
+            }
             "terabox" => Ok(Box::new(TeraboxDriver)),
             "netease_music" => Ok(Box::new(NeteaseMusicDriver)),
             _ => Err(DriverError::UnsupportedProvider(provider_type.to_string())),
@@ -114,15 +137,40 @@ mod tests {
     }
 
     #[test]
-    fn registry_stubs_instantiate() {
-        // Production drivers need access_token
+    fn registry_aliyun_requires_token_and_drive_id() {
+        // Missing access_token
+        match DriverRegistry::create_driver("aliyundrive", serde_json::json!({})) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        // Missing drive_id
+        match DriverRegistry::create_driver("aliyun", serde_json::json!({"access_token":"tok"})) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        // Both present
+        assert!(DriverRegistry::create_driver(
+            "aliyundrive",
+            serde_json::json!({"access_token": "tok", "drive_id": "drv"})).is_ok());
+    }
+
+    #[test]
+    fn registry_115_requires_token() {
+        match DriverRegistry::create_driver("115", serde_json::json!({})) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        assert!(DriverRegistry::create_driver(
+            "open115", serde_json::json!({"access_token": "tok"})).is_ok());
+    }
+
+    #[test]
+    fn registry_production_drivers_instantiate() {
         assert!(DriverRegistry::create_driver(
             "baidu", serde_json::json!({"access_token": "tok"})).is_ok());
         assert!(DriverRegistry::create_driver(
             "123_open", serde_json::json!({"access_token": "tok"})).is_ok());
         // Remaining stubs need no config
-        assert!(DriverRegistry::create_driver("aliyundrive", serde_json::json!({})).is_ok());
-        assert!(DriverRegistry::create_driver("115", serde_json::json!({})).is_ok());
         assert!(DriverRegistry::create_driver("terabox", serde_json::json!({})).is_ok());
         assert!(DriverRegistry::create_driver("netease_music", serde_json::json!({})).is_ok());
     }

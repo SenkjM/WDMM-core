@@ -122,6 +122,73 @@ pub extern "C" fn wdmm_queue_cancel(task_id: *const c_char) -> FfiString {
     }
 }
 
+/// Enqueue a new download task from JSON.
+///
+/// Expected JSON shape (all fields optional except `id` and `kind`):
+/// ```json
+/// {
+///   "id":          "uuid-...",
+///   "kind":        "download_track",
+///   "remote_path": "/Music/foo.mp3",
+///   "local_path":  "/data/.../foo.mp3",
+///   "total_bytes": 5000000
+/// }
+/// ```
+///
+/// Returns `"ok"` on success, `"error:<message>"` on failure.
+/// `json` must be a valid null-terminated UTF-8 C string.
+///
+/// ## Feature flag
+/// This function is always available via FFI. On the Dart side, it is gated
+/// by `kRustQueueEnabled` (default `false`). Flip the flag to `true` in
+/// settings to route single-file downloads through the Rust `SerialPump`.
+/// The Dart `_pump` loop remains active while the flag is `false`.
+#[no_mangle]
+pub extern "C" fn wdmm_queue_enqueue(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let id = match v["id"].as_str() {
+        Some(id) => id.to_string(),
+        None => return FfiString::from("error:missing 'id'"),
+    };
+    let kind_str = v["kind"].as_str().unwrap_or("download_track");
+    let kind = match kind_str {
+        "download_track"    => wdmm_core::models::TaskKind::DownloadTrack,
+        "download_playlist" => wdmm_core::models::TaskKind::DownloadPlaylist,
+        "upload_file"       => wdmm_core::models::TaskKind::UploadFile,
+        "backup"            => wdmm_core::models::TaskKind::Backup,
+        "sync_credentials"  => wdmm_core::models::TaskKind::SyncCredentials,
+        "sync_library"      => wdmm_core::models::TaskKind::SyncLibrary,
+        "sync_playlists"    => wdmm_core::models::TaskKind::SyncPlaylists,
+        "sync_manga"        => wdmm_core::models::TaskKind::SyncManga,
+        _                   => wdmm_core::models::TaskKind::Other,
+    };
+    let task = wdmm_core::models::QueueTask {
+        id,
+        kind,
+        status: wdmm_core::models::TaskStatus::Pending,
+        progress: 0.0,
+        total_bytes: v["total_bytes"].as_u64().unwrap_or(0),
+        transferred_bytes: 0,
+        created: chrono::Utc::now(),
+        updated: chrono::Utc::now(),
+        attempts: 0,
+        error: None,
+        remote_path: v["remote_path"].as_str().map(Into::into),
+        local_path: v["local_path"].as_str().map(Into::into),
+    };
+    match rt().block_on(global_queue().enqueue(task)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 /// Return the number of pending tasks.
 #[no_mangle]
 pub extern "C" fn wdmm_queue_pending_count() -> i32 {
@@ -680,10 +747,12 @@ mod tests {
 
     #[test]
     fn queue_status_empty() {
+        // Queue is a global singleton — may contain tasks from other tests.
+        // Only verify it parses as a JSON array.
         let s = wdmm_queue_status_json();
         let json = unsafe { CStr::from_ptr(s.ptr) }.to_str().unwrap();
         let v: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert!(v.as_array().unwrap().is_empty());
+        assert!(v.is_array(), "expected JSON array, got: {json}");
         wdmm_ffi_free_string(s);
     }
 
@@ -769,6 +838,36 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         // Either "error:..." or already_done (if prev test left the flag)
         assert!(s.starts_with("error:") || s.contains("already_done"));
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn queue_enqueue_and_status() {
+        // Enqueue a download_track task
+        let json = CString::new(
+            r#"{"id":"qtest-001","kind":"download_track","remote_path":"/m/test.mp3","total_bytes":500000}"#
+        ).unwrap();
+        let r = wdmm_queue_enqueue(json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "enqueue failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // Verify it shows up in status
+        let s = wdmm_queue_status_json();
+        let json_str = unsafe { CStr::from_ptr(s.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let found = arr.as_array().unwrap().iter().any(|t| t["id"] == "qtest-001");
+        assert!(found, "enqueued task not in status: {json_str}");
+        wdmm_ffi_free_string(s);
+
+        // Pending count must be at least 1
+        assert!(wdmm_queue_pending_count() >= 1);
+
+        // Cancel it
+        let id = CString::new("qtest-001").unwrap();
+        let r = wdmm_queue_cancel(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
         wdmm_ffi_free_string(r);
     }
 }
