@@ -8,14 +8,14 @@
 //! Implemented this round:
 //! - `webdav`  (wdmm_drivers::WebDavDriver)
 //! - `ctfile`  (wdmm_drivers::CtFileDriver)
+//! - `baidu`   (wdmm_drivers::BaiduDriver) — list/get production; write ops TODO
+//! - `123`     (wdmm_drivers::Pan123Driver) — list/get production; write ops TODO
 //!
 //! Stubbed (Round 3+):
-//! - baidu_netdisk  — Baidu NetDisk OpenAPI
 //! - aliyundrive     — Aliyun Drive OpenAPI (OAuth, user-supplied app key)
 //! - open115         — 115 OpenAPI
 //! - terabox         — Terabox
 //! - netease_music   — NetEase Cloud Music (excluded from public release per §9)
-//! - 123_open        — 123 Pan OpenAPI
 
 use async_trait::async_trait;
 use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
@@ -50,9 +50,9 @@ macro_rules! impl_stub_driver {
     };
 }
 
-impl_stub_driver!(BaiduDriver, "baidu_netdisk");
 impl_stub_driver!(AliyunDriveDriver, "aliyundrive");
 impl_stub_driver!(Open115Driver, "open115");
 impl_stub_driver!(TeraboxDriver, "terabox");
 impl_stub_driver!(NeteaseMusicDriver, "netease_music");
+impl_stub_driver!(BaiduDriver, "baidu_netdisk");
 impl_stub_driver!(Pan123OpenDriver, "123_open");

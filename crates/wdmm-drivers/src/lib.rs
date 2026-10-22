@@ -1,30 +1,29 @@
 //! `wdmm-drivers` — CloudDriver trait + implementations.
 //!
 //! Implemented drivers (production paths):
-//! - `WebDavDriver` — WebDAV `list`/`get`/`mkdir`/`rename`(MOVE)/`remove`/`put_content`/`get_content`
-//! - `CtFileDriver` — CtFile (城通网盘) `list()` + `get()` download_url ported from
-//!   Dart ctfile_driver.dart using official API patterns.
+//! - `WebDavDriver`    — WebDAV list/get/mkdir/rename/remove/put_content/get_content
+//! - `CtFileDriver`    — CtFile (城通网盘) list/get + write ops
+//! - `BaiduDriver`     — Baidu NetDisk list/get (write ops TODO)
+//! - `Pan123Driver`    — 123 Pan list/get (write ops TODO)
 //!
-//! Stubbed drivers (Round 4): each has a clear `CloudDriver` method surface
-//! (list/get/mkdir/rename/remove + default put_content/get_content) matching
-//! the Dart ports list in docs/11-CLOUD-DRIVER-PORTING.md §10–12. Methods
-//! return a loud `TODO` error so callers fail rather than silently no-op'ing:
-//! - baidu_netdisk, aliyundrive_open, open115, terabox, netease_music, 123_open.
+//! Stubbed drivers (Round 3+): each returns a loud TODO error.
+//! - aliyundrive, open115, terabox, netease_music.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod baidu;
 pub mod ctfile;
 pub mod driver;
+pub mod pan123;
 pub mod stubs;
 pub mod webdav;
 
+pub use baidu::{BaiduConfig, BaiduDriver};
 pub use ctfile::{CtFileConfig, CtFileDriver};
 pub use driver::{CloudDriver, CloudFileItem, DriverError, Result};
-pub use stubs::{
-    AliyunDriveDriver, BaiduDriver, NeteaseMusicDriver, Open115Driver, Pan123OpenDriver,
-    TeraboxDriver,
-};
+pub use pan123::{Pan123Config, Pan123Driver};
+pub use stubs::{AliyunDriveDriver, NeteaseMusicDriver, Open115Driver, TeraboxDriver};
 pub use webdav::WebDavDriver;
 
 /// Driver registry — instantiates a `CloudDriver` from a provider type + config JSON.
@@ -48,41 +47,39 @@ impl DriverRegistry {
                 Ok(Box::new(WebDavDriver::new(url, username, password)?))
             }
             "ctfile" => {
-                // Session token (开放接口登录密钥) is the only required secret.
-                // It must come from the user's config — never embedded here.
                 let session = config["session"]
                     .as_str()
                     .ok_or_else(|| DriverError::Config("ctfile: missing session token".into()))?;
                 let mut cfg = CtFileConfig::with_session(session);
-                if let Some(s) = config["cloud_type"].as_str() {
-                    cfg.cloud_type = s.to_string();
-                }
-                if let Some(s) = config["base_url"].as_str() {
-                    cfg.base_url = s.to_string();
-                }
-                if let Some(s) = config["order_by"].as_str() {
-                    cfg.order_by = s.to_string();
-                }
-                if let Some(s) = config["order_direction"].as_str() {
-                    cfg.order_direction = s.to_string();
-                }
-                if let Some(s) = config["user_agent"].as_str() {
-                    cfg.user_agent = s.to_string();
-                }
-                if let Some(n) = config["list_cache_sec"].as_u64() {
-                    cfg.list_cache_sec = n;
-                }
-                if let Some(n) = config["request_interval_ms"].as_u64() {
-                    cfg.request_interval_ms = n;
-                }
+                if let Some(s) = config["cloud_type"].as_str() { cfg.cloud_type = s.to_string(); }
+                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                if let Some(s) = config["order_by"].as_str() { cfg.order_by = s.to_string(); }
+                if let Some(s) = config["order_direction"].as_str() { cfg.order_direction = s.to_string(); }
+                if let Some(s) = config["user_agent"].as_str() { cfg.user_agent = s.to_string(); }
+                if let Some(n) = config["list_cache_sec"].as_u64() { cfg.list_cache_sec = n; }
+                if let Some(n) = config["request_interval_ms"].as_u64() { cfg.request_interval_ms = n; }
                 Ok(Box::new(CtFileDriver::new(cfg)?))
             }
-            "baidu" | "baidu_netdisk" => Ok(Box::new(BaiduDriver)),
+            "baidu" | "baidu_netdisk" => {
+                let token = config["access_token"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::Config("baidu: missing access_token".into()))?;
+                let mut cfg = BaiduConfig::new(token);
+                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                Ok(Box::new(BaiduDriver::new(cfg)?))
+            }
+            "123" | "123_open" | "pan123" => {
+                let token = config["access_token"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::Config("123pan: missing access_token".into()))?;
+                let mut cfg = Pan123Config::new(token);
+                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                Ok(Box::new(Pan123Driver::new(cfg)?))
+            }
             "aliyundrive" | "aliyun" => Ok(Box::new(AliyunDriveDriver)),
             "115" | "open115" => Ok(Box::new(Open115Driver)),
             "terabox" => Ok(Box::new(TeraboxDriver)),
             "netease_music" => Ok(Box::new(NeteaseMusicDriver)),
-            "123" | "123_open" | "pan123" => Ok(Box::new(Pan123OpenDriver)),
             _ => Err(DriverError::UnsupportedProvider(provider_type.to_string())),
         }
     }
@@ -118,12 +115,15 @@ mod tests {
 
     #[test]
     fn registry_stubs_instantiate() {
-        // Stubs build OK; their methods error at call-time, not build-time.
-        assert!(DriverRegistry::create_driver("baidu", serde_json::json!({})).is_ok());
+        // Production drivers need access_token
+        assert!(DriverRegistry::create_driver(
+            "baidu", serde_json::json!({"access_token": "tok"})).is_ok());
+        assert!(DriverRegistry::create_driver(
+            "123_open", serde_json::json!({"access_token": "tok"})).is_ok());
+        // Remaining stubs need no config
         assert!(DriverRegistry::create_driver("aliyundrive", serde_json::json!({})).is_ok());
         assert!(DriverRegistry::create_driver("115", serde_json::json!({})).is_ok());
         assert!(DriverRegistry::create_driver("terabox", serde_json::json!({})).is_ok());
         assert!(DriverRegistry::create_driver("netease_music", serde_json::json!({})).is_ok());
-        assert!(DriverRegistry::create_driver("123_open", serde_json::json!({})).is_ok());
     }
 }
