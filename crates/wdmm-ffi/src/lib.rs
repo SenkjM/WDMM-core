@@ -454,6 +454,183 @@ pub extern "C" fn wdmm_token_rotate() -> FfiString {
     }
 }
 
+// ── Library DB singleton ──────────────────────────────────────────────────────
+//
+// The FFI exposes a process-global library database. Real Android/Windows
+// integration calls `wdmm_library_init(path)` at app start; falls back to
+// ":memory:" for testing. All track/artist/album operations use this.
+
+static LIBRARY_DB: OnceLock<std::sync::Arc<LibraryDatabase>> = OnceLock::new();
+
+fn global_library_db() -> &'static std::sync::Arc<LibraryDatabase> {
+    LIBRARY_DB.get_or_init(|| {
+        std::sync::Arc::new(
+            LibraryDatabase::open(std::path::Path::new(":memory:"))
+                .expect("FFI: failed to open in-memory library DB"),
+        )
+    })
+}
+
+/// Initialise the library database at a custom path.
+///
+/// Must be called once before any other `wdmm_track_*` / `wdmm_artist_*` /
+/// `wdmm_album_*` functions. If called after the singleton is already
+/// initialised (e.g. from tests), this is a no-op — the path is ignored and
+/// `"ok"` is returned.
+///
+/// `path` must be a valid null-terminated UTF-8 C string (file path or
+/// `":memory:"`).
+///
+/// Returns `"ok"` on success or `"error:<message>"` on failure.
+#[no_mangle]
+pub extern "C" fn wdmm_library_init(path: *const c_char) -> FfiString {
+    let p = match ptr_to_str(path) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid path pointer"),
+    };
+    // OnceLock: if already set this call is a no-op.
+    LIBRARY_DB.get_or_init(|| {
+        std::sync::Arc::new(
+            LibraryDatabase::open(std::path::Path::new(p))
+                .expect("FFI: failed to open library DB at given path"),
+        )
+    });
+    FfiString::ok()
+}
+
+// ── Track CRUD ────────────────────────────────────────────────────────────────
+
+/// Upsert a track from a JSON object.
+///
+/// Expected JSON shape (all optional fields may be absent):
+/// ```json
+/// {
+///   "id":           "sha1hex",
+///   "title":        "Song Title",
+///   "artist":       "Artist Name",
+///   "remote_path":  "/path/on/cloud",
+///   "account_id":   "acc-uuid",
+///   "size":         12345,
+///   "album_id":     "alb-uuid",
+///   "artist_id":    "art-uuid",
+///   "duration_ms":  210000,
+///   "genre":        "Rock",
+///   "track_number": 3,
+///   "disc_number":  1,
+///   "year":         2024,
+///   "mime_type":    "audio/mpeg"
+/// }
+/// ```
+///
+/// Returns `"ok"` on success, `"error:<message>"` otherwise.
+/// `json` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_track_upsert(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let track = match json_to_track(&v) {
+        Ok(t) => t,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    match global_library_db().upsert_track(&track) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get a track by id. Returns the track as JSON or `"null"` if not found.
+/// Returns `"error:<message>"` on storage error.
+#[no_mangle]
+pub extern "C" fn wdmm_track_get(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().get_track(id) {
+        Ok(Some(t)) => FfiString::from(serde_json::to_string(&t).unwrap_or_else(|_| "{}".into())),
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List all tracks. Returns a JSON array.
+#[no_mangle]
+pub extern "C" fn wdmm_track_list() -> FfiString {
+    match global_library_db().list_tracks() {
+        Ok(tracks) => FfiString::from(
+            serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Search tracks by title/artist. `query` is a case-insensitive substring.
+/// Returns a JSON array.
+#[no_mangle]
+pub extern "C" fn wdmm_track_search(query: *const c_char) -> FfiString {
+    let q = match ptr_to_str(query) {
+        Some(s) => s,
+        None => return FfiString::from("error:null query pointer"),
+    };
+    match global_library_db().search_tracks(q) {
+        Ok(tracks) => FfiString::from(
+            serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a track by id. Returns `"ok"`.
+#[no_mangle]
+pub extern "C" fn wdmm_track_delete(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().delete_track(id) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── JSON → model helpers ──────────────────────────────────────────────────────
+
+fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrack, String> {
+    let id = v["id"].as_str().ok_or("missing 'id'")?.to_string();
+    let title = v["title"].as_str().ok_or("missing 'title'")?.to_string();
+    let account_id = v["account_id"]
+        .as_str()
+        .ok_or("missing 'account_id'")?
+        .to_string();
+    let remote_path = v["remote_path"]
+        .as_str()
+        .ok_or("missing 'remote_path'")?
+        .to_string();
+    Ok(wdmm_core::models::LibraryTrack {
+        id,
+        title,
+        artist: v["artist"].as_str().map(Into::into),
+        remote_path,
+        account_id,
+        size: v["size"].as_u64().unwrap_or(0),
+        modified: None, // callers can omit for now
+        album_id: v["album_id"].as_str().map(Into::into),
+        artist_id: v["artist_id"].as_str().map(Into::into),
+        duration_ms: v["duration_ms"].as_i64().unwrap_or(0),
+        genre: v["genre"].as_str().map(Into::into),
+        track_number: v["track_number"].as_i64().map(|n| n as i32),
+        disc_number: v["disc_number"].as_i64().map(|n| n as i32),
+        year: v["year"].as_i64().map(|n| n as i32),
+        mime_type: v["mime_type"].as_str().map(Into::into),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +687,52 @@ mod tests {
         let s = unsafe { CStr::from_ptr(result.ptr) }.to_str().unwrap();
         assert_eq!(s, "not_found");
         wdmm_ffi_free_string(result);
+    }
+
+    #[test]
+    fn track_ffi_crud() {
+        let json = CString::new(r#"{"id":"aabbcc","title":"Test Song","artist":"Artist","remote_path":"/m/test.mp3","account_id":"acc1","size":5000,"duration_ms":180000,"mime_type":"audio/mpeg"}"#).unwrap();
+
+        // Upsert
+        let r = wdmm_track_upsert(json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // Get
+        let id = CString::new("aabbcc").unwrap();
+        let r = wdmm_track_get(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(s != "null" && !s.starts_with("error:"), "get failed: {s}");
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(v["title"], "Test Song");
+        wdmm_ffi_free_string(r);
+
+        // List
+        let r = wdmm_track_list();
+        let arr_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(arr_s).unwrap();
+        assert!(arr.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+        wdmm_ffi_free_string(r);
+
+        // Search
+        let q = CString::new("song").unwrap();
+        let r = wdmm_track_search(q.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(!arr.as_array().unwrap().is_empty());
+        wdmm_ffi_free_string(r);
+
+        // Delete
+        let r = wdmm_track_delete(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Gone
+        let r = wdmm_track_get(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null");
+        wdmm_ffi_free_string(r);
     }
 }
