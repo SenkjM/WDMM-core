@@ -939,4 +939,272 @@ mod tests {
 
         server.stop().await;
     }
+
+    // ── Library: tracks (Round 8) ─────────────────────────────────────────────
+
+    /// `GET /v1/library/tracks` requires bearer token.
+    #[tokio::test]
+    async fn library_tracks_requires_token() {
+        let (server, client, base) = start_test_server().await;
+        assert_eq!(
+            client.get(format!("{base}/v1/library/tracks")).send().await.unwrap().status(),
+            401
+        );
+        assert_eq!(
+            client.get(format!("{base}/v1/library/tracks"))
+                .bearer_auth("test-token")
+                .send().await.unwrap().status(),
+            200
+        );
+        server.stop().await;
+    }
+
+    /// PUT → GET → DELETE a track through the HTTP API.
+    #[tokio::test]
+    async fn library_track_crud_via_http() {
+        let (server, client, base) = start_test_server().await;
+        let tok = "test-token";
+
+        // PUT (upsert) a track
+        let resp = client
+            .put(format!("{base}/v1/library/tracks/tt-01"))
+            .bearer_auth(tok)
+            .json(&serde_json::json!({
+                "id":           "tt-01",
+                "title":        "Round 8 Track",
+                "artist":       "Test Artist",
+                "remote_path":  "/music/r8.mp3",
+                "account_id":   "acc-r8",
+                "size":         999_000u64
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "PUT track failed: {:?}", resp.status());
+
+        // GET the inserted track
+        let got: serde_json::Value = client
+            .get(format!("{base}/v1/library/tracks/tt-01"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["title"], "Round 8 Track");
+        assert_eq!(got["artist"], "Test Artist");
+
+        // LIST — must include the inserted track
+        let list: serde_json::Value = client
+            .get(format!("{base}/v1/library/tracks"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            list["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == "tt-01"),
+            "track not in list"
+        );
+
+        // SEARCH — q=r8 should find it
+        let search: serde_json::Value = client
+            .get(format!("{base}/v1/library/tracks?q=round"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !search["tracks"].as_array().unwrap().is_empty(),
+            "search returned nothing"
+        );
+
+        // DELETE
+        assert_eq!(
+            client
+                .delete(format!("{base}/v1/library/tracks/tt-01"))
+                .bearer_auth(tok)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+
+        // GET after delete → 404
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/library/tracks/tt-01"))
+                .bearer_auth(tok)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+
+        server.stop().await;
+    }
+
+    // ── Library: playlists (Round 8) ──────────────────────────────────────────
+
+    /// `GET /v1/playlists` requires bearer token.
+    #[tokio::test]
+    async fn playlists_requires_token() {
+        let (server, client, base) = start_test_server().await;
+        assert_eq!(
+            client.get(format!("{base}/v1/playlists")).send().await.unwrap().status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/playlists"))
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        server.stop().await;
+    }
+
+    /// POST → GET → PUT entries → GET entries → DELETE a playlist through HTTP.
+    #[tokio::test]
+    async fn playlist_crud_and_entries_via_http() {
+        let (server, client, base) = start_test_server().await;
+        let tok = "test-token";
+
+        // Create playlist
+        let resp = client
+            .post(format!("{base}/v1/playlists"))
+            .bearer_auth(tok)
+            .json(&serde_json::json!({ "name": "My Round-8 Playlist" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let pl_id = created["id"].as_str().unwrap().to_string();
+
+        // GET playlist
+        let pl: serde_json::Value = client
+            .get(format!("{base}/v1/playlists/{pl_id}"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pl["name"], "My Round-8 Playlist");
+
+        // LIST → includes our playlist
+        let list: serde_json::Value = client
+            .get(format!("{base}/v1/playlists"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            list["playlists"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == pl_id)
+        );
+
+        // PUT entries (replace-all)
+        let entries = serde_json::json!([
+            {
+                "playlist_id": pl_id,
+                "position":    0,
+                "music_id":    "aabbccddeeff00112233445566778899aabbccdd",
+                "source_name": "my_nas",
+                "remote_path": "/music/first.mp3",
+                "title":       "First",
+                "duration_ms": 200_000i64
+            },
+            {
+                "playlist_id": pl_id,
+                "position":    1,
+                "music_id":    "bbccddeeff00112233445566778899aabbccddee",
+                "source_name": "my_nas",
+                "remote_path": "/music/second.mp3",
+                "title":       "Second",
+                "duration_ms": 180_000i64
+            }
+        ]);
+        let put_resp = client
+            .put(format!("{base}/v1/playlists/{pl_id}/entries"))
+            .bearer_auth(tok)
+            .json(&entries)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 200);
+        let count: serde_json::Value = put_resp.json().await.unwrap();
+        assert_eq!(count["count"], 2);
+
+        // GET entries
+        let ents: serde_json::Value = client
+            .get(format!("{base}/v1/playlists/{pl_id}/entries"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ents["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(ents["entries"][0]["title"], "First");
+
+        // Rename playlist via PUT
+        let rename = client
+            .put(format!("{base}/v1/playlists/{pl_id}"))
+            .bearer_auth(tok)
+            .json(&serde_json::json!({ "name": "Renamed" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rename.status(), 200);
+
+        // DELETE playlist → cascades entries
+        assert_eq!(
+            client
+                .delete(format!("{base}/v1/playlists/{pl_id}"))
+                .bearer_auth(tok)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        // Verify gone
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/playlists/{pl_id}"))
+                .bearer_auth(tok)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+
+        server.stop().await;
+    }
 }

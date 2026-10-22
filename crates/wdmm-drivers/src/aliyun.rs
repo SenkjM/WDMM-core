@@ -6,8 +6,11 @@
 //!
 //! Reference: https://www.aliyundrive.com/developer
 //!
-//! Implements: list(), get() (with raw_url via getDownloadUrl).
-//! Write ops (mkdir/rename/remove): TODO stubs.
+//! Implements:
+//! - list(), get() (with raw_url via getDownloadUrl)
+//! - mkdir()   — `/adrive/v1.0/openFile/create` (type=folder)
+//! - rename()  — `/adrive/v1.0/openFile/update` (name)
+//! - remove()  — `/adrive/v1.0/openFile/recyclebin/trash`
 
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -219,22 +222,76 @@ impl CloudDriver for AliyunDriver {
         })
     }
 
-    async fn mkdir(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: Aliyun mkdir — implement via /adrive/v1.0/openFile/create (type=folder)".into(),
-        ))
+    /// Create a directory at `path`.
+    ///
+    /// Uses `POST /adrive/v1.0/openFile/create` with `type = "folder"`.
+    /// If the immediate parent does not exist this returns `DriverError::NotFound`.
+    async fn mkdir(&self, path: &str) -> Result<()> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent_path, name) = match trimmed.rfind('/') {
+            None | Some(0) => ("/", trimmed.trim_start_matches('/')),
+            Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
+        };
+        if name.is_empty() {
+            return Err(DriverError::Config("aliyun mkdir: empty folder name".into()));
+        }
+        let parent_id = if parent_path == "/" || parent_path.is_empty() {
+            "root".to_string()
+        } else {
+            self.path_to_file_id(parent_path).await?
+        };
+        let url = format!("{}/adrive/v1.0/openFile/create", self.config.base_url);
+        let body = serde_json::json!({
+            "drive_id":        self.config.drive_id,
+            "parent_file_id":  parent_id,
+            "name":            name,
+            "type":            "folder",
+            "check_name_mode": "refuse"   // refuse → error on duplicate
+        });
+        self.post_json(&url, &body).await?;
+        Ok(())
     }
 
-    async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: Aliyun rename — implement via /adrive/v1.0/openFile/update (name)".into(),
-        ))
+    /// Rename/move a file or folder.
+    ///
+    /// Uses `POST /adrive/v1.0/openFile/update` to change the `name` field.
+    /// Only single-segment renames (same parent) are supported; cross-directory
+    /// moves are not supported by the Aliyun Drive Open Platform rename API.
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let file_id = self.path_to_file_id(old_path).await?;
+        // Derive the new name from new_path (last segment).
+        let new_name = new_path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Config("aliyun rename: empty new name".into()))?;
+        let url = format!("{}/adrive/v1.0/openFile/update", self.config.base_url);
+        let body = serde_json::json!({
+            "drive_id": self.config.drive_id,
+            "file_id":  file_id,
+            "name":     new_name,
+            "check_name_mode": "refuse"
+        });
+        self.post_json(&url, &body).await?;
+        Ok(())
     }
 
-    async fn remove(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: Aliyun remove — implement via /adrive/v1.0/openFile/recyclebin/trash".into(),
-        ))
+    /// Move a file or folder to the recycle bin.
+    ///
+    /// Uses `POST /adrive/v1.0/openFile/recyclebin/trash`.
+    async fn remove(&self, path: &str) -> Result<()> {
+        let file_id = self.path_to_file_id(path).await?;
+        let url = format!(
+            "{}/adrive/v1.0/openFile/recyclebin/trash",
+            self.config.base_url
+        );
+        let body = serde_json::json!({
+            "drive_id": self.config.drive_id,
+            "file_id":  file_id
+        });
+        self.post_json(&url, &body).await?;
+        Ok(())
     }
 }
 
@@ -373,5 +430,85 @@ mod tests {
 
         let err = driver.list("/").await.unwrap_err();
         assert!(matches!(err, DriverError::AuthFailed));
+    }
+
+    // ── Write-op mock tests ───────────────────────────────────────────────────
+
+    /// mkdir at "/" creates a folder at root — needs one POST to /create.
+    #[tokio::test]
+    async fn mkdir_root_level() {
+        // Single response for POST /create → folder created
+        let resp = serde_json::json!({
+            "file_id": "new_folder_id",
+            "name":    "NewAlbum",
+            "type":    "folder"
+        })
+        .to_string();
+        let port = start_mock_server(vec![resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = AliyunConfig::new("tok", "drv");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = AliyunDriver::new(cfg).unwrap();
+
+        driver.mkdir("/NewAlbum").await.expect("mkdir should succeed");
+    }
+
+    /// rename resolves the file_id first, then calls /update.
+    /// Mock: two requests — (1) path_to_file_id search → file_id, (2) /update → ok.
+    #[tokio::test]
+    async fn rename_file() {
+        let search_resp = serde_json::json!({
+            "items": [{"file_id": "fid42", "name": "old.mp3", "type": "file",
+                       "size": 0u64, "updated_at": "2024-01-15T10:00:00Z"}]
+        })
+        .to_string();
+        let update_resp = serde_json::json!({
+            "file_id": "fid42",
+            "name":    "new.mp3",
+            "type":    "file"
+        })
+        .to_string();
+        let port = start_mock_server(vec![search_resp, update_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = AliyunConfig::new("tok", "drv");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = AliyunDriver::new(cfg).unwrap();
+
+        driver
+            .rename("/old.mp3", "/new.mp3")
+            .await
+            .expect("rename should succeed");
+    }
+
+    /// remove resolves the file_id then calls /recyclebin/trash.
+    /// Mock: (1) path_to_file_id search → file_id, (2) /recyclebin/trash → ok.
+    #[tokio::test]
+    async fn remove_file() {
+        let search_resp = serde_json::json!({
+            "items": [{"file_id": "fid99", "name": "trash.mp3", "type": "file",
+                       "size": 0u64, "updated_at": "2024-01-15T10:00:00Z"}]
+        })
+        .to_string();
+        let trash_resp = serde_json::json!({ "file_id": "fid99" }).to_string();
+        let port = start_mock_server(vec![search_resp, trash_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = AliyunConfig::new("tok", "drv");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = AliyunDriver::new(cfg).unwrap();
+
+        driver.remove("/trash.mp3").await.expect("remove should succeed");
+    }
+
+    /// mkdir with an empty name segment is a config error (not a network call).
+    #[test]
+    fn mkdir_empty_name_is_config_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = AliyunConfig::new("tok", "drv");
+        let driver = AliyunDriver::new(cfg).unwrap();
+        let err = rt.block_on(driver.mkdir("/")).unwrap_err();
+        assert!(matches!(err, DriverError::Config(_)), "expected Config error, got {err:?}");
     }
 }
