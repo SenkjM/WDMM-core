@@ -5,8 +5,10 @@
 //!
 //! Reference: https://open.115.com
 //!
-//! Implements: list(), get() (with raw_url via download info API).
-//! Write ops (mkdir/rename/remove): TODO stubs.
+//! Implements: list(), get() (with raw_url via download info API),
+//! mkdir() — `/open/folder/create`,
+//! rename() — `/open/file/edit` (same-parent name change),
+//! remove() — `/open/rbfile/delete` (recycle bin).
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -93,6 +95,66 @@ impl Open115Driver {
             return Err(DriverError::Network(format!("HTTP {}", status)));
         }
         resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
+    }
+
+    /// POST JSON body and return JSON. Retries once on 429/5xx.
+    async fn post_json(&self, url: &str, body: &Value) -> Result<Value> {
+        let do_req = || {
+            self.client
+                .post(url)
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send()
+        };
+        let resp = do_req().await.map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(DriverError::AuthFailed);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DriverError::NotFound("resource".into()));
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            let resp2 = do_req().await.map_err(|e| DriverError::Network(e.to_string()))?;
+            if !resp2.status().is_success() {
+                return Err(DriverError::Network(format!("HTTP {}", resp2.status())));
+            }
+            return resp2.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()));
+        }
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {}", status)));
+        }
+        resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
+    }
+
+    /// Resolve a path to an item's id. For files returns (fid, false); for
+    /// folders returns (cid_string, true). Lists the parent directory.
+    async fn path_to_item_id(&self, path: &str) -> Result<(String, bool)> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent, name) = match trimmed.rfind('/') {
+            Some(0) | None => ("/", trimmed.trim_start_matches('/')),
+            Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
+        };
+        let cid = self.path_to_cid(parent).await?;
+        let url = format!("{}/open/folder/list", self.config.base_url);
+        let cid_str = cid.to_string();
+        let params = [("cid", cid_str.as_str()), ("limit", "1150")];
+        let json = self.get_json(&url, &params).await?;
+        let items = json["data"].as_array().cloned().unwrap_or_default();
+        let entry = items
+            .iter()
+            .find(|item| item["n"].as_str() == Some(name))
+            .ok_or_else(|| DriverError::NotFound(path.to_string()))?;
+        // Files carry fid; folders carry cid but no fid.
+        if let Some(fid) = entry["fid"].as_str() {
+            return Ok((fid.to_string(), false));
+        }
+        let folder_cid = entry["cid"]
+            .as_u64()
+            .or_else(|| entry["cid"].as_str().and_then(|s| s.parse().ok()))
+            .ok_or_else(|| DriverError::Network("115: missing cid for folder".into()))?;
+        Ok((folder_cid.to_string(), true))
     }
 
     /// The 115 Open API uses numeric folder IDs. Resolve a slash-path to a
@@ -218,22 +280,59 @@ impl CloudDriver for Open115Driver {
         })
     }
 
-    async fn mkdir(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: 115 mkdir — implement via /open/folder/create".into(),
-        ))
+    /// Create a directory at `path`.
+    ///
+    /// Uses `POST /open/folder/create` with `pid` (parent cid) and `cname`
+    /// (folder name). Parent must already exist; use "/" for root.
+    async fn mkdir(&self, path: &str) -> Result<()> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent_path, name) = match trimmed.rfind('/') {
+            None | Some(0) => ("/", trimmed.trim_start_matches('/')),
+            Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
+        };
+        if name.is_empty() {
+            return Err(DriverError::Config("115 mkdir: empty folder name".into()));
+        }
+        let parent_cid = self.path_to_cid(parent_path).await?;
+        let url = format!("{}/open/folder/create", self.config.base_url);
+        self.post_json(
+            &url,
+            &serde_json::json!({ "pid": parent_cid.to_string(), "cname": name }),
+        )
+        .await?;
+        Ok(())
     }
 
-    async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: 115 rename — implement via /open/file/edit (file_name)".into(),
-        ))
+    /// Rename a file or folder (same-parent name change only).
+    ///
+    /// Uses `POST /open/file/edit` with `fid` and `file_name`. The `fid` field
+    /// also accepts folder cids for the 115 Open Platform.
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let (id, _is_dir) = self.path_to_item_id(old_path).await?;
+        let new_name = new_path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Config("115 rename: empty new name".into()))?;
+        let url = format!("{}/open/file/edit", self.config.base_url);
+        self.post_json(
+            &url,
+            &serde_json::json!({ "fid": id, "file_name": new_name }),
+        )
+        .await?;
+        Ok(())
     }
 
-    async fn remove(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: 115 remove — implement via /open/rbfile/delete".into(),
-        ))
+    /// Move a file or folder to the recycle bin.
+    ///
+    /// Uses `POST /open/rbfile/delete` with `fid[]` containing the item id.
+    async fn remove(&self, path: &str) -> Result<()> {
+        let (id, _is_dir) = self.path_to_item_id(path).await?;
+        let url = format!("{}/open/rbfile/delete", self.config.base_url);
+        self.post_json(&url, &serde_json::json!({ "fid[]": id }))
+            .await?;
+        Ok(())
     }
 }
 
@@ -284,23 +383,47 @@ mod tests {
         assert!(item.is_dir);
     }
 
-    // ── Mock HTTP tests ───────────────────────────────────────────────────────
+    #[test]
+    fn mkdir_empty_name_is_config_error() {
+        // path "/" → name="" → Config error without any HTTP
+        let cfg = Open115Config::new("tok");
+        let driver = Open115Driver::new(cfg).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(driver.mkdir("/")).unwrap_err();
+        assert!(matches!(err, DriverError::Config(_)), "expected Config err, got {err:?}");
+    }
 
-    async fn start_mock_server(response_body: String) -> u16 {
+    // ── Mock HTTP helpers ─────────────────────────────────────────────────────
+    //
+    // Serves responses in order; repeats the last one when the list is exhausted.
+
+    async fn start_mock_server(responses: Vec<String>) -> u16 {
+        use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let responses = Arc::new(Mutex::new(responses));
         tokio::spawn(async move {
+            let mut idx = 0usize;
             loop {
                 if let Ok((mut sock, _)) = listener.accept().await {
+                    let body = {
+                        let r = responses.lock().unwrap();
+                        if idx < r.len() {
+                            r[idx].clone()
+                        } else {
+                            r.last().cloned().unwrap_or_default()
+                        }
+                    };
+                    idx += 1;
                     let mut buf = vec![0u8; 4096];
                     let _ = sock.read(&mut buf).await;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        response_body.len(),
-                        response_body
+                        body.len(),
+                        body
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
                 }
@@ -329,9 +452,10 @@ mod tests {
                     "te": 1700000000i64
                 }
             ]
-        }).to_string();
+        })
+        .to_string();
 
-        let port = start_mock_server(body).await;
+        let port = start_mock_server(vec![body]).await;
         tokio::task::yield_now().await;
 
         let mut cfg = Open115Config::new("test_token");
@@ -357,7 +481,9 @@ mod tests {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];
                 let _ = sock.read(&mut buf).await;
-                let _ = sock.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
             }
         });
         tokio::task::yield_now().await;
@@ -368,5 +494,88 @@ mod tests {
 
         let err = driver.list("/").await.unwrap_err();
         assert!(matches!(err, DriverError::AuthFailed));
+    }
+
+    // ── Write-op mock tests ───────────────────────────────────────────────────
+
+    /// mkdir at root level — parent cid=0 is known, single POST to /open/folder/create.
+    #[tokio::test]
+    async fn mkdir_root_level() {
+        let resp = serde_json::json!({
+            "state": true,
+            "file_id": "new_folder_cid",
+            "cname": "NewAlbum"
+        })
+        .to_string();
+        let port = start_mock_server(vec![resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Open115Config::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Open115Driver::new(cfg).unwrap();
+
+        driver.mkdir("/NewAlbum").await.expect("mkdir should succeed");
+    }
+
+    /// rename a root-level file — one GET (list cid=0) + one POST to /open/file/edit.
+    #[tokio::test]
+    async fn rename_root_file() {
+        // response 1: list cid=0 to find fid of "song.mp3"
+        let list_resp = serde_json::json!({
+            "state": true,
+            "data": [{
+                "fid": "fid_song",
+                "n": "song.mp3",
+                "s": 1_000_000u64,
+                "sha": "abc",
+                "te": 1700000000i64
+            }]
+        })
+        .to_string();
+        // response 2: POST /open/file/edit → ok
+        let edit_resp =
+            serde_json::json!({ "state": true, "file_id": "fid_song", "file_name": "renamed.mp3" })
+                .to_string();
+
+        let port = start_mock_server(vec![list_resp, edit_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Open115Config::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Open115Driver::new(cfg).unwrap();
+
+        driver
+            .rename("/song.mp3", "/renamed.mp3")
+            .await
+            .expect("rename should succeed");
+    }
+
+    /// remove a root-level file — one GET (list cid=0) + one POST to /open/rbfile/delete.
+    #[tokio::test]
+    async fn remove_root_file() {
+        let list_resp = serde_json::json!({
+            "state": true,
+            "data": [{
+                "fid": "fid_del",
+                "n": "old.mp3",
+                "s": 500_000u64,
+                "sha": "def",
+                "te": 1700000000i64
+            }]
+        })
+        .to_string();
+        let del_resp = serde_json::json!({ "state": true }).to_string();
+
+        let port = start_mock_server(vec![list_resp, del_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Open115Config::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Open115Driver::new(cfg).unwrap();
+
+        driver
+            .remove("/old.mp3")
+            .await
+            .expect("remove should succeed");
     }
 }

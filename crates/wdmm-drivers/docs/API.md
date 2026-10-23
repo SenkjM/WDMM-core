@@ -104,7 +104,11 @@ Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 ### `struct Open115Driver` / `struct Open115Config`
 `pub fn Open115Config::new(access_token: impl Into<String>) -> Self`
 `pub fn Open115Driver::new(cfg: Open115Config) -> Result<Self>`
-List/get (write ops TODO).
+List/get (with `raw_url` via `/open/file/downurl`) + write ops (Round 9):
+- `mkdir` — `POST /open/folder/create` with `pid` + `cname`; parent must exist.
+- `rename` — `POST /open/file/edit` with `fid` + `file_name`; same-parent only.
+- `remove` — `POST /open/rbfile/delete` with `fid[]`; moves item to recycle bin.
+Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 
 ### `struct TeraboxDriver` / `struct NeteaseMusicDriver`
 Unit-struct stubs. All `CloudDriver` methods return `DriverError::Other("TODO: …")`.
