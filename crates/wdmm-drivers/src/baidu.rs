@@ -1,8 +1,10 @@
 //! Baidu NetDisk driver — Baidu PCS OpenAPI.
 //!
 //! Auth: user-supplied OAuth2 access_token. No credentials are embedded in source.
-//! Implements: list(), get() (with raw_url + auth headers).
-//! Write ops (mkdir/rename/remove) are TODO stubs.
+//! Implements: list(), get() (with raw_url + auth headers),
+//! mkdir() — `/rest/2.0/xpan/file?method=create`,
+//! rename() — `/rest/2.0/xpan/file?method=rename` (same-parent),
+//! remove() — `/rest/2.0/xpan/file?method=delete`.
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -121,6 +123,48 @@ impl BaiduDriver {
         resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
     }
 
+    /// POST with query params and form-encoded body. Retries once on 429/5xx.
+    /// The access_token is passed as a query param (Baidu convention); the
+    /// actual payload (path / filelist / …) goes in the form body.
+    async fn post_form(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+        form: &[(&str, &str)],
+    ) -> Result<Value> {
+        let do_req = || {
+            self.client
+                .post(url)
+                .query(query)
+                .form(form)
+                .send()
+        };
+        let resp = do_req().await.map_err(|e| map_http_error(&e))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(DriverError::AuthFailed);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DriverError::NotFound("resource".into()));
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            let resp2 = do_req().await.map_err(|e| map_http_error(&e))?;
+            if !resp2.status().is_success() {
+                return Err(DriverError::Network(format!("HTTP {}", resp2.status())));
+            }
+            return resp2
+                .json::<Value>()
+                .await
+                .map_err(|e| DriverError::Network(e.to_string()));
+        }
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {}", status)));
+        }
+        resp.json::<Value>()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))
+    }
+
     /// List a directory, returning the raw JSON list array.
     async fn list_dir(&self, path: &str) -> Result<Vec<Value>> {
         let url = format!("{}/rest/2.0/xpan/file", self.config.base_url);
@@ -217,22 +261,74 @@ impl CloudDriver for BaiduDriver {
         })
     }
 
-    async fn mkdir(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: Baidu mkdir — implement via /rest/2.0/xpan/file?method=create".into(),
-        ))
+    /// Create a directory at the given absolute path.
+    ///
+    /// Uses `POST /rest/2.0/xpan/file?method=create` with `isdir=1`.
+    async fn mkdir(&self, path: &str) -> Result<()> {
+        let url = format!("{}/rest/2.0/xpan/file", self.config.base_url);
+        let query = [
+            ("method", "create"),
+            ("access_token", self.config.access_token.as_str()),
+        ];
+        let form = [
+            ("path", path),
+            ("isdir", "1"),
+            ("size", "0"),
+            ("block_list", "[]"),
+        ];
+        let json = self.post_form(&url, &query, &form).await?;
+        let errno = json["errno"].as_i64().unwrap_or(0);
+        if errno != 0 {
+            return Err(Self::map_errno(errno));
+        }
+        Ok(())
     }
 
-    async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: Baidu rename — implement via /rest/2.0/xpan/file?method=rename".into(),
-        ))
+    /// Rename a file or folder (same-parent name change).
+    ///
+    /// Uses `POST /rest/2.0/xpan/file?method=rename` with
+    /// `filelist=[{"path": old_path, "newname": new_name}]`.
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let new_name = new_path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Config("baidu rename: empty new name".into()))?;
+        let filelist =
+            serde_json::json!([{"path": old_path, "newname": new_name}]).to_string();
+        let url = format!("{}/rest/2.0/xpan/file", self.config.base_url);
+        let query = [
+            ("method", "rename"),
+            ("access_token", self.config.access_token.as_str()),
+        ];
+        let form = [("filelist", filelist.as_str())];
+        let json = self.post_form(&url, &query, &form).await?;
+        let errno = json["errno"].as_i64().unwrap_or(0);
+        if errno != 0 {
+            return Err(Self::map_errno(errno));
+        }
+        Ok(())
     }
 
-    async fn remove(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: Baidu remove — implement via /rest/2.0/xpan/file?method=delete".into(),
-        ))
+    /// Delete a file or directory (permanent, sync delete).
+    ///
+    /// Uses `POST /rest/2.0/xpan/file?method=delete` with
+    /// `filelist=["path"]&async=0`.
+    async fn remove(&self, path: &str) -> Result<()> {
+        let filelist = serde_json::json!([path]).to_string();
+        let url = format!("{}/rest/2.0/xpan/file", self.config.base_url);
+        let query = [
+            ("method", "delete"),
+            ("access_token", self.config.access_token.as_str()),
+        ];
+        let form = [("filelist", filelist.as_str()), ("async", "0")];
+        let json = self.post_form(&url, &query, &form).await?;
+        let errno = json["errno"].as_i64().unwrap_or(0);
+        if errno != 0 {
+            return Err(Self::map_errno(errno));
+        }
+        Ok(())
     }
 }
 
@@ -395,6 +491,132 @@ mod tests {
         let driver = BaiduDriver::new(cfg).unwrap();
 
         let err = driver.list("/").await.unwrap_err();
+        assert!(matches!(err, DriverError::Network(_)));
+    }
+
+    // ── Write-op mock helpers ──────────────────────────────────────────────────
+    // Serves responses in order; repeats the last one when exhausted.
+
+    async fn start_mock_baidu_multi_server(responses: Vec<String>) -> u16 {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responses = Arc::new(Mutex::new(responses));
+        tokio::spawn(async move {
+            let mut idx = 0usize;
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let body = {
+                        let r = responses.lock().unwrap();
+                        if idx < r.len() { r[idx].clone() } else { r.last().cloned().unwrap_or_default() }
+                    };
+                    idx += 1;
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        port
+    }
+
+    // ── mkdir tests ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mkdir_succeeds() {
+        let body = serde_json::json!({
+            "errno": 0,
+            "fs_id": 99999,
+            "category": 6,
+            "path": "/Music/NewAlbum"
+        }).to_string();
+        let port = start_mock_baidu_multi_server(vec![body]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = BaiduConfig::new("test_token");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = BaiduDriver::new(cfg).unwrap();
+
+        driver.mkdir("/Music/NewAlbum").await.expect("mkdir should succeed");
+    }
+
+    #[tokio::test]
+    async fn mkdir_maps_errno_to_auth_error() {
+        let body = serde_json::json!({ "errno": 111 }).to_string();
+        let port = start_mock_baidu_multi_server(vec![body]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = BaiduConfig::new("bad_token");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = BaiduDriver::new(cfg).unwrap();
+
+        let err = driver.mkdir("/Fail").await.unwrap_err();
+        assert!(matches!(err, DriverError::AuthFailed));
+    }
+
+    // ── rename tests ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rename_succeeds() {
+        let body = serde_json::json!({
+            "errno": 0,
+            "info": [{"path": "/Music/new.mp3"}]
+        }).to_string();
+        let port = start_mock_baidu_multi_server(vec![body]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = BaiduConfig::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = BaiduDriver::new(cfg).unwrap();
+
+        driver
+            .rename("/Music/old.mp3", "/Music/new.mp3")
+            .await
+            .expect("rename should succeed");
+    }
+
+    #[tokio::test]
+    async fn rename_empty_new_name_is_config_error() {
+        // No HTTP needed — validation fires before any request.
+        let cfg = BaiduConfig::new("tok");
+        let driver = BaiduDriver::new(cfg).unwrap();
+        let err = driver.rename("/foo.mp3", "/").await.unwrap_err();
+        assert!(matches!(err, DriverError::Config(_)));
+    }
+
+    // ── remove tests ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_succeeds() {
+        let body = serde_json::json!({ "errno": 0, "info": { "taskid": 1 } }).to_string();
+        let port = start_mock_baidu_multi_server(vec![body]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = BaiduConfig::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = BaiduDriver::new(cfg).unwrap();
+
+        driver.remove("/Music/old.mp3").await.expect("remove should succeed");
+    }
+
+    #[tokio::test]
+    async fn remove_maps_errno_to_network_error() {
+        let body = serde_json::json!({ "errno": 31021 }).to_string();
+        let port = start_mock_baidu_multi_server(vec![body]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = BaiduConfig::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = BaiduDriver::new(cfg).unwrap();
+
+        let err = driver.remove("/gone.mp3").await.unwrap_err();
         assert!(matches!(err, DriverError::Network(_)));
     }
 }

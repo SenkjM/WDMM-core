@@ -1,8 +1,10 @@
 //! 123 Pan driver — 123 Pan open-api.
 //!
 //! Auth: user-supplied Bearer access_token. No credentials are embedded in source.
-//! Implements: list(), get() (with raw_url).
-//! Write ops (mkdir/rename/remove) are TODO stubs.
+//! Implements: list(), get() (with raw_url),
+//! mkdir() — `/api/v1/upload/mkdir`,
+//! rename() — `/api/v1/file/rename` (same-parent),
+//! remove() — `/api/v1/file/trash`.
 
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -96,6 +98,42 @@ impl Pan123Driver {
             return Err(DriverError::Network(format!("HTTP {}", status)));
         }
         resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
+    }
+
+    /// POST JSON body with Bearer auth and return JSON. Retries once on 429/5xx.
+    async fn post_json(&self, url: &str, body: &Value) -> Result<Value> {
+        let do_req = || {
+            self.client
+                .post(url)
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send()
+        };
+        let resp = do_req().await.map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(DriverError::AuthFailed);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DriverError::NotFound("resource".into()));
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            let resp2 = do_req().await.map_err(|e| DriverError::Network(e.to_string()))?;
+            if !resp2.status().is_success() {
+                return Err(DriverError::Network(format!("HTTP {}", resp2.status())));
+            }
+            return resp2
+                .json::<Value>()
+                .await
+                .map_err(|e| DriverError::Network(e.to_string()));
+        }
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {}", status)));
+        }
+        resp.json::<Value>()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))
     }
 
     /// List files under a given parentFileId (single page, pageSize=100).
@@ -230,22 +268,79 @@ impl CloudDriver for Pan123Driver {
         })
     }
 
-    async fn mkdir(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: 123Pan mkdir — implement via /api/v1/upload/mkdir".into(),
-        ))
+    /// Create a directory at the given path.
+    ///
+    /// Resolves parent to a `parentFileId` then calls
+    /// `POST /api/v1/upload/mkdir` with `{"name": …, "parentFileId": …}`.
+    async fn mkdir(&self, path: &str) -> Result<()> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent_path, name) = match trimmed.rfind('/') {
+            None | Some(0) => ("/", trimmed.trim_start_matches('/')),
+            Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
+        };
+        if name.is_empty() {
+            return Err(DriverError::Config("123pan mkdir: empty folder name".into()));
+        }
+        let (parent_id, _) = self.resolve_path(parent_path).await?;
+        let url = format!("{}/api/v1/upload/mkdir", self.config.base_url);
+        let json = self
+            .post_json(&url, &serde_json::json!({"name": name, "parentFileId": parent_id}))
+            .await?;
+        let code = json["code"].as_i64().unwrap_or(0);
+        if code != 0 {
+            return Err(map_code(code));
+        }
+        Ok(())
     }
 
-    async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: 123Pan rename — implement via /api/v1/file/rename".into(),
-        ))
+    /// Rename a file or folder (same-parent name change).
+    ///
+    /// Resolves `old_path` to a `fileId` then calls
+    /// `POST /api/v1/file/rename` with `{"fileId": …, "fileName": …}`.
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        // Validate new name before any HTTP round-trips.
+        let new_name = new_path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Config("123pan rename: empty new name".into()))?;
+        let (file_id, _) = self.resolve_path(old_path).await?;
+        if file_id == 0 {
+            return Err(DriverError::Config("123pan rename: cannot rename root".into()));
+        }
+        let url = format!("{}/api/v1/file/rename", self.config.base_url);
+        let json = self
+            .post_json(&url, &serde_json::json!({"fileId": file_id, "fileName": new_name}))
+            .await?;
+        let code = json["code"].as_i64().unwrap_or(0);
+        if code != 0 {
+            return Err(map_code(code));
+        }
+        Ok(())
     }
 
-    async fn remove(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other(
-            "TODO: 123Pan remove — implement via /api/v1/file/trash".into(),
-        ))
+    /// Move a file or folder to the trash.
+    ///
+    /// Resolves `path` to a `fileId` then calls
+    /// `POST /api/v1/file/trash` with `{"fileTrashInfoList": [{"fileId": …}]}`.
+    async fn remove(&self, path: &str) -> Result<()> {
+        let (file_id, _) = self.resolve_path(path).await?;
+        if file_id == 0 {
+            return Err(DriverError::Config("123pan remove: cannot remove root".into()));
+        }
+        let url = format!("{}/api/v1/file/trash", self.config.base_url);
+        let json = self
+            .post_json(
+                &url,
+                &serde_json::json!({"fileTrashInfoList": [{"fileId": file_id}]}),
+            )
+            .await?;
+        let code = json["code"].as_i64().unwrap_or(0);
+        if code != 0 {
+            return Err(map_code(code));
+        }
+        Ok(())
     }
 }
 
@@ -418,5 +513,180 @@ mod tests {
 
         let err = driver.list("/").await.unwrap_err();
         assert!(matches!(err, DriverError::Network(_)));
+    }
+
+    // ── Multi-response mock server ─────────────────────────────────────────────
+    // Serves responses in order; repeats the last one when exhausted.
+
+    async fn start_mock_pan123_multi_server(responses: Vec<String>) -> u16 {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responses = Arc::new(Mutex::new(responses));
+        tokio::spawn(async move {
+            let mut idx = 0usize;
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let body = {
+                        let r = responses.lock().unwrap();
+                        if idx < r.len() { r[idx].clone() } else { r.last().cloned().unwrap_or_default() }
+                    };
+                    idx += 1;
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        port
+    }
+
+    // ── mkdir tests ────────────────────────────────────────────────────────────
+
+    /// mkdir at root level: resolve_path("/") returns (0, root) without HTTP,
+    /// so only one POST to /api/v1/upload/mkdir is needed.
+    #[tokio::test]
+    async fn mkdir_root_level() {
+        let post_resp = serde_json::json!({
+            "code": 0,
+            "message": "ok",
+            "data": { "dirID": 9001 }
+        }).to_string();
+        let port = start_mock_pan123_multi_server(vec![post_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Pan123Driver::new(cfg).unwrap();
+
+        driver.mkdir("/NewFolder").await.expect("mkdir should succeed");
+    }
+
+    #[tokio::test]
+    async fn mkdir_empty_name_is_config_error() {
+        // path="/" → name="" after trimming, no HTTP needed.
+        let cfg = Pan123Config::new("tok");
+        let driver = Pan123Driver::new(cfg).unwrap();
+        let err = driver.mkdir("/").await.unwrap_err();
+        assert!(matches!(err, DriverError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn mkdir_maps_auth_code() {
+        let post_resp = serde_json::json!({"code": 401, "message": "unauthorized", "data": {}}).to_string();
+        let port = start_mock_pan123_multi_server(vec![post_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("bad");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Pan123Driver::new(cfg).unwrap();
+
+        let err = driver.mkdir("/Fail").await.unwrap_err();
+        assert!(matches!(err, DriverError::AuthFailed));
+    }
+
+    // ── rename tests ───────────────────────────────────────────────────────────
+
+    /// rename a root-level file: one GET (list parentFileId=0) + one POST rename.
+    #[tokio::test]
+    async fn rename_root_file() {
+        let list_resp = serde_json::json!({
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "fileList": [{
+                    "fileId": 1001,
+                    "filename": "song.mp3",
+                    "type": 0,
+                    "size": 5000000,
+                    "etag": "abc",
+                    "s3KeyFlag": "cn/key",
+                    "updateAt": "2024-01-01T00:00:00.000Z"
+                }],
+                "total": 1
+            }
+        }).to_string();
+        let rename_resp = serde_json::json!({"code": 0, "message": "ok", "data": {}}).to_string();
+
+        let port = start_mock_pan123_multi_server(vec![list_resp, rename_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Pan123Driver::new(cfg).unwrap();
+
+        driver
+            .rename("/song.mp3", "/renamed.mp3")
+            .await
+            .expect("rename should succeed");
+    }
+
+    #[tokio::test]
+    async fn rename_empty_new_name_is_config_error() {
+        // Validation fires before any HTTP — no mock needed.
+        let cfg = Pan123Config::new("tok");
+        let driver = Pan123Driver::new(cfg).unwrap();
+        let err = driver.rename("/foo.mp3", "/").await.unwrap_err();
+        assert!(matches!(err, DriverError::Config(_)));
+    }
+
+    // ── remove tests ───────────────────────────────────────────────────────────
+
+    /// remove a root-level file: one GET (list parentFileId=0) + one POST trash.
+    #[tokio::test]
+    async fn remove_root_file() {
+        let list_resp = serde_json::json!({
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "fileList": [{
+                    "fileId": 2001,
+                    "filename": "old.mp3",
+                    "type": 0,
+                    "size": 3000000,
+                    "etag": "def",
+                    "s3KeyFlag": "cn/key2",
+                    "updateAt": "2024-01-01T00:00:00.000Z"
+                }],
+                "total": 1
+            }
+        }).to_string();
+        let trash_resp = serde_json::json!({"code": 0, "message": "ok", "data": {}}).to_string();
+
+        let port = start_mock_pan123_multi_server(vec![list_resp, trash_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Pan123Driver::new(cfg).unwrap();
+
+        driver.remove("/old.mp3").await.expect("remove should succeed");
+    }
+
+    #[tokio::test]
+    async fn remove_maps_not_found() {
+        // resolve_path fails → NotFound before POST
+        let list_resp = serde_json::json!({
+            "code": 0,
+            "message": "ok",
+            "data": { "fileList": [], "total": 0 }
+        }).to_string();
+
+        let port = start_mock_pan123_multi_server(vec![list_resp]).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{}", port);
+        let driver = Pan123Driver::new(cfg).unwrap();
+
+        let err = driver.remove("/ghost.mp3").await.unwrap_err();
+        assert!(matches!(err, DriverError::NotFound(_)));
     }
 }

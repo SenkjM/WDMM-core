@@ -86,12 +86,20 @@ List/get + write ops.
 ### `struct BaiduDriver` / `struct BaiduConfig`
 `pub fn BaiduConfig::new(access_token: impl Into<String>) -> Self`
 `pub fn BaiduDriver::new(cfg: BaiduConfig) -> Result<Self>`
-List/get (write ops TODO).
+List/get (with `raw_url` via dlink + Bearer header) and write ops (Round 10):
+- `mkdir` — `POST /rest/2.0/xpan/file?method=create` with `path`, `isdir=1`, `size=0`, `block_list=[]`.
+- `rename` — `POST /rest/2.0/xpan/file?method=rename` with `filelist=[{"path": old, "newname": new_name}]`; same-parent rename only.
+- `remove` — `POST /rest/2.0/xpan/file?method=delete` with `filelist=["path"]`, `async=0`.
+Auth: `access_token` as query param (Baidu convention). Retries once on 429/5xx.
 
 ### `struct Pan123Driver` / `struct Pan123Config`
 `pub fn Pan123Config::new(access_token: impl Into<String>) -> Self`
 `pub fn Pan123Driver::new(cfg: Pan123Config) -> Result<Self>`
-List/get (write ops TODO).
+List/get (with `raw_url` via `getDownloadUrl`) and write ops (Round 10):
+- `mkdir` — `POST /api/v1/upload/mkdir` with `{"name": …, "parentFileId": …}`; resolves parent path to `parentFileId`.
+- `rename` — `POST /api/v1/file/rename` with `{"fileId": …, "fileName": …}`; same-parent name change; resolves old path to `fileId`.
+- `remove` — `POST /api/v1/file/trash` with `{"fileTrashInfoList": [{"fileId": …}]}`; resolves path to `fileId`.
+Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 
 ### `struct AliyunDriver` / `struct AliyunConfig`
 `pub fn AliyunConfig::new(access_token: impl Into<String>, drive_id: impl Into<String>) -> Self`
