@@ -37,6 +37,7 @@ jobs:
       - name: Prepare ffmpeg vendor cache and fetch binaries
         env:
           WDMM_FFMPEG_CACHE: ${{ runner.temp }}/ffmpeg-vendor-cache
+          WDMM_FFMPEG_ONLY: android-arm64
         run: |
           set -euo pipefail
           mkdir -p "$WDMM_FFMPEG_CACHE"
@@ -112,6 +113,7 @@ jobs:
         shell: bash
         env:
           WDMM_FFMPEG_CACHE: ${{ runner.temp }}/ffmpeg-vendor-cache
+          WDMM_FFMPEG_ONLY: windows-x86_64
         run: |
           set -euo pipefail
           mkdir -p "$WDMM_FFMPEG_CACHE"

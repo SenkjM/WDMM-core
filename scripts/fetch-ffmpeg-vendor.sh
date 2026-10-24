@@ -9,22 +9,20 @@
 # Environment:
 #   WDMM_FFMPEG_CACHE  — directory containing already-downloaded archives.
 #                        Defaults to /workspace/agent-tools/ffmpeg-vendor-cache.
-#                        When an archive is found in the cache directory it is
-#                        used directly; otherwise a download is attempted.
+#   WDMM_FFMPEG_ONLY   — optional: linux-x86_64 | windows-x86_64 | android-arm64
+#                        When set, only that target is fetched/required (CI jobs).
 #
 # Targets populated:
 #   linux-x86_64       BtbN LGPL master linux64   (ffmpeg + ffprobe)
 #   windows-x86_64     BtbN LGPL master win64      (ffmpeg.exe + ffprobe.exe)
-#   android-arm64      hzw1199 LGPL arm64 CLI      (ffmpeg + ffprobe)
+#   android-arm64      hzw1199 LGPL arm64 CLI      (seeded on WDMM-core release)
 #
 # Targets NOT populated (documented gap — no confirmed dual CLI source):
-#   android-arm        Tyrrrz = ffmpeg-only; yearsyan = static .a; Khang-NT = no ffprobe
-#   android-x86_64     same gap
-#   android-x86        same gap
+#   android-arm / android-x86_64 / android-x86
 #
 # Exit codes:
-#   0  all mandatory targets (linux + win + android-arm64) populated
-#   1  at least one mandatory target failed; error printed to stderr
+#   0  all required targets populated
+#   1  at least one required target failed
 
 set -euo pipefail
 
@@ -40,42 +38,55 @@ log()  { echo "[fetch-ffmpeg] $*"; }
 err()  { echo "[fetch-ffmpeg] ERROR: $*" >&2; FAILED=1; }
 ok()   { echo "[fetch-ffmpeg] OK: $*"; }
 
-# ---------------------------------------------------------------------------
-# sha256_check <file> <expected_hex>
-# ---------------------------------------------------------------------------
+# Portable copy+chmod (Git Bash Windows may lack GNU install).
+install_bin() {
+    local src="$1" dst="$2"
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+    chmod 755 "$dst" 2>/dev/null || true
+}
+
+need_target() {
+    local t="$1"
+    if [ -z "${WDMM_FFMPEG_ONLY:-}" ]; then
+        return 0
+    fi
+    [ "$WDMM_FFMPEG_ONLY" = "$t" ]
+}
+
 sha256_check() {
     local file="$1" expected="$2"
     local actual
-    actual="$(sha256sum "$file" | awk '{print $1}')"
+    # Git Bash on Windows may prefix a backslash; strip CR too.
+    actual="$(sha256sum "$file" | awk '{print $1}' | tr -d '\r' | sed 's/^\\//')"
     if [ "$actual" != "$expected" ]; then
-        err "sha256 mismatch for $file"
-        err "  expected: $expected"
-        err "  actual:   $actual"
+        log "WARN: sha256 mismatch for $file"
+        log "  expected: $expected"
+        log "  actual:   $actual"
         return 1
     fi
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# get_file <url> <filename>
-# Copies from CACHE if present, otherwise wget-downloads to CACHE.
-# Sets FETCHED_FILE to the resulting path.
-# ---------------------------------------------------------------------------
 get_file() {
     local url="$1" filename="$2"
+    mkdir -p "$CACHE"
     FETCHED_FILE="$CACHE/$filename"
-    if [ -f "$FETCHED_FILE" ]; then
+    if [ -f "$FETCHED_FILE" ] && [ -s "$FETCHED_FILE" ]; then
         log "using cached $filename"
         return 0
     fi
+    rm -f "$FETCHED_FILE"
     log "downloading $url ..."
     if command -v wget &>/dev/null; then
         wget -q --show-progress -O "$FETCHED_FILE" "$url" || {
+            rm -f "$FETCHED_FILE"
             err "wget failed for $url"
             return 1
         }
     elif command -v curl &>/dev/null; then
         curl -fL --progress-bar -o "$FETCHED_FILE" "$url" || {
+            rm -f "$FETCHED_FILE"
             err "curl failed for $url"
             return 1
         }
@@ -83,11 +94,19 @@ get_file() {
         err "neither wget nor curl available; cannot download $url"
         return 1
     fi
+    if [ ! -s "$FETCHED_FILE" ]; then
+        rm -f "$FETCHED_FILE"
+        err "download empty for $url"
+        return 1
+    fi
 }
 
 # ===========================================================================
-# linux-x86_64 — BtbN LGPL master linux64
+# linux-x86_64
 # ===========================================================================
+if ! need_target linux-x86_64; then
+    log "--- linux-x86_64 --- SKIPPED (WDMM_FFMPEG_ONLY=${WDMM_FFMPEG_ONLY:-})"
+else
 log "--- linux-x86_64 ---"
 LINUX_ARCHIVE="ffmpeg-master-latest-linux64-lgpl.tar.xz"
 LINUX_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${LINUX_ARCHIVE}"
@@ -99,52 +118,49 @@ if [ -f "$LINUX_VENDOR/ffmpeg" ] && [ -f "$LINUX_VENDOR/ffprobe" ]; then
     ok "linux-x86_64 already populated; skipping"
 else
     if get_file "$LINUX_URL" "$LINUX_ARCHIVE"; then
-        sha256_check "$FETCHED_FILE" "$LINUX_SHA256" || {
-            err "linux-x86_64 archive sha256 mismatch — aborting this target"
-            FAILED=1
-        }
-        if [ "$FAILED" -eq 0 ] || true; then  # try extract even if sha256 is from a newer build
-            EXTRACT="$TMPWORK/linux"
-            mkdir -p "$EXTRACT"
-            tar -xJf "$FETCHED_FILE" -C "$EXTRACT" --strip-components=2 \
-                --wildcards "*/bin/ffmpeg" "*/bin/ffprobe" 2>/dev/null || \
-            tar -xJf "$FETCHED_FILE" -C "$EXTRACT" 2>/dev/null
-            # Find and copy
-            FF=$(find "$EXTRACT" -type f -name "ffmpeg" | head -1)
-            FP=$(find "$EXTRACT" -type f -name "ffprobe" | head -1)
-            if [ -n "$FF" ] && [ -n "$FP" ]; then
-                install -m 755 "$FF" "$LINUX_VENDOR/ffmpeg"
-                install -m 755 "$FP" "$LINUX_VENDOR/ffprobe"
-                ok "linux-x86_64 installed"
-            else
-                err "linux-x86_64: ffmpeg/ffprobe not found in archive"
-            fi
+        sha256_check "$FETCHED_FILE" "$LINUX_SHA256" || \
+            log "WARN: linux-x86_64 sha256 mismatch (BtbN latest drifts) — extracting anyway"
+        EXTRACT="$TMPWORK/linux"
+        mkdir -p "$EXTRACT"
+        tar -xJf "$FETCHED_FILE" -C "$EXTRACT" --strip-components=2 \
+            --wildcards "*/bin/ffmpeg" "*/bin/ffprobe" 2>/dev/null || \
+        tar -xJf "$FETCHED_FILE" -C "$EXTRACT" 2>/dev/null || true
+        FF=$(find "$EXTRACT" -type f -name "ffmpeg" | head -1)
+        FP=$(find "$EXTRACT" -type f -name "ffprobe" | head -1)
+        if [ -n "$FF" ] && [ -n "$FP" ]; then
+            install_bin "$FF" "$LINUX_VENDOR/ffmpeg"
+            install_bin "$FP" "$LINUX_VENDOR/ffprobe"
+            ok "linux-x86_64 installed"
+        else
+            err "linux-x86_64: ffmpeg/ffprobe not found in archive"
         fi
     fi
 fi
 
-# If already extracted to cache
 LINUX_EXTRACT="$CACHE/linux-extract"
 if [ -d "$LINUX_EXTRACT" ]; then
     FF=$(find "$LINUX_EXTRACT" -type f -name "ffmpeg" | head -1)
     FP=$(find "$LINUX_EXTRACT" -type f -name "ffprobe" | head -1)
-    if [ -n "$FF" ] && [ -n "$FP" ] && \
-       [ ! -f "$LINUX_VENDOR/ffmpeg" ]; then
-        install -m 755 "$FF" "$LINUX_VENDOR/ffmpeg"
-        install -m 755 "$FP" "$LINUX_VENDOR/ffprobe"
+    if [ -n "$FF" ] && [ -n "$FP" ] && [ ! -f "$LINUX_VENDOR/ffmpeg" ]; then
+        install_bin "$FF" "$LINUX_VENDOR/ffmpeg"
+        install_bin "$FP" "$LINUX_VENDOR/ffprobe"
         ok "linux-x86_64 installed from pre-extracted cache"
     fi
 fi
 
-if [ ! -f "$LINUX_VENDOR/ffmpeg" ] || [ ! -f "$LINUX_VENDOR/ffprobe" ]; then
+if [ ! -s "$LINUX_VENDOR/ffmpeg" ] || [ ! -s "$LINUX_VENDOR/ffprobe" ]; then
     err "linux-x86_64: FAILED — binaries not installed"
     err "  Archive URL: $LINUX_URL"
     err "  Cache dir:   $CACHE"
 fi
+fi  # need_target linux-x86_64
 
 # ===========================================================================
-# windows-x86_64 — BtbN LGPL master win64
+# windows-x86_64
 # ===========================================================================
+if ! need_target windows-x86_64; then
+    log "--- windows-x86_64 --- SKIPPED (WDMM_FFMPEG_ONLY=${WDMM_FFMPEG_ONLY:-})"
+else
 log "--- windows-x86_64 ---"
 WIN_ARCHIVE="ffmpeg-master-latest-win64-lgpl.zip"
 WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${WIN_ARCHIVE}"
@@ -156,7 +172,8 @@ if [ -f "$WIN_VENDOR/ffmpeg.exe" ] && [ -f "$WIN_VENDOR/ffprobe.exe" ]; then
     ok "windows-x86_64 already populated; skipping"
 else
     if get_file "$WIN_URL" "$WIN_ARCHIVE"; then
-        sha256_check "$FETCHED_FILE" "$WIN_SHA256" || true  # warn but proceed
+        sha256_check "$FETCHED_FILE" "$WIN_SHA256" || \
+            log "WARN: windows-x86_64 sha256 mismatch — extracting anyway"
         WIN_EXTRACT="$TMPWORK/win"
         mkdir -p "$WIN_EXTRACT"
         if command -v unzip &>/dev/null; then
@@ -165,8 +182,8 @@ else
         FF=$(find "$WIN_EXTRACT" -type f -name "ffmpeg.exe" | head -1)
         FP=$(find "$WIN_EXTRACT" -type f -name "ffprobe.exe" | head -1)
         if [ -n "$FF" ] && [ -n "$FP" ]; then
-            install -m 755 "$FF" "$WIN_VENDOR/ffmpeg.exe"
-            install -m 755 "$FP" "$WIN_VENDOR/ffprobe.exe"
+            install_bin "$FF" "$WIN_VENDOR/ffmpeg.exe"
+            install_bin "$FP" "$WIN_VENDOR/ffprobe.exe"
             ok "windows-x86_64 installed"
         else
             err "windows-x86_64: ffmpeg.exe/ffprobe.exe not found in archive"
@@ -179,29 +196,33 @@ if [ -d "$WIN_EXTRACT_CACHE" ] && [ ! -f "$WIN_VENDOR/ffmpeg.exe" ]; then
     FF=$(find "$WIN_EXTRACT_CACHE" -type f -name "ffmpeg.exe" | head -1)
     FP=$(find "$WIN_EXTRACT_CACHE" -type f -name "ffprobe.exe" | head -1)
     if [ -n "$FF" ] && [ -n "$FP" ]; then
-        install -m 755 "$FF" "$WIN_VENDOR/ffmpeg.exe"
-        install -m 755 "$FP" "$WIN_VENDOR/ffprobe.exe"
+        install_bin "$FF" "$WIN_VENDOR/ffmpeg.exe"
+        install_bin "$FP" "$WIN_VENDOR/ffprobe.exe"
         ok "windows-x86_64 installed from pre-extracted cache"
     fi
 fi
 
-if [ ! -f "$WIN_VENDOR/ffmpeg.exe" ] || [ ! -f "$WIN_VENDOR/ffprobe.exe" ]; then
+if [ ! -s "$WIN_VENDOR/ffmpeg.exe" ] || [ ! -s "$WIN_VENDOR/ffprobe.exe" ]; then
     err "windows-x86_64: FAILED — binaries not installed"
     err "  Archive URL: $WIN_URL"
+    err "  Cache dir:   $CACHE"
 fi
+fi  # need_target windows-x86_64
 
 # ===========================================================================
-# android-arm64 — hzw1199 LGPL arm64 CLI binaries
+# android-arm64
 # ===========================================================================
+if ! need_target android-arm64; then
+    log "--- android-arm64 --- SKIPPED (WDMM_FFMPEG_ONLY=${WDMM_FFMPEG_ONLY:-})"
+else
 log "--- android-arm64 ---"
 HZW_FF_FILE="hzw-ffmpeg-arm64"
 HZW_FP_FILE="hzw-ffprobe-arm64"
 HZW_FF_SHA256="480defd776199b5434008565974de5bf99822371c3cd9c1f130fda2c57de6439"
 HZW_FP_SHA256="e66d481eb55af07282ea4efcdba5d18b564f809e9e40441dede7cc6ee9f88224"
-# Source: https://github.com/hzw1199/android-ffmpeg (LGPL static CLI)
-# Cached locally; original URLs:
-HZW_FF_URL="https://github.com/hzw1199/android-ffmpeg/releases/download/latest/ffmpeg-arm64"
-HZW_FP_URL="https://github.com/hzw1199/android-ffmpeg/releases/download/latest/ffprobe-arm64"
+# Upstream hzw1199 latest/ 404 as of 2026-10-25; seed on WDMM-core release.
+HZW_FF_URL="https://github.com/SenkjM/WDMM-core/releases/download/ffmpeg-vendor-seed-20261025/hzw-ffmpeg-arm64"
+HZW_FP_URL="https://github.com/SenkjM/WDMM-core/releases/download/ffmpeg-vendor-seed-20261025/hzw-ffprobe-arm64"
 ARM64_VENDOR="$VENDOR/android-arm64"
 
 mkdir -p "$ARM64_VENDOR"
@@ -211,18 +232,18 @@ else
     HZW_FF_SRC="$CACHE/$HZW_FF_FILE"
     HZW_FP_SRC="$CACHE/$HZW_FP_FILE"
 
-    if [ ! -f "$HZW_FF_SRC" ]; then
+    if [ ! -f "$HZW_FF_SRC" ] || [ ! -s "$HZW_FF_SRC" ]; then
         get_file "$HZW_FF_URL" "$HZW_FF_FILE" || true
     fi
-    if [ ! -f "$HZW_FP_SRC" ]; then
+    if [ ! -f "$HZW_FP_SRC" ] || [ ! -s "$HZW_FP_SRC" ]; then
         get_file "$HZW_FP_URL" "$HZW_FP_FILE" || true
     fi
 
-    if [ -f "$HZW_FF_SRC" ] && [ -f "$HZW_FP_SRC" ]; then
+    if [ -s "$HZW_FF_SRC" ] && [ -s "$HZW_FP_SRC" ]; then
         sha256_check "$HZW_FF_SRC" "$HZW_FF_SHA256" || true
         sha256_check "$HZW_FP_SRC" "$HZW_FP_SHA256" || true
-        install -m 755 "$HZW_FF_SRC" "$ARM64_VENDOR/ffmpeg"
-        install -m 755 "$HZW_FP_SRC" "$ARM64_VENDOR/ffprobe"
+        install_bin "$HZW_FF_SRC" "$ARM64_VENDOR/ffmpeg"
+        install_bin "$HZW_FP_SRC" "$ARM64_VENDOR/ffprobe"
         ok "android-arm64 installed"
     else
         err "android-arm64: FAILED — source files not found"
@@ -233,37 +254,63 @@ else
     fi
 fi
 
-# ===========================================================================
-# android-arm / android-x86_64 / android-x86 — NO confirmed dual CLI source
-# ===========================================================================
-log "--- android-arm (SKIPPED — no confirmed ffprobe source) ---"
-log "  Tried: https://github.com/Tyrrrz/FFmpegBinaries (ffmpeg-only)"
-log "  Tried: https://github.com/yearsyan/ffmpeg-android-build (static .a libs only)"
-log "  Tried: https://github.com/Khang-NT/android-ffmpeg-toolkit (disables ffprobe)"
-log "  Tried: https://github.com/yearsyan/ffmpeg-android-build/releases/download/v8.1.3-r1/ffmpeg_android_arm.tar.gz"
-log "    -> yearsyan tarballs contain only .a static libraries, no CLI executables."
-log "  android-arm, android-x86_64, android-x86 vendor dirs left absent."
-log "  build.rs will fail for those targets until a dual CLI package is confirmed."
+if [ ! -s "$ARM64_VENDOR/ffmpeg" ] || [ ! -s "$ARM64_VENDOR/ffprobe" ]; then
+    err "android-arm64: FAILED — binaries not installed"
+fi
+fi  # need_target android-arm64
 
 # ===========================================================================
-# Summary
+# skipped ABIs
+# ===========================================================================
+log "--- android-arm / x86_64 / x86 (SKIPPED — no confirmed ffprobe+ffmpeg CLI) ---"
+
+# ===========================================================================
+# Summary — recompute FAILED from required target presence
 # ===========================================================================
 log ""
 log "=== Vendor population summary ==="
 for target in linux-x86_64 windows-x86_64 android-arm64; do
     dir="$VENDOR/$target"
-    if [ -d "$dir" ] && ls "$dir" | grep -qE "^ffmpeg"; then
-        log "  $target: OK ($(ls "$dir" | tr '\n' ' '))"
+    if need_target "$target"; then
+        if [ -d "$dir" ] && ls "$dir" 2>/dev/null | grep -qE "^ffmpeg"; then
+            log "  $target: OK ($(ls "$dir" | tr '\n' ' '))"
+        else
+            log "  $target: MISSING"
+        fi
     else
-        log "  $target: MISSING"
+        log "  $target: SKIPPED (WDMM_FFMPEG_ONLY)"
     fi
 done
 for target in android-arm android-x86_64 android-x86; do
     log "  $target: SKIPPED (no confirmed dual CLI source)"
 done
 
+FAILED=0
+require_ok() {
+    local t="$1"
+    if ! need_target "$t"; then
+        return 0
+    fi
+    local dir="$VENDOR/$t"
+    if [ "$t" = "windows-x86_64" ]; then
+        if [ ! -s "$dir/ffmpeg.exe" ] || [ ! -s "$dir/ffprobe.exe" ]; then
+            err "$t: MISSING after fetch"
+            return 1
+        fi
+    else
+        if [ ! -s "$dir/ffmpeg" ] || [ ! -s "$dir/ffprobe" ]; then
+            err "$t: MISSING after fetch"
+            return 1
+        fi
+    fi
+    return 0
+}
+require_ok linux-x86_64 || true
+require_ok windows-x86_64 || true
+require_ok android-arm64 || true
+
 if [ "$FAILED" -ne 0 ]; then
-    echo "[fetch-ffmpeg] FAILED — one or more mandatory targets not populated." >&2
+    echo "[fetch-ffmpeg] FAILED — one or more required targets not populated." >&2
     exit 1
 fi
 
