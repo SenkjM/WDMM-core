@@ -103,6 +103,64 @@ wav/ogg/opus; fallback `application/octet-stream`).
 
 ---
 
+## HLS session API
+
+### `async fn ProxyHandle::register_hls(&self, input: impl Into<PathBuf>, mode: wdmm_ffmpeg::HlsMode) -> ProxyResult<HlsRegistration>`
+Register an HLS session for `input`.
+
+Calls `wdmm_ffmpeg::open_job` to create the segment directory (and, once
+vendored binaries are wired, spawn the transcode process). Use
+`HlsMode::DirectCopy` (default) for codec-compatible media and
+`HlsMode::Compat` for transcoding.
+
+For the 「单文件直通」 compat option, use `register_file` with byte Range instead.
+
+Returns `HlsRegistration`; callers compose:
+```text
+http://{bind_host}:{port}{playlist_template}
+```
+
+### `async fn ProxyHandle::seek_hls(&self, token: &str, offset_secs: f64) -> ProxyResult<()>`
+Seek an active HLS session to `offset_secs`.
+
+Kills the current transcode job and restarts it (`-ss offset_secs`). The old
+segment directory is removed when the old `JobHandle` drops. No-op if the
+token is unknown.
+
+### `fn ProxyHandle::unregister_hls(&self, token: &str)`
+Revoke an HLS session token. The transcode job is killed and the segment
+directory is cleaned up.
+
+---
+
+### `struct HlsRegistration`
+Result of `register_hls`.
+
+Fields:
+- `token: String` — 32-hex, 128-bit random token.
+- `playlist_template: String` — URL path to the master playlist,
+  e.g. `"/h/3f7a…/index.m3u8"`.
+
+---
+
+## HLS routes
+
+The proxy adds the following routes automatically when the server starts:
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| GET | `/h/:token/index.m3u8` | Master HLS playlist (served from segment dir) |
+| GET | `/h/:token/:seg.ts` | HLS segment file |
+
+Content-Type mapping:
+- `*.m3u8` → `application/vnd.apple.mpegurl`
+- `*.ts` → `video/mp2t`
+
+Path traversal (`..`, `/` in segment name) → `400 Bad Request`.
+Unknown token → `404 Not Found`.
+
+---
+
 ## URL composition
 
 Callers (DLNA, OpenAPI `mode=proxy`, platform players) compose the URL

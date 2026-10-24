@@ -1,0 +1,17 @@
+[package]
+name        = "wdmm-ffmpeg"
+description = "Vendored FFmpeg bindings — probe, HLS transcode jobs, segment management"
+version     = { workspace = true }
+edition     = { workspace = true }
+publish     = { workspace = true }
+
+[dependencies]
+thiserror = { workspace = true }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+rand      = { workspace = true }
+serde     = { workspace = true }
+
+[build-dependencies]
+# No external build-dep yet; link logic lives in build.rs comments.
+# TODO(round-12+): add a download script or cmake crate for vendored libs.

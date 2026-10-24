@@ -14,6 +14,7 @@ wdmm-crypto  = { workspace = true }
 wdmm-drivers = { workspace = true }
 wdmm-dlna    = { workspace = true }
 wdmm-proxy   = { workspace = true }
+wdmm-ffmpeg  = { workspace = true }
 wdmm-openapi = { workspace = true }
 wdmm-queue   = { workspace = true }
 wdmm-storage = { workspace = true }

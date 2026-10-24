@@ -12,9 +12,10 @@ futures-core = "0.3"
 thiserror  = { workspace = true }
 serde      = { workspace = true }
 bytes      = { workspace = true }
-axum       = { workspace = true }
-tracing    = { workspace = true }
-rand       = { workspace = true }
+axum        = { workspace = true }
+tracing     = { workspace = true }
+rand        = { workspace = true }
+wdmm-ffmpeg = { workspace = true }
 
 [dev-dependencies]
 reqwest    = { workspace = true }

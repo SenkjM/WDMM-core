@@ -547,6 +547,132 @@ pub extern "C" fn wdmm_proxy_unregister(token: *const std::os::raw::c_char) -> F
     FfiString::ok()
 }
 
+// ── Proxy HLS FFI ─────────────────────────────────────────────────────────────
+//
+// Thin wrappers around `ProxyHandle::register_hls`, `seek_hls`, and
+// `unregister_hls`. The proxy singleton must already be started via
+// `wdmm_proxy_start`. DLNA cast takes the URL from the caller — the proxy only
+// supplies the token path; the caller composes the full URL.
+
+/// Register an HLS session with the proxy.
+///
+/// `file_path` — absolute path to the input media file (null-terminated UTF-8).
+/// `mode_json` — transcode mode as a JSON object (may be `NULL` for the default):
+///
+/// ```json
+/// {"mode":"direct_copy"}
+/// {"mode":"compat","video_codec":"libx264","audio_codec":"aac"}
+/// ```
+///
+/// Returns JSON on success:
+/// ```json
+/// {"token":"3f7a…","playlist_template":"/h/3f7a…/index.m3u8","port":43221}
+/// ```
+/// or `"error:<message>"` on failure. Caller must free the result via
+/// [`wdmm_ffi_free_string`].
+///
+/// # Safety
+/// `file_path` must be a valid null-terminated UTF-8 C string.
+/// `mode_json` may be `NULL` (treated as `{"mode":"direct_copy"}`).
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_register_hls(
+    file_path: *const c_char,
+    mode_json: *const c_char,
+) -> FfiString {
+    let path_str = match ptr_to_str(file_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid file_path"),
+    };
+    let mode_str = ptr_to_str(mode_json).unwrap_or(r#"{"mode":"direct_copy"}"#);
+    let mode = parse_hls_mode(mode_str);
+
+    let guard = proxy_cell().lock().unwrap();
+    let handle = match guard.as_ref() {
+        Some(h) => h,
+        None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
+    };
+    let path = std::path::Path::new(path_str);
+    let reg = rt().block_on(handle.register_hls(path, mode));
+    match reg {
+        Ok(r) => {
+            let port = handle.addr().map(|a| a.port()).unwrap_or(0);
+            FfiString::from(
+                serde_json::json!({
+                    "token":             r.token,
+                    "playlist_template": r.playlist_template,
+                    "port":              port,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Seek an active HLS session to a new position.
+///
+/// Kills the current transcode job for `token` and restarts it from
+/// `offset_secs` seconds.  Returns `"ok"` or `"error:<message>"`.
+/// Caller must free the result.
+///
+/// # Safety
+/// `token` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_hls_seek(
+    token: *const c_char,
+    offset_secs: f64,
+) -> FfiString {
+    let tok = match ptr_to_str(token) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid token"),
+    };
+    let guard = proxy_cell().lock().unwrap();
+    let handle = match guard.as_ref() {
+        Some(h) => h,
+        None => return FfiString::from("error:proxy not started"),
+    };
+    match rt().block_on(handle.seek_hls(tok, offset_secs)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Unregister an HLS session. The transcode job is killed and the segment
+/// directory is removed. Returns `"ok"`.
+///
+/// # Safety
+/// `token` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_unregister_hls(token: *const c_char) -> FfiString {
+    let tok = match ptr_to_str(token) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid token"),
+    };
+    if let Some(h) = proxy_cell().lock().unwrap().as_ref() {
+        h.unregister_hls(tok);
+    }
+    FfiString::ok()
+}
+
+/// Parse an HLS mode JSON object.
+///
+/// ```json
+/// {"mode":"direct_copy"}
+/// {"mode":"compat","video_codec":"libx264","audio_codec":"aac"}
+/// ```
+///
+/// Unknown or missing `mode` field → [`HlsMode::DirectCopy`].
+fn parse_hls_mode(json: &str) -> wdmm_ffmpeg::HlsMode {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    match v["mode"].as_str().unwrap_or("direct_copy") {
+        "compat" => wdmm_ffmpeg::HlsMode::Compat {
+            video_codec: v["video_codec"].as_str().map(Into::into),
+            audio_codec: v["audio_codec"].as_str().map(Into::into),
+        },
+        _ => wdmm_ffmpeg::HlsMode::DirectCopy,
+    }
+}
+
 // ── DLNA FFI ──────────────────────────────────────────────────────────────────
 
 /// Discover DLNA/UPnP MediaRenderer devices on the LAN using SSDP.

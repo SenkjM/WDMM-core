@@ -1812,11 +1812,23 @@ dependencies = [
  "wdmm-crypto",
  "wdmm-dlna",
  "wdmm-drivers",
+ "wdmm-ffmpeg",
  "wdmm-openapi",
  "wdmm-proxy",
  "wdmm-queue",
  "wdmm-storage",
  "wdmm-sync",
+]
+
+[[package]]
+name = "wdmm-ffmpeg"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.8",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1866,6 +1878,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "wdmm-ffmpeg",
 ]
 
 [[package]]

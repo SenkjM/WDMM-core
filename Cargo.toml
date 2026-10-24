@@ -9,6 +9,7 @@ members = [
     "crates/wdmm-sync",
     "crates/wdmm-dlna",
     "crates/wdmm-proxy",
+    "crates/wdmm-ffmpeg",
     "crates/wdmm-platform",
     "crates/wdmm-openapi",
     "crates/wdmm-ffi",
@@ -29,6 +30,7 @@ wdmm-queue    = { path = "crates/wdmm-queue"    }
 wdmm-sync     = { path = "crates/wdmm-sync"     }
 wdmm-dlna     = { path = "crates/wdmm-dlna"     }
 wdmm-proxy    = { path = "crates/wdmm-proxy"    }
+wdmm-ffmpeg   = { path = "crates/wdmm-ffmpeg"   }
 wdmm-platform = { path = "crates/wdmm-platform" }
 wdmm-openapi  = { path = "crates/wdmm-openapi"  }
 

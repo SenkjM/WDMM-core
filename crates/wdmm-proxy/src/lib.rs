@@ -53,6 +53,8 @@ use tracing::{error, info};
 pub enum ProxyError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("ffmpeg error: {0}")]
+    Ffmpeg(String),
 }
 
 pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
@@ -77,10 +79,44 @@ struct Entry {
     source: BackSource,
 }
 
+// ── HLS session ───────────────────────────────────────────────────────────────
+
+/// An active HLS transcode session keyed by a proxy-assigned token.
+///
+/// Dropped (killing the underlying process and removing the segment directory)
+/// when `unregister_hls` is called or when replaced by a seek restart.
+struct HlsSession {
+    /// Directory where the transcode job writes `index.m3u8` + numbered segments.
+    segment_dir: std::path::PathBuf,
+    /// Active transcode job. Replaced atomically on seek.
+    job: wdmm_ffmpeg::JobHandle,
+    /// Original input path — preserved so seek can restart the job.
+    input: std::path::PathBuf,
+    /// Transcode mode — preserved for seek restarts.
+    mode: wdmm_ffmpeg::HlsMode,
+}
+
+/// Result of a successful `register_hls` call.
+///
+/// Callers compose the playlist URL as:
+/// ```text
+/// http://{bind_host}:{port}{playlist_template}
+/// ```
+/// The proxy never returns a full URL.
+#[derive(Debug, Clone)]
+pub struct HlsRegistration {
+    /// 32-hex, 128-bit random token.
+    pub token: String,
+    /// URL path to the master playlist, e.g. `"/h/3f7a…/index.m3u8"`.
+    pub playlist_template: String,
+}
+
 // ── Shared server state ───────────────────────────────────────────────────────
 
 struct Shared {
     entries: HashMap<String, Entry>,
+    /// Active HLS transcode sessions keyed by their proxy token.
+    hls_sessions: HashMap<String, HlsSession>,
     addr: Option<SocketAddr>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// Drop the old sender to cancel the previous idle task; assign new one.
@@ -129,6 +165,7 @@ impl ProxyHandle {
     pub fn with_idle_timeout(bind: SocketAddr, idle_timeout: Duration) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             entries: HashMap::new(),
+            hls_sessions: HashMap::new(),
             addr: None,
             shutdown_tx: None,
             idle_cancel_tx: None,
@@ -202,6 +239,85 @@ impl ProxyHandle {
         }
     }
 
+    // ── HLS register / seek / unregister ─────────────────────────────────────
+
+    /// Register an HLS session for `input`.
+    ///
+    /// Calls [`wdmm_ffmpeg::open_job`] which creates the segment directory and
+    /// (once vendored binaries are wired) spawns the transcode process. Use
+    /// [`HlsMode::DirectCopy`] (the default) for codec-compatible media and
+    /// [`HlsMode::Compat`] for transcoding. For the 「单文件直通」 compat option
+    /// use [`register_file`](Self::register_file) with byte Range instead.
+    ///
+    /// Returns [`HlsRegistration`]; callers compose the playlist URL as
+    /// `http://{bind_host}:{port}{playlist_template}`.
+    pub async fn register_hls(
+        &self,
+        input: impl Into<std::path::PathBuf>,
+        mode: wdmm_ffmpeg::HlsMode,
+    ) -> ProxyResult<HlsRegistration> {
+        self.ensure_server().await?;
+        let input = input.into();
+        let job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+            input: input.clone(),
+            mode: mode.clone(),
+            subtitles: wdmm_ffmpeg::SubtitleMode::Off,
+            start_offset_secs: 0.0,
+            segment_duration_secs: 6,
+        })
+        .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
+        let segment_dir = job.segment_dir.clone();
+        let token = new_token();
+        let playlist_template = format!("/h/{token}/index.m3u8");
+        {
+            let mut g = self.shared.lock().unwrap();
+            g.hls_sessions.insert(
+                token.clone(),
+                HlsSession { segment_dir, job, input, mode },
+            );
+            arm_idle_timer(&mut g, Arc::clone(&self.shared));
+        }
+        Ok(HlsRegistration { token, playlist_template })
+    }
+
+    /// Seek an active HLS session to `offset_secs`.
+    ///
+    /// Kills the current transcode job and restarts it with `-ss offset_secs`.
+    /// The old segment directory is removed when the old [`JobHandle`] drops.
+    /// No-op if the token is unknown.
+    pub async fn seek_hls(&self, token: &str, offset_secs: f64) -> ProxyResult<()> {
+        // Extract input + mode without holding the lock across an await point.
+        let (input, mode) = {
+            let g = self.shared.lock().unwrap();
+            match g.hls_sessions.get(token) {
+                None => return Ok(()),
+                Some(s) => (s.input.clone(), s.mode.clone()),
+            }
+        };
+        let new_job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+            input: input.clone(),
+            mode: mode.clone(),
+            subtitles: wdmm_ffmpeg::SubtitleMode::Off,
+            start_offset_secs: offset_secs,
+            segment_duration_secs: 6,
+        })
+        .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
+        let new_segment_dir = new_job.segment_dir.clone();
+        // Atomically replace the session — old job drops here, killing the old process.
+        let mut g = self.shared.lock().unwrap();
+        if let Some(session) = g.hls_sessions.get_mut(token) {
+            session.segment_dir = new_segment_dir;
+            session.job = new_job;
+        }
+        Ok(())
+    }
+
+    /// Revoke an HLS session token. The transcode job is killed and the
+    /// segment directory is removed (on [`JobHandle`] drop).
+    pub fn unregister_hls(&self, token: &str) {
+        self.shared.lock().unwrap().hls_sessions.remove(token);
+    }
+
     /// Gracefully stop the proxy. The handle is still usable; the server will
     /// restart automatically on the next `register_*`.
     pub fn stop(&self) {
@@ -241,6 +357,7 @@ impl ProxyHandle {
         let shared_for_router = Arc::clone(&self.shared);
         let app = Router::new()
             .route("/s/:token", get(serve))
+            .route("/h/:token/*seg", get(serve_hls))
             .with_state(shared_for_router);
 
         let shared_for_cleanup = Arc::clone(&self.shared);
@@ -479,8 +596,48 @@ fn serve_callback(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── HLS handler ───────────────────────────────────────────────────────────────
 
+async fn serve_hls(
+    State(shared): State<Arc<Mutex<Shared>>>,
+    Path((token, seg)): Path<(String, String)>,
+) -> Result<Response, StatusCode> {
+    // Reject path traversal attempts — HLS segment names are always flat.
+    if seg.contains('/') || seg.contains("..") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let (segment_dir, content_type) = {
+        let mut g = shared.lock().unwrap();
+        let session = g.hls_sessions.get(&token).ok_or(StatusCode::NOT_FOUND)?;
+        let segment_dir = session.segment_dir.clone();
+        let ct: &'static str = if seg.ends_with(".m3u8") {
+            "application/vnd.apple.mpegurl"
+        } else {
+            "video/mp2t"
+        };
+        arm_idle_timer(&mut g, Arc::clone(&shared));
+        (segment_dir, ct)
+    };
+
+    let file_path = segment_dir.join(&seg);
+    let file = tokio::fs::File::open(&file_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let file_len = tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .len();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, file_len)
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +801,59 @@ mod tests {
         // path_template must start with "/" and not contain "http"
         assert!(reg.path_template.starts_with('/'), "path_template must start with /");
         assert!(!reg.path_template.contains("http"), "path_template must not embed scheme");
+        proxy.stop();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── HLS skeleton ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn proxy_hls_register_serve_unregister() {
+        let path = std::env::temp_dir().join(format!(
+            "wdmm-hls-reg-{}.mp4",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"stub").unwrap();
+
+        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let reg = proxy
+            .register_hls(&path, wdmm_ffmpeg::HlsMode::DirectCopy)
+            .await
+            .unwrap();
+
+        assert!(!reg.token.is_empty());
+        assert!(reg.playlist_template.starts_with("/h/"));
+        assert!(reg.playlist_template.ends_with("/index.m3u8"));
+
+        // Stub: segment dir is created but index.m3u8 is never written → 404.
+        let addr = proxy.addr().unwrap();
+        let url = format!("http://{addr}{}", reg.playlist_template);
+        let r = reqwest::Client::new().get(&url).send().await.unwrap();
+        assert_eq!(r.status(), 404, "stub m3u8 must not exist yet");
+
+        proxy.unregister_hls(&reg.token);
+        proxy.stop();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn proxy_hls_seek_ok() {
+        let path = std::env::temp_dir().join(format!(
+            "wdmm-hls-seek-{}.mp4",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"stub").unwrap();
+
+        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let reg = proxy
+            .register_hls(&path, wdmm_ffmpeg::HlsMode::DirectCopy)
+            .await
+            .unwrap();
+
+        // Seek to 30 s — creates a new job+segment_dir; must not error in stub mode.
+        proxy.seek_hls(&reg.token, 30.0).await.unwrap();
+
+        proxy.unregister_hls(&reg.token);
         proxy.stop();
         let _ = std::fs::remove_file(&path);
     }

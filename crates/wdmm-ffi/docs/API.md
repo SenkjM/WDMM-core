@@ -164,6 +164,37 @@ Revoke a token. Returns `"ok"`.
 
 ---
 
+## Proxy HLS
+
+Process-global HLS session management. Requires `wdmm_proxy_start` to have
+been called first. DLNA cast still takes the URL from the caller — the proxy
+supplies only the token path; callers compose the full URL.
+
+### `extern "C" fn wdmm_proxy_register_hls(file_path: *const c_char, mode_json: *const c_char) -> FfiString`
+Register an HLS session for `file_path`.
+
+`mode_json` (may be `NULL` → `{"mode":"direct_copy"}`):
+```json
+{"mode":"direct_copy"}
+{"mode":"compat","video_codec":"libx264","audio_codec":"aac"}
+```
+
+Returns JSON on success:
+```json
+{"token":"3f7a…","playlist_template":"/h/3f7a…/index.m3u8","port":43221}
+```
+or `"error:<message>"`. Caller composes `http://127.0.0.1:{port}{playlist_template}`.
+
+### `extern "C" fn wdmm_proxy_hls_seek(token: *const c_char, offset_secs: f64) -> FfiString`
+Seek an active HLS session to `offset_secs`. Kills the current transcode job
+and restarts from the new offset. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_proxy_unregister_hls(token: *const c_char) -> FfiString`
+Revoke an HLS session. The transcode job is killed and the segment directory
+is cleaned up. Returns `"ok"`.
+
+---
+
 ## Library database
 
 ### `extern "C" fn wdmm_library_init(path: *const c_char) -> FfiString`
