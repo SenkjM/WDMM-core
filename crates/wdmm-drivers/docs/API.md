@@ -17,11 +17,47 @@ registry. No driver embeds credentials in source; all secrets are user-supplied.
 
 ## Core trait (`wdmm_drivers::driver`)
 
+### `enum ContentDeliveryKind`
+
+How bytes are obtained for a `CloudFileItem`. `#[non_exhaustive]` — match with a
+`_` catch-all.
+
+| Variant | Meaning |
+|---------|---------|
+| `NetworkDirect` | A network URL is available (`raw_url` + optional `raw_headers`). media_kit can consume directly if the caller can pass custom headers; otherwise route through proxy. |
+| `LocalStream` | No URL and no local path — bytes come from an in-process Range/byte stream only (e.g. a crypt-wrapper driver). Callers must bridge through `ProxyHandle::register_driver` (Rust) or `wdmm_proxy_register_stream` (FFI/Dart). |
+| `LocalFile` | A local filesystem path (`local_path`) is directly readable. |
+
+```rust
+impl ContentDeliveryKind {
+    /// Infer from presence of raw_url / local_path. Prefer explicit construction.
+    pub fn infer(raw_url: Option<&str>, local_path: Option<&Path>) -> Self;
+}
+```
+
 ### `struct CloudFileItem`
 A cloud file or directory.
-Fields: `name`, `is_dir`, `size: u64`, `modified: Option<DateTime<Utc>>`,
-`raw_url: Option<String>` (direct download URL, with auth headers if needed),
-`raw_headers: Vec<(String, String)>` (custom headers for `raw_url`).
+
+Fields:
+- `name: String`
+- `is_dir: bool`
+- `size: u64`
+- `modified: Option<DateTime<Utc>>`
+- `raw_url: Option<String>` — direct download URL; present when `delivery == NetworkDirect`.
+- `raw_headers: Vec<(String, String)>` — custom headers for `raw_url`; empty otherwise.
+- `delivery: ContentDeliveryKind` — how bytes are obtained; callers use this to decide routing.
+- `local_path: Option<PathBuf>` — filesystem path; present when `delivery == LocalFile`.
+
+Constructors (prefer these over struct literal):
+
+```rust
+// delivery = NetworkDirect
+CloudFileItem::network_direct(name, is_dir, size, modified, raw_url, raw_headers)
+// delivery = LocalStream (no URL, no path)
+CloudFileItem::local_stream(name, is_dir, size, modified)
+// delivery = LocalFile
+CloudFileItem::local_file(name, is_dir, size, modified, local_path)
+```
 
 ### `trait CloudDriver: Send + Sync`
 Cloud storage abstraction. Required methods:
@@ -122,13 +158,5 @@ Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 Unit-struct stubs. All `CloudDriver` methods return `DriverError::Other("TODO: …")`.
 
 ---
-
-## Planned: `ContentDeliveryKind` (P0.5, not landed)
-
-Discriminant on `CloudFileItem` for how the virtual layer exposes bytes:
-
-- `NetworkDirect` — use `raw_url` / `raw_headers`
-- `LocalStream` — no URL/path; callers use `get_content_range` or proxy `register_driver`
-- `LocalFile` — filesystem path in planned `local_path` field
 
 Callers (media_kit, DLNA, future mounts) decide proxy need from this kind. Enum is `#[non_exhaustive]`. See `/workspace/agent-tools/wdmm-crypt-proxy-path.md` §6.

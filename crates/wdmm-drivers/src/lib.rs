@@ -26,7 +26,7 @@ pub mod webdav;
 pub use aliyun::{AliyunConfig, AliyunDriver};
 pub use baidu::{BaiduConfig, BaiduDriver};
 pub use ctfile::{CtFileConfig, CtFileDriver};
-pub use driver::{CloudDriver, CloudFileItem, DriverError, Result};
+pub use driver::{CloudDriver, CloudFileItem, ContentDeliveryKind, DriverError, Result};
 pub use open115::{Open115Config, Open115Driver};
 pub use pan123::{Pan123Config, Pan123Driver};
 pub use stubs::{NeteaseMusicDriver, TeraboxDriver};

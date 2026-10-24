@@ -700,6 +700,8 @@ impl CloudDriver for CtFileDriver {
                 modified: f.modified,
                 raw_url: None,
                 raw_headers: vec![],
+                delivery: crate::driver::ContentDeliveryKind::LocalStream,
+                local_path: None,
             });
         }
         for f in &files {
@@ -713,6 +715,8 @@ impl CloudDriver for CtFileDriver {
                 modified: f.modified,
                 raw_url: None,
                 raw_headers: vec![],
+                delivery: crate::driver::ContentDeliveryKind::LocalStream,
+                local_path: None,
             });
         }
         Ok(seen.into_values().collect())
@@ -728,6 +732,8 @@ impl CloudDriver for CtFileDriver {
                 modified: None,
                 raw_url: None,
                 raw_headers: vec![],
+                delivery: crate::driver::ContentDeliveryKind::LocalStream,
+                local_path: None,
             });
         }
         let name = Self::file_name(&norm);
@@ -742,6 +748,8 @@ impl CloudDriver for CtFileDriver {
                 modified: None,
                 raw_url: None,
                 raw_headers: vec![],
+                delivery: crate::driver::ContentDeliveryKind::LocalStream,
+                local_path: None,
             });
         }
         let meta = self.client.file_meta(&id).await?;
@@ -759,6 +767,8 @@ impl CloudDriver for CtFileDriver {
             modified: None,
             raw_url: Some(url),
             raw_headers: vec![("User-Agent".to_string(), self.user_agent.clone())],
+            delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
+            local_path: None,
         })
     }
 

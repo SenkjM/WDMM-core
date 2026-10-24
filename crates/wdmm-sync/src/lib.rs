@@ -702,6 +702,8 @@ mod tests {
                     modified: None,
                     raw_url: None,
                     raw_headers: vec![],
+                    delivery: wdmm_drivers::ContentDeliveryKind::LocalStream,
+                    local_path: None,
                 })
                 .collect();
             Ok(items)
@@ -715,6 +717,8 @@ mod tests {
                     modified: None,
                     raw_url: Some(path.to_string()),
                     raw_headers: vec![],
+                    delivery: wdmm_drivers::ContentDeliveryKind::NetworkDirect,
+                    local_path: None,
                 })
             } else {
                 Err(DriverError::NotFound(path.into()))

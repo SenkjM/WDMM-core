@@ -124,6 +124,8 @@ impl WebDavDriver {
                                     modified: current_modified,
                                     raw_url: Some(self.join_path(&decoded_href)),
                                     raw_headers: vec![],
+                                    delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
+                                    local_path: None,
                                 });
                             }
                         }

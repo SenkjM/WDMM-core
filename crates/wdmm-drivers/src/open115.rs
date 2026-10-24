@@ -211,6 +211,8 @@ impl Open115Driver {
             modified,
             raw_url: None,
             raw_headers: vec![],
+            delivery: crate::driver::ContentDeliveryKind::LocalStream,
+            local_path: None,
         })
     }
 }
@@ -277,6 +279,8 @@ impl CloudDriver for Open115Driver {
             modified,
             raw_url: Some(raw_url),
             raw_headers: vec![],
+            delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
+            local_path: None,
         })
     }
 

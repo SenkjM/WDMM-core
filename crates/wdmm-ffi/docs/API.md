@@ -170,8 +170,8 @@ Process-global HLS session management. Requires `wdmm_proxy_start` to have
 been called first. DLNA cast still takes the URL from the caller — the proxy
 supplies only the token path; callers compose the full URL.
 
-### `extern "C" fn wdmm_proxy_register_hls(file_path: *const c_char, mode_json: *const c_char) -> FfiString`
-Register an HLS session for `file_path`.
+### `extern "C" fn wdmm_proxy_register_hls(device_id: *const c_char, file_path: *const c_char, mode_json: *const c_char) -> FfiString`
+Register an HLS session for `device_id` + `file_path`.
 
 `mode_json` (may be `NULL` → `{"mode":"direct_copy"}`):
 ```json
@@ -192,6 +192,68 @@ and restarts from the new offset. Returns `"ok"` or `"error:<message>"`.
 ### `extern "C" fn wdmm_proxy_unregister_hls(token: *const c_char) -> FfiString`
 Revoke an HLS session. The transcode job is killed and the segment directory
 is cleaned up. Returns `"ok"`.
+
+---
+
+## Proxy stream (LocalStream / MustProxy)
+
+For `ContentDeliveryKind::LocalStream` items — files that have no `raw_url`
+and no filesystem path (e.g. crypt-wrapper drivers, streaming-only protocols).
+The proxy serves bytes on demand via a C callback.
+
+### `type WdmmProxyRangeCallback`
+
+```c
+typedef int32_t (*WdmmProxyRangeCallback)(
+    void*    user_data,   // opaque; passed through from register_stream
+    int64_t  start,       // inclusive byte offset
+    int64_t  end,         // inclusive end offset; -1 = read to EOF
+    uint8_t** out_buf,    // set to buffer allocated via wdmm_proxy_stream_alloc_buf
+    size_t*  out_len      // set to byte count in *out_buf
+);
+```
+
+Return `0` on success; any negative value on error (proxy emits IO error to HTTP
+client). The callback is invoked synchronously from a Tokio worker thread —
+`user_data` and `cb` must be safe to call from any thread for the registration
+lifetime.
+
+### `extern "C" fn wdmm_proxy_stream_alloc_buf(len: usize) -> *mut u8`
+Allocate `len` bytes in Rust's heap for use as a callback output buffer.
+The C callback **must** use this to allocate `*out_buf`; Rust reclaims the
+memory after consuming it. Returns null if `len == 0`.
+
+### `unsafe extern "C" fn wdmm_proxy_stream_free_buf(buf: *mut u8, len: usize)`
+Free a buffer previously returned by `wdmm_proxy_stream_alloc_buf`. Exported for
+C error paths. No-op if `buf` is null or `len == 0`.
+
+### `unsafe extern "C" fn wdmm_proxy_register_stream(size: u64, name: *const c_char, cb: WdmmProxyRangeCallback, user_data: *mut c_void) -> FfiString`
+Register an in-process Range/byte stream with the proxy.
+
+Parameters:
+- `size` — known file size in bytes; `0` if unknown (stream until EOF).
+- `name` — nullable; used only for Content-Type guessing (e.g. `"video.mp4"`).
+- `cb` — Range callback (see `WdmmProxyRangeCallback` above).
+- `user_data` — opaque pointer passed to every `cb` invocation.
+
+Returns JSON on success:
+```json
+{"token":"3f7a…","path_template":"/s/3f7a…","port":43221}
+```
+or `"error:<message>"`. Caller builds URL as `http://127.0.0.1:{port}{path_template}`.
+
+Requires `wdmm_proxy_start` to have been called. Caller must free the result.
+
+#### Dart/Flutter note
+The callback is invoked **synchronously** from a Tokio worker thread. For async
+decrypt (e.g. calling `openContentRange` across a Dart isolate), use a
+`NativeCallable.listener` port bridge: the Dart side enqueues the request and
+signals back; the C callback blocks until the Dart side replies.
+
+### `unsafe extern "C" fn wdmm_proxy_renew_stream_callback(token: *const c_char, cb: WdmmProxyRangeCallback, user_data: *mut c_void) -> FfiString`
+Replace the Range callback for an existing stream registration. Use after
+credential refresh or decryption key rotation. No-op if `token` is unknown or
+refers to a file (not stream) registration. Returns `"ok"`.
 
 ---
 

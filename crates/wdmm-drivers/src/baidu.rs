@@ -91,6 +91,8 @@ impl BaiduDriver {
             modified,
             raw_url: None,
             raw_headers: vec![],
+            delivery: crate::driver::ContentDeliveryKind::LocalStream,
+            local_path: None,
         })
     }
 
@@ -258,6 +260,8 @@ impl CloudDriver for BaiduDriver {
                 "Authorization".to_string(),
                 format!("Bearer {}", self.config.access_token),
             )],
+            delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
+            local_path: None,
         })
     }
 

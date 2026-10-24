@@ -679,7 +679,242 @@ fn parse_hls_mode(json: &str) -> wdmm_ffmpeg::HlsMode {
     }
 }
 
-// ── DLNA FFI ──────────────────────────────────────────────────────────────────
+// ── Proxy stream FFI ──────────────────────────────────────────────────────────
+//
+// Exposes `ProxyHandle::register_driver` as a C ABI for Android MustProxy /
+// crypt-wrapper local stream playback. The callback is invoked synchronously
+// from the Tokio request-handler thread; Dart callers needing true async
+// decrypt should use a NativeCallable.listener port bridge.
+
+/// Range callback type for `wdmm_proxy_register_stream`.
+///
+/// Invoked from the proxy HTTP request-handler thread (a Tokio worker) for
+/// every Range/full-content request on the registered token.
+///
+/// Parameters:
+/// - `user_data` — opaque pointer passed through from `wdmm_proxy_register_stream`.
+/// - `start`     — inclusive byte offset.
+/// - `end`       — inclusive end offset; **`-1` means read to EOF** (unknown size).
+/// - `out_buf`   — on success (`return 0`), set to a buffer allocated via
+///   [`wdmm_proxy_stream_alloc_buf`] and filled with the requested bytes.
+///   Rust takes ownership and frees it after consuming.
+/// - `out_len`   — on success, set to the byte count in `*out_buf`.
+///
+/// Return `0` on success, any negative value on error (the proxy will emit
+/// an IO error to the HTTP client).
+///
+/// **Thread safety**: the callback and `user_data` must be safe to call from
+/// any thread for the full lifetime of the registration.
+pub type WdmmProxyRangeCallback = unsafe extern "C" fn(
+    user_data: *mut std::os::raw::c_void,
+    start: i64,
+    end: i64,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32;
+
+/// Allocate `len` bytes in Rust's heap for use as a callback output buffer.
+///
+/// The C callback must call this to allocate the output buffer it sets as
+/// `*out_buf`. Rust reclaims the memory automatically after consuming it.
+///
+/// Returns a non-null pointer on success, null if `len == 0`.
+///
+/// ## Usage in the callback
+/// ```c
+/// uint8_t* buf = wdmm_proxy_stream_alloc_buf(chunk_len);
+/// memcpy(buf, source, chunk_len);
+/// *out_buf = buf;
+/// *out_len = chunk_len;
+/// return 0; // success
+/// ```
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_stream_alloc_buf(len: usize) -> *mut u8 {
+    if len == 0 {
+        return std::ptr::null_mut();
+    }
+    let mut v = Vec::<u8>::with_capacity(len);
+    let ptr = v.as_mut_ptr();
+    std::mem::forget(v); // caller takes ownership
+    ptr
+}
+
+/// Free a buffer previously returned by [`wdmm_proxy_stream_alloc_buf`].
+///
+/// Rust calls this automatically after consuming the callback output. Also
+/// exported so C can call it on error paths (e.g. when a callback succeeded
+/// but the registration failed).
+///
+/// No-op if `buf` is null or `len` is 0.
+///
+/// # Safety
+/// `buf` must have been allocated via [`wdmm_proxy_stream_alloc_buf`] and
+/// must not have been freed already.
+#[no_mangle]
+pub unsafe extern "C" fn wdmm_proxy_stream_free_buf(buf: *mut u8, len: usize) {
+    if !buf.is_null() && len > 0 {
+        drop(Vec::from_raw_parts(buf, len, len));
+    }
+}
+
+// ── C callback helpers ────────────────────────────────────────────────────────
+
+/// Wraps `*mut c_void` to implement `Send + Sync`.
+///
+/// Safety invariant: the C caller guarantees that `user_data` is accessible
+/// from any thread for the lifetime of the registration.
+struct UnsafeUserData(*mut std::os::raw::c_void);
+unsafe impl Send for UnsafeUserData {}
+unsafe impl Sync for UnsafeUserData {}
+
+/// Thread-safe wrapper for the C range callback + user_data.
+struct StreamCallbackCtx {
+    cb: WdmmProxyRangeCallback,
+    user_data: UnsafeUserData,
+}
+unsafe impl Send for StreamCallbackCtx {}
+unsafe impl Sync for StreamCallbackCtx {}
+
+/// Build a `BoxStream` from one invocation of the C callback.
+///
+/// Called on each Range (or full-content) HTTP request. The callback fills a
+/// Rust-heap buffer; we consume it as a single-chunk stream.
+fn invoke_c_callback(
+    ctx: &StreamCallbackCtx,
+    start: i64,
+    end: i64,
+) -> wdmm_proxy::BoxStream {
+    use bytes::Bytes;
+    use std::io;
+
+    let mut out_buf: *mut u8 = std::ptr::null_mut();
+    let mut out_len: usize = 0;
+
+    // Safety: caller holds Arc<StreamCallbackCtx> alive.
+    let result = unsafe { (ctx.cb)(ctx.user_data.0, start, end, &mut out_buf, &mut out_len) };
+
+    if result < 0 || out_buf.is_null() || out_len == 0 {
+        return Box::pin(futures::stream::once(futures::future::ready(
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("wdmm_proxy stream callback returned {result}"),
+            )),
+        )));
+    }
+
+    // Safety: buffer was allocated by wdmm_proxy_stream_alloc_buf (Rust heap).
+    let chunk = unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) };
+    Box::pin(futures::stream::once(futures::future::ready(
+        Ok::<Bytes, io::Error>(Bytes::from(chunk)),
+    )))
+}
+
+/// Register an in-process Range/byte stream with the proxy.
+///
+/// This is the C ABI equivalent of `ProxyHandle::register_driver`. Use it for
+/// `ContentDeliveryKind::LocalStream` items (e.g. crypt-wrapper drivers whose
+/// `get()` returns no `raw_url`).
+///
+/// ## Parameters
+/// - `size`      — known file size in bytes; `0` if unknown (streams to EOF).
+/// - `name`      — nullable; used only for Content-Type guessing (`"video.mp4"`
+///   etc.). Does not affect routing or auth.
+/// - `cb`        — Range callback; see [`WdmmProxyRangeCallback`].
+/// - `user_data` — opaque pointer passed to every `cb` invocation.
+///
+/// ## Returns
+/// JSON on success:
+/// ```json
+/// {"token":"3f7a…","path_template":"/s/3f7a…","port":N}
+/// ```
+/// or `"error:<message>"` on failure. Caller must free the result via
+/// [`wdmm_ffi_free_string`].
+///
+/// Caller builds the URL as `http://127.0.0.1:{port}{path_template}`.
+///
+/// ## Dart/Flutter note
+/// The callback is invoked **synchronously** from a Tokio worker thread.
+/// For async decrypt (e.g. calling `openContentRange` across a Dart isolate),
+/// use a `NativeCallable.listener` port bridge: the Dart side enqueues the
+/// request and signals back; the C callback blocks until the Dart side replies.
+/// A fully async two-step bridge is a future improvement.
+///
+/// # Safety
+/// `cb` must be a valid function pointer for the lifetime of the registration.
+/// `user_data` must remain valid from any thread for the lifetime of the
+/// registration. `name` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn wdmm_proxy_register_stream(
+    size: u64,
+    name: *const c_char,
+    cb: WdmmProxyRangeCallback,
+    user_data: *mut std::os::raw::c_void,
+) -> FfiString {
+    use std::sync::Arc;
+
+    let name_opt: Option<String> = if name.is_null() {
+        None
+    } else {
+        ptr_to_str(name).map(|s| s.to_string())
+    };
+
+    let guard = proxy_cell().lock().unwrap();
+    let handle = match guard.as_ref() {
+        Some(h) => h,
+        None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
+    };
+
+    let ctx = Arc::new(StreamCallbackCtx { cb, user_data: UnsafeUserData(user_data) });
+
+    let reg = rt().block_on(handle.register_driver(size, name_opt, move |start, end| {
+        invoke_c_callback(&ctx, start, end)
+    }));
+
+    match reg {
+        Ok(r) => {
+            let port = handle.addr().map(|a| a.port()).unwrap_or(0);
+            FfiString::from(
+                serde_json::json!({
+                    "token":         r.token,
+                    "path_template": r.path_template,
+                    "port":          port,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Renew the Range callback for an existing stream registration.
+///
+/// Use after credential refresh or when the decryption key has changed. The
+/// new callback will be used for all subsequent Range requests on `token`.
+/// No-op if `token` is unknown or refers to a file (not stream) registration.
+///
+/// Returns `"ok"`. Caller must free the result.
+///
+/// # Safety
+/// Same requirements as [`wdmm_proxy_register_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn wdmm_proxy_renew_stream_callback(
+    token: *const c_char,
+    cb: WdmmProxyRangeCallback,
+    user_data: *mut std::os::raw::c_void,
+) -> FfiString {
+    use std::sync::Arc;
+
+    let tok = match ptr_to_str(token) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid token"),
+    };
+    let guard = proxy_cell().lock().unwrap();
+    if let Some(h) = guard.as_ref() {
+        let ctx = Arc::new(StreamCallbackCtx { cb, user_data: UnsafeUserData(user_data) });
+        h.renew_callback(tok, move |start, end| invoke_c_callback(&ctx, start, end));
+    }
+    FfiString::ok()
+}
 
 /// Discover DLNA/UPnP MediaRenderer devices on the LAN using SSDP.
 ///
@@ -1003,6 +1238,15 @@ fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrac
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use std::sync::Mutex;
+
+    // Proxy tests share the process-global proxy_cell() singleton.  Run them
+    // sequentially behind this lock to avoid one test's stop() tearing down the
+    // proxy mid-request of another test.
+    fn proxy_lock() -> &'static Mutex<()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn version_smoke() {
@@ -1147,7 +1391,120 @@ mod tests {
     }
 
     #[test]
-    fn proxy_start_register_stop() {
+    fn proxy_register_stream_smoke() {
+        let _guard = proxy_lock().lock().unwrap();
+        // Start proxy on an OS-assigned port.
+        let port_str = wdmm_proxy_start(0);
+        let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(port_str);
+        let port: u16 = port_s.parse().expect("proxy_start returns a port");
+
+        // Fixed data served by the C callback.
+        static DATA: &[u8] = b"hello-register-stream";
+
+        unsafe extern "C" fn range_cb(
+            _user_data: *mut std::os::raw::c_void,
+            start: i64,
+            end: i64,
+            out_buf: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> i32 {
+            let s = start as usize;
+            let e = if end < 0 {
+                DATA.len()
+            } else {
+                (end as usize + 1).min(DATA.len())
+            };
+            if s >= DATA.len() {
+                return -1;
+            }
+            let chunk = &DATA[s..e];
+            let buf = wdmm_proxy_stream_alloc_buf(chunk.len());
+            if buf.is_null() {
+                return -1;
+            }
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), buf, chunk.len());
+            *out_buf = buf;
+            *out_len = chunk.len();
+            0
+        }
+
+        let name = CString::new("hello.bin").unwrap();
+        let r = unsafe {
+            wdmm_proxy_register_stream(
+                DATA.len() as u64,
+                name.as_ptr(),
+                range_cb,
+                std::ptr::null_mut(),
+            )
+        };
+        let body = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+
+        // Must return JSON with token, path_template, port.
+        let v: serde_json::Value =
+            serde_json::from_str(&body).expect("register_stream must return JSON");
+        assert!(v["token"].is_string(), "missing token in: {body}");
+        assert!(
+            v["path_template"].as_str().unwrap().starts_with("/s/"),
+            "bad path_template in: {body}"
+        );
+        assert_eq!(v["port"], port as i64);
+
+        let path_template = v["path_template"].as_str().unwrap().to_string();
+        let token = v["token"].as_str().unwrap().to_string();
+
+        // GET full content through the proxy — use a fresh single-threaded
+        // runtime so we don't block the global rt() that runs the proxy server.
+        let url = format!("http://127.0.0.1:{port}{path_template}");
+        let got = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                reqwest::Client::new()
+                    .get(&url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            });
+        assert_eq!(got.as_ref(), DATA, "stream bytes mismatch");
+
+        // Range request — bytes=5-9.
+        let url2 = format!("http://127.0.0.1:{port}{path_template}");
+        let got_range = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                reqwest::Client::new()
+                    .get(&url2)
+                    .header("Range", "bytes=5-9")
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            });
+        assert_eq!(got_range.as_ref(), &DATA[5..10], "range bytes mismatch");
+
+        // Unregister and stop.
+        let tok = CString::new(token).unwrap();
+        let r = wdmm_proxy_unregister(tok.as_ptr());
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_proxy_stop();
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_proxy_port(), -1);
+    }
+
+    #[test]
+    fn proxy_start_stop_and_register_file() {
+        let _guard = proxy_lock().lock().unwrap();
         // Start on an OS-assigned port.
         let port_str = wdmm_proxy_start(0);
         let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();

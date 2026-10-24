@@ -207,6 +207,8 @@ impl Pan123Driver {
             modified,
             raw_url: None,
             raw_headers: vec![],
+            delivery: crate::driver::ContentDeliveryKind::LocalStream,
+            local_path: None,
         })
     }
 }
@@ -265,6 +267,8 @@ impl CloudDriver for Pan123Driver {
             modified,
             raw_url: Some(download_url),
             raw_headers: vec![],
+            delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
+            local_path: None,
         })
     }
 
