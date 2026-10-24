@@ -1,0 +1,146 @@
+name: Native Artifacts
+
+# Builds libwdmm_ffi.so (android-arm64) and wdmm_ffi.dll (windows-x64) from
+# the wdmm-ffi crate and uploads them as Actions artifacts.
+#
+# Consumers: Android Testbuild and Desktop Testbuild download these artifacts
+# by matching the exact Core commit SHA embedded in COMMIT.txt.
+#
+# Dispatch order: run this workflow on a given commit FIRST, then trigger the
+# Android / Desktop Testbuild workflows — they require a matching artifact.
+#
+# ABI note: ONLY arm64-v8a is built for Android. wdmm-ffmpeg hard-fails for
+# armeabi-v7a / x86 / x86_64 because no confirmed dual CLI (ffmpeg + ffprobe)
+# vendor source exists for those ABIs. See scripts/fetch-ffmpeg-vendor.sh.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/proxy-hls-ffmpeg
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # android-arm64: build libwdmm_ffi.so via cargo-ndk
+  # ---------------------------------------------------------------------------
+  android-arm64:
+    name: Build libwdmm_ffi.so (android-arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare ffmpeg vendor cache and fetch binaries
+        env:
+          WDMM_FFMPEG_CACHE: ${{ runner.temp }}/ffmpeg-vendor-cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$WDMM_FFMPEG_CACHE"
+          bash scripts/fetch-ffmpeg-vendor.sh
+
+      - name: Install Rust toolchain (stable + aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      # ubuntu-latest has no Android SDK; install NDK r27 (AGP default 27.0.12077973 family)
+      # via nttld/setup-ndk rather than sdkmanager (no cmdline-tools on this runner).
+      - name: Setup Android NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          link-to-sdk: false
+
+      - name: Export NDK env for cargo-ndk
+        run: |
+          set -euo pipefail
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "NDK path: ${NDK_PATH}"
+
+      - name: Cache cargo-ndk binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-${{ runner.os }}-stable
+
+      - name: Install cargo-ndk
+        run: |
+          if ! command -v cargo-ndk &>/dev/null; then
+            cargo install cargo-ndk
+          fi
+
+      - name: Build wdmm-ffi for arm64-v8a
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a -o dist/android build --release -p wdmm-ffi
+          SO="dist/android/arm64-v8a/libwdmm_ffi.so"
+          if [ ! -f "$SO" ]; then
+            echo "::error::libwdmm_ffi.so not found at $SO"
+            exit 1
+          fi
+          echo "Built: $SO ($(du -sh "$SO" | cut -f1))"
+
+      - name: Write COMMIT.txt
+        run: git rev-parse HEAD > dist/android/arm64-v8a/COMMIT.txt
+
+      - name: Upload wdmm-ffi-android-arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdmm-ffi-android-arm64
+          path: dist/android/arm64-v8a/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # windows-x64: build wdmm_ffi.dll (x86_64-pc-windows-msvc)
+  # ---------------------------------------------------------------------------
+  windows-x64:
+    name: Build wdmm_ffi.dll (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare ffmpeg vendor cache and fetch binaries
+        shell: bash
+        env:
+          WDMM_FFMPEG_CACHE: ${{ runner.temp }}/ffmpeg-vendor-cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$WDMM_FFMPEG_CACHE"
+          bash scripts/fetch-ffmpeg-vendor.sh
+
+      - name: Install Rust toolchain (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wdmm-ffi for windows-x64
+        run: cargo build --release -p wdmm-ffi
+
+      - name: Stage artifact and write COMMIT.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          DLL="target/release/wdmm_ffi.dll"
+          if [ ! -f "$DLL" ]; then
+            echo "::error::wdmm_ffi.dll not found at $DLL"
+            exit 1
+          fi
+          mkdir -p dist/windows-x64
+          cp "$DLL" dist/windows-x64/wdmm_ffi.dll
+          git rev-parse HEAD > dist/windows-x64/COMMIT.txt
+          echo "Staged: dist/windows-x64/wdmm_ffi.dll"
+
+      - name: Upload wdmm-ffi-windows-x64
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdmm-ffi-windows-x64
+          path: dist/windows-x64/
+          if-no-files-found: error
+          retention-days: 14
