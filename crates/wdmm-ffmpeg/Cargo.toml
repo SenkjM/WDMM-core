@@ -12,7 +12,6 @@ tracing      = { workspace = true }
 rand         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-which        = "7"
 
 [build-dependencies]
 # No external build-dep yet; link logic lives in build.rs comments.

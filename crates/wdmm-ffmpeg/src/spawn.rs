@@ -1,50 +1,65 @@
-// Real FFmpeg process spawn implementation
+// Real FFmpeg process spawn implementation — vendor-only, no PATH fallback.
+//
+// All supported targets resolve their binary from
+// `CARGO_MANIFEST_DIR/vendor/<triple>/{ffmpeg,ffprobe}[.exe]`.
+// There is intentionally no `which` / PATH lookup.  If the vendor binary is
+// missing, the error message directs the developer to run
+// `scripts/fetch-ffmpeg-vendor.sh`.
 
 use crate::{FfmpegError, FfmpegResult, HlsMode, JobOpts, SubtitleMode};
 use std::path::PathBuf;
 
-/// Resolve the vendored ffmpeg binary path for the current target.
+/// Return the vendored `ffmpeg` binary path for the current target triple.
+///
+/// Fails with [`FfmpegError::Unavailable`] if the vendor directory is absent
+/// or if no confirmed binary source exists for the target ABI.
 pub fn ffmpeg_bin() -> FfmpegResult<PathBuf> {
     resolve_bin("ffmpeg")
 }
 
+/// Return the vendored `ffprobe` binary path for the current target triple.
 pub fn ffprobe_bin() -> FfmpegResult<PathBuf> {
     resolve_bin("ffprobe")
 }
 
 fn resolve_bin(name: &str) -> FfmpegResult<PathBuf> {
-    let target_os = std::env::consts::OS;
-    let target_arch = std::env::consts::ARCH;
+    let os   = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
 
-    // Host Linux x86_64: use system PATH.
-    if target_os == "linux" && target_arch == "x86_64" {
-        return which::which(name).map_err(|_| {
-            FfmpegError::Unavailable(format!(
-                "{} not found in PATH; install via apt", name
-            ))
-        });
-    }
-
-    // Cross-compilation targets
-    let vendor_subdir = match (target_os, target_arch) {
+    // Targets with confirmed vendor binaries.
+    let vendor_subdir = match (os, arch) {
+        ("linux",   "x86_64")  => "linux-x86_64",
         ("android", "aarch64") => "android-arm64",
-        ("android", "arm")     => "android-arm",
-        ("android", "x86_64")  => "android-x86_64",
-        ("android", "x86")     => "android-x86",
         ("windows", "x86_64")  => "windows-x86_64",
+        // android-arm, android-x86_64, android-x86: no confirmed ffprobe+ffmpeg
+        // CLI binary source found after checking Tyrrrz (ffmpeg-only),
+        // yearsyan (static .a libs only), Khang-NT (disables ffprobe).
+        // Fail loudly so callers know why.
+        ("android", abi @ ("arm" | "x86_64" | "x86")) => {
+            return Err(FfmpegError::Unavailable(format!(
+                "android-{abi}: no confirmed ffprobe+ffmpeg CLI binary source found. \
+                 Tried: Tyrrrz/FFmpegBinaries (ffmpeg-only), \
+                 yearsyan/ffmpeg-android-build (static libs only), \
+                 Khang-NT/android-ffmpeg-toolkit (disables ffprobe). \
+                 See crates/wdmm-ffmpeg/docs/FFMPEG-ATTRIBUTION.md §Android gaps."
+            )));
+        }
         _ => {
             return Err(FfmpegError::Unavailable(format!(
-                "unsupported target: {}-{}", target_os, target_arch
-            )))
+                "unsupported target: {os}-{arch}"
+            )));
         }
     };
 
-    let exe_name = if target_os == "windows" {
-        format!("{}.exe", name)
+    let exe_name = if os == "windows" {
+        format!("{name}.exe")
     } else {
         name.to_string()
     };
 
+    // CARGO_MANIFEST_DIR is set at compile time via std::env! so the path is
+    // always the *source* tree; vendor binaries are populated by
+    // scripts/fetch-ffmpeg-vendor.sh before building.
     let manifest_dir = std::env!("CARGO_MANIFEST_DIR");
     let vendor_path = PathBuf::from(manifest_dir)
         .join("vendor")
@@ -55,12 +70,14 @@ fn resolve_bin(name: &str) -> FfmpegResult<PathBuf> {
         Ok(vendor_path)
     } else {
         Err(FfmpegError::Unavailable(format!(
-            "vendored {} not found at {}", name, vendor_path.display()
+            "vendored {name} not found at {path}; \
+             run: scripts/fetch-ffmpeg-vendor.sh",
+            path = vendor_path.display()
         )))
     }
 }
 
-/// Spawn the ffmpeg process for an HLS job
+/// Spawn the ffmpeg process for an HLS job.
 pub fn spawn_hls_job(
     opts: &JobOpts,
     segment_dir: &std::path::Path,
@@ -91,7 +108,10 @@ pub fn spawn_hls_job(
             // Subtitle burn-in
             match &opts.subtitles {
                 SubtitleMode::BurnIn { stream_index } => {
-                    cmd.args(["-vf", &format!("subtitles={}:si={}", opts.input.display(), stream_index)]);
+                    cmd.args([
+                        "-vf",
+                        &format!("subtitles={}:si={}", opts.input.display(), stream_index),
+                    ]);
                 }
                 SubtitleMode::SidecarBurnIn { path } => {
                     cmd.args(["-vf", &format!("subtitles={}", path.display())]);
@@ -118,4 +138,47 @@ pub fn spawn_hls_job(
     );
 
     cmd.spawn().map_err(Into::into)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffmpeg_bin_resolves_to_vendor_path() {
+        let path = ffmpeg_bin().expect("ffmpeg_bin() failed on host linux-x86_64");
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.contains("vendor/linux-x86_64"),
+            "expected vendor/linux-x86_64 in path, got: {path_str}"
+        );
+        assert!(path.exists(), "vendor ffmpeg binary does not exist at {path_str}");
+    }
+
+    #[test]
+    fn ffprobe_bin_resolves_to_vendor_path() {
+        let path = ffprobe_bin().expect("ffprobe_bin() failed on host linux-x86_64");
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.contains("vendor/linux-x86_64"),
+            "expected vendor/linux-x86_64 in path, got: {path_str}"
+        );
+        assert!(path.exists(), "vendor ffprobe binary does not exist at {path_str}");
+    }
+
+    #[test]
+    fn ffmpeg_bin_is_not_usr_bin() {
+        let path = ffmpeg_bin().expect("ffmpeg_bin() must succeed on host");
+        let path_str = path.to_string_lossy();
+        assert!(
+            !path_str.starts_with("/usr/bin"),
+            "PATH fallback active — must use vendor binary, got: {path_str}"
+        );
+        assert!(
+            !path_str.starts_with("/usr/local"),
+            "PATH fallback active — must use vendor binary, got: {path_str}"
+        );
+    }
 }

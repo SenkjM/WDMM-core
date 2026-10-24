@@ -255,48 +255,67 @@ cargo clippy --workspace
 
 ---
 
-## Honest Leftovers / Known Gaps (R12)
+## Corrections (added post-P0.5 fix-up)
 
-### 1. Android/Windows vendored FFmpeg binaries — NOT present
+### ⚠️ R12 PATH fallback was a mistake — corrected in P0.5 fix-up commit
 
-The `crates/wdmm-ffmpeg/vendor/` directory is a **stub** (contains only `.gitkeep`).
-No platform-specific binaries have been downloaded or included.
+The R12 implementation used `which::which` to find `ffmpeg`/`ffprobe` on the
+host Linux PATH. This violated the owner's vendor-only policy
+(`docs/CONSTRAINTS.md` §7: "no PATH/`which` for ANY target including
+linux-x86_64"). It was corrected in the commit immediately following R12:
 
-- **Host Linux x86_64**: uses `ffmpeg`/`ffprobe` from system PATH (via `which`).
-  Tests pass on this box as long as `ffmpeg` is installed.
-- **Android arm64 / arm / x86_64**: vendor subdir path is implemented in `spawn.rs`
-  but the binaries are absent. Cross-compiled Android builds will fail at runtime
-  with `FfmpegError::Unavailable("vendored ffmpeg not found at …")`.
-- **Windows x86_64**: same situation — vendor path is defined, no binary present.
+**What changed:**
+- `spawn.rs`: removed `which` PATH fallback entirely; `linux-x86_64` now
+  resolves from `vendor/linux-x86_64/` just like every other target.
+- `build.rs`: `linux-x86_64` no longer short-circuits to "no vendor needed";
+  it checks for `vendor/linux-x86_64/{ffmpeg,ffprobe}` and panics if absent.
+- `Cargo.toml`: `which = "7"` dependency removed.
+- `scripts/fetch-ffmpeg-vendor.sh`: created — populates all vendor dirs from
+  cache or downloads. Run once after clone.
 
-**Root cause**: no automated download script exists yet. The `vendor/.gitkeep`
-comment lists the expected layout (see file). Binary download via `build.rs` or
-a `Makefile` step is a future task.
+### R12 vendor state (after fetch script ran)
 
-### 2. `wdmm_proxy_register_stream` FFI — NOT yet exported
+| Target | State | Source |
+|--------|-------|--------|
+| linux-x86_64 | ✅ ffmpeg + ffprobe | BtbN LGPL master linux64 |
+| windows-x86_64 | ✅ ffmpeg.exe + ffprobe.exe | BtbN LGPL master win64 |
+| android-arm64 | ✅ ffmpeg + ffprobe | hzw1199 LGPL arm64 CLI |
+| android-arm | ❌ no confirmed dual CLI source | Tyrrrz=ffmpeg-only; yearsyan=.a libs only |
+| android-x86_64 | ❌ no confirmed dual CLI source | same gap |
+| android-x86 | ❌ no confirmed dual CLI source | same gap |
 
-`ProxyHandle::register_driver` exists in `wdmm-proxy` and is functional
-(unit-tested). The C ABI wrapper `wdmm_proxy_register_stream` (needed for Android
-MustProxy / crypt-wrapper local stream playback) is **not yet in `wdmm-ffi`**.
+The android-arm/x86_64/x86 vendor dirs are intentionally absent.
+`build.rs` panics for those targets; `spawn.rs` returns `Unavailable` at
+runtime. See `crates/wdmm-ffmpeg/docs/FFMPEG-ATTRIBUTION.md §Android gaps`.
 
-This is the P0.5 blocker described in `docs/dmr-ffi-blocker.md` and
-`agent-tools/wdmm-crypt-proxy-path.md` §5. It ships in the next commit (P0.5).
+---
 
-### 3. `ContentDeliveryKind` on `CloudFileItem` — NOT yet added
+## P0.5 items shipped in the follow-up commit
 
-The discriminant (`NetworkDirect` / `LocalStream` / `LocalFile`) is documented
-in `CONSTRAINTS.md` §7 and the drivers `docs/API.md` "Planned" note but has not
-been added to the Rust types yet. Ships in P0.5.
+The leftovers from R12 that landed in the P0.5 commit:
+- `ContentDeliveryKind` + `CloudFileItem.delivery/local_path` + constructors
+  + `infer()` — landed in `crates/wdmm-drivers/src/driver.rs` (dirty → committed).
+- Driver migrations: aliyun, baidu, ctfile, open115, pan123, webdav all use
+  `CloudFileItem::network_direct(…)`.
+- `wdmm_proxy_register_stream` FFI + `WdmmProxyRangeCallback` + alloc/free
+  helpers — landed in `crates/wdmm-ffi/src/lib.rs`.
+- `wdmm-sync` updated to consume new `CloudFileItem` fields.
+- Documentation: `docs/P0.5-PROXY-DELIVERY.md`, updated `docs/API.md` in
+  both `wdmm-drivers` and `wdmm-ffi`.
+
+---
+
+## Original leftovers still open after P0.5
 
 ### 4. Codec probe / bitrate / multi-audio / subtitle — out of scope
-
 See "Next Steps" above. All deferred.
 
 ### 5. Segment filename format
-
 The spawn command omits explicit `-hls_segment_filename`; FFmpeg writes
-`seg000.ts`, `seg001.ts`, … by default (OpenBSD/macOS may differ slightly).
-Verified on Linux.
+`seg000.ts`, `seg001.ts`, … by default. Verified on Linux.
+
+### 6. Flutter/WinUI wiring — out of scope
+Platform adapter layer, Kotlin/C# Dart bridge, rclone crypt driver. Future rounds.
 
 ---
 
