@@ -205,18 +205,45 @@ The proxy serves bytes on demand via a C callback.
 
 ```c
 typedef int32_t (*WdmmProxyRangeCallback)(
-    void*    user_data,   // opaque; passed through from register_stream
-    int64_t  start,       // inclusive byte offset
-    int64_t  end,         // inclusive end offset; -1 = read to EOF
-    uint8_t** out_buf,    // set to buffer allocated via wdmm_proxy_stream_alloc_buf
-    size_t*  out_len      // set to byte count in *out_buf
+    void*     user_data,    // opaque; passed through from register_stream
+    int64_t   start,        // inclusive byte offset
+    int64_t   end,          // inclusive end offset; -1 = read to EOF
+    uint8_t** out_buf,      // sync path: set to wdmm_proxy_stream_alloc_buf output
+    size_t*   out_len,      // sync path: set to byte count in *out_buf
+    uint64_t  request_id    // NEW — async reply channel id (see below)
 );
 ```
 
-Return `0` on success; any negative value on error (proxy emits IO error to HTTP
-client). The callback is invoked synchronously from a Tokio worker thread —
-`user_data` and `cb` must be safe to call from any thread for the registration
-lifetime.
+Return `0` on success (either sync fill or async intent); any negative value is
+an immediate error (proxy emits IO error to the HTTP client).
+
+#### Sync fill path (native C callers)
+
+Fill `*out_buf` (must be allocated via `wdmm_proxy_stream_alloc_buf`) and
+`*out_len` before returning `0`. Rust takes ownership and frees the buffer
+after consuming. The waiter for `request_id` is cancelled automatically.
+
+#### Async fill path (Dart `NativeCallable.listener`)
+
+Return `0` and leave `*out_buf` null. Rust parks the Tokio request-handler
+thread (up to **30 seconds** — `PROXY_STREAM_TIMEOUT_SECS`) waiting for a call
+to `wdmm_proxy_stream_set_result`. The Dart listener should:
+
+1. Schedule `openContentRange(start, end)` on the Dart isolate.
+2. Allocate a buffer: `buf = wdmm_proxy_stream_alloc_buf(len)`.
+3. Copy bytes into `buf`.
+4. Call `wdmm_proxy_stream_set_result(request_id, buf, len, 0)`.
+5. On any error: `wdmm_proxy_stream_set_result(request_id, NULL, 0, -1)`.
+
+`request_id` is always passed as an **input parameter** on the callback —
+thread-locals cannot be used because the Dart listener runs later on the Dart
+isolate, not on the Tokio thread that entered the callback.
+
+On timeout the proxy surfaces an IO error to the HTTP client. Waiter map entries
+are cleaned up on timeout, `set_result`, or `unregister`.
+
+The `user_data` and `cb` must remain callable from any thread for the full
+lifetime of the registration.
 
 ### `extern "C" fn wdmm_proxy_stream_alloc_buf(len: usize) -> *mut u8`
 Allocate `len` bytes in Rust's heap for use as a callback output buffer.
@@ -226,6 +253,24 @@ memory after consuming it. Returns null if `len == 0`.
 ### `unsafe extern "C" fn wdmm_proxy_stream_free_buf(buf: *mut u8, len: usize)`
 Free a buffer previously returned by `wdmm_proxy_stream_alloc_buf`. Exported for
 C error paths. No-op if `buf` is null or `len == 0`.
+
+### `extern "C" fn wdmm_proxy_stream_set_result(request_id: u64, buf: *mut u8, len: usize, status: i32)`
+
+Deliver async Range bytes to a parked `invoke_c_callback` invocation.
+
+- `request_id` — id received by the `WdmmProxyRangeCallback`.
+- `buf`        — buffer allocated via `wdmm_proxy_stream_alloc_buf`; Rust takes
+  ownership on the success path. Pass `NULL` on the error path.
+- `len`        — byte count in `buf` (ignored when `status < 0`).
+- `status`     — `0` = success (buf/len valid); negative = error.
+
+Wakes the waiter for `request_id`. Safe to call from any thread. No-op (and
+safe) if `request_id` is unknown (already timed out or double-called — orphaned
+buffer is freed).
+
+**Timeout**: if `set_result` is not called within 30 s, `invoke_c_callback`
+returns a `TimedOut` IO error to the proxy. The waiter is removed from the map
+at that point; a late `set_result` call is a safe no-op.
 
 ### `unsafe extern "C" fn wdmm_proxy_register_stream(size: u64, name: *const c_char, cb: WdmmProxyRangeCallback, user_data: *mut c_void) -> FfiString`
 Register an in-process Range/byte stream with the proxy.
@@ -243,12 +288,6 @@ Returns JSON on success:
 or `"error:<message>"`. Caller builds URL as `http://127.0.0.1:{port}{path_template}`.
 
 Requires `wdmm_proxy_start` to have been called. Caller must free the result.
-
-#### Dart/Flutter note
-The callback is invoked **synchronously** from a Tokio worker thread. For async
-decrypt (e.g. calling `openContentRange` across a Dart isolate), use a
-`NativeCallable.listener` port bridge: the Dart side enqueues the request and
-signals back; the C callback blocks until the Dart side replies.
 
 ### `unsafe extern "C" fn wdmm_proxy_renew_stream_callback(token: *const c_char, cb: WdmmProxyRangeCallback, user_data: *mut c_void) -> FfiString`
 Replace the Range callback for an existing stream registration. Use after

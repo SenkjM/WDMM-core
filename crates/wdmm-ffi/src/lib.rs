@@ -11,9 +11,11 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 use wdmm_queue::TaskQueue;
 use wdmm_storage::LibraryDatabase;
@@ -682,26 +684,51 @@ fn parse_hls_mode(json: &str) -> wdmm_ffmpeg::HlsMode {
 // ── Proxy stream FFI ──────────────────────────────────────────────────────────
 //
 // Exposes `ProxyHandle::register_driver` as a C ABI for Android MustProxy /
-// crypt-wrapper local stream playback. The callback is invoked synchronously
-// from the Tokio request-handler thread; Dart callers needing true async
-// decrypt should use a NativeCallable.listener port bridge.
+// crypt-wrapper local stream playback. The callback is invoked from a Tokio
+// request-handler thread. Two fill paths are supported:
+//
+//   * sync  — a native C callback fills `*out_buf` before returning `0`.
+//   * async — a Dart `NativeCallable.listener` returns `0` with `*out_buf`
+//     null; Rust parks the worker thread and waits for
+//     `wdmm_proxy_stream_set_result(request_id, …)` to deposit the bytes.
+//
+// `request_id` is passed as an input parameter on the callback (thread-locals
+// do not work: the Dart listener runs later on the Dart isolate, not the
+// Tokio thread that entered the callback).
 
 /// Range callback type for `wdmm_proxy_register_stream`.
 ///
 /// Invoked from the proxy HTTP request-handler thread (a Tokio worker) for
 /// every Range/full-content request on the registered token.
 ///
-/// Parameters:
-/// - `user_data` — opaque pointer passed through from `wdmm_proxy_register_stream`.
-/// - `start`     — inclusive byte offset.
-/// - `end`       — inclusive end offset; **`-1` means read to EOF** (unknown size).
-/// - `out_buf`   — on success (`return 0`), set to a buffer allocated via
-///   [`wdmm_proxy_stream_alloc_buf`] and filled with the requested bytes.
-///   Rust takes ownership and frees it after consuming.
-/// - `out_len`   — on success, set to the byte count in `*out_buf`.
+/// ## Sync fill path (native C callers)
+/// Fill `*out_buf` (via [`wdmm_proxy_stream_alloc_buf`]) and `*out_len` before
+/// returning `0`. Rust consumes the buffer immediately after the call returns.
+/// Do **not** call [`wdmm_proxy_stream_set_result`] — the waiter is cancelled.
 ///
-/// Return `0` on success, any negative value on error (the proxy will emit
-/// an IO error to the HTTP client).
+/// ## Async fill path (Dart `NativeCallable.listener`)
+/// Return `0` and leave `*out_buf` null. Rust parks the request-handler thread
+/// (up to [`PROXY_STREAM_TIMEOUT_SECS`] seconds) waiting for a call to
+/// [`wdmm_proxy_stream_set_result`] with the given `request_id`. The Dart
+/// listener should schedule `openContentRange`, allocate a buffer via
+/// `wdmm_proxy_stream_alloc_buf`, copy the bytes, then call
+/// `wdmm_proxy_stream_set_result(request_id, buf, len, 0)`. On error, call
+/// `wdmm_proxy_stream_set_result(request_id, null, 0, -1)`.
+///
+/// ## Parameters
+/// - `user_data`  — opaque pointer passed through from `wdmm_proxy_register_stream`.
+/// - `start`      — inclusive byte offset.
+/// - `end`        — inclusive end offset; **`-1` means read to EOF** (unknown size).
+/// - `out_buf`    — sync path: set to a buffer allocated via
+///   [`wdmm_proxy_stream_alloc_buf`]; Rust takes ownership and frees it after
+///   consuming. Async path: leave null.
+/// - `out_len`    — sync path: set to the byte count in `*out_buf`.
+/// - `request_id` — async path: opaque `u64` id unique to this invocation; pass
+///   it to [`wdmm_proxy_stream_set_result`] from the async reply. Always valid
+///   for the lifetime of this invocation; cannot be derived from thread-locals.
+///
+/// Return `0` on success (sync-fill or async intent); any negative value is an
+/// immediate error (the proxy emits an IO error to the HTTP client).
 ///
 /// **Thread safety**: the callback and `user_data` must be safe to call from
 /// any thread for the full lifetime of the registration.
@@ -711,6 +738,7 @@ pub type WdmmProxyRangeCallback = unsafe extern "C" fn(
     end: i64,
     out_buf: *mut *mut u8,
     out_len: *mut usize,
+    request_id: u64, // NEW — async reply channel id; see wdmm_proxy_stream_set_result
 ) -> i32;
 
 /// Allocate `len` bytes in Rust's heap for use as a callback output buffer.
@@ -757,6 +785,43 @@ pub unsafe extern "C" fn wdmm_proxy_stream_free_buf(buf: *mut u8, len: usize) {
     }
 }
 
+// ── Async reply channel ────────────────────────────────────────────────────────
+//
+// When a Dart NativeCallable.listener callback returns 0 with *out_buf == null,
+// invoke_c_callback parks the Tokio worker thread waiting for
+// wdmm_proxy_stream_set_result to deposit the bytes.  The waiter map links a
+// per-invocation request_id to a (Mutex + Condvar) pair held by an Arc so
+// both set_result and the timeout cleanup can access it safely.
+
+/// Seconds invoke_c_callback will wait for wdmm_proxy_stream_set_result before
+/// returning a timeout IO error to the HTTP client (30 s matches typical stream
+/// decrypt latency budgets).
+pub const PROXY_STREAM_TIMEOUT_SECS: u64 = 30;
+
+/// Bytes (or error status) deposited by `wdmm_proxy_stream_set_result`.
+struct WaiterResult {
+    buf: *mut u8,
+    len: usize,
+    status: i32,
+}
+// Safety: buf was allocated on the Rust heap via wdmm_proxy_stream_alloc_buf.
+// Exclusive ownership is transferred from set_result to invoke_c_callback.
+unsafe impl Send for WaiterResult {}
+
+struct Waiter {
+    result: Mutex<Option<WaiterResult>>,
+    condvar: Condvar,
+}
+
+/// Process-global, monotonically increasing request-id counter.
+/// Starts at 1; 0 is reserved as a sentinel "no request".
+static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
+
+fn waiter_map() -> &'static Mutex<HashMap<u64, std::sync::Arc<Waiter>>> {
+    static MAP: OnceLock<Mutex<HashMap<u64, std::sync::Arc<Waiter>>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 // ── C callback helpers ────────────────────────────────────────────────────────
 
 /// Wraps `*mut c_void` to implement `Send + Sync`.
@@ -777,8 +842,15 @@ unsafe impl Sync for StreamCallbackCtx {}
 
 /// Build a `BoxStream` from one invocation of the C callback.
 ///
-/// Called on each Range (or full-content) HTTP request. The callback fills a
-/// Rust-heap buffer; we consume it as a single-chunk stream.
+/// Supports two fill paths:
+///
+/// **Sync path** — callback fills `*out_buf` before returning `0`. Used by
+/// native C callers (existing behaviour; existing C tests keep working).
+///
+/// **Async path** — callback returns `0` with `*out_buf` null. Used by Dart
+/// `NativeCallable.listener` callers that schedule async decrypt. This function
+/// parks the calling thread (up to [`PROXY_STREAM_TIMEOUT_SECS`]) until
+/// [`wdmm_proxy_stream_set_result`] wakes it with the filled buffer.
 fn invoke_c_callback(
     ctx: &StreamCallbackCtx,
     start: i64,
@@ -786,27 +858,128 @@ fn invoke_c_callback(
 ) -> wdmm_proxy::BoxStream {
     use bytes::Bytes;
     use std::io;
+    use std::sync::Arc;
+
+    // Allocate a request id and register a waiter *before* calling the
+    // callback so set_result has somewhere to deposit bytes even if it races.
+    let req_id = NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let waiter = Arc::new(Waiter {
+        result: Mutex::new(None),
+        condvar: Condvar::new(),
+    });
+    waiter_map().lock().unwrap().insert(req_id, Arc::clone(&waiter));
 
     let mut out_buf: *mut u8 = std::ptr::null_mut();
     let mut out_len: usize = 0;
 
     // Safety: caller holds Arc<StreamCallbackCtx> alive.
-    let result = unsafe { (ctx.cb)(ctx.user_data.0, start, end, &mut out_buf, &mut out_len) };
+    let result = unsafe {
+        (ctx.cb)(ctx.user_data.0, start, end, &mut out_buf, &mut out_len, req_id)
+    };
 
-    if result < 0 || out_buf.is_null() || out_len == 0 {
+    // ── Immediate error path ──────────────────────────────────────────────────
+    if result < 0 {
+        waiter_map().lock().unwrap().remove(&req_id);
         return Box::pin(futures::stream::once(futures::future::ready(
             Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("wdmm_proxy stream callback returned {result}"),
+                format!("wdmm_proxy stream callback error {result}"),
             )),
         )));
     }
 
-    // Safety: buffer was allocated by wdmm_proxy_stream_alloc_buf (Rust heap).
-    let chunk = unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) };
+    // ── Sync fill path ────────────────────────────────────────────────────────
+    if !out_buf.is_null() && out_len > 0 {
+        // Callback filled the buffer synchronously — cancel the waiter.
+        waiter_map().lock().unwrap().remove(&req_id);
+        // Safety: buffer was allocated by wdmm_proxy_stream_alloc_buf (Rust heap).
+        let chunk = unsafe { Vec::from_raw_parts(out_buf, out_len, out_len) };
+        return Box::pin(futures::stream::once(futures::future::ready(
+            Ok::<Bytes, io::Error>(Bytes::from(chunk)),
+        )));
+    }
+
+    // ── Async fill path ───────────────────────────────────────────────────────
+    // result == 0 but out_buf is null: Dart listener will call set_result.
+    // Park this Tokio worker thread until the bytes arrive or timeout expires.
+    let timeout = std::time::Duration::from_secs(PROXY_STREAM_TIMEOUT_SECS);
+    let guard = waiter.result.lock().unwrap();
+    let (mut guard, tout) = waiter
+        .condvar
+        .wait_timeout_while(guard, timeout, |opt| opt.is_none())
+        .unwrap();
+
+    // Remove from map regardless of outcome (set_result may have already done so).
+    waiter_map().lock().unwrap().remove(&req_id);
+
+    if tout.timed_out() || guard.is_none() {
+        return Box::pin(futures::stream::once(futures::future::ready(
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("wdmm_proxy async callback timed out (req_id={req_id})"),
+            )),
+        )));
+    }
+
+    let wr = guard.take().unwrap();
+    if wr.status < 0 || wr.buf.is_null() || wr.len == 0 {
+        // Error status from the Dart side — free any orphaned buffer.
+        if !wr.buf.is_null() && wr.len > 0 {
+            unsafe { drop(Vec::from_raw_parts(wr.buf, wr.len, wr.len)) };
+        }
+        return Box::pin(futures::stream::once(futures::future::ready(
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("wdmm_proxy async callback error status {}", wr.status),
+            )),
+        )));
+    }
+
+    // Safety: buf was allocated via wdmm_proxy_stream_alloc_buf (Rust heap).
+    let chunk = unsafe { Vec::from_raw_parts(wr.buf, wr.len, wr.len) };
     Box::pin(futures::stream::once(futures::future::ready(
         Ok::<Bytes, io::Error>(Bytes::from(chunk)),
     )))
+}
+
+/// Deliver async Range bytes to a parked [`invoke_c_callback`] invocation.
+///
+/// Called by the Dart listener (or any thread) after it has fetched and
+/// decrypted the bytes for `request_id`.
+///
+/// - `request_id` — the id received by the [`WdmmProxyRangeCallback`].
+/// - `buf`        — buffer allocated via [`wdmm_proxy_stream_alloc_buf`] and
+///   filled with the requested bytes. Rust takes ownership on the success path
+///   (`status == 0`). Pass `NULL` on the error path.
+/// - `len`        — byte count in `buf` (ignored if `status < 0`).
+/// - `status`     — `0` = success (buf/len valid); negative = error.
+///
+/// Wakes the waiter for `request_id`. Safe to call from any thread.
+/// No-op (and safe) if `request_id` is unknown (already timed out or used).
+///
+/// # Safety
+/// On the success path (`status == 0`, `buf` non-null), `buf` must have been
+/// allocated via [`wdmm_proxy_stream_alloc_buf`]. Do not free it separately —
+/// Rust reclaims it.
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_stream_set_result(
+    request_id: u64,
+    buf: *mut u8,
+    len: usize,
+    status: i32,
+) {
+    // Remove first so a racing timeout cannot also try to use the waiter.
+    let waiter = waiter_map().lock().unwrap().remove(&request_id);
+    if let Some(w) = waiter {
+        let mut guard = w.result.lock().unwrap();
+        *guard = Some(WaiterResult { buf, len, status });
+        w.condvar.notify_one();
+    } else {
+        // No waiter (timed out or double-call) — free an orphaned success buf.
+        if !buf.is_null() && len > 0 {
+            unsafe { drop(Vec::from_raw_parts(buf, len, len)) };
+        }
+    }
 }
 
 /// Register an in-process Range/byte stream with the proxy.
@@ -1408,6 +1581,7 @@ mod tests {
             end: i64,
             out_buf: *mut *mut u8,
             out_len: *mut usize,
+            _request_id: u64, // sync fill — no set_result needed
         ) -> i32 {
             let s = start as usize;
             let e = if end < 0 {
@@ -1497,6 +1671,233 @@ mod tests {
         let r = wdmm_proxy_unregister(tok.as_ptr());
         wdmm_ffi_free_string(r);
 
+        let r = wdmm_proxy_stop();
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_proxy_port(), -1);
+    }
+
+    /// Simulates the Dart async listener path: the C callback returns `0`
+    /// with `*out_buf` null and deposits its `request_id`; a helper thread
+    /// then allocates a Rust-heap buffer, copies the bytes, and calls
+    /// `wdmm_proxy_stream_set_result`. The HTTP GET through the proxy must
+    /// return those bytes.
+    #[test]
+    fn proxy_register_stream_async_set_result() {
+        let _guard = proxy_lock().lock().unwrap();
+
+        // Bytes the "Dart" reply thread will deliver.
+        static ADATA: &[u8] = b"async-set-result-bytes";
+
+        // One-shot state: the C callback deposits req_id here so the reply
+        // thread can call set_result with the right id.
+        struct AsyncSlot {
+            req_id: Mutex<Option<u64>>,
+            ready: Condvar,
+        }
+        static SLOT: OnceLock<AsyncSlot> = OnceLock::new();
+        fn slot() -> &'static AsyncSlot {
+            SLOT.get_or_init(|| AsyncSlot {
+                req_id: Mutex::new(None),
+                ready: Condvar::new(),
+            })
+        }
+        // Reset for this test run.
+        *slot().req_id.lock().unwrap() = None;
+
+        // Callback: returns 0, leaves out_buf null → triggers the async path.
+        unsafe extern "C" fn async_cb(
+            _user_data: *mut std::os::raw::c_void,
+            _start: i64,
+            _end: i64,
+            _out_buf: *mut *mut u8,
+            _out_len: *mut usize,
+            request_id: u64,
+        ) -> i32 {
+            *slot().req_id.lock().unwrap() = Some(request_id);
+            slot().ready.notify_one();
+            0 // success intent — bytes not ready yet (async path)
+        }
+
+        // Start the proxy on an OS-assigned port.
+        let port_str = wdmm_proxy_start(0);
+        let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(port_str);
+        let port: u16 = port_s.parse().expect("proxy_start returns a port");
+
+        // Register the stream with the async callback.
+        let name = CString::new("async.bin").unwrap();
+        let r = unsafe {
+            wdmm_proxy_register_stream(
+                ADATA.len() as u64,
+                name.as_ptr(),
+                async_cb,
+                std::ptr::null_mut(),
+            )
+        };
+        let body = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&body).expect("register_stream must return JSON");
+        assert!(v["token"].is_string(), "missing token in: {body}");
+        assert!(
+            v["path_template"].as_str().unwrap().starts_with("/s/"),
+            "bad path_template in: {body}"
+        );
+        assert_eq!(v["port"], port as i64);
+
+        let path_template = v["path_template"].as_str().unwrap().to_string();
+        let token = v["token"].as_str().unwrap().to_string();
+
+        // Spawn a reply thread that waits for req_id then calls set_result.
+        let reply = std::thread::spawn(|| {
+            let guard = slot().req_id.lock().unwrap();
+            let (guard, tout) = slot()
+                .ready
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |opt| {
+                    opt.is_none()
+                })
+                .unwrap();
+            assert!(!tout.timed_out(), "async_cb not invoked within 5 s");
+            let req_id = guard.unwrap();
+            // Allocate a Rust-heap buf and fill it with ADATA.
+            let buf = wdmm_proxy_stream_alloc_buf(ADATA.len());
+            assert!(!buf.is_null(), "alloc_buf returned null");
+            unsafe { std::ptr::copy_nonoverlapping(ADATA.as_ptr(), buf, ADATA.len()) };
+            wdmm_proxy_stream_set_result(req_id, buf, ADATA.len(), 0);
+        });
+
+        // GET — blocks invoke_c_callback until the reply thread calls set_result.
+        let url = format!("http://127.0.0.1:{port}{path_template}");
+        let got = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                reqwest::Client::new()
+                    .get(&url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            });
+
+        reply.join().expect("reply thread panicked");
+        assert_eq!(got.as_ref(), ADATA, "async stream bytes mismatch");
+
+        // Cleanup.
+        let tok = CString::new(token).unwrap();
+        let r = wdmm_proxy_unregister(tok.as_ptr());
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_proxy_stop();
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_proxy_port(), -1);
+    }
+
+    /// Verifies the async error path: callback returns 0 + null out_buf, the
+    /// reply thread calls set_result with status = -1. The proxy must surface
+    /// an IO error to the HTTP client (no hang, no spurious bytes).
+    #[test]
+    fn proxy_register_stream_async_error_status() {
+        let _guard = proxy_lock().lock().unwrap();
+
+        struct AsyncSlot {
+            req_id: Mutex<Option<u64>>,
+            ready: Condvar,
+        }
+        static SLOT: OnceLock<AsyncSlot> = OnceLock::new();
+        fn slot() -> &'static AsyncSlot {
+            SLOT.get_or_init(|| AsyncSlot {
+                req_id: Mutex::new(None),
+                ready: Condvar::new(),
+            })
+        }
+        *slot().req_id.lock().unwrap() = None;
+
+        unsafe extern "C" fn async_err_cb(
+            _user_data: *mut std::os::raw::c_void,
+            _start: i64,
+            _end: i64,
+            _out_buf: *mut *mut u8,
+            _out_len: *mut usize,
+            request_id: u64,
+        ) -> i32 {
+            *slot().req_id.lock().unwrap() = Some(request_id);
+            slot().ready.notify_one();
+            0 // async intent
+        }
+
+        let port_str = wdmm_proxy_start(0);
+        let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(port_str);
+        let port: u16 = port_s.parse().expect("proxy_start returns a port");
+
+        let name = CString::new("async_err.bin").unwrap();
+        let r = unsafe {
+            wdmm_proxy_register_stream(
+                16,
+                name.as_ptr(),
+                async_err_cb,
+                std::ptr::null_mut(),
+            )
+        };
+        let body = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let path_template = v["path_template"].as_str().unwrap().to_string();
+        let token = v["token"].as_str().unwrap().to_string();
+
+        // Reply thread signals an error.
+        let reply = std::thread::spawn(|| {
+            let guard = slot().req_id.lock().unwrap();
+            let (guard, tout) = slot()
+                .ready
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |opt| {
+                    opt.is_none()
+                })
+                .unwrap();
+            assert!(!tout.timed_out());
+            let req_id = guard.unwrap();
+            wdmm_proxy_stream_set_result(req_id, std::ptr::null_mut(), 0, -1);
+        });
+
+        // GET — the proxy should surface an IO error (connection reset / partial
+        // body). Accept either a send error or an empty/non-matching body.
+        let url = format!("http://127.0.0.1:{port}{path_template}");
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let resp = reqwest::Client::new().get(&url).send().await;
+                match resp {
+                    Err(_) => Ok(()), // network-level error is acceptable
+                    Ok(r) => match r.bytes().await {
+                        Err(_) => Ok(()),
+                        Ok(b) => Err(b),
+                    },
+                }
+            });
+        reply.join().expect("reply thread panicked");
+        // The bytes (if any) must NOT be ADATA-like garbage; an error path
+        // surfaces no valid payload. We accept network error or empty body.
+        match outcome {
+            Ok(()) => { /* error surfaced — expected */ }
+            Err(b) => {
+                assert!(
+                    b.is_empty(),
+                    "async error path must not deliver valid bytes, got {}B",
+                    b.len()
+                );
+            }
+        }
+
+        let tok = CString::new(token).unwrap();
+        let r = wdmm_proxy_unregister(tok.as_ptr());
+        wdmm_ffi_free_string(r);
         let r = wdmm_proxy_stop();
         wdmm_ffi_free_string(r);
         assert_eq!(wdmm_proxy_port(), -1);
