@@ -6,13 +6,6 @@
 //!   into a token-keyed directory; returns a [`JobHandle`] whose [`Drop`]
 //!   kills the process and cleans the segment directory.
 //!
-//! ## Round 11 skeleton
-//! All functions are stubs returning placeholder results. The vendored
-//! prebuilt library paths are wired in `build.rs` but not yet downloaded — see
-//! the TODO there. The proxy exercises the session lifecycle (register / seek
-//! / unregister) without a real FFmpeg process; `open_job` only creates the
-//! segment directory so the proxy skeleton can serve from it.
-//!
 //! ## Mode model (brief §3)
 //! - [`HlsMode::DirectCopy`] — remux into HLS segments with `-c copy`. Default
 //!   for codec-compatible media.
@@ -24,11 +17,15 @@
 //! default (see [`SubtitleMode`]). No HDR tone mapping.
 //!
 //! ## License
-//! This crate links FFmpeg, licensed under LGPL v2.1+ (optionally GPL v2+ when
-//! certain components are enabled). See `docs/FFMPEG-ATTRIBUTION.md` for the
-//! full third-party attribution note. WDMM is distributed under AGPL-3.0.
+//! This crate uses FFmpeg command-line binaries, licensed under LGPL v2.1+
+//! (optionally GPL v2+ when certain components are enabled). See
+//! `docs/FFMPEG-ATTRIBUTION.md` for the full third-party attribution note.
+//! WDMM is distributed under AGPL-3.0.
 
 #![allow(dead_code)]
+
+mod probe;
+mod spawn;
 
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -86,15 +83,8 @@ pub struct ProbeResult {
 }
 
 /// Probe a local file via `ffprobe` (JSON format).
-///
-/// # Stub
-/// Always returns `Err(FfmpegError::Unavailable)` until vendored binaries are
-/// linked. See `build.rs` TODO.
-pub fn probe(_path: &Path) -> FfmpegResult<ProbeResult> {
-    // TODO(round-12+): invoke vendored ffprobe, parse JSON output.
-    Err(FfmpegError::Unavailable(
-        "vendored ffprobe not yet linked — see build.rs TODO".into(),
-    ))
+pub fn probe(path: &Path) -> FfmpegResult<ProbeResult> {
+    probe::probe_file(path)
 }
 
 // ── HLS transcode job ─────────────────────────────────────────────────────────
@@ -164,7 +154,7 @@ impl Default for JobOpts {
 pub struct JobHandle {
     /// Unique session id (internal; the proxy assigns its own route token).
     pub segment_dir: PathBuf,
-    // OS process handle — `None` in stub mode.
+    // OS process handle.
     _proc: Option<tokio::process::Child>,
 }
 
@@ -174,9 +164,8 @@ impl JobHandle {
         &self.segment_dir
     }
 
-    /// Kill the transcoding process. No-op if already exited (or in stub mode).
+    /// Kill the transcoding process. No-op if already exited.
     pub fn kill(&mut self) {
-        // TODO(round-12+): kill vendored ffmpeg process.
         if let Some(ref mut child) = self._proc {
             let _ = child.start_kill();
         }
@@ -195,34 +184,24 @@ impl Drop for JobHandle {
 
 /// Open a new HLS transcode job.
 ///
-/// Creates a temporary directory for segments, then (in a real build) spawns
-/// the vendored `ffmpeg` process writing to that directory.
-///
-/// # Stub
-/// Currently only creates the segment directory; no actual process is spawned.
-/// Returns `Ok(JobHandle)` so the proxy skeleton can exercise the session path
-/// without FFmpeg.
+/// Creates a temporary directory for segments, then spawns the vendored
+/// `ffmpeg` process writing to that directory.
 pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
     let id = format!("{:016x}", rand::random::<u64>());
-    let segment_dir = std::env::temp_dir().join(format!("wdmm-hls-{id}"));
+    let segment_dir = std::env::temp_dir().join(format!("wdmm-hls-{}", id));
     std::fs::create_dir_all(&segment_dir)?;
 
-    // TODO(round-12+): spawn vendored ffmpeg with:
-    //   -ss <start_offset_secs> -i <input> [codec flags per mode]
-    //   -hls_time <segment_duration_secs> -hls_list_size 0 -f hls
-    //   <segment_dir>/index.m3u8
-    // Store the process handle in JobHandle._proc.
+    let proc = spawn::spawn_hls_job(&opts, &segment_dir)?;
 
     tracing::debug!(
-        "wdmm-ffmpeg: stub open_job mode={:?} start={:?}s seg_dir={}",
+        "wdmm-ffmpeg: open_job mode={:?} seg_dir={}",
         opts.mode,
-        opts.start_offset_secs,
         segment_dir.display()
     );
 
     Ok(JobHandle {
         segment_dir,
-        _proc: None,
+        _proc: Some(proc),
     })
 }
 
@@ -231,31 +210,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_stub_unavailable() {
-        let r = probe(Path::new("/dev/null"));
-        assert!(matches!(r, Err(FfmpegError::Unavailable(_))));
+    fn ffmpeg_bin_resolves() {
+        let r = spawn::ffmpeg_bin();
+        assert!(r.is_ok(), "ffmpeg not found: {:?}", r);
     }
 
     #[test]
-    fn open_job_creates_segment_dir() {
+    fn ffprobe_bin_resolves() {
+        let r = spawn::ffprobe_bin();
+        assert!(r.is_ok(), "ffprobe not found: {:?}", r);
+    }
+
+    #[tokio::test]
+    async fn open_job_creates_segment_dir() {
         let h = open_job(JobOpts {
-            input: PathBuf::from("/tmp/x.mp4"),
+            input: PathBuf::from("/tmp/wdmm-test-stub.mp4"),
             mode: HlsMode::DirectCopy,
             subtitles: SubtitleMode::Off,
             start_offset_secs: 0.0,
             segment_duration_secs: 6,
         })
         .unwrap();
-        assert!(h.segment_dir().exists(), "segment dir should exist");
+        assert!(h.segment_dir().exists());
         assert!(h.segment_dir().to_string_lossy().contains("wdmm-hls-"));
-        // Drop cleans it up.
         let dir = h.segment_dir().to_path_buf();
         drop(h);
-        assert!(!dir.exists(), "segment dir should be removed on drop");
+        // Dir is removed on drop
+        assert!(!dir.exists());
     }
 
     #[test]
-    fn jobopts_default_is_direct_copy_off() {
+    fn jobopts_default() {
         let o = JobOpts::default();
         assert!(matches!(o.mode, HlsMode::DirectCopy));
         assert!(matches!(o.subtitles, SubtitleMode::Off));
@@ -264,7 +249,6 @@ mod tests {
 
     #[test]
     fn hls_mode_clone() {
-        // Seek restarts clone the mode from the session — ensure Clone works.
         let m = HlsMode::Compat {
             video_codec: Some("libx264".into()),
             audio_codec: None,

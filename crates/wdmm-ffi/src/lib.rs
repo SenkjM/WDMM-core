@@ -556,6 +556,7 @@ pub extern "C" fn wdmm_proxy_unregister(token: *const std::os::raw::c_char) -> F
 
 /// Register an HLS session with the proxy.
 ///
+/// `device_id` — unique identifier for the player device (null-terminated UTF-8).
 /// `file_path` — absolute path to the input media file (null-terminated UTF-8).
 /// `mode_json` — transcode mode as a JSON object (may be `NULL` for the default):
 ///
@@ -572,13 +573,18 @@ pub extern "C" fn wdmm_proxy_unregister(token: *const std::os::raw::c_char) -> F
 /// [`wdmm_ffi_free_string`].
 ///
 /// # Safety
-/// `file_path` must be a valid null-terminated UTF-8 C string.
+/// `device_id` and `file_path` must be valid null-terminated UTF-8 C strings.
 /// `mode_json` may be `NULL` (treated as `{"mode":"direct_copy"}`).
 #[no_mangle]
 pub extern "C" fn wdmm_proxy_register_hls(
+    device_id: *const c_char,
     file_path: *const c_char,
     mode_json: *const c_char,
 ) -> FfiString {
+    let device_str = match ptr_to_str(device_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid device_id"),
+    };
     let path_str = match ptr_to_str(file_path) {
         Some(s) => s,
         None => return FfiString::from("error:invalid file_path"),
@@ -592,7 +598,7 @@ pub extern "C" fn wdmm_proxy_register_hls(
         None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
     };
     let path = std::path::Path::new(path_str);
-    let reg = rt().block_on(handle.register_hls(path, mode));
+    let reg = rt().block_on(handle.register_hls(device_str, path, mode));
     match reg {
         Ok(r) => {
             let port = handle.addr().map(|a| a.port()).unwrap_or(0);

@@ -77,6 +77,22 @@
 
 ---
 
+
+
+## 7. Content delivery kinds (2026-10-25)
+
+Virtual file layer (`CloudFileItem` / driver `get`) **must** label how bytes are obtained. Callers decide whether to use proxy.
+
+| Kind | Meaning | media_kit |
+|------|---------|-----------|
+| `NetworkDirect` | HTTP(S) URL (+ optional headers) | OK if HTTP |
+| `LocalStream` | In-process Range/byte stream only | **No** → must `register_driver` / stream FFI or materialize |
+| `LocalFile` | Filesystem path (cache / future mounts) | OK |
+
+- Ideal shape still mirrors Dart nesting: wrapper drivers (Crypt) expose **LocalStream** (MustProxy), never plaintext `raw_url`.
+- Proxy stays token-only; after HLS R12, push proxy/FFI immediately — do **not** revive Dart `LocalStreamBridge`.
+- Enum is extensible (`#[non_exhaustive]`). Detail: agent-tools `wdmm-crypt-proxy-path.md` §6.
+
 ## 6. Implementation & Collaboration
 
 - **Task mode**: **One-shot** (land skeleton + ownership per settled constraints, not long-term dual-track).

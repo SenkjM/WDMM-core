@@ -120,3 +120,15 @@ Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 
 ### `struct TeraboxDriver` / `struct NeteaseMusicDriver`
 Unit-struct stubs. All `CloudDriver` methods return `DriverError::Other("TODO: …")`.
+
+---
+
+## Planned: `ContentDeliveryKind` (P0.5, not landed)
+
+Discriminant on `CloudFileItem` for how the virtual layer exposes bytes:
+
+- `NetworkDirect` — use `raw_url` / `raw_headers`
+- `LocalStream` — no URL/path; callers use `get_content_range` or proxy `register_driver`
+- `LocalFile` — filesystem path in planned `local_path` field
+
+Callers (media_kit, DLNA, future mounts) decide proxy need from this kind. Enum is `#[non_exhaustive]`. See `/workspace/agent-tools/wdmm-crypt-proxy-path.md` §6.

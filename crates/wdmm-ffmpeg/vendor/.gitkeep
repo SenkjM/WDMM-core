@@ -1,0 +1,26 @@
+# Vendored FFmpeg binaries
+
+This directory contains vendored FFmpeg prebuilt binaries for cross-compilation targets.
+Binaries are downloaded by build.rs and gitignored to avoid bloating the repository.
+
+Layout:
+```
+vendor/
+  linux-x86_64/          # Host for box tests
+    ffmpeg
+    ffprobe
+  android-arm64/         # aarch64-linux-android
+    ffmpeg
+    ffprobe
+  android-arm/           # armv7-linux-androideabi
+    ffmpeg
+    ffprobe
+  android-x86_64/        # x86_64-linux-android
+    ffmpeg
+    ffprobe
+  windows-x86_64/        # x86_64-pc-windows-msvc
+    ffmpeg.exe
+    ffprobe.exe
+```
+
+See build.rs for download URLs and checksums.

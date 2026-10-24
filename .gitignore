@@ -4,3 +4,8 @@
 *.swo
 *~
 .DS_Store
+# Vendored FFmpeg binaries (downloaded by build.rs)
+crates/wdmm-ffmpeg/vendor/*/ffmpeg
+crates/wdmm-ffmpeg/vendor/*/ffprobe
+crates/wdmm-ffmpeg/vendor/*/ffmpeg.exe
+crates/wdmm-ffmpeg/vendor/*/ffprobe.exe
