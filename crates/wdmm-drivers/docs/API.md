@@ -96,8 +96,9 @@ Recognised `provider_type` values and required config fields:
 | `123`, `123_open`, `pan123`       | `Pan123Driver`   | `access_token`                        | `base_url` |
 | `aliyundrive`, `aliyun`           | `AliyunDriver`   | `access_token`, `drive_id`           | `base_url`, `remove_way` |
 | `115`, `open115`                  | `Open115Driver`  | `access_token`                        | `base_url` |
-| `terabox`                         | `TeraboxDriver`   | — (stub)                             | — |
-| `netease_music`                   | `NeteaseMusicDriver` | — (stub)                          | — |
+| `terabox`                         | `TeraboxDriver`   | `cookie`                              | `sign_key`, `sign_version`, `skip_sign` |
+| `netease_music`                   | `NeteaseMusicDriver` | `cookie`                          | `song_limit` |
+| `crypt`                           | `CryptDriver`     | `password`, `source`                  | `salt`, `filename_encryption`, `filename_encoding`, `encrypted_suffix`, `directory_name_encryption`, `source_account_id_name`, `source_dir` |
 
 Errors: `Config` for a missing required field; `UnsupportedProvider` for an
 unknown type.
@@ -161,8 +162,44 @@ List/get (with `raw_url` via `/open/file/downurl`) + write ops (Round 9):
 - `remove` — `POST /open/rbfile/delete` with `fid[]`; moves item to recycle bin.
 Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 
-### `struct TeraboxDriver` / `struct NeteaseMusicDriver`
-Unit-struct stubs. All `CloudDriver` methods return `DriverError::Other("TODO: …")`.
+### `struct TeraboxDriver` / `struct TeraboxConfig`
+`pub fn TeraboxDriver::new(cfg: TeraboxConfig) -> Result<Self>`
+Cookie-based (not OAuth). Requires `cookie` containing `ndus` + `BDUSS`. List/get only;
+write ops return not-supported. get returns `NetworkDirect` with extracted dlink + cookie header.
+Signature logic: if `skip_sign=true`, uses raw jsToken from `/api/account/info`;
+otherwise signs the dlink URL with `sign_key` + `sign_version` (`c0`, `c3`, or `c4`).
+**HARD BLOCKERS** (documented in terabox.rs):
+- Signature schemes c0/c3/c4 are stub placeholders; real requests fail → cannot verify dlink.
+- No rename/remove/mkdir — these require working signatures.
+Auth: cookie header. No retries beyond Rust default.
+
+### `struct NeteaseMusicDriver` / `struct NeteaseMusicConfig`
+`pub fn NeteaseMusicDriver::new(cfg: NeteaseMusicConfig) -> Result<Self>`
+Cloud music service. Requires `cookie` with `__csrf` and `MUSIC_U`. Optional `song_limit` (default 200).
+- `list` — weapi `/weapi/v1/cloud/get` (flat song list as files, no nested dirs).
+- `get` — linuxapi `/api/linux/forward` to fetch stream URL; returns `NetworkDirect` with URL if non-empty, else error.
+- `remove` — weapi `http://music.163.com/weapi/cloud/del` (note HTTP, not HTTPS).
+- `mkdir`/`rename` — return clear not-supported.
+Auth: cookie + CSRF token extracted from cookie. Uses `wdmm_crypto::netease::{weapi_encrypt, linuxapi_encrypt}`.
+User-Agent: `Mozilla/5.0 ...` for weapi, specific linuxapi UA for linuxapi. Referer: `https://music.163.com`.
+
+### `struct CryptDriver` / `struct CryptConfig`
+`pub fn CryptDriver::new(cfg: CryptConfig) -> Result<Self>`
+Wrapper driver that encrypts/decrypts filenames and content using rclone crypt protocol.
+Required config: `password`, `source` (nested driver config with `provider_type` and `config`).
+Optional: `salt`, `filename_encryption` (off|standard|obfuscate, default off),
+`filename_encoding` (base32|base64|base32768, default base64), `encrypted_suffix` (default `.bin`),
+`directory_name_encryption` (bool, default false), `source_account_id_name`, `source_dir` (default `/`).
+
+Also constructible via `CryptDriver::with_source(Arc<dyn CloudDriver>, CryptConfig)`.
+
+- `list` — decrypts names from source; skips items that fail name decryption (allows mixed dirs).
+- `get` — returns `LocalStream` with plaintext size (`RcloneCipher::decrypted_size`); no `raw_url`.
+- `get_content` / `get_content_range` — read ciphertext from source, decrypt in-memory.
+- `mkdir`/`rename`/`remove` — map names and delegate to source.
+- No `put_content`.
+
+Uses `wdmm_crypto::rclone::RcloneCipher`. Callers must route `LocalStream` through `ProxyHandle`.
 
 ---
 
