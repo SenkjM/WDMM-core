@@ -477,6 +477,96 @@ pub extern "C" fn wdmm_webdav_list(
     }
 }
 
+
+/// Create a WebDAV collection (MKCOL). Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_webdav_mkdir(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let pass = ptr_to_str(webdav_pass).unwrap_or("");
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+    match rt().block_on(wdmm_drivers::CloudDriver::mkdir(&driver, path)) {
+        Ok(()) => FfiString::from("ok"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Rename/move a WebDAV path. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_webdav_rename(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    old_path: *const c_char,
+    new_path: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let pass = ptr_to_str(webdav_pass).unwrap_or("");
+    let old = match ptr_to_str(old_path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid old_path"),
+    };
+    let newp = match ptr_to_str(new_path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid new_path"),
+    };
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+    match rt().block_on(wdmm_drivers::CloudDriver::rename(&driver, old, newp)) {
+        Ok(()) => FfiString::from("ok"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a WebDAV file or directory. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_webdav_remove(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let pass = ptr_to_str(webdav_pass).unwrap_or("");
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+    match rt().block_on(wdmm_drivers::CloudDriver::remove(&driver, path)) {
+        Ok(()) => FfiString::from("ok"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── Proxy FFI ─────────────────────────────────────────────────────────────────
 //
 // The proxy is a process-global singleton, like the OpenAPI server. It starts
@@ -2244,6 +2334,22 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert!(s.starts_with("error:"), "expected error:…, got: {s}");
         wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn webdav_mkdir_rename_remove_invalid_url_errors() {
+        let url = CString::new("not-a-url").unwrap();
+        let empty = CString::new("").unwrap();
+        let path = CString::new("/x").unwrap();
+        for r in [
+            wdmm_webdav_mkdir(url.as_ptr(), empty.as_ptr(), empty.as_ptr(), path.as_ptr()),
+            wdmm_webdav_rename(url.as_ptr(), empty.as_ptr(), empty.as_ptr(), path.as_ptr(), path.as_ptr()),
+            wdmm_webdav_remove(url.as_ptr(), empty.as_ptr(), empty.as_ptr(), path.as_ptr()),
+        ] {
+            let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+            assert!(s.starts_with("error:"), "expected error:…, got: {s}");
+            wdmm_ffi_free_string(r);
+        }
     }
 
     #[test]

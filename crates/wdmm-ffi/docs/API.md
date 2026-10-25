@@ -123,6 +123,15 @@ Returns a JSON array on success:
 `path` is the request directory joined with each entry `name`. `modified` is
 RFC3339 or `null`. On failure returns `"error:<message>"`. Caller must free.
 
+### `extern "C" fn wdmm_webdav_mkdir(webdav_url, webdav_user, webdav_pass, path) -> FfiString`
+MKCOL. Returns `"ok"` or `"error:…"`.
+
+### `extern "C" fn wdmm_webdav_rename(webdav_url, webdav_user, webdav_pass, old_path, new_path) -> FfiString`
+MOVE/rename. Returns `"ok"` or `"error:…"`.
+
+### `extern "C" fn wdmm_webdav_remove(webdav_url, webdav_user, webdav_pass, path) -> FfiString`
+DELETE. Returns `"ok"` or `"error:…"`.
+
 ---
 
 ## DLNA
