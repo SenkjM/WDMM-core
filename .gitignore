@@ -11,3 +11,4 @@ crates/wdmm-ffmpeg/vendor/*/ffmpeg.exe
 crates/wdmm-ffmpeg/vendor/*/ffprobe.exe
 # Local CRLF/LF process copy used when building on Windows
 scripts/fetch-ffmpeg-vendor.lf.sh
+crates/wdmm-ffmpeg/vendor/

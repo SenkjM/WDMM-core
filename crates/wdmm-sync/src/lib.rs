@@ -13,6 +13,9 @@
 
 #![forbid(unsafe_code)]
 
+mod backup;
+pub use backup::*;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
