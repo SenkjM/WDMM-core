@@ -182,3 +182,15 @@ Behaviour:
   tombstones/cursors). Returns `already_done: true` with `tracks`/`playlists`/
   `entries` = 0 and non-zero v6 counts; sets `sqflite_imported_v6`.
 - neither set → full import of all five surfaces, then sets **both** flags.
+
+**Track column mapping (PRAGMA-detected).** Real Android `music_library.db`
+stores tracks with `music_id` (PK) + `source_name` — no `id`, `account_id`,
+`size`, or `modified`. Desktop/legacy DBs use `id` + `account_id`. The tracks
+columns are detected via `PRAGMA table_info(tracks)`: source → `source_name` if
+present else `account_id`; id → `music_id` if present else `id`. The detected
+source value is written to Core `LibraryTrack.account_id` (Core/FFI column name
+**unchanged** — Android `source_name` == Core `account_id`, matching
+`compare_with_sqflite`). Missing optional columns default: `title` → file
+basename of `remote_path`, `artist` → `None`, `size` → `0`, `modified` → `None`,
+`duration_ms` → `0`. A missing `tracks` table, or one with neither a source nor
+an id column, yields **0 tracks** (not an error); the other surfaces still import.

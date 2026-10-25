@@ -1057,6 +1057,22 @@ impl LibraryDatabase {
     ///
     /// The read is defensive: if expected columns are absent (old schema), the
     /// row is skipped and import continues.
+    ///
+    /// **Track column mapping (PRAGMA-detected, mirrors [`Self::compare_with_sqflite`]).**
+    /// Real Android `music_library.db` stores tracks with `music_id` (PK) and
+    /// `source_name` — there is no `id`, `account_id`, `size`, or `modified`
+    /// column. Desktop/legacy DBs instead use `id` + `account_id` (plus `size` /
+    /// `modified`). The columns are detected via `PRAGMA table_info(tracks)`:
+    /// * source → `source_name` if present, else `account_id`
+    /// * id → `music_id` if present, else `id`
+    ///
+    /// The detected source value is stored in the Core `LibraryTrack.account_id`
+    /// field (the Core/FFI column name is intentionally unchanged — Android
+    /// `source_name` == Core `account_id`). Optional columns default when absent:
+    /// `title` → file basename of `remote_path`, `artist` → `None`, `size` → `0`,
+    /// `modified` → `None`, `duration_ms` → `0`. A missing `tracks` table, or a
+    /// table with neither a source nor an id column, yields **0 tracks** rather
+    /// than an error.
     pub fn import_from_sqflite(
         old_db_path: &std::path::Path,
         dest: &LibraryDatabase,
@@ -1088,26 +1104,57 @@ impl LibraryDatabase {
 
         // The three legacy surfaces are only read on the first (full) import.
         // On the v6 backfill pass they were already copied, so we skip them.
+        //
+        // Column mapping is detected via PRAGMA (same spirit as `compare_tracks`):
+        // Android `music_library.db` stores tracks with `music_id` + `source_name`
+        // (no `id` / `account_id` / `size` / `modified`), while Desktop/legacy DBs
+        // use `id` + `account_id`. The detected source value is mapped into the
+        // Core `LibraryTrack.account_id` field (the Core column name is unchanged).
         let tracks: Vec<wdmm_core::models::LibraryTrack> = if imported {
             Vec::new()
-        } else {
-            let mut stmt = old.prepare(
-                "SELECT id, title, artist, remote_path, account_id, size, modified FROM tracks",
-            ).map_err(|e| StorageError::Database(format!("tracks prepare: {e}")))?;
+        } else if let (Some(source_col), Some(id_col)) = (
+            tracks_source_column(&old),
+            tracks_id_column(&old),
+        ) {
+            // Build the projection only from columns that actually exist.
+            let cols = table_columns(&old, "tracks").unwrap_or_default();
+            let has = |c: &str| cols.iter().any(|x| x == c);
+
+            let title_expr = if has("title") { "title" } else { "NULL" };
+            let artist_expr = if has("artist") { "artist" } else { "NULL" };
+            let size_expr = if has("size") { "size" } else { "0" };
+            let modified_expr = if has("modified") { "modified" } else { "NULL" };
+            let duration_expr = if has("duration_ms") { "duration_ms" } else { "0" };
+
+            let sql = format!(
+                "SELECT {id_col}, {title_expr}, {artist_expr}, remote_path, \
+                 {source_col}, {size_expr}, {modified_expr}, {duration_expr} FROM tracks"
+            );
+
+            let mut stmt = old
+                .prepare(&sql)
+                .map_err(|e| StorageError::Database(format!("tracks prepare: {e}")))?;
 
             let rows = stmt
                 .query_map([], |row| {
+                    let remote_path: String = row.get::<_, String>(3).unwrap_or_default();
+                    // Title falls back to the file basename when absent/empty.
+                    let mut title: String = row.get::<_, String>(1).unwrap_or_default();
+                    if title.is_empty() {
+                        title = basename_of(&remote_path);
+                    }
                     Ok(wdmm_core::models::LibraryTrack {
                         id: row.get::<_, String>(0).unwrap_or_default(),
-                        title: row.get::<_, String>(1).unwrap_or_default(),
+                        title,
                         artist: row.get::<_, Option<String>>(2).unwrap_or(None),
-                        remote_path: row.get::<_, String>(3).unwrap_or_default(),
+                        remote_path,
                         account_id: row.get::<_, String>(4).unwrap_or_default(),
                         size: row.get::<_, i64>(5).unwrap_or(0) as u64,
                         modified: row
                             .get::<_, Option<i64>>(6)
                             .unwrap_or(None)
                             .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
+                        duration_ms: row.get::<_, i64>(7).unwrap_or(0),
                         ..Default::default()
                     })
                 })
@@ -1121,6 +1168,10 @@ impl LibraryDatabase {
                 }
             }
             out
+        } else {
+            // No usable source or id column (or no `tracks` table at all):
+            // treat as 0 tracks and continue with the other surfaces.
+            Vec::new()
         };
 
         // ── Read old playlists ────────────────────────────────────────────────
@@ -2312,6 +2363,67 @@ fn collect_descendants(conn: &Connection, root_id: &str) -> StorageResult<Vec<St
 
 // ── Comparison helpers ───────────────────────────────────────────────────────
 
+/// Column names of `table` on `conn`, or `None` if the table does not exist.
+/// Used to bridge the Core schema (`account_id` / `id`) with the Android
+/// sqflite schema (`source_name` / `music_id`) without hardcoding either.
+fn table_columns(conn: &Connection, table: &str) -> Option<Vec<String>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |row| row.get::<_, i64>(0).map(|c| c > 0),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return None;
+    }
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", table))
+        .ok()?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    Some(cols)
+}
+
+/// The old-side tracks source column: `source_name` on Android, else
+/// `account_id` on Desktop/legacy, else `None` when neither is present.
+fn tracks_source_column(conn: &Connection) -> Option<&'static str> {
+    let cols = table_columns(conn, "tracks")?;
+    if cols.iter().any(|c| c == "source_name") {
+        Some("source_name")
+    } else if cols.iter().any(|c| c == "account_id") {
+        Some("account_id")
+    } else {
+        None
+    }
+}
+
+/// The old-side tracks id column: `music_id` on Android, else `id` on
+/// Desktop/legacy, else `None` when neither is present.
+fn tracks_id_column(conn: &Connection) -> Option<&'static str> {
+    let cols = table_columns(conn, "tracks")?;
+    if cols.iter().any(|c| c == "music_id") {
+        Some("music_id")
+    } else if cols.iter().any(|c| c == "id") {
+        Some("id")
+    } else {
+        None
+    }
+}
+
+/// File basename of a remote path (last non-empty `/`-segment), used as a
+/// title fallback when the old DB has no `title`/empty title.
+fn basename_of(remote_path: &str) -> String {
+    remote_path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(remote_path)
+        .to_string()
+}
+
 fn compare_tracks(
     old: &Connection,
     dest: &LibraryDatabase,
@@ -3081,6 +3193,121 @@ mod tests {
 
         // Clean up temp file (best-effort).
         let _ = std::fs::remove_file(&old_path);
+    }
+
+    #[test]
+    fn import_from_sqflite_android_source_name() {
+        use std::fs;
+
+        // Android `music_library.db` tracks DDL — `music_id` + `source_name`,
+        // NO `id` / `account_id` / `size` / `modified`. Mirrors compare's
+        // Android-ish fixture. `import_from_sqflite` must PRAGMA-detect these
+        // and map the `source_name` value into Core `LibraryTrack.account_id`.
+        let mut old_path = std::env::temp_dir();
+        old_path.push(format!("wdmm_sqflite_android_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let old = Connection::open(&old_path).expect("create old db");
+            old.execute_batch(
+                r#"
+                CREATE TABLE tracks (
+                    music_id    TEXT PRIMARY KEY,
+                    source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    file_name   TEXT NOT NULL,
+                    title       TEXT,
+                    artist      TEXT,
+                    duration_ms INTEGER,
+                    UNIQUE(source_name, remote_path)
+                );
+                CREATE TABLE playlists (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE playlist_entries (
+                    playlist_id TEXT NOT NULL, position INTEGER NOT NULL,
+                    music_id TEXT NOT NULL, source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL, title TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO tracks VALUES
+                    ('m1','MyAccount','/music/a.mp3','a.mp3','A Song','Artist A',180000);
+                INSERT INTO tracks VALUES
+                    ('m2','MyAccount','/music/b.mp3','b.mp3',NULL,NULL,NULL);
+                "#,
+            )
+            .expect("seed old db");
+        }
+
+        let dest = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let summary = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
+        assert!(!summary.already_done);
+        assert_eq!(summary.tracks, 2);
+
+        let tracks = dest.list_tracks().unwrap();
+        assert_eq!(tracks.len(), 2);
+
+        let a = tracks.iter().find(|t| t.id == "m1").expect("m1 imported");
+        // Android `source_name` maps into Core `account_id`.
+        assert_eq!(a.account_id, "MyAccount");
+        assert_eq!(a.remote_path, "/music/a.mp3");
+        assert_eq!(a.title, "A Song");
+        assert_eq!(a.artist.as_deref(), Some("Artist A"));
+        assert_eq!(a.duration_ms, 180000);
+        assert_eq!(a.size, 0); // no `size` column → 0
+
+        // NULL title → falls back to the remote-path basename; NULL duration → 0.
+        let b = tracks.iter().find(|t| t.id == "m2").expect("m2 imported");
+        assert_eq!(b.account_id, "MyAccount");
+        assert_eq!(b.title, "b.mp3");
+        assert_eq!(b.duration_ms, 0);
+
+        let _ = fs::remove_file(&old_path);
+    }
+
+    #[test]
+    fn import_from_sqflite_no_source_column_yields_zero_tracks() {
+        use std::fs;
+
+        // A `tracks` table with neither `source_name` nor `account_id` (and no
+        // `music_id`/`id`) must yield 0 tracks — not an error — while the other
+        // surfaces still import.
+        let mut old_path = std::env::temp_dir();
+        old_path.push(format!("wdmm_sqflite_nosrc_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let old = Connection::open(&old_path).expect("create old db");
+            old.execute_batch(
+                r#"
+                CREATE TABLE tracks (
+                    remote_path TEXT NOT NULL,
+                    title       TEXT
+                );
+                INSERT INTO tracks VALUES ('/x/1.mp3','One');
+                CREATE TABLE playlists (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                INSERT INTO playlists VALUES ('pl1','P',1700000000,1700000001);
+                CREATE TABLE playlist_entries (
+                    playlist_id TEXT NOT NULL, position INTEGER NOT NULL,
+                    music_id TEXT NOT NULL, source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL, title TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                "#,
+            )
+            .expect("seed old db");
+        }
+
+        let dest = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let summary = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
+        assert!(!summary.already_done);
+        assert_eq!(summary.tracks, 0);
+        assert_eq!(summary.playlists, 1); // other surfaces still import
+        assert!(dest.list_tracks().unwrap().is_empty());
+
+        let _ = fs::remove_file(&old_path);
     }
 
     #[test]
