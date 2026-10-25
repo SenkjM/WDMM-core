@@ -1375,6 +1375,344 @@ pub extern "C" fn wdmm_library_import_from_sqflite(old_db_path: *const c_char) -
     }
 }
 
+// ── User folders FFI ──────────────────────────────────────────────────────────
+
+/// List direct children of a folder.
+///
+/// `parent_id` may be null, `""`, or `"root"` — all mean the virtual root
+/// (returns folders with `parent_id IS NULL`). Returns a JSON array of folder
+/// objects, or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_list_children(parent_id: *const c_char) -> FfiString {
+    // null pointer → virtual root (same as "root")
+    let pid: Option<&str> = if parent_id.is_null() {
+        None
+    } else {
+        ptr_to_str(parent_id)
+    };
+    match global_library_db().list_user_folder_children(pid) {
+        Ok(folders) => FfiString::from(
+            serde_json::to_string(&folders).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Create a user folder from JSON.
+///
+/// Input shape: `{"name":"…","parent_id":null|"…","sort_order":0}`
+/// `parent_id` absent/null/`"root"` → virtual root.
+/// Returns the new folder as JSON, or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_create(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let name = match v["name"].as_str() {
+        Some(n) => n,
+        None => return FfiString::from("error:missing 'name'"),
+    };
+    let parent_id: Option<&str> = v["parent_id"].as_str();
+    let sort_order: Option<i64> = v["sort_order"].as_i64();
+    match global_library_db().create_user_folder(name, parent_id, sort_order) {
+        Ok(folder) => FfiString::from(
+            serde_json::to_string(&folder).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Rename a folder. Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_rename(
+    id: *const c_char,
+    name: *const c_char,
+) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    let name = match ptr_to_str(name) {
+        Some(s) => s,
+        None => return FfiString::from("error:null name pointer"),
+    };
+    match global_library_db().rename_user_folder(id, name) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Move a folder to a new parent.
+///
+/// `new_parent_id` null/`""`/`"root"` → virtual root. Returns `"ok"` or
+/// `"error:<message>"` (including `"error:…cycle…"` on invalid moves).
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_move(
+    id: *const c_char,
+    new_parent_id: *const c_char,
+) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    let new_parent: Option<&str> = if new_parent_id.is_null() {
+        None
+    } else {
+        ptr_to_str(new_parent_id)
+    };
+    match global_library_db().move_user_folder(id, new_parent) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a folder and all descendants + their items recursively.
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_delete(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().delete_user_folder(id) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List items in a folder. `folder_id = "root"` is valid (virtual root items).
+/// Returns a JSON array or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_list_items(folder_id: *const c_char) -> FfiString {
+    let fid = match ptr_to_str(folder_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null folder_id pointer"),
+    };
+    match global_library_db().list_user_folder_items(fid) {
+        Ok(items) => FfiString::from(
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Add (or update) an item in a folder from JSON.
+///
+/// Input shape: `{"folder_id":"…","ref_kind":"album|artist|track",
+/// "ref_key":"…","sort_order":0}`. `added_at` defaults to now if absent.
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_add_item(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let folder_id = match v["folder_id"].as_str() {
+        Some(s) => s.to_string(),
+        None => return FfiString::from("error:missing 'folder_id'"),
+    };
+    let ref_kind = match v["ref_kind"].as_str() {
+        Some(s) => s.to_string(),
+        None => return FfiString::from("error:missing 'ref_kind'"),
+    };
+    let ref_key = match v["ref_key"].as_str() {
+        Some(s) => s.to_string(),
+        None => return FfiString::from("error:missing 'ref_key'"),
+    };
+    let sort_order = v["sort_order"].as_i64().unwrap_or(0);
+    let added_at = v["added_at"]
+        .as_i64()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let item = wdmm_storage::UserFolderItem {
+        folder_id,
+        ref_kind,
+        ref_key,
+        sort_order,
+        added_at,
+    };
+    match global_library_db().add_user_folder_item(&item) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Remove a specific item from a folder.
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_remove_item(
+    folder_id: *const c_char,
+    ref_kind: *const c_char,
+    ref_key: *const c_char,
+) -> FfiString {
+    let fid = match ptr_to_str(folder_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null folder_id pointer"),
+    };
+    let kind = match ptr_to_str(ref_kind) {
+        Some(s) => s,
+        None => return FfiString::from("error:null ref_kind pointer"),
+    };
+    let key = match ptr_to_str(ref_key) {
+        Some(s) => s,
+        None => return FfiString::from("error:null ref_key pointer"),
+    };
+    match global_library_db().remove_user_folder_item(fid, kind, key) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Playlists FFI ─────────────────────────────────────────────────────────────
+
+/// List all playlists. Returns a JSON array or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_playlist_list() -> FfiString {
+    match global_library_db().list_playlists() {
+        Ok(playlists) => FfiString::from(
+            serde_json::to_string(&playlists).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Create a playlist from JSON.
+///
+/// Input shape: `{"id":"optional-uuid","name":"…"}`.
+/// If `id` is absent a UUID is generated.
+/// Returns the new playlist as JSON, or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_playlist_create(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let name = match v["name"].as_str() {
+        Some(n) => n.to_string(),
+        None => return FfiString::from("error:missing 'name'"),
+    };
+    let id = v["id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let now = chrono::Utc::now();
+    let playlist = wdmm_storage::Playlist {
+        id,
+        name,
+        created_at: now,
+        updated_at: now,
+    };
+    match global_library_db().upsert_playlist(&playlist) {
+        Ok(()) => FfiString::from(
+            serde_json::to_string(&playlist).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a playlist (and its entries via ON DELETE CASCADE).
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_playlist_delete(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().delete_playlist(id) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List entries of a playlist ordered by position.
+/// Returns a JSON array or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_playlist_list_entries(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().list_playlist_entries(id) {
+        Ok(entries) => FfiString::from(
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Replace all entries of a playlist from a JSON array.
+///
+/// Each element: `{"music_id":"…","source_name":"…","remote_path":"…",
+/// "title":"…","duration_ms":0}`. Position is assigned by array order.
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_playlist_set_entries(
+    id: *const c_char,
+    json_array: *const c_char,
+) -> FfiString {
+    let playlist_id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    let s = match ptr_to_str(json_array) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json_array pointer"),
+    };
+    let arr: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let items = match arr.as_array() {
+        Some(a) => a,
+        None => return FfiString::from("error:json_array must be a JSON array"),
+    };
+    let mut entries = Vec::with_capacity(items.len());
+    for (pos, item) in items.iter().enumerate() {
+        let music_id = match item["music_id"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:entry[{pos}] missing 'music_id'")),
+        };
+        let source_name = match item["source_name"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:entry[{pos}] missing 'source_name'")),
+        };
+        let remote_path = match item["remote_path"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:entry[{pos}] missing 'remote_path'")),
+        };
+        let title = match item["title"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:entry[{pos}] missing 'title'")),
+        };
+        let duration_ms = item["duration_ms"].as_i64().unwrap_or(0);
+        entries.push(wdmm_storage::PlaylistEntry {
+            playlist_id: playlist_id.to_string(),
+            position: pos as i64,
+            music_id,
+            source_name,
+            remote_path,
+            title,
+            duration_ms,
+        });
+    }
+    match global_library_db().set_playlist_entries(playlist_id, &entries) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── JSON → model helpers ──────────────────────────────────────────────────────
 
 fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrack, String> {
@@ -1947,5 +2285,224 @@ mod tests {
         assert_eq!(wdmm_proxy_port(), -1);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── User folders + playlist FFI ──────────────────────────────────────────
+
+    #[test]
+    fn user_folder_ffi_crud() {
+        // Create two root folders (UUID ids auto-generated).
+        let j1 = CString::new(r#"{"name":"FFI Music","sort_order":0}"#).unwrap();
+        let r = wdmm_user_folder_create(j1.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "create1 failed: {s}");
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let f1_id = v["id"].as_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+
+        let j2 = CString::new(r#"{"name":"FFI Playlists","parent_id":null,"sort_order":1}"#).unwrap();
+        let r = wdmm_user_folder_create(j2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let f2_id = v["id"].as_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+
+        // List root children via null pointer → at least our two new folders.
+        let r = wdmm_user_folder_list_children(std::ptr::null());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        let names: Vec<&str> = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        assert!(names.contains(&"FFI Music"));
+        assert!(names.contains(&"FFI Playlists"));
+        wdmm_ffi_free_string(r);
+
+        // "root" sentinel yields the same set.
+        let root = CString::new("root").unwrap();
+        let r = wdmm_user_folder_list_children(root.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            arr.as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"].as_str() == Some(f1_id.as_str())),
+            "f1 should be a root child"
+        );
+        wdmm_ffi_free_string(r);
+
+        // Create child under f1.
+        let child_json = CString::new(format!(
+            r#"{{"name":"FFI Rock","parent_id":"{}"}}"#,
+            f1_id
+        ))
+        .unwrap();
+        let r = wdmm_user_folder_create(child_json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let child_id = v["id"].as_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+
+        // Add an item to the virtual root (folder_id = "root").
+        let item_root = CString::new(
+            r#"{"folder_id":"root","ref_kind":"track","ref_key":"ffi-track-1","sort_order":0}"#,
+        )
+        .unwrap();
+        let r = wdmm_user_folder_add_item(item_root.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Add an item to the child folder.
+        let item_child = CString::new(format!(
+            r#"{{"folder_id":"{}","ref_kind":"album","ref_key":"ffi-alb-1","sort_order":0}}"#,
+            child_id
+        ))
+        .unwrap();
+        let r = wdmm_user_folder_add_item(item_child.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // List root items — contains the track we added.
+        let root2 = CString::new("root").unwrap();
+        let r = wdmm_user_folder_list_items(root2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            arr.as_array()
+                .unwrap()
+                .iter()
+                .any(|it| it["ref_key"].as_str() == Some("ffi-track-1")),
+            "root should contain ffi-track-1 item"
+        );
+        wdmm_ffi_free_string(r);
+
+        // Rename f1.
+        let id1 = CString::new(f1_id.clone()).unwrap();
+        let new_name = CString::new("FFI Musik").unwrap();
+        let r = wdmm_user_folder_rename(id1.as_ptr(), new_name.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Move child to virtual root (null pointer).
+        let cid = CString::new(child_id.clone()).unwrap();
+        let r = wdmm_user_folder_move(cid.as_ptr(), std::ptr::null());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Recursive delete f1 (no children now).
+        let r = wdmm_user_folder_delete(id1.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Remove root item.
+        let root3 = CString::new("root").unwrap();
+        let kind = CString::new("track").unwrap();
+        let key = CString::new("ffi-track-1").unwrap();
+        let r = wdmm_user_folder_remove_item(root3.as_ptr(), kind.as_ptr(), key.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Clean up remaining folders + child.
+        let cid2 = CString::new(child_id).unwrap();
+        let r = wdmm_user_folder_delete(cid2.as_ptr());
+        wdmm_ffi_free_string(r);
+        let f2 = CString::new(f2_id).unwrap();
+        let r = wdmm_user_folder_delete(f2.as_ptr());
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn playlist_ffi_crud() {
+        // Create a playlist (id auto-generated).
+        let j = CString::new(r#"{"name":"FFI Playlist CRUD"}"#).unwrap();
+        let r = wdmm_playlist_create(j.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "create failed: {s}");
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let pl_id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(v["name"].as_str(), Some("FFI Playlist CRUD"));
+        wdmm_ffi_free_string(r);
+
+        let id = CString::new(pl_id.clone()).unwrap();
+
+        // Set entries — replace-all; positions assigned by array order.
+        let entries = CString::new(
+            r#"[
+                {"music_id":"aa","source_name":"nas","remote_path":"/m/a.mp3","title":"A","duration_ms":1000},
+                {"music_id":"bb","source_name":"nas","remote_path":"/m/b.mp3","title":"B","duration_ms":2000}
+            ]"#,
+        )
+        .unwrap();
+        let r = wdmm_playlist_set_entries(id.as_ptr(), entries.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // List entries — verify order and fields.
+        let r = wdmm_playlist_list_entries(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        let items = arr.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["position"], 0);
+        assert_eq!(items[0]["title"], "A");
+        assert_eq!(items[1]["position"], 1);
+        assert_eq!(items[1]["title"], "B");
+        wdmm_ffi_free_string(r);
+
+        // Playlist appears in list.
+        let r = wdmm_playlist_list();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            arr.as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"].as_str() == Some(pl_id.as_str())),
+            "playlist should be in list"
+        );
+        wdmm_ffi_free_string(r);
+
+        // Replace-all: single entry replaces the previous two.
+        let entries2 = CString::new(
+            r#"[
+                {"music_id":"cc","source_name":"nas","remote_path":"/m/c.mp3","title":"C","duration_ms":3000}
+            ]"#,
+        )
+        .unwrap();
+        let r = wdmm_playlist_set_entries(id.as_ptr(), entries2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+        let r = wdmm_playlist_list_entries(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        let items = arr.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["title"], "C");
+        wdmm_ffi_free_string(r);
+
+        // Delete playlist.
+        let r = wdmm_playlist_delete(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Entries gone (cascade).
+        let r = wdmm_playlist_list_entries(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 0);
+        wdmm_ffi_free_string(r);
     }
 }

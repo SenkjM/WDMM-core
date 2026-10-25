@@ -1,10 +1,12 @@
-//! `wdmm-storage` — rusqlite library DB (schema v2, music library essentials).
+//! `wdmm-storage` — rusqlite library DB (schema v3, music library essentials).
 //!
-//! Aligns with WDMM `music_library.db` direction (schema v18 from architecture
-//! report). Schema v2 (Round 5) adds artists/albums tables, extends `tracks`
-//! with library metadata columns, and adds search + delete. Manga tables are
-//! skeleton stubs (Round 6 for full parity). Migrations are one-shot additive:
-//! each `open()` runs the full DDL with `IF NOT EXISTS`, then a version bump.
+//! Schema v1 (Round 4): base tables.
+//! Schema v2 (Round 5): artists/albums tables, extended `tracks` columns,
+//!   search + delete.
+//! Schema v3 (Round 12): `user_folders` column fix (`created` → `created_at`,
+//!   add `sort_order`), new `user_folder_items` table + indexes. Migrations are
+//!   idempotent: base DDL uses `IF NOT EXISTS`; v3 ALTER statements ignore
+//!   duplicate-column errors so opening any DB version converges to v3.
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +14,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use std::sync::Mutex;
 use thiserror::Error as ThisError;
+use uuid::Uuid;
 
 use wdmm_core::models::{CloudAccount, LibraryAlbum, LibraryArtist, LibraryTrack};
 
@@ -127,12 +130,13 @@ impl LibraryDatabase {
             CREATE INDEX IF NOT EXISTS idx_tracks_artist   ON tracks (artist_id);
             CREATE INDEX IF NOT EXISTS idx_tracks_title    ON tracks (title COLLATE NOCASE);
 
-            -- ── User folders ──────────────────────────────────────────────────
+            -- ── User folders (v3: created_at + sort_order; ALTER migration handles old DBs) ──
             CREATE TABLE IF NOT EXISTS user_folders (
-                id        TEXT PRIMARY KEY,
-                name      TEXT NOT NULL,
-                parent_id TEXT,
-                created   INTEGER NOT NULL
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                parent_id  TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
             );
 
             -- ── Deleted items tombstone ───────────────────────────────────────
@@ -198,12 +202,49 @@ impl LibraryDatabase {
             "#,
         )?;
 
-        // Bump schema version to 2 (idempotent).
+        // Seed schema version rows for v1 and v2.
         conn.execute("INSERT OR IGNORE INTO _schema_version (version) VALUES (1)", [])?;
-        conn.execute(
-            "INSERT OR REPLACE INTO _schema_version (version) VALUES (2)",
+        conn.execute("INSERT OR IGNORE INTO _schema_version (version) VALUES (2)", [])?;
+
+        // ── v3 migration: fix user_folders columns + create user_folder_items ──
+        let current_ver: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM _schema_version",
             [],
+            |row| row.get(0),
         )?;
+        if current_ver < 3 {
+            // Rename old 'created' → 'created_at'. On fresh DBs the DDL
+            // above already uses created_at, so the RENAME will fail and the
+            // error is silently discarded (idempotent).
+            let _ = conn.execute_batch(
+                "ALTER TABLE user_folders RENAME COLUMN created TO created_at;",
+            );
+            // Add sort_order column. Silently discarded if already present.
+            let _ = conn.execute_batch(
+                "ALTER TABLE user_folders ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;",
+            );
+            // Create user_folder_items table + indexes (all idempotent).
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS user_folder_items (
+                    folder_id  TEXT    NOT NULL,
+                    ref_kind   TEXT    NOT NULL,
+                    ref_key    TEXT    NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    added_at   INTEGER NOT NULL,
+                    PRIMARY KEY (folder_id, ref_kind, ref_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_folders_parent
+                    ON user_folders (parent_id);
+                CREATE INDEX IF NOT EXISTS idx_user_folder_items_folder
+                    ON user_folder_items (folder_id);
+                "#,
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (3)",
+                [],
+            )?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -820,6 +861,190 @@ impl LibraryDatabase {
             entries: entry_count,
         })
     }
+
+    // ── User folders ──────────────────────────────────────────────────────────
+
+    /// List direct children of a folder.
+    ///
+    /// `parent_id = None`, `""`, or `"root"` all mean the virtual root —
+    /// returns folders whose `parent_id IS NULL`.
+    pub fn list_user_folder_children(
+        &self,
+        parent_id: Option<&str>,
+    ) -> StorageResult<Vec<UserFolder>> {
+        let normalized = normalize_parent(parent_id);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, parent_id, sort_order, created_at
+             FROM user_folders WHERE parent_id IS ?1
+             ORDER BY sort_order, name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![normalized], row_to_folder)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// Fetch a single folder by id. Returns `None` if not found.
+    pub fn get_user_folder(&self, id: &str) -> StorageResult<Option<UserFolder>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, parent_id, sort_order, created_at
+             FROM user_folders WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_folder(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create a folder with a generated UUID id. `sort_order` defaults to 0.
+    pub fn create_user_folder(
+        &self,
+        name: &str,
+        parent_id: Option<&str>,
+        sort_order: Option<i64>,
+    ) -> StorageResult<UserFolder> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp();
+        let sort = sort_order.unwrap_or(0);
+        let normalized = normalize_parent(parent_id);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_folders (id, name, parent_id, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, normalized, sort, now],
+        )?;
+        Ok(UserFolder {
+            id,
+            name: name.to_string(),
+            parent_id: normalized.map(|s| s.to_string()),
+            sort_order: sort,
+            created_at: now,
+        })
+    }
+
+    /// Rename a folder. Returns `NotFound` if the id is absent.
+    pub fn rename_user_folder(&self, id: &str, name: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE user_folders SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+        if n == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Move a folder to a new parent. `new_parent_id = None / "" / "root"`
+    /// places it under the virtual root. Rejects moves that would form a cycle.
+    pub fn move_user_folder(
+        &self,
+        id: &str,
+        new_parent_id: Option<&str>,
+    ) -> StorageResult<()> {
+        let normalized = normalize_parent(new_parent_id);
+        let conn = self.conn.lock().unwrap();
+        // Cycle guard: new parent must not be the folder itself or a descendant.
+        if let Some(target) = normalized {
+            if target == id {
+                return Err(StorageError::Database(
+                    "move would create a cycle (target is self)".to_string(),
+                ));
+            }
+            let desc = collect_descendants(&conn, id)?;
+            if desc.iter().any(|d| d == target) {
+                return Err(StorageError::Database(
+                    "move would create a cycle".to_string(),
+                ));
+            }
+        }
+        let n = conn.execute(
+            "UPDATE user_folders SET parent_id = ?1 WHERE id = ?2",
+            params![normalized, id],
+        )?;
+        if n == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Delete a folder and recursively all descendants + their items.
+    /// Deletion order is children-first; no FK cascade is assumed.
+    pub fn delete_user_folder(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let descendants = collect_descendants(&conn, id)?;
+        let tx = conn.unchecked_transaction()?;
+        // Deepest descendants first (collect_descendants is BFS so we reverse).
+        for desc_id in descendants.iter().rev() {
+            tx.execute(
+                "DELETE FROM user_folder_items WHERE folder_id = ?1",
+                params![desc_id],
+            )?;
+            tx.execute(
+                "DELETE FROM user_folders WHERE id = ?1",
+                params![desc_id],
+            )?;
+        }
+        // Self items + self.
+        tx.execute(
+            "DELETE FROM user_folder_items WHERE folder_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM user_folders WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// List items in a folder. `folder_id = "root"` is valid (virtual root).
+    pub fn list_user_folder_items(
+        &self,
+        folder_id: &str,
+    ) -> StorageResult<Vec<UserFolderItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, ref_kind, ref_key, sort_order, added_at
+             FROM user_folder_items WHERE folder_id = ?1
+             ORDER BY sort_order",
+        )?;
+        let rows = stmt.query_map(params![folder_id], row_to_folder_item)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// Insert an item (or replace its sort_order if the PK already exists).
+    pub fn add_user_folder_item(&self, item: &UserFolderItem) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO user_folder_items
+             (folder_id, ref_kind, ref_key, sort_order, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &item.folder_id,
+                &item.ref_kind,
+                &item.ref_key,
+                item.sort_order,
+                item.added_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a specific item by (folder_id, ref_kind, ref_key).
+    pub fn remove_user_folder_item(
+        &self,
+        folder_id: &str,
+        ref_kind: &str,
+        ref_key: &str,
+    ) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM user_folder_items
+             WHERE folder_id = ?1 AND ref_kind = ?2 AND ref_key = ?3",
+            params![folder_id, ref_kind, ref_key],
+        )?;
+        Ok(())
+    }
 }
 
 // ── Playlist models (storage-local; identity aligns with wdmm-core) ──────────
@@ -848,6 +1073,39 @@ pub struct PlaylistEntry {
     pub title: String,
     /// Duration in milliseconds (0 if unknown).
     pub duration_ms: i64,
+}
+
+// ── User folder models (schema v3) ─────────────────────────────────────────
+
+/// A user-created folder in the library hierarchy.
+///
+/// `parent_id = None` means the folder is a direct child of the virtual root
+/// (`我的文件夹` / Android `kUserFolderRootId = "root"`). The virtual root has
+/// no DB row; its leaf references live in `user_folder_items` with
+/// `folder_id = "root"`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserFolder {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub sort_order: i64,
+    /// Unix timestamp (seconds).
+    pub created_at: i64,
+}
+
+/// An item reference within a user folder.
+///
+/// `folder_id` may be `"root"` (the virtual root; no corresponding DB row).
+/// `ref_kind` is one of `"album"`, `"artist"`, or `"track"` (mirrors Android
+/// `UserFolderRefKind`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserFolderItem {
+    pub folder_id: String,
+    pub ref_kind: String,
+    pub ref_key: String,
+    pub sort_order: i64,
+    /// Unix timestamp (seconds).
+    pub added_at: i64,
 }
 
 fn ts_to_dt(ts: i64) -> StorageResult<DateTime<Utc>> {
@@ -879,14 +1137,64 @@ fn row_to_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryTrack> {
     })
 }
 
+fn row_to_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserFolder> {
+    Ok(UserFolder {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        parent_id: row.get(2)?,
+        sort_order: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+fn row_to_folder_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserFolderItem> {
+    Ok(UserFolderItem {
+        folder_id: row.get(0)?,
+        ref_kind: row.get(1)?,
+        ref_key: row.get(2)?,
+        sort_order: row.get(3)?,
+        added_at: row.get(4)?,
+    })
+}
+
+/// Normalise virtual-root sentinels (`None`, `""`, `"root"`) to `None`
+/// so SQL can use `parent_id IS NULL`.
+fn normalize_parent(parent_id: Option<&str>) -> Option<&str> {
+    match parent_id {
+        None | Some("") | Some("root") => None,
+        Some(s) => Some(s),
+    }
+}
+
+/// BFS-collect all descendant folder IDs of `root_id` (not including root).
+fn collect_descendants(conn: &Connection, root_id: &str) -> StorageResult<Vec<String>> {
+    let mut result = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root_id.to_string());
+    while let Some(parent) = queue.pop_front() {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM user_folders WHERE parent_id = ?1",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![parent], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for child_id in ids {
+            queue.push_back(child_id.clone());
+            result.push(child_id);
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn schema_v2() {
+    fn schema_v3() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -1173,5 +1481,144 @@ mod tests {
 
         // Clean up temp file (best-effort).
         let _ = std::fs::remove_file(&old_path);
+    }
+
+    // ── User folder tests (schema v3) ─────────────────────────────────────────
+
+    #[test]
+    fn user_folder_tree_crud() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        // Virtual root is empty initially.
+        assert!(db.list_user_folder_children(None).unwrap().is_empty());
+        assert!(db.list_user_folder_children(Some("root")).unwrap().is_empty());
+        assert!(db.list_user_folder_children(Some("")).unwrap().is_empty());
+
+        // Create two root-level folders.
+        let f1 = db.create_user_folder("Music", None, None).unwrap();
+        let f2 = db.create_user_folder("Playlists", None, Some(1)).unwrap();
+        assert_eq!(db.list_user_folder_children(None).unwrap().len(), 2);
+
+        // Create a child under f1.
+        let f3 = db.create_user_folder("Rock", Some(&f1.id), None).unwrap();
+        let children = db.list_user_folder_children(Some(&f1.id)).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "Rock");
+
+        // get_user_folder returns correct fields.
+        let fetched = db.get_user_folder(&f2.id).unwrap().unwrap();
+        assert_eq!(fetched.name, "Playlists");
+        assert_eq!(fetched.sort_order, 1);
+        assert!(db.get_user_folder("nonexistent").unwrap().is_none());
+
+        // Rename.
+        db.rename_user_folder(&f1.id, "Musik").unwrap();
+        assert_eq!(db.get_user_folder(&f1.id).unwrap().unwrap().name, "Musik");
+        // NotFound.
+        assert!(db.rename_user_folder("bad-id", "X").is_err());
+
+        // Move f3 from under f1 to under f2.
+        db.move_user_folder(&f3.id, Some(&f2.id)).unwrap();
+        assert!(db.list_user_folder_children(Some(&f1.id)).unwrap().is_empty());
+        assert_eq!(db.list_user_folder_children(Some(&f2.id)).unwrap().len(), 1);
+
+        // Move to virtual root using "" sentinel.
+        db.move_user_folder(&f3.id, Some("")).unwrap();
+        assert_eq!(db.list_user_folder_children(None).unwrap().len(), 3);
+
+        // Cycle rejection: create f4 under f1, then try to move f1 under f4.
+        let f4 = db.create_user_folder("Sub", Some(&f1.id), None).unwrap();
+        let cycle = db.move_user_folder(&f1.id, Some(&f4.id));
+        assert!(cycle.is_err(), "move into own descendant must fail");
+        // Self-move also rejected.
+        assert!(db.move_user_folder(&f1.id, Some(&f1.id)).is_err());
+
+        // Recursive delete: f1 and f4 (child of f1) both removed.
+        db.delete_user_folder(&f1.id).unwrap();
+        assert!(db.get_user_folder(&f1.id).unwrap().is_none());
+        assert!(db.get_user_folder(&f4.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn user_folder_items_crud() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let folder = db.create_user_folder("Favs", None, None).unwrap();
+        let now = Utc::now().timestamp();
+
+        // Add item to virtual root (folder_id = "root").
+        db.add_user_folder_item(&UserFolderItem {
+            folder_id: "root".to_string(),
+            ref_kind: "track".to_string(),
+            ref_key: "sha1abc".to_string(),
+            sort_order: 0,
+            added_at: now,
+        })
+        .unwrap();
+
+        // Add item to named folder.
+        db.add_user_folder_item(&UserFolderItem {
+            folder_id: folder.id.clone(),
+            ref_kind: "album".to_string(),
+            ref_key: "alb-001".to_string(),
+            sort_order: 0,
+            added_at: now,
+        })
+        .unwrap();
+
+        let root_items = db.list_user_folder_items("root").unwrap();
+        assert_eq!(root_items.len(), 1);
+        assert_eq!(root_items[0].ref_kind, "track");
+
+        let folder_items = db.list_user_folder_items(&folder.id).unwrap();
+        assert_eq!(folder_items.len(), 1);
+        assert_eq!(folder_items[0].ref_key, "alb-001");
+
+        // Remove item from root.
+        db.remove_user_folder_item("root", "track", "sha1abc").unwrap();
+        assert!(db.list_user_folder_items("root").unwrap().is_empty());
+
+        // Delete folder — items inside are cleaned up too.
+        db.delete_user_folder(&folder.id).unwrap();
+        assert!(db.list_user_folder_items(&folder.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_folder_recursive_delete_removes_items() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().timestamp();
+
+        let parent = db.create_user_folder("P", None, None).unwrap();
+        let child = db.create_user_folder("C", Some(&parent.id), None).unwrap();
+
+        db.add_user_folder_item(&UserFolderItem {
+            folder_id: child.id.clone(),
+            ref_kind: "artist".to_string(),
+            ref_key: "art-x".to_string(),
+            sort_order: 0,
+            added_at: now,
+        })
+        .unwrap();
+
+        // Delete parent → child and its items must also vanish.
+        db.delete_user_folder(&parent.id).unwrap();
+        assert!(db.get_user_folder(&child.id).unwrap().is_none());
+        assert!(db.list_user_folder_items(&child.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn playlist_crud_unchanged() {
+        // Quick sanity: existing playlist API still works after schema v3.
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now();
+        let pl = Playlist {
+            id: "pl-v3".into(),
+            name: "v3 Test".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        db.upsert_playlist(&pl).unwrap();
+        assert_eq!(db.get_playlist("pl-v3").unwrap().unwrap().name, "v3 Test");
+        db.delete_playlist("pl-v3").unwrap();
+        assert!(db.get_playlist("pl-v3").unwrap().is_none());
     }
 }

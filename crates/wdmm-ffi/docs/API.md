@@ -326,3 +326,150 @@ Returns JSON summary:
 {"already_done":false,"tracks":42,"playlists":3,"entries":120}
 ```
 or `"error:<message>"`. Idempotent (guarded by KV flag `sqflite_imported = 1`).
+
+---
+
+## User folders
+
+Process-global library DB must be initialised via `wdmm_library_init` first.
+
+**Virtual root**: there is no DB row for the root folder. Its label is `我的文件夹`
+(Android `kUserFolderRootId = "root"`). Use `null`, `""`, or `"root"` as
+`parent_id` / `folder_id` to address it. Storage represents virtual-root
+children as rows with `parent_id IS NULL`.
+
+**Ref kinds**: `"album"` | `"artist"` | `"track"` (mirrors Android `UserFolderRefKind`).
+
+### Folder object shape
+```json
+{
+  "id":         "uuid-…",
+  "name":       "Rock",
+  "parent_id":  null,
+  "sort_order": 0,
+  "created_at": 1700000000
+}
+```
+`parent_id` is `null` for virtual-root children.
+
+### Item object shape
+```json
+{
+  "folder_id":  "uuid-… | root",
+  "ref_kind":   "track",
+  "ref_key":    "sha1hex…",
+  "sort_order": 0,
+  "added_at":   1700000000
+}
+```
+
+---
+
+### `extern "C" fn wdmm_user_folder_list_children(parent_id: *const c_char) -> FfiString`
+List direct children of a folder. `parent_id` null / `""` / `"root"` → virtual
+root (rows with `parent_id IS NULL`). Returns a JSON array of folder objects
+(ordered by `sort_order`, then name), or `"error:<message>"`.
+
+### `extern "C" fn wdmm_user_folder_create(json: *const c_char) -> FfiString`
+Create a folder. Input:
+```json
+{"name":"Rock","parent_id":null,"sort_order":0}
+```
+`parent_id` absent/null/`"root"` → virtual root. A UUID `id` is generated.
+Returns the new folder as JSON, or `"error:<message>"`.
+
+### `extern "C" fn wdmm_user_folder_rename(id: *const c_char, name: *const c_char) -> FfiString`
+Rename a folder by id. Returns `"ok"` or `"error:<message>"` (including
+`"error:not found: …"` if the id is absent).
+
+### `extern "C" fn wdmm_user_folder_move(id: *const c_char, new_parent_id: *const c_char) -> FfiString`
+Move a folder to a new parent. `new_parent_id` null / `""` / `"root"` → virtual
+root. Returns `"ok"` or `"error:<message>"` (including `"error:…cycle…"` when
+the move would create a cycle).
+
+### `extern "C" fn wdmm_user_folder_delete(id: *const c_char) -> FfiString`
+Delete a folder and recursively all descendants + their items (child-first; no
+FK cascade required). Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_user_folder_list_items(folder_id: *const c_char) -> FfiString`
+List items in a folder. `folder_id = "root"` is valid (virtual root items).
+Returns a JSON array of item objects ordered by `sort_order`, or
+`"error:<message>"`.
+
+### `extern "C" fn wdmm_user_folder_add_item(json: *const c_char) -> FfiString`
+Insert or update an item reference. Input:
+```json
+{"folder_id":"uuid… | root","ref_kind":"album","ref_key":"…","sort_order":0}
+```
+`added_at` defaults to the current Unix timestamp if absent.
+Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_user_folder_remove_item(folder_id: *const c_char, ref_kind: *const c_char, ref_key: *const c_char) -> FfiString`
+Remove a specific item by `(folder_id, ref_kind, ref_key)`. Returns `"ok"` or
+`"error:<message>"`.
+
+---
+
+## Playlists
+
+Process-global library DB must be initialised via `wdmm_library_init` first.
+
+### Playlist object shape
+```json
+{
+  "id":         "uuid-…",
+  "name":       "Favourites",
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-01-01T00:00:00Z"
+}
+```
+
+### Entry object shape
+```json
+{
+  "playlist_id": "uuid-…",
+  "position":    0,
+  "music_id":    "sha1hex…",
+  "source_name": "my_nas",
+  "remote_path": "/music/song.mp3",
+  "title":       "Song Title",
+  "duration_ms": 210000
+}
+```
+
+---
+
+### `extern "C" fn wdmm_playlist_list() -> FfiString`
+List all playlists. Returns a JSON array of playlist objects ordered by name,
+or `"error:<message>"`.
+
+### `extern "C" fn wdmm_playlist_create(json: *const c_char) -> FfiString`
+Create a playlist. Input:
+```json
+{"id":"optional-uuid","name":"My Mix"}
+```
+`id` is generated (UUID v4) if absent. Returns the new playlist as JSON, or
+`"error:<message>"`.
+
+### `extern "C" fn wdmm_playlist_delete(id: *const c_char) -> FfiString`
+Delete a playlist and all its entries (ON DELETE CASCADE). Returns `"ok"` or
+`"error:<message>"`.
+
+### `extern "C" fn wdmm_playlist_list_entries(id: *const c_char) -> FfiString`
+List entries of a playlist ordered by `position`. Returns a JSON array of entry
+objects, or `"error:<message>"`.
+
+### `extern "C" fn wdmm_playlist_set_entries(id: *const c_char, json_array: *const c_char) -> FfiString`
+Replace **all** entries of a playlist in one shot. Input is a JSON array:
+```json
+[
+  {"music_id":"sha1…","source_name":"nas","remote_path":"/m/a.mp3",
+   "title":"A","duration_ms":180000},
+  {"music_id":"sha1…","source_name":"nas","remote_path":"/m/b.mp3",
+   "title":"B","duration_ms":240000}
+]
+```
+`position` is assigned by array index (0-based). The previous entries are
+deleted atomically before the new ones are inserted (transaction). Returns
+`"ok"` or `"error:<message>"`.
+
