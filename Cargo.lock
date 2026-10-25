@@ -1919,12 +1919,16 @@ dependencies = [
 name = "wdmm-sync"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "base64",
  "chrono",
  "futures",
+ "pbkdf2",
+ "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

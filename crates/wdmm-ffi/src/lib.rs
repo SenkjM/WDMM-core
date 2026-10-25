@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 use wdmm_queue::TaskQueue;
-use wdmm_storage::LibraryDatabase;
+use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase};
 
 // ── Runtime singleton ─────────────────────────────────────────────────────────
 
@@ -2442,6 +2442,225 @@ fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrac
         mime_type: v["mime_type"].as_str().map(Into::into),
     })
 }
+
+
+// ── DMR prefs (independent DB) ───────────────────────────────────────────────
+
+static DMR_PREFS_DB: OnceLock<std::sync::Arc<DmrPrefsDatabase>> = OnceLock::new();
+
+fn global_dmr_prefs_db() -> &'static std::sync::Arc<DmrPrefsDatabase> {
+    DMR_PREFS_DB.get_or_init(|| {
+        std::sync::Arc::new(
+            DmrPrefsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("FFI: failed to open in-memory dmr_prefs DB"),
+        )
+    })
+}
+
+/// Initialise the independent DMR prefs DB. Path or `":memory:"`.
+#[no_mangle]
+pub extern "C" fn wdmm_dmr_prefs_init(path: *const c_char) -> FfiString {
+    let p = match ptr_to_str(path) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid path pointer"),
+    };
+    DMR_PREFS_DB.get_or_init(|| {
+        std::sync::Arc::new(
+            DmrPrefsDatabase::open(std::path::Path::new(p))
+                .expect("FFI: failed to open dmr_prefs DB"),
+        )
+    });
+    FfiString::ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_dmr_prefs_list() -> FfiString {
+    match global_dmr_prefs_db().list() {
+        Ok(rows) => match serde_json::to_string(&rows) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_dmr_prefs_get(usn: *const c_char) -> FfiString {
+    let usn = match ptr_to_str(usn) {
+        Some(s) => s,
+        None => return FfiString::from("error:null usn"),
+    };
+    match global_dmr_prefs_db().get(usn) {
+        Ok(Some(r)) => match serde_json::to_string(&r) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_dmr_prefs_upsert(json: *const c_char) -> FfiString {
+    let raw = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json"),
+    };
+    let mut pref: DmrPrefRow = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json: {e}")),
+    };
+    if pref.usn.trim().is_empty() {
+        return FfiString::from("error:missing usn");
+    }
+    if pref.updated_at.is_empty() {
+        pref.updated_at = chrono::Utc::now().to_rfc3339();
+    }
+    match global_dmr_prefs_db().upsert(&pref) {
+        Ok(()) => match serde_json::to_string(&pref) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_dmr_prefs_delete(usn: *const c_char) -> FfiString {
+    let usn = match ptr_to_str(usn) {
+        Some(s) => s,
+        None => return FfiString::from("error:null usn"),
+    };
+    match global_dmr_prefs_db().delete(usn) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Backup archive FFI (WDMMBK01 / WDMMEN01) ──────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn wdmm_backup_create(passphrase: *const c_char, out_path: *const c_char) -> FfiString {
+    let pass = ptr_to_str(passphrase).unwrap_or("");
+    let path = match ptr_to_str(out_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null out_path"),
+    };
+    match wdmm_sync::write_backup_file(
+        global_library_db().as_ref(),
+        Some(global_dmr_prefs_db().as_ref()),
+        pass,
+        std::path::Path::new(path),
+    ) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_backup_restore(passphrase: *const c_char, path: *const c_char) -> FfiString {
+    let pass = ptr_to_str(passphrase).unwrap_or("");
+    let path = match ptr_to_str(path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null path"),
+    };
+    match wdmm_sync::restore_backup_file(
+        global_library_db().as_ref(),
+        Some(global_dmr_prefs_db().as_ref()),
+        pass,
+        std::path::Path::new(path),
+    ) {
+        Ok(msg) => FfiString::from(msg),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_backup_upload(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    remote_dir: *const c_char,
+    passphrase: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let wpass = ptr_to_str(webdav_pass).unwrap_or("");
+    let dir = ptr_to_str(remote_dir).unwrap_or("/WebdavMediaManager/backup/");
+    let pass = ptr_to_str(passphrase).unwrap_or("");
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, wpass) {
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+    let lib = std::sync::Arc::clone(global_library_db());
+    let dmr = Some(std::sync::Arc::clone(global_dmr_prefs_db()));
+    match rt().block_on(wdmm_sync::backup_upload(lib, dmr, driver, dir, pass)) {
+        Ok(path) => FfiString::from(path),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_backup_list(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    remote_dir: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let wpass = ptr_to_str(webdav_pass).unwrap_or("");
+    let dir = ptr_to_str(remote_dir).unwrap_or("/WebdavMediaManager/backup/");
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, wpass) {
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+    match rt().block_on(wdmm_sync::backup_list(driver, dir)) {
+        Ok(names) => match serde_json::to_string(&names) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wdmm_backup_download_restore(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    remote_file: *const c_char,
+    passphrase: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let wpass = ptr_to_str(webdav_pass).unwrap_or("");
+    let remote = match ptr_to_str(remote_file) {
+        Some(s) => s,
+        None => return FfiString::from("error:null remote_file"),
+    };
+    let pass = ptr_to_str(passphrase).unwrap_or("");
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, wpass) {
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+    let lib = std::sync::Arc::clone(global_library_db());
+    let dmr = Some(std::sync::Arc::clone(global_dmr_prefs_db()));
+    match rt().block_on(wdmm_sync::backup_download_restore(lib, dmr, driver, remote, pass)) {
+        Ok(msg) => FfiString::from(msg),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

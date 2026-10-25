@@ -678,3 +678,56 @@ Insert-or-replace. Returns the account JSON (with `credentials_b64`) or `"error:
 
 ### Sync note
 `wdmm_sync_trigger` uses the process-global library DB (same as account/playlist/manga).
+
+---
+
+## DMR prefs (independent DB)
+
+USN-keyed cast compatibility preferences live in a **separate** SQLite DB from
+`library.db` (default path chosen by the host via `wdmm_dmr_prefs_init`).
+
+JSON row shape:
+```json
+{"usn":"uuid:…","force_direct":true,"override_name":"Living Room","updated_at":"…"}
+```
+
+### `extern "C" fn wdmm_dmr_prefs_init(path: *const c_char) -> FfiString`
+Open/create the prefs DB. `":memory:"` allowed. OnceLock — later calls no-op.
+
+### `extern "C" fn wdmm_dmr_prefs_list() -> FfiString`
+JSON array of rows.
+
+### `extern "C" fn wdmm_dmr_prefs_get(usn: *const c_char) -> FfiString`
+One row JSON, `"null"`, or `"error:…"`.
+
+### `extern "C" fn wdmm_dmr_prefs_upsert(json: *const c_char) -> FfiString`
+Insert-or-replace; returns stored row JSON.
+
+### `extern "C" fn wdmm_dmr_prefs_delete(usn: *const c_char) -> FfiString`
+`"ok"` or `"error:…"`.
+
+---
+
+## Backup archive (WDMMBK01 / WDMMEN01)
+
+Whole-app backup matching Android sync/backup surface. Container magic
+`WDMMBK01` (raw JSON section payloads). Optional passphrase wraps with
+`WDMMEN01` (AES-256-GCM, PBKDF2-HMAC-SHA256 120000 iters — Android `BackupCrypto`).
+
+Sections include credentials, library tracks, playlists, settings KV, manga,
+user folders, and **dmr_prefs** (section id 16).
+
+### `extern "C" fn wdmm_backup_create(passphrase, out_path) -> FfiString`
+Write archive file from global library + dmr prefs DBs.
+
+### `extern "C" fn wdmm_backup_restore(passphrase, path) -> FfiString`
+Restore archive into global DBs. Returns `ok:restored:…` summary.
+
+### `extern "C" fn wdmm_backup_upload(webdav_url, user, pass, remote_dir, passphrase) -> FfiString`
+Create + PUT timestamped `.wdmm` under `remote_dir`. Returns remote path.
+
+### `extern "C" fn wdmm_backup_list(webdav_url, user, pass, remote_dir) -> FfiString`
+JSON string array of remote backup filenames.
+
+### `extern "C" fn wdmm_backup_download_restore(webdav_url, user, pass, remote_file, passphrase) -> FfiString`
+GET + restore.
