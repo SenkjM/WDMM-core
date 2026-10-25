@@ -1905,9 +1905,11 @@ name = "wdmm-storage"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
  "thiserror 1.0.69",
  "uuid",
  "wdmm-core",

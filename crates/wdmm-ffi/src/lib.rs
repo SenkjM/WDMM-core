@@ -1904,6 +1904,203 @@ pub extern "C" fn wdmm_settings_set_network_last_path(path: *const c_char) -> Ff
     FfiString::ok()
 }
 
+// ── Manga FFI ─────────────────────────────────────────────────────────────────
+
+/// Return all mangas in the library as a JSON array.
+/// Returns `"error:…"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_list() -> FfiString {
+    let db = global_library_db();
+    match db.list_mangas() {
+        Ok(mangas) => match serde_json::to_string(&mangas) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get a single manga by id. Returns the manga as JSON or `"null"` if not found.
+/// `id` must be a valid null-terminated UTF-8 C string.
+/// Returns `"error:…"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_get(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    let db = global_library_db();
+    match db.get_manga(id) {
+        Ok(Some(m)) => match serde_json::to_string(&m) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Upsert a manga. `json` is the manga serialised as a JSON object.
+/// Returns `"ok"` or `"error:…"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_upsert(json: *const c_char) -> FfiString {
+    let raw = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let manga: wdmm_storage::Manga = match serde_json::from_str(raw) {
+        Ok(m) => m,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    match global_library_db().upsert_manga(&manga) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a manga (cascades to pages + progress; writes a `deleted_mangas` tombstone).
+/// `id` must be a valid null-terminated UTF-8 C string.
+/// Returns `"ok"`, `"not_found"`, or `"error:…"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_delete(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().delete_manga(id) {
+        Ok(()) => FfiString::ok(),
+        Err(wdmm_storage::StorageError::NotFound(_)) => FfiString::from("not_found"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List all pages for a manga as a JSON array.
+/// `manga_id` must be a valid null-terminated UTF-8 C string.
+/// Returns `"error:…"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_list_pages(manga_id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(manga_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null manga_id pointer"),
+    };
+    match global_library_db().list_pages(id) {
+        Ok(pages) => match serde_json::to_string(&pages) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Atomically replace all pages for a manga.
+/// `manga_id` must be a valid null-terminated UTF-8 C string.
+/// `json_array` is a JSON array of `{"manga_id","page_index","rel_path"}` objects.
+/// Returns `"ok"` or `"error:…"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_set_pages(
+    manga_id: *const c_char,
+    json_array: *const c_char,
+) -> FfiString {
+    let id = match ptr_to_str(manga_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null manga_id pointer"),
+    };
+    let raw = match ptr_to_str(json_array) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json_array pointer"),
+    };
+    let pages: Vec<wdmm_storage::MangaPage> = match serde_json::from_str(raw) {
+        Ok(p) => p,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    match global_library_db().replace_pages(id, &pages) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get the reading progress for a manga. Returns the progress as JSON or `"null"`.
+/// `manga_id` must be a valid null-terminated UTF-8 C string.
+/// Returns `"error:…"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_get_progress(manga_id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(manga_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null manga_id pointer"),
+    };
+    match global_library_db().get_progress(id) {
+        Ok(Some(p)) => match serde_json::to_string(&p) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Set (upsert) the reading progress for a manga.
+/// `manga_id` must be a valid null-terminated UTF-8 C string.
+/// `page_index` is the current 0-based page index.
+/// Returns `"ok"` or `"error:…"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_set_progress(
+    manga_id: *const c_char,
+    page_index: i64,
+) -> FfiString {
+    let id = match ptr_to_str(manga_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null manga_id pointer"),
+    };
+    match global_library_db().set_progress(id, page_index) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List reading progress for all mangas as a JSON array.
+/// Returns `"error:…"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_list_progress() -> FfiString {
+    match global_library_db().list_progress() {
+        Ok(progress) => match serde_json::to_string(&progress) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List distinct series tags as a JSON array of `{"id","title"}` objects.
+///
+/// The `id` field is `sha1("mangaSeries" ‖ title)` encoded as lower-case hex.
+/// Returns `"error:…"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_list_series() -> FfiString {
+    match global_library_db().list_series_tags() {
+        Ok(tags) => match serde_json::to_string(&tags) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Queue concurrency FFI ─────────────────────────────────────────────────────
+
+/// Return the current queue concurrency limit (1–8).
+#[no_mangle]
+pub extern "C" fn wdmm_queue_get_concurrency() -> i32 {
+    global_queue().concurrency() as i32
+}
+
+/// Set the queue concurrency limit. `n` is clamped to `1..=8`.
+/// Returns `"ok"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_queue_set_concurrency(n: i32) -> FfiString {
+    global_queue().set_concurrency(n.max(1) as usize);
+    FfiString::ok()
+}
+
 // ── JSON → model helpers ──────────────────────────────────────────────────────
 
 fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrack, String> {
@@ -2860,6 +3057,179 @@ mod tests {
         let r = wdmm_user_folder_delete(fid.as_ptr());
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+    }
+
+    // ── Manga FFI smoke tests ────────────────────────────────────────────────
+
+    #[test]
+    fn manga_ffi_smoke() {
+        use std::ffi::CString;
+
+        // ── list (empty) ──────────────────────────────────────────────────────
+        let r = wdmm_manga_list();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(
+            !s.starts_with("error:"),
+            "wdmm_manga_list failed: {s}"
+        );
+        let arr: serde_json::Value = serde_json::from_str(s).expect("list must be JSON");
+        assert!(arr.is_array(), "list must be an array");
+        wdmm_ffi_free_string(r);
+
+        // ── upsert ────────────────────────────────────────────────────────────
+        let manga_id = "ffi-manga-1";
+        let json = serde_json::json!({
+            "id": manga_id,
+            "source_name": "nas",
+            "remote_path": "/manga/test.cbz",
+            "title": "FFI Test Manga",
+            "author": "Author",
+            "series": "FFI Series",
+            "volume": "1",
+            "chapter_number": "1",
+            "page_count": 2,
+            "cover_relpath": null,
+            "format": "cbz",
+            "remote_missing": 0,
+            "page_turn": "ltr",
+            "rev": 0,
+            "updated_at": "2026-01-01T00:00:00+00:00"
+        })
+        .to_string();
+        let cjson = CString::new(json).unwrap();
+        let r = wdmm_manga_upsert(cjson.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "wdmm_manga_upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // ── get ───────────────────────────────────────────────────────────────
+        let cid = CString::new(manga_id).unwrap();
+        let r = wdmm_manga_get(cid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "wdmm_manga_get failed: {s}");
+        assert_ne!(s, "null", "manga must exist after upsert");
+        let got: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(got["title"], "FFI Test Manga");
+        wdmm_ffi_free_string(r);
+
+        // ── list (now 1) ──────────────────────────────────────────────────────
+        let r = wdmm_manga_list();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(arr.as_array().unwrap().len() >= 1);
+        wdmm_ffi_free_string(r);
+
+        // ── set_pages ─────────────────────────────────────────────────────────
+        let pages_json = serde_json::json!([
+            {"manga_id": manga_id, "page_index": 0, "rel_path": "p0.jpg"},
+            {"manga_id": manga_id, "page_index": 1, "rel_path": "p1.jpg"}
+        ])
+        .to_string();
+        let cmid = CString::new(manga_id).unwrap();
+        let cpages = CString::new(pages_json).unwrap();
+        let r = wdmm_manga_set_pages(cmid.as_ptr(), cpages.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "wdmm_manga_set_pages failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // ── list_pages ────────────────────────────────────────────────────────
+        let cmid = CString::new(manga_id).unwrap();
+        let r = wdmm_manga_list_pages(cmid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "wdmm_manga_list_pages failed: {s}");
+        let pages_arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(pages_arr.as_array().unwrap().len(), 2);
+        wdmm_ffi_free_string(r);
+
+        // ── set_progress ──────────────────────────────────────────────────────
+        let cmid = CString::new(manga_id).unwrap();
+        let r = wdmm_manga_set_progress(cmid.as_ptr(), 1);
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "wdmm_manga_set_progress failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // ── get_progress ──────────────────────────────────────────────────────
+        let cmid = CString::new(manga_id).unwrap();
+        let r = wdmm_manga_get_progress(cmid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "wdmm_manga_get_progress failed: {s}");
+        assert_ne!(s, "null", "progress must exist after set");
+        let prog: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(prog["page_index"], 1);
+        wdmm_ffi_free_string(r);
+
+        // ── list_progress ─────────────────────────────────────────────────────
+        let r = wdmm_manga_list_progress();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "wdmm_manga_list_progress failed: {s}");
+        let prog_arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(prog_arr.as_array().unwrap().len() >= 1);
+        wdmm_ffi_free_string(r);
+
+        // ── list_series ───────────────────────────────────────────────────────
+        let r = wdmm_manga_list_series();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "wdmm_manga_list_series failed: {s}");
+        let series_arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        let series = series_arr.as_array().unwrap();
+        assert!(
+            series.iter().any(|it| it["title"] == "FFI Series"),
+            "series tag 'FFI Series' missing from: {series_arr}"
+        );
+        wdmm_ffi_free_string(r);
+
+        // ── delete ────────────────────────────────────────────────────────────
+        let cid = CString::new(manga_id).unwrap();
+        let r = wdmm_manga_delete(cid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "wdmm_manga_delete failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // ── get after delete returns null ─────────────────────────────────────
+        let cid = CString::new(manga_id).unwrap();
+        let r = wdmm_manga_get(cid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null", "manga must be gone after delete");
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn manga_delete_not_found() {
+        let cid = std::ffi::CString::new("does-not-exist").unwrap();
+        let r = wdmm_manga_delete(cid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "not_found");
+        wdmm_ffi_free_string(r);
+    }
+
+    // ── Queue concurrency FFI tests ──────────────────────────────────────────
+
+    #[test]
+    fn queue_concurrency_ffi() {
+        // get default
+        let initial = wdmm_queue_get_concurrency();
+        assert!(initial >= 1, "default concurrency must be >= 1");
+
+        // set to 3
+        let r = wdmm_queue_set_concurrency(3);
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "set_concurrency failed: {s}");
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_queue_get_concurrency(), 3);
+
+        // clamp: 0 → 1
+        let r = wdmm_queue_set_concurrency(0);
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_queue_get_concurrency(), 1);
+
+        // clamp: 100 → 8
+        let r = wdmm_queue_set_concurrency(100);
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_queue_get_concurrency(), 8);
+
+        // restore initial
+        let r = wdmm_queue_set_concurrency(initial);
         wdmm_ffi_free_string(r);
     }
 }

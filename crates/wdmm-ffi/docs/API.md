@@ -527,3 +527,110 @@ Never reads from the KV store.
 ### `extern "C" fn wdmm_settings_set_network_last_path(path: *const c_char) -> FfiString`
 Set the session-only path (in-process only; never persisted). Returns `"ok"`.
 
+---
+
+## Manga (schema v4)
+
+Manga storage added in Wave D. Schema: `mangas`, `manga_pages`, `manga_progress`,
+`deleted_mangas` tables. The `manga_series` / `manga_chapters` stub tables from
+earlier schemas are dropped by the v4 migration.
+
+### Manga object shape
+```json
+{
+  "id":             "string (UUID or app-chosen)",
+  "source_name":    "string",
+  "remote_path":    "string",
+  "title":          "string",
+  "author":         "string|null",
+  "series":         "string|null",
+  "volume":         "string|null",
+  "chapter_number": "string|null",
+  "page_count":     0,
+  "cover_relpath":  "string|null",
+  "format":         "cbz|pdf|images|unknown",
+  "remote_missing": 0,
+  "page_turn":      "ltr|rtl|null",
+  "rev":            0,
+  "updated_at":     "RFC-3339 string"
+}
+```
+
+**Partial unique index:** `(source_name, remote_path)` must be unique when
+`format <> 'images'`. Multiple entries with `format = 'images'` at the same path
+are allowed (loose-image folders that may be distinct volumes/chapters).
+
+### Page object shape
+```json
+{"manga_id": "string", "page_index": 0, "rel_path": "string"}
+```
+
+### Progress object shape
+```json
+{"manga_id": "string", "page_index": 0, "updated_at": "RFC-3339 string"}
+```
+
+### Series id formula
+```
+sha1( utf8("mangaSeries") || utf8(title) )   encoded as lower-case hex
+```
+This matches the client-side `mangaSeriesId` helper. The formula is implemented
+in `wdmm_storage::series_id_for_title`.
+
+### `extern "C" fn wdmm_manga_list() -> FfiString`
+Return all mangas as a JSON array, ordered by `updated_at DESC`.
+Returns `"error:…"` on failure.
+
+### `extern "C" fn wdmm_manga_get(id: *const c_char) -> FfiString`
+Get a single manga by id. Returns the manga as JSON, `"null"` if not found, or
+`"error:…"` on failure.
+
+### `extern "C" fn wdmm_manga_upsert(json: *const c_char) -> FfiString`
+Insert or replace a manga. `json` must be a UTF-8 manga JSON object (all fields
+required; use `null` for optional fields). Returns `"ok"` or `"error:…"`.
+
+### `extern "C" fn wdmm_manga_delete(id: *const c_char) -> FfiString`
+Delete a manga. Cascades to `manga_pages` and `manga_progress`. Appends a row to
+`deleted_mangas` with `sync_key = "{source_name}:{remote_path}"` and `pushed = 0`.
+Returns `"ok"`, `"not_found"`, or `"error:…"`.
+
+### `extern "C" fn wdmm_manga_list_pages(manga_id: *const c_char) -> FfiString`
+Return all pages for a manga as a JSON array ordered by `page_index`.
+Returns `"error:…"` on failure.
+
+### `extern "C" fn wdmm_manga_set_pages(manga_id: *const c_char, json_array: *const c_char) -> FfiString`
+Atomically replace all pages for a manga. `json_array` is a JSON array of page
+objects. Existing pages are deleted before the new ones are inserted.
+Returns `"ok"` or `"error:…"`.
+
+### `extern "C" fn wdmm_manga_get_progress(manga_id: *const c_char) -> FfiString`
+Get reading progress for a manga. Returns the progress JSON object, `"null"` if no
+progress recorded, or `"error:…"`.
+
+### `extern "C" fn wdmm_manga_set_progress(manga_id: *const c_char, page_index: i64) -> FfiString`
+Upsert reading progress (0-based page index). Returns `"ok"` or `"error:…"`.
+
+### `extern "C" fn wdmm_manga_list_progress() -> FfiString`
+Return reading progress for all mangas as a JSON array ordered by `updated_at DESC`.
+Returns `"error:…"` on failure.
+
+### `extern "C" fn wdmm_manga_list_series() -> FfiString`
+Return distinct non-null series tags as a JSON array of `{"id","title"}` objects,
+ordered alphabetically (case-insensitive). The `id` field is derived via the
+series id formula above. Returns `"error:…"` on failure.
+
+---
+
+## Queue concurrency (Wave D)
+
+The default concurrency is **1** (serial FIFO, matching the original Dart behaviour).
+Set it higher to allow `ConcurrentPump` to run multiple tasks in parallel.
+
+### `extern "C" fn wdmm_queue_get_concurrency() -> i32`
+Return the current concurrency limit (always in `[1, 8]`).
+
+### `extern "C" fn wdmm_queue_set_concurrency(n: i32) -> FfiString`
+Set the concurrency limit. `n` is clamped to `1..=8`.
+Returns `"ok"`. Caller must free the result.
+
+

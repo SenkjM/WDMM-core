@@ -1,4 +1,4 @@
-//! `wdmm-storage` — rusqlite library DB (schema v3, music library essentials).
+//! `wdmm-storage` — rusqlite library DB (schema v4, music + manga library).
 //!
 //! Schema v1 (Round 4): base tables.
 //! Schema v2 (Round 5): artists/albums tables, extended `tracks` columns,
@@ -7,6 +7,8 @@
 //!   add `sort_order`), new `user_folder_items` table + indexes. Migrations are
 //!   idempotent: base DDL uses `IF NOT EXISTS`; v3 ALTER statements ignore
 //!   duplicate-column errors so opening any DB version converges to v3.
+//! Schema v4 (Wave D): replace manga stubs with real `mangas` / `manga_pages` /
+//!   `manga_progress` / `deleted_mangas` tables.
 
 #![forbid(unsafe_code)]
 
@@ -46,6 +48,80 @@ pub struct ImportSummary {
     pub playlists: usize,
     /// Number of playlist entries inserted.
     pub entries: usize,
+}
+
+/// A manga item stored in the library.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Manga {
+    pub id: String,
+    pub source_name: String,
+    pub remote_path: String,
+    pub title: String,
+    pub author: Option<String>,
+    pub series: Option<String>,
+    pub volume: Option<String>,
+    pub chapter_number: Option<String>,
+    pub page_count: i64,
+    pub cover_relpath: Option<String>,
+    /// Format tag (e.g. `"cbz"`, `"pdf"`, `"images"`, `"unknown"`).
+    pub format: String,
+    /// Non-zero when the remote source no longer has this file.
+    pub remote_missing: i64,
+    pub page_turn: Option<String>,
+    pub rev: i64,
+    /// RFC-3339 timestamp string.
+    pub updated_at: String,
+}
+
+/// A single page within a [`Manga`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MangaPage {
+    pub manga_id: String,
+    pub page_index: i64,
+    pub rel_path: String,
+}
+
+/// Reading progress for a manga.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MangaProgress {
+    pub manga_id: String,
+    pub page_index: i64,
+    /// RFC-3339 timestamp string.
+    pub updated_at: String,
+}
+
+/// Tombstone appended to `deleted_mangas` when a manga is deleted locally.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeletedManga {
+    pub manga_id: String,
+    pub source_name: String,
+    pub remote_path: String,
+    pub sync_key: String,
+    pub rev: Option<i64>,
+    /// RFC-3339 timestamp string.
+    pub deleted_at: String,
+    /// `1` once the tombstone has been pushed to the sync server.
+    pub pushed: i64,
+}
+
+/// A distinct series tag with its derived id.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SeriesTag {
+    /// SHA-1 hex of `"mangaSeries"` ‖ `title`. See [`series_id_for_title`].
+    pub id: String,
+    pub title: String,
+}
+
+/// Derive the series id from a series title.
+///
+/// Formula: `sha1(utf8("mangaSeries") || utf8(title))` encoded as lower-case hex.
+/// Matches the client-side `mangaSeriesId` helper.
+pub fn series_id_for_title(title: &str) -> String {
+    use sha1::Digest as _;
+    let mut h = sha1::Sha1::new();
+    h.update(b"mangaSeries");
+    h.update(title.as_bytes());
+    hex::encode(h.finalize())
 }
 
 pub struct LibraryDatabase {
@@ -181,23 +257,52 @@ impl LibraryDatabase {
                 updated_at INTEGER NOT NULL
             );
 
-            -- ── Manga stubs (skeleton — Round 6 for full parity) ─────────────
-            CREATE TABLE IF NOT EXISTS manga_series (
-                id          TEXT PRIMARY KEY,
-                title       TEXT NOT NULL,
-                source_name TEXT NOT NULL,
-                remote_path TEXT NOT NULL,
-                created_at  INTEGER NOT NULL
+            -- ── Manga (schema v4) ─────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS mangas (
+                id              TEXT NOT NULL PRIMARY KEY,
+                source_name     TEXT NOT NULL,
+                remote_path     TEXT NOT NULL,
+                title           TEXT NOT NULL,
+                author          TEXT,
+                series          TEXT,
+                volume          TEXT,
+                chapter_number  TEXT,
+                page_count      INTEGER NOT NULL DEFAULT 0,
+                cover_relpath   TEXT,
+                format          TEXT NOT NULL DEFAULT 'unknown',
+                remote_missing  INTEGER NOT NULL DEFAULT 0,
+                page_turn       TEXT,
+                rev             INTEGER NOT NULL DEFAULT 0,
+                updated_at      TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS manga_chapters (
-                id          TEXT PRIMARY KEY,
-                series_id   TEXT NOT NULL,
-                title       TEXT,
-                remote_path TEXT NOT NULL,
-                page_count  INTEGER NOT NULL DEFAULT 0,
-                created_at  INTEGER NOT NULL,
-                FOREIGN KEY (series_id) REFERENCES manga_series(id) ON DELETE CASCADE
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mangas_source_path
+                ON mangas (source_name, remote_path)
+                WHERE format <> 'images';
+
+            CREATE TABLE IF NOT EXISTS manga_pages (
+                manga_id    TEXT    NOT NULL,
+                page_index  INTEGER NOT NULL,
+                rel_path    TEXT    NOT NULL,
+                PRIMARY KEY (manga_id, page_index),
+                FOREIGN KEY (manga_id) REFERENCES mangas(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS manga_progress (
+                manga_id    TEXT    PRIMARY KEY,
+                page_index   INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT    NOT NULL,
+                FOREIGN KEY (manga_id) REFERENCES mangas(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS deleted_mangas (
+                manga_id    TEXT    PRIMARY KEY,
+                source_name TEXT    NOT NULL,
+                remote_path TEXT    NOT NULL,
+                sync_key    TEXT    NOT NULL,
+                rev         INTEGER,
+                deleted_at  TEXT    NOT NULL,
+                pushed      INTEGER NOT NULL DEFAULT 0
             );
             "#,
         )?;
@@ -242,6 +347,25 @@ impl LibraryDatabase {
             )?;
             conn.execute(
                 "INSERT OR IGNORE INTO _schema_version (version) VALUES (3)",
+                [],
+            )?;
+        }
+
+        // ── v4 migration: drop manga stubs; real tables live in base DDL above ──
+        // The v1/v2 base DDL created `manga_series` / `manga_chapters` stubs. The
+        // current base DDL instead creates the real `mangas` / `manga_pages` /
+        // `manga_progress` / `deleted_mangas` tables with `IF NOT EXISTS`, so for
+        // an upgrading DB they are already present by the time we reach here —
+        // we only need to drop the obsolete stubs and record the new version.
+        if current_ver < 4 {
+            conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS manga_chapters;
+                DROP TABLE IF EXISTS manga_series;
+                "#,
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (4)",
                 [],
             )?;
         }
@@ -1080,6 +1204,185 @@ impl LibraryDatabase {
         tx.commit()?;
         Ok(())
     }
+
+    // ── Manga (schema v4) ─────────────────────────────────────────────────────
+
+    pub fn list_mangas(&self) -> StorageResult<Vec<Manga>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_name, remote_path, title, author, series, volume,
+                    chapter_number, page_count, cover_relpath, format,
+                    remote_missing, page_turn, rev, updated_at
+             FROM mangas ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_manga)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    pub fn get_manga(&self, id: &str) -> StorageResult<Option<Manga>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_name, remote_path, title, author, series, volume,
+                    chapter_number, page_count, cover_relpath, format,
+                    remote_missing, page_turn, rev, updated_at
+             FROM mangas WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_manga(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn upsert_manga(&self, m: &Manga) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO mangas
+             (id, source_name, remote_path, title, author, series, volume,
+              chapter_number, page_count, cover_relpath, format,
+              remote_missing, page_turn, rev, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                &m.id, &m.source_name, &m.remote_path, &m.title,
+                &m.author, &m.series, &m.volume, &m.chapter_number,
+                m.page_count, &m.cover_relpath, &m.format, m.remote_missing,
+                &m.page_turn, m.rev, &m.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a manga. Cascades to `manga_pages` and `manga_progress`. Appends
+    /// a tombstone row to `deleted_mangas` using `source_name:remote_path` as
+    /// the `sync_key` and the current UTC timestamp for `deleted_at`.
+    pub fn delete_manga(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        // Look up the manga to build the tombstone.
+        let (source_name, remote_path, rev) = {
+            let mut stmt = conn.prepare(
+                "SELECT source_name, remote_path, rev FROM mangas WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(params![id])?;
+            match rows.next()? {
+                Some(r) => (
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ),
+                None => return Err(StorageError::NotFound(id.to_string())),
+            }
+        };
+        let sync_key = format!("{}:{}", source_name, remote_path);
+        let deleted_at = Utc::now().to_rfc3339();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO deleted_mangas
+             (manga_id, source_name, remote_path, sync_key, rev, deleted_at, pushed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![id, &source_name, &remote_path, &sync_key, rev, &deleted_at],
+        )?;
+        // ON DELETE CASCADE removes manga_pages and manga_progress.
+        tx.execute("DELETE FROM mangas WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_pages(&self, manga_id: &str) -> StorageResult<Vec<MangaPage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT manga_id, page_index, rel_path
+             FROM manga_pages WHERE manga_id = ?1 ORDER BY page_index",
+        )?;
+        let rows = stmt.query_map(params![manga_id], |row| {
+            Ok(MangaPage {
+                manga_id: row.get(0)?,
+                page_index: row.get(1)?,
+                rel_path: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    /// Atomically replace all pages for a manga.
+    pub fn replace_pages(&self, manga_id: &str, pages: &[MangaPage]) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM manga_pages WHERE manga_id = ?1", params![manga_id])?;
+        for p in pages {
+            tx.execute(
+                "INSERT INTO manga_pages (manga_id, page_index, rel_path) VALUES (?1, ?2, ?3)",
+                params![&p.manga_id, p.page_index, &p.rel_path],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_progress(&self, manga_id: &str) -> StorageResult<Option<MangaProgress>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT manga_id, page_index, updated_at
+             FROM manga_progress WHERE manga_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![manga_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(MangaProgress {
+                manga_id: row.get(0)?,
+                page_index: row.get(1)?,
+                updated_at: row.get(2)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_progress(&self, manga_id: &str, page_index: i64) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated_at = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO manga_progress (manga_id, page_index, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![manga_id, page_index, &updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_progress(&self) -> StorageResult<Vec<MangaProgress>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT manga_id, page_index, updated_at
+             FROM manga_progress ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MangaProgress {
+                manga_id: row.get(0)?,
+                page_index: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    /// Return distinct non-null series tags with their derived IDs.
+    pub fn list_series_tags(&self) -> StorageResult<Vec<SeriesTag>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT series FROM mangas
+             WHERE series IS NOT NULL ORDER BY series COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let title = r?;
+            out.push(SeriesTag { id: series_id_for_title(&title), title });
+        }
+        Ok(out)
+    }
 }
 
 // ── Playlist models (storage-local; identity aligns with wdmm-core) ──────────
@@ -1148,6 +1451,27 @@ fn ts_to_dt(ts: i64) -> StorageResult<DateTime<Utc>> {
     DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.with_timezone(&Utc))
         .ok_or_else(|| StorageError::Database(format!("invalid timestamp {ts}")))
+}
+
+/// Map a rusqlite `Row` (15-column manga select) to a [`Manga`].
+fn row_to_manga(row: &rusqlite::Row<'_>) -> rusqlite::Result<Manga> {
+    Ok(Manga {
+        id:             row.get(0)?,
+        source_name:    row.get(1)?,
+        remote_path:    row.get(2)?,
+        title:          row.get(3)?,
+        author:         row.get(4)?,
+        series:         row.get(5)?,
+        volume:         row.get(6)?,
+        chapter_number: row.get(7)?,
+        page_count:     row.get(8)?,
+        cover_relpath:  row.get(9)?,
+        format:         row.get(10)?,
+        remote_missing: row.get(11)?,
+        page_turn:      row.get(12)?,
+        rev:            row.get(13)?,
+        updated_at:     row.get(14)?,
+    })
 }
 
 /// Map a rusqlite `Row` (in the v2 column order) to a `LibraryTrack`.
@@ -1228,9 +1552,120 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_v3() {
+    fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
+    }
+
+    #[test]
+    fn manga_stubs_dropped() {
+        // The v4 migration must remove the obsolete manga_series / manga_chapters
+        // stub tables from older schemas.
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let exists = |name: &str| -> bool {
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+                > 0
+        };
+        assert!(!exists("manga_series"), "manga_series must be dropped");
+        assert!(!exists("manga_chapters"), "manga_chapters must be dropped");
+        assert!(exists("mangas"));
+        assert!(exists("manga_pages"));
+        assert!(exists("manga_progress"));
+        assert!(exists("deleted_mangas"));
+    }
+
+    #[test]
+    fn manga_crud_and_pages_and_progress() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let mk = |i: usize, src: &str, path: &str, fmt: &str| Manga {
+            id: format!("m-{i}"),
+            source_name: src.into(),
+            remote_path: path.into(),
+            title: format!("Title {i}"),
+            author: Some("Author".into()),
+            series: Some("Saga One".into()),
+            volume: Some("1".into()),
+            chapter_number: Some(format!("{i}")),
+            page_count: 2,
+            cover_relpath: Some("cover.jpg".into()),
+            format: fmt.into(),
+            remote_missing: 0,
+            page_turn: Some("ltr".into()),
+            rev: 0,
+            updated_at: now.clone(),
+        };
+
+        // upsert two mangas sharing the same series tag
+        db.upsert_manga(&mk(1, "nas", "/m/a.cbz", "cbz")).unwrap();
+        db.upsert_manga(&mk(2, "nas", "/m/b.cbz", "cbz")).unwrap();
+        assert_eq!(db.list_mangas().unwrap().len(), 2);
+        assert_eq!(db.get_manga("m-1").unwrap().unwrap().title, "Title 1");
+        assert!(db.get_manga("nope").unwrap().is_none());
+
+        // partial unique index: two 'cbz' entries with same (source, path) collapse
+        db.upsert_manga(&mk(1, "nas", "/m/a.cbz", "cbz")).unwrap();
+        assert_eq!(db.list_mangas().unwrap().len(), 2);
+        // 'images' format is exempt from the unique constraint
+        db.upsert_manga(&mk(3, "nas", "/m/b.cbz", "images")).unwrap();
+        assert_eq!(db.list_mangas().unwrap().len(), 3);
+
+        // pages replace
+        let pages = vec![
+            MangaPage { manga_id: "m-1".into(), page_index: 0, rel_path: "p0.jpg".into() },
+            MangaPage { manga_id: "m-1".into(), page_index: 1, rel_path: "p1.jpg".into() },
+        ];
+        db.replace_pages("m-1", &pages).unwrap();
+        assert_eq!(db.list_pages("m-1").unwrap().len(), 2);
+        db.replace_pages("m-1", &[MangaPage {
+            manga_id: "m-1".into(),
+            page_index: 0,
+            rel_path: "only.jpg".into(),
+        }])
+        .unwrap();
+        assert_eq!(db.list_pages("m-1").unwrap().len(), 1);
+
+        // progress round-trip
+        assert!(db.get_progress("m-1").unwrap().is_none());
+        db.set_progress("m-1", 1).unwrap();
+        assert_eq!(db.get_progress("m-1").unwrap().unwrap().page_index, 1);
+        db.set_progress("m-1", 0).unwrap();
+        assert_eq!(db.get_progress("m-1").unwrap().unwrap().page_index, 0);
+        assert_eq!(db.list_progress().unwrap().len(), 1);
+
+        // series derived
+        let series = db.list_series_tags().unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].title, "Saga One");
+        assert_eq!(series[0].id, series_id_for_title("Saga One"));
+
+        // delete cascades pages+progress and writes a tombstone
+        db.delete_manga("m-1").unwrap();
+        assert!(db.get_manga("m-1").unwrap().is_none());
+        assert!(db.list_pages("m-1").unwrap().is_empty());
+        assert!(db.get_progress("m-1").unwrap().is_none());
+        // verify the deleted_mangas tombstone
+        let conn = db.conn.lock().unwrap();
+        let (sync_key, pushed): (String, i64) = conn
+            .query_row(
+                "SELECT sync_key, pushed FROM deleted_mangas WHERE manga_id = ?1",
+                params!["m-1"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sync_key, "nas:/m/a.cbz");
+        assert_eq!(pushed, 0);
+        drop(conn);
+
+        // series tag persists for the remaining manga
+        assert_eq!(db.list_series_tags().unwrap().len(), 1);
     }
 
     #[test]
