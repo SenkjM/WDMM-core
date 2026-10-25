@@ -817,3 +817,66 @@ JSON string array of remote backup filenames.
 
 ### `extern "C" fn wdmm_backup_download_restore(webdav_url, user, pass, remote_file, passphrase) -> FfiString`
 GET + restore.
+
+
+## Deleted tracks (schema v6 tombstones)
+
+Tombstone tracking for deleted tracks. Dual-write with deletes for sync reconciliation.
+
+### `extern "C" fn wdmm_deleted_track_upsert(json: *const c_char) -> FfiString`
+Upsert from JSON. Returns `"ok"` or `"error:<message>"`.
+
+Expected shape:
+```json
+{
+  "source_name": "wd-main",
+  "remote_path": "/music/track.flac",
+  "rev": 123,
+  "deleted_at": "2024-01-01T00:00:00Z",
+  "pushed": 0
+}
+```
+
+### `extern "C" fn wdmm_deleted_track_clear(source_name: *const c_char, remote_path: *const c_char) -> FfiString`
+Clear a tombstone by source and path. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_deleted_tracks_list() -> FfiString`
+List all deleted tracks. Returns JSON array or `"error:<message>"`.
+
+### `extern "C" fn wdmm_deleted_tracks_unpushed() -> FfiString`
+List unpushed deleted tracks (pushed=0). Returns JSON array or `"error:<message>"`.
+
+### `extern "C" fn wdmm_deleted_tracks_mark_pushed(revs_json: *const c_char) -> FfiString`
+Mark deleted tracks as pushed by rev. `revs_json` is a JSON array of integers. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_deleted_tracks_purge_up_to(up_to: i64) -> FfiString`
+Purge pushed deleted tracks up to and including the given rev. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_tombstoned_remote_paths(source_name: *const c_char) -> FfiString`
+Get tombstoned remote paths for a source. Returns JSON array of strings or `"error:<message>"`.
+
+
+## Sync state (schema v6 cursors)
+
+Per-remote sync cursors and state tracking.
+
+### `extern "C" fn wdmm_sync_state_get(remote_key: *const c_char) -> FfiString`
+Get sync state by remote_key. Returns JSON object, `"null"`, or `"error:<message>"`.
+
+### `extern "C" fn wdmm_sync_state_save(json: *const c_char) -> FfiString`
+Save sync state from JSON. Returns `"ok"` or `"error:<message>"`.
+
+Expected shape:
+```json
+{
+  "remote_key": "library:webdav-main",
+  "last_seq": 50,
+  "base_up_to": 25,
+  "parts": "{\"x\":1}",
+  "updated_at": "2024-01-01T00:00:00Z"
+}
+```
+
+### `extern "C" fn wdmm_sync_state_clear(prefix: *const c_char) -> FfiString`
+Clear sync state. `prefix` is optional (pass NULL to clear all). Returns `"ok"` or `"error:<message>"`.
+

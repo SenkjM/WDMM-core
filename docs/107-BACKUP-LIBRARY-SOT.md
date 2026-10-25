@@ -16,6 +16,8 @@ Core (`wdmm-storage` + `wdmm-sync`) already handles the following library operat
   - **Restore**: Dual-read supporting both Core JSON sections AND Android binary sections (codec 1, nested WDMMCV01/WDMMPL01)
 - **User Folders**: Create, list, delete user folder hierarchy + items
 - **CUE Sheets** (v5): Upsert, delete CUE albums and slices
+- **Deleted Tracks** (v6): Tombstone tracking with upsert/clear/list/unpushed/mark_pushed/purge/tombstoned_remote_paths
+- **Sync State** (v6): Per-remote sync cursors with get/save/clear
 - **Library Clear Operations**: Clear all library data (tracks/playlists/mangas) or index-only (tracks/CUE/tombstones)
 
 ### Android SoT via sqflite `LibraryDatabase`
@@ -43,10 +45,9 @@ This allows seamless cross-platform restore: Desktop can restore Android backups
 The following gaps remain before Android can fully switch to Core as library source of truth:
 
 1. **Dual-write parity**: Android must write to both sqflite and Core during migration phase
-2. **Tombstones + sync_state**: Android's `deleted` table and music sync cursors (`sync_state`) not yet ported to Core
-3. **Album/artist aggregation**: Core has tables but no track → album/artist auto-aggregation logic yet
-4. **Search indexes**: FTS or optimized search indexes (current Core uses basic LIKE queries)
-5. **Migration validation**: Comprehensive testing of sqflite → Core data migration at scale
+2. **Album/artist aggregation**: Core has tables but no track → album/artist auto-aggregation logic yet
+3. **Search indexes**: FTS or optimized search indexes (current Core uses basic LIKE queries)
+4. **Migration validation**: Comprehensive testing of sqflite → Core data migration at scale
 
 Once these are resolved, Android can:
 - Switch backup **create** to read from Core's Rust DB (removing sqflite dependency)
@@ -56,7 +57,8 @@ Once these are resolved, Android can:
 
 - ✅ **Dual-read restore**: Complete and tested (both Core JSON and Android binary)
 - ✅ **Cutover FFI** (v5): `wdmm_track_delete_by_source`, `wdmm_library_clear_all`, `wdmm_library_clear_index`, CUE slice upsert/delete/remaining
-- ⏸ **Create cutover**: Blocked on dual-write validation, tombstones, aggregation logic
+- ✅ **Tombstones + sync_state** (v6): `deleted_tracks` and `sync_state` tables in Core with full FFI CRUD
+- ⏸ **Create cutover**: Blocked on dual-write validation and aggregation logic
 - 📋 **Full SoT migration**: Requires resolving gaps listed above
 
 ## References
@@ -75,7 +77,8 @@ Once these are resolved, Android can:
 - Debug startup still runs `RustLibraryProbe` for track row-count parity (`[RustLibraryProbe] tracks … (match)`).
 - After CUE ingest with `kRustLibraryWriteEnabled`, compare Core `wdmm_cue_remaining_slices(source, cuePath)` against sqflite `remainingSlicesForCue` for the same album; mismatch means dual-write drift.
 
-### Status notes (2026-10-26 continue)
+### Status notes (2026-10-26 schema v6)
 - Android CUE **upsert** on ingest/scan is dual-written (Rust first, then sqflite); delete/clear paths already dual-written earlier.
-- Music **tombstones** (`deleted_tracks`) + **sync_state** are still Android-only. Core still has only a stub `deleted(id, deleted_at)` plus manga `deleted_mangas`. Porting is schema v6 + CRUD + FFI + client dual-write — not landed this turn.
+- Music **tombstones** (`deleted_tracks`) + **sync_state** now landed in Core schema v6 with full FFI CRUD. Android dual-write remains TODO.
+- Album/artist aggregation and FTS search remain deferred.
 - Backup **create** remains sqflite/JSON; do not half-cut.
