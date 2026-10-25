@@ -3321,6 +3321,166 @@ pub extern "C" fn wdmm_backup_download_restore(
 }
 
 
+// ── Deleted tracks (v6 tombstones) ────────────────────────────────────────────
+
+/// Upsert a deleted track from JSON. Returns `"ok"` or `"error:<message>"`.
+///
+/// Expected JSON shape: see `DeletedTrack` struct fields.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_track_upsert(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let track: wdmm_storage::DeletedTrack = match serde_json::from_str(s) {
+        Ok(t) => t,
+        Err(e) => return FfiString::from(format!("error:parse DeletedTrack: {e}")),
+    };
+    match global_library_db().upsert_deleted_track(&track) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Clear a deleted track by source and path. Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_track_clear(
+    source_name: *const c_char,
+    remote_path: *const c_char,
+) -> FfiString {
+    let src = match ptr_to_str(source_name) {
+        Some(s) => s,
+        None => return FfiString::from("error:null source_name pointer"),
+    };
+    let path = match ptr_to_str(remote_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null remote_path pointer"),
+    };
+    match global_library_db().clear_deleted_track(src, path) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List all deleted tracks. Returns JSON array or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_tracks_list() -> FfiString {
+    match global_library_db().list_deleted_tracks() {
+        Ok(tracks) => match serde_json::to_string(&tracks) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:serialize: {e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List unpushed deleted tracks. Returns JSON array or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_tracks_unpushed() -> FfiString {
+    match global_library_db().list_unpushed_deleted_tracks() {
+        Ok(tracks) => match serde_json::to_string(&tracks) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:serialize: {e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Mark deleted tracks as pushed. `revs_json` is a JSON array of integers.
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_tracks_mark_pushed(revs_json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(revs_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null revs_json pointer"),
+    };
+    let revs: Vec<i64> = match serde_json::from_str(s) {
+        Ok(r) => r,
+        Err(e) => return FfiString::from(format!("error:parse revs: {e}")),
+    };
+    match global_library_db().mark_deleted_tracks_pushed(&revs) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Purge pushed deleted tracks up to and including the given rev.
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_tracks_purge_up_to(up_to: i64) -> FfiString {
+    match global_library_db().purge_deleted_tracks_up_to(up_to) {
+        Ok(_) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get tombstoned remote paths for a source. Returns JSON array of strings
+/// or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_tombstoned_remote_paths(source_name: *const c_char) -> FfiString {
+    let src = match ptr_to_str(source_name) {
+        Some(s) => s,
+        None => return FfiString::from("error:null source_name pointer"),
+    };
+    match global_library_db().tombstoned_remote_paths(src) {
+        Ok(paths) => match serde_json::to_string(&paths) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:serialize: {e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Sync state (v6 cursors) ───────────────────────────────────────────────────
+
+/// Get sync state by remote_key. Returns JSON object, `"null"`, or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_state_get(remote_key: *const c_char) -> FfiString {
+    let key = match ptr_to_str(remote_key) {
+        Some(s) => s,
+        None => return FfiString::from("error:null remote_key pointer"),
+    };
+    match global_library_db().get_sync_state(key) {
+        Ok(Some(state)) => match serde_json::to_string(&state) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:serialize: {e}")),
+        },
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Save sync state from JSON. Returns `"ok"` or `"error:<message>"`.
+///
+/// Expected JSON shape: see `SyncState` struct fields.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_state_save(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let state: wdmm_storage::SyncState = match serde_json::from_str(s) {
+        Ok(st) => st,
+        Err(e) => return FfiString::from(format!("error:parse SyncState: {e}")),
+    };
+    match global_library_db().save_sync_state(&state) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Clear sync state. `prefix` is optional; if null, clears all.
+/// Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_state_clear(prefix: *const c_char) -> FfiString {
+    let pfx = ptr_to_str(prefix);
+    match global_library_db().clear_sync_state(pfx) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4496,6 +4656,120 @@ mod tests {
 
         // restore initial
         let r = wdmm_queue_set_concurrency(initial);
+        wdmm_ffi_free_string(r);
+    }
+
+    // ── Deleted tracks FFI tests ─────────────────────────────────────────────
+
+    #[test]
+    fn deleted_track_ffi_roundtrip() {
+        let json = CString::new(
+            r#"{"source_name":"src1","remote_path":"/music/track.flac","rev":100,"deleted_at":"2024-01-01T00:00:00Z","pushed":0}"#,
+        )
+        .unwrap();
+        let r = wdmm_deleted_track_upsert(json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_deleted_tracks_list();
+        let list_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!list_s.starts_with("error:"));
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&list_s).unwrap();
+        assert!(arr.iter().any(|t| t["source_name"] == "src1"));
+
+        let r = wdmm_deleted_tracks_unpushed();
+        let unpushed_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let unpushed: Vec<serde_json::Value> = serde_json::from_str(&unpushed_s).unwrap();
+        assert!(unpushed.iter().any(|t| t["rev"] == 100));
+
+        let revs = CString::new("[100]").unwrap();
+        let r = wdmm_deleted_tracks_mark_pushed(revs.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_deleted_tracks_unpushed();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let u: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+        assert!(u.iter().all(|t| t["rev"] != 100));
+
+        let r = wdmm_deleted_tracks_purge_up_to(100);
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let src = CString::new("src2").unwrap();
+        let path = CString::new("/music/del.mp3").unwrap();
+        let r = wdmm_deleted_track_clear(src.as_ptr(), path.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn tombstoned_remote_paths_ffi() {
+        let json1 = CString::new(
+            r#"{"source_name":"src_x","remote_path":"/a.mp3","rev":1,"deleted_at":"2024-01-01T00:00:00Z","pushed":0}"#,
+        )
+        .unwrap();
+        let json2 = CString::new(
+            r#"{"source_name":"src_x","remote_path":"/b.mp3","rev":2,"deleted_at":"2024-01-01T00:00:00Z","pushed":0}"#,
+        )
+        .unwrap();
+        wdmm_ffi_free_string(wdmm_deleted_track_upsert(json1.as_ptr()));
+        wdmm_ffi_free_string(wdmm_deleted_track_upsert(json2.as_ptr()));
+
+        let src = CString::new("src_x").unwrap();
+        let r = wdmm_tombstoned_remote_paths(src.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let paths: Vec<String> = serde_json::from_str(&s).unwrap();
+        assert!(paths.contains(&"/a.mp3".to_string()));
+        assert!(paths.contains(&"/b.mp3".to_string()));
+    }
+
+    // ── Sync state FFI tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn sync_state_ffi_roundtrip() {
+        let json = CString::new(
+            r#"{"remote_key":"library:test","last_seq":50,"base_up_to":25,"parts":"{\"x\":1}","updated_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let r = wdmm_sync_state_save(json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "save failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        let key = CString::new("library:test").unwrap();
+        let r = wdmm_sync_state_get(key.as_ptr());
+        let get_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!get_s.starts_with("error:") && get_s != "null");
+        let state: serde_json::Value = serde_json::from_str(&get_s).unwrap();
+        assert_eq!(state["last_seq"], 50);
+        assert_eq!(state["base_up_to"], 25);
+        assert_eq!(state["parts"], r#"{"x":1}"#);
+
+        let missing = CString::new("missing_key").unwrap();
+        let r = wdmm_sync_state_get(missing.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null");
+        wdmm_ffi_free_string(r);
+
+        let prefix = CString::new("library:").unwrap();
+        let r = wdmm_sync_state_clear(prefix.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_sync_state_get(key.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null");
         wdmm_ffi_free_string(r);
     }
 }
