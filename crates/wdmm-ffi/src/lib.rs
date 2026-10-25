@@ -2306,12 +2306,14 @@ pub extern "C" fn wdmm_account_get(id: *const c_char) -> FfiString {
 ///   "display_name": "…",
 ///   "base_url": "https://…",
 ///   "credentials_b64": "<optional>",
-///   "credentials": { "username":"…", "password":"…", "remote_dir":"/wdmm" },
-///   "passphrase": "<optional; with credentials map → CredentialEncoder>"
+///   "credentials": { /* any JSON object */ },
+///   "passphrase": "<optional; non-empty → encrypt via CredentialEncoder (requires flat string map)>"
 /// }
 /// ```
-/// If `credentials` is present and `passphrase` non-empty → encrypt via CredentialEncoder.
-/// If `credentials` is present and passphrase empty/absent → store UTF-8 JSON bytes of the map.
+/// If `credentials` is present and `passphrase` empty/absent → store UTF-8 JSON bytes of the object
+/// (supports nested structures like crypt `source:{provider_type,config}`).
+/// If `credentials` is present and `passphrase` non-empty → parse as flat `HashMap<String,String>` and
+/// encrypt via CredentialEncoder (nested structures not supported for encrypted vault).
 /// If only `credentials_b64` → decode into `credentials_encrypted`.
 /// Returns the account JSON (with `credentials_b64`) or `"error:…"`.
 #[no_mangle]
@@ -2339,18 +2341,20 @@ pub extern "C" fn wdmm_account_upsert(json: *const c_char) -> FfiString {
     let base_url = v["base_url"].as_str().map(|s| s.to_string());
 
     let credentials_encrypted = if let Some(obj) = v.get("credentials").filter(|x| x.is_object()) {
-        let map: std::collections::HashMap<String, String> = match serde_json::from_value(obj.clone())
-        {
-            Ok(m) => m,
-            Err(e) => return FfiString::from(format!("error:credentials map: {e}")),
-        };
         let pass = v["passphrase"].as_str().unwrap_or("");
         if pass.is_empty() {
-            match serde_json::to_vec(&map) {
+            // Plaintext path: accept any JSON object structure (nested objects, arrays, numbers, etc.)
+            match serde_json::to_vec(obj) {
                 Ok(b) => b,
                 Err(e) => return FfiString::from(format!("error:credentials json: {e}")),
             }
         } else {
+            // Encrypted path: parse as flat HashMap<String,String> for CredentialEncoder
+            let map: std::collections::HashMap<String, String> = match serde_json::from_value(obj.clone())
+            {
+                Ok(m) => m,
+                Err(e) => return FfiString::from(format!("error:credentials must be flat string map for encryption: {e}")),
+            };
             match CredentialEncoder::encode(&map, pass) {
                 Ok(b) => b,
                 Err(e) => return FfiString::from(format!("error:encrypt: {e}")),
