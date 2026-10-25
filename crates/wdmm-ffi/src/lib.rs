@@ -390,10 +390,9 @@ pub extern "C" fn wdmm_sync_trigger(
     let pass = ptr_to_str(webdav_pass).unwrap_or("");
     let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
 
-    let db = match LibraryDatabase::open(std::path::Path::new(":memory:")) {
-        Ok(db) => std::sync::Arc::new(db),
-        Err(e) => return FfiString::from(format!("error:db: {e}")),
-    };
+    // Use the process-global library DB (same as playlist/manga/kv/account FFI).
+    // A throwaway ":memory:" DB made sync a no-op for real app state.
+    let db = std::sync::Arc::clone(global_library_db());
     let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
         Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
@@ -2156,6 +2155,156 @@ pub extern "C" fn wdmm_manga_list_series() -> FfiString {
     }
 }
 
+
+// ── Cloud account FFI ─────────────────────────────────────────────────────────
+
+use wdmm_core::models::CloudAccount;
+use wdmm_crypto::CredentialEncoder;
+
+fn account_to_json(a: &CloudAccount) -> serde_json::Value {
+    serde_json::json!({
+        "id": a.id,
+        "provider_type": a.provider_type,
+        "display_name": a.display_name,
+        "base_url": a.base_url,
+        "credentials_b64": BASE64_STANDARD.encode(&a.credentials_encrypted),
+    })
+}
+
+/// List all cloud accounts as a JSON array.
+/// Each element includes `credentials_b64` (base64 of `credentials_encrypted`).
+/// Returns `"error:…"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_account_list() -> FfiString {
+    match global_library_db().list_accounts() {
+        Ok(accounts) => {
+            let view: Vec<_> = accounts.iter().map(account_to_json).collect();
+            match serde_json::to_string(&view) {
+                Ok(j) => FfiString::from(j),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get one account by id. Returns account JSON, `"null"` if missing, or `"error:…"`.
+/// `id` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_account_get(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().get_account(id) {
+        Ok(Some(a)) => match serde_json::to_string(&account_to_json(&a)) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Upsert a cloud account from JSON.
+///
+/// Shape:
+/// ```json
+/// {
+///   "id": "optional-uuid",
+///   "provider_type": "webdav",
+///   "display_name": "…",
+///   "base_url": "https://…",
+///   "credentials_b64": "<optional>",
+///   "credentials": { "username":"…", "password":"…", "remote_dir":"/wdmm" },
+///   "passphrase": "<optional; with credentials map → CredentialEncoder>"
+/// }
+/// ```
+/// If `credentials` is present and `passphrase` non-empty → encrypt via CredentialEncoder.
+/// If `credentials` is present and passphrase empty/absent → store UTF-8 JSON bytes of the map.
+/// If only `credentials_b64` → decode into `credentials_encrypted`.
+/// Returns the account JSON (with `credentials_b64`) or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_upsert(json: *const c_char) -> FfiString {
+    let raw = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let provider_type = match v["provider_type"].as_str() {
+        Some(s) => s.to_string(),
+        None => return FfiString::from("error:missing 'provider_type'"),
+    };
+    let display_name = match v["display_name"].as_str() {
+        Some(s) => s.to_string(),
+        None => return FfiString::from("error:missing 'display_name'"),
+    };
+    let id = v["id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let base_url = v["base_url"].as_str().map(|s| s.to_string());
+
+    let credentials_encrypted = if let Some(obj) = v.get("credentials").filter(|x| x.is_object()) {
+        let map: std::collections::HashMap<String, String> = match serde_json::from_value(obj.clone())
+        {
+            Ok(m) => m,
+            Err(e) => return FfiString::from(format!("error:credentials map: {e}")),
+        };
+        let pass = v["passphrase"].as_str().unwrap_or("");
+        if pass.is_empty() {
+            match serde_json::to_vec(&map) {
+                Ok(b) => b,
+                Err(e) => return FfiString::from(format!("error:credentials json: {e}")),
+            }
+        } else {
+            match CredentialEncoder::encode(&map, pass) {
+                Ok(b) => b,
+                Err(e) => return FfiString::from(format!("error:encrypt: {e}")),
+            }
+        }
+    } else if let Some(b64) = v["credentials_b64"].as_str() {
+        match BASE64_STANDARD.decode(b64) {
+            Ok(b) => b,
+            Err(e) => return FfiString::from(format!("error:credentials_b64: {e}")),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let account = CloudAccount {
+        id,
+        provider_type,
+        display_name,
+        base_url,
+        credentials_encrypted,
+    };
+    match global_library_db().insert_account(&account) {
+        Ok(()) => match serde_json::to_string(&account_to_json(&account)) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete an account by id. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_delete(id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().delete_account(id) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+
 // ── Queue concurrency FFI ─────────────────────────────────────────────────────
 
 /// Return the current queue concurrency limit (1–8).
@@ -3284,6 +3433,56 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert_eq!(s, "not_found");
         wdmm_ffi_free_string(r);
+    }
+
+
+    // ── Account FFI tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn account_ffi_crud_roundtrip() {
+        let upsert = CString::new(
+            r#"{"provider_type":"webdav","display_name":"NAS","base_url":"https://nas.local/dav","credentials":{"username":"u","password":"p","remote_dir":"/wdmm"}}"#,
+        )
+        .unwrap();
+        let r = wdmm_account_upsert(upsert.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!s.starts_with("error:"), "upsert failed: {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(v["display_name"], "NAS");
+        assert!(v["credentials_b64"].as_str().unwrap().len() > 0);
+
+        let r = wdmm_account_list();
+        let list_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!list_s.starts_with("error:"), "list failed: {list_s}");
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&list_s).unwrap();
+        assert!(arr.iter().any(|a| a["id"] == id));
+
+        let cid = CString::new(id.clone()).unwrap();
+        let r = wdmm_account_get(cid.as_ptr());
+        let get_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!get_s.starts_with("error:") && get_s != "null", "get failed: {get_s}");
+        let got: serde_json::Value = serde_json::from_str(&get_s).unwrap();
+        let raw = BASE64_STANDARD
+            .decode(got["credentials_b64"].as_str().unwrap())
+            .unwrap();
+        let map: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(map["username"], "u");
+        assert_eq!(map["password"], "p");
+        assert_eq!(map["remote_dir"], "/wdmm");
+
+        let r = wdmm_account_delete(cid.as_ptr());
+        let del_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert_eq!(del_s, "ok", "delete failed: {del_s}");
+
+        let r = wdmm_account_get(cid.as_ptr());
+        let after = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert_eq!(after, "null");
     }
 
     // ── Queue concurrency FFI tests ──────────────────────────────────────────

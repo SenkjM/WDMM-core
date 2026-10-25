@@ -644,3 +644,28 @@ Set the concurrency limit. `n` is clamped to `1..=8`.
 Returns `"ok"`. Caller must free the result.
 
 
+
+---
+
+## Cloud accounts
+
+Accounts live in the library SQLite `accounts` table (`CloudAccount`).
+Credentials are opaque bytes (`credentials_encrypted`); FFI exposes them as
+`credentials_b64`. A `credentials` JSON object may be supplied on upsert:
+with a non-empty `passphrase` it is encrypted via `CredentialEncoder`; otherwise
+the map is stored as UTF-8 JSON bytes (Desktop interim until vault UX lands).
+
+### `extern "C" fn wdmm_account_list() -> FfiString`
+JSON array of accounts (each with `credentials_b64`), or `"error:…"`.
+
+### `extern "C" fn wdmm_account_get(id: *const c_char) -> FfiString`
+One account JSON, `"null"`, or `"error:…"`.
+
+### `extern "C" fn wdmm_account_upsert(json: *const c_char) -> FfiString`
+Insert-or-replace. Returns the account JSON (with `credentials_b64`) or `"error:…"`.
+
+### `extern "C" fn wdmm_account_delete(id: *const c_char) -> FfiString`
+`"ok"` or `"error:…"`.
+
+### Sync note
+`wdmm_sync_trigger` uses the process-global library DB (same as account/playlist/manga).
