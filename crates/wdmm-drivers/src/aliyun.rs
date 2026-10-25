@@ -6,11 +6,8 @@
 //!
 //! Reference: https://www.aliyundrive.com/developer
 //!
-//! Implements:
-//! - list(), get() (with raw_url via getDownloadUrl)
-//! - mkdir()   — `/adrive/v1.0/openFile/create` (type=folder)
-//! - rename()  — `/adrive/v1.0/openFile/update` (name)
-//! - remove()  — `/adrive/v1.0/openFile/recyclebin/trash`
+//! Implements list/get/mkdir/rename/move/remove and direct content reads.
+//! Upload-style `put_content` is explicitly unsupported to match Dart parity.
 
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -30,6 +27,8 @@ pub struct AliyunConfig {
     pub drive_id: String,
     /// API base URL. Defaults to `https://openapi.aliyundrive.com`.
     pub base_url: String,
+    /// Removal mode: `trash` (default) or `delete`.
+    pub remove_way: String,
 }
 
 impl Default for AliyunConfig {
@@ -38,6 +37,7 @@ impl Default for AliyunConfig {
             access_token: String::new(),
             drive_id: String::new(),
             base_url: "https://openapi.aliyundrive.com".to_string(),
+            remove_way: "trash".to_string(),
         }
     }
 }
@@ -87,7 +87,9 @@ impl AliyunDriver {
                 .json(body)
                 .send()
         };
-        let resp = do_req().await.map_err(|e| DriverError::Network(e.to_string()))?;
+        let resp = do_req()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(DriverError::AuthFailed);
@@ -96,16 +98,23 @@ impl AliyunDriver {
             return Err(DriverError::NotFound("resource".into()));
         }
         if status.as_u16() == 429 || status.is_server_error() {
-            let resp2 = do_req().await.map_err(|e| DriverError::Network(e.to_string()))?;
+            let resp2 = do_req()
+                .await
+                .map_err(|e| DriverError::Network(e.to_string()))?;
             if !resp2.status().is_success() {
                 return Err(DriverError::Network(format!("HTTP {}", resp2.status())));
             }
-            return resp2.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()));
+            return resp2
+                .json::<Value>()
+                .await
+                .map_err(|e| DriverError::Network(e.to_string()));
         }
         if !status.is_success() {
             return Err(DriverError::Network(format!("HTTP {}", status)));
         }
-        resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
+        resp.json::<Value>()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))
     }
 
     /// Resolve a remote slash-path to a file_id by walking segments.
@@ -127,9 +136,7 @@ impl AliyunDriver {
             });
             let json = self.post_json(&url, &body).await?;
             let items = json["items"].as_array().cloned().unwrap_or_default();
-            let found = items.iter().find(|item| {
-                item["name"].as_str() == Some(seg)
-            });
+            let found = items.iter().find(|item| item["name"].as_str() == Some(seg));
             match found {
                 Some(item) => {
                     parent_id = item["file_id"].as_str().unwrap_or("").to_string();
@@ -203,7 +210,10 @@ impl CloudDriver for AliyunDriver {
             .map(|dt| dt.with_timezone(&chrono::Utc));
 
         // Get download URL (expires in ~15min per API docs)
-        let dl_url = format!("{}/adrive/v1.0/openFile/getDownloadUrl", self.config.base_url);
+        let dl_url = format!(
+            "{}/adrive/v1.0/openFile/getDownloadUrl",
+            self.config.base_url
+        );
         let dl_body = serde_json::json!({
             "drive_id": self.config.drive_id,
             "file_id": file_id
@@ -237,7 +247,9 @@ impl CloudDriver for AliyunDriver {
             Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
         };
         if name.is_empty() {
-            return Err(DriverError::Config("aliyun mkdir: empty folder name".into()));
+            return Err(DriverError::Config(
+                "aliyun mkdir: empty folder name".into(),
+            ));
         }
         let parent_id = if parent_path == "/" || parent_path.is_empty() {
             "root".to_string()
@@ -257,45 +269,148 @@ impl CloudDriver for AliyunDriver {
     }
 
     /// Rename/move a file or folder.
-    ///
-    /// Uses `POST /adrive/v1.0/openFile/update` to change the `name` field.
-    /// Only single-segment renames (same parent) are supported; cross-directory
-    /// moves are not supported by the Aliyun Drive Open Platform rename API.
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
         let file_id = self.path_to_file_id(old_path).await?;
-        // Derive the new name from new_path (last segment).
-        let new_name = new_path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| DriverError::Config("aliyun rename: empty new name".into()))?;
-        let url = format!("{}/adrive/v1.0/openFile/update", self.config.base_url);
-        let body = serde_json::json!({
-            "drive_id": self.config.drive_id,
-            "file_id":  file_id,
-            "name":     new_name,
-            "check_name_mode": "refuse"
-        });
+        let new_name = Self::file_name(new_path);
+        if new_name.is_empty() {
+            return Err(DriverError::Config("aliyun rename: empty new name".into()));
+        }
+        if Self::parent_dir(old_path) != Self::parent_dir(new_path) {
+            let parent_id = if Self::parent_dir(new_path) == "/" {
+                "root".to_string()
+            } else {
+                self.path_to_file_id(Self::parent_dir(new_path)).await?
+            };
+            let move_url = format!("{}/adrive/v1.0/openFile/move", self.config.base_url);
+            self.post_json(
+                &move_url,
+                &serde_json::json!({
+                    "drive_id": self.config.drive_id,
+                    "file_id": file_id,
+                    "to_parent_file_id": parent_id,
+                    "check_name_mode": "refuse"
+                }),
+            )
+            .await?;
+        }
+        let update_url = format!("{}/adrive/v1.0/openFile/update", self.config.base_url);
+        self.post_json(
+            &update_url,
+            &serde_json::json!({
+                "drive_id": self.config.drive_id,
+                "file_id": file_id,
+                "name": new_name,
+                "check_name_mode": "refuse"
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Move a file or folder to trash or permanently delete it.
+    async fn remove(&self, path: &str) -> Result<()> {
+        let file_id = self.path_to_file_id(path).await?;
+        let endpoint =
+            if self.config.remove_way.trim().is_empty() || self.config.remove_way == "trash" {
+                "recyclebin"
+            } else if self.config.remove_way == "delete" {
+                "delete"
+            } else {
+                return Err(DriverError::Config(format!(
+                    "aliyun: invalid remove_way {}",
+                    self.config.remove_way
+                )));
+            };
+        let url = format!("{}/adrive/v1.0/openFile/{endpoint}", self.config.base_url);
+        let body = serde_json::json!({ "drive_id": self.config.drive_id, "file_id": file_id });
         self.post_json(&url, &body).await?;
         Ok(())
     }
 
-    /// Move a file or folder to the recycle bin.
-    ///
-    /// Uses `POST /adrive/v1.0/openFile/recyclebin/trash`.
-    async fn remove(&self, path: &str) -> Result<()> {
-        let file_id = self.path_to_file_id(path).await?;
-        let url = format!(
-            "{}/adrive/v1.0/openFile/recyclebin/trash",
-            self.config.base_url
-        );
-        let body = serde_json::json!({
-            "drive_id": self.config.drive_id,
-            "file_id":  file_id
-        });
-        self.post_json(&url, &body).await?;
-        Ok(())
+    async fn put_content(&self, path: &str, data: &[u8]) -> Result<()> {
+        let _ = (path, data);
+        Err(DriverError::Other(
+            "aliyun: put_content/upload not supported (Dart parity)".into(),
+        ))
+    }
+
+    async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
+        let item = self.get(path).await?;
+        let url = item
+            .raw_url
+            .ok_or_else(|| DriverError::Network("aliyun: missing download url".into()))?;
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(DriverError::AuthFailed);
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(DriverError::NotFound(path.to_string()));
+        }
+        if !resp.status().is_success() {
+            return Err(DriverError::Network(format!("HTTP {}", resp.status())));
+        }
+        Ok(resp
+            .bytes()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?
+            .to_vec())
+    }
+
+    async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
+        let item = self.get(path).await?;
+        let url = item
+            .raw_url
+            .ok_or_else(|| DriverError::Network("aliyun: missing download url".into()))?;
+        let range = end
+            .map(|e| format!("bytes={start}-{e}"))
+            .unwrap_or_else(|| format!("bytes={start}-"));
+        let resp = self
+            .client
+            .get(url)
+            .header(reqwest::header::RANGE, range)
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(DriverError::AuthFailed);
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(DriverError::NotFound(path.to_string()));
+        }
+        if !resp.status().is_success() {
+            return Err(DriverError::Network(format!("HTTP {}", resp.status())));
+        }
+        Ok(resp
+            .bytes()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?
+            .to_vec())
+    }
+}
+
+impl AliyunDriver {
+    fn parent_dir(path: &str) -> &str {
+        let trimmed = path.trim_end_matches('/');
+        match trimmed.rfind('/') {
+            Some(0) => "/",
+            Some(idx) => &trimmed[..idx],
+            None => "/",
+        }
+    }
+    fn file_name(path: &str) -> &str {
+        path.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
     }
 }
 
@@ -309,14 +424,20 @@ mod tests {
     fn config_requires_token() {
         let mut cfg = AliyunConfig::default();
         cfg.drive_id = "drv1".into();
-        assert!(matches!(AliyunDriver::new(cfg), Err(DriverError::Config(_))));
+        assert!(matches!(
+            AliyunDriver::new(cfg),
+            Err(DriverError::Config(_))
+        ));
     }
 
     #[test]
     fn config_requires_drive_id() {
         let mut cfg = AliyunConfig::default();
         cfg.access_token = "tok".into();
-        assert!(matches!(AliyunDriver::new(cfg), Err(DriverError::Config(_))));
+        assert!(matches!(
+            AliyunDriver::new(cfg),
+            Err(DriverError::Config(_))
+        ));
     }
 
     #[test]
@@ -354,12 +475,25 @@ mod tests {
         assert!(item.is_dir);
     }
 
+    #[tokio::test]
+    async fn put_content_is_loudly_unsupported() {
+        let driver = AliyunDriver::new(AliyunConfig::new("tok", "drv")).unwrap();
+        assert!(
+            matches!(driver.put_content("/x", b"x").await, Err(DriverError::Other(message)) if message.contains("Dart parity"))
+        );
+    }
+
+    #[test]
+    fn config_defaults_remove_way_to_trash() {
+        assert_eq!(AliyunConfig::default().remove_way, "trash");
+    }
+
     // ── Mock HTTP tests ───────────────────────────────────────────────────────
 
     async fn start_mock_server(responses: Vec<String>) -> u16 {
+        use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
-        use std::sync::{Arc, Mutex};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -370,7 +504,11 @@ mod tests {
                 if let Ok((mut sock, _)) = listener.accept().await {
                     let body = {
                         let r = responses.lock().unwrap();
-                        if idx < r.len() { r[idx].clone() } else { r.last().cloned().unwrap_or_default() }
+                        if idx < r.len() {
+                            r[idx].clone()
+                        } else {
+                            r.last().cloned().unwrap_or_default()
+                        }
                     };
                     idx += 1;
                     let mut buf = vec![0u8; 4096];
@@ -422,7 +560,8 @@ mod tests {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];
                 let _ = sock.read(&mut buf).await;
-                let resp = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let resp =
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 let _ = sock.write_all(resp.as_bytes()).await;
             }
         });
@@ -437,6 +576,37 @@ mod tests {
     }
 
     // ── Write-op mock tests ───────────────────────────────────────────────────
+
+    /// rename cross-directory moves then updates the filename.
+    #[tokio::test]
+    async fn rename_cross_directory_moves_and_updates() {
+        let search_resp =
+            serde_json::json!({"items": [{"file_id":"f1","name":"old.mp3","type":"file"}]})
+                .to_string();
+        let parent_resp =
+            serde_json::json!({"items": [{"file_id":"dst","name":"dest","type":"folder"}]})
+                .to_string();
+        let ok = serde_json::json!({}).to_string();
+        let port = start_mock_server(vec![search_resp, parent_resp, ok.clone(), ok]).await;
+        let mut cfg = AliyunConfig::new("tok", "drv");
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        AliyunDriver::new(cfg)
+            .unwrap()
+            .rename("/old.mp3", "/dest/new.mp3")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_delete_uses_delete_endpoint() {
+        let search =
+            serde_json::json!({"items": [{"file_id":"f1","name":"x","type":"file"}]}).to_string();
+        let port = start_mock_server(vec![search, "{}".into()]).await;
+        let mut cfg = AliyunConfig::new("tok", "drv");
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        cfg.remove_way = "delete".into();
+        AliyunDriver::new(cfg).unwrap().remove("/x").await.unwrap();
+    }
 
     /// mkdir at "/" creates a folder at root — needs one POST to /create.
     #[tokio::test]
@@ -455,7 +625,10 @@ mod tests {
         cfg.base_url = format!("http://127.0.0.1:{}", port);
         let driver = AliyunDriver::new(cfg).unwrap();
 
-        driver.mkdir("/NewAlbum").await.expect("mkdir should succeed");
+        driver
+            .mkdir("/NewAlbum")
+            .await
+            .expect("mkdir should succeed");
     }
 
     /// rename resolves the file_id first, then calls /update.
@@ -503,7 +676,10 @@ mod tests {
         cfg.base_url = format!("http://127.0.0.1:{}", port);
         let driver = AliyunDriver::new(cfg).unwrap();
 
-        driver.remove("/trash.mp3").await.expect("remove should succeed");
+        driver
+            .remove("/trash.mp3")
+            .await
+            .expect("remove should succeed");
     }
 
     /// mkdir with an empty name segment is a config error (not a network call).
@@ -513,6 +689,9 @@ mod tests {
         let cfg = AliyunConfig::new("tok", "drv");
         let driver = AliyunDriver::new(cfg).unwrap();
         let err = rt.block_on(driver.mkdir("/")).unwrap_err();
-        assert!(matches!(err, DriverError::Config(_)), "expected Config error, got {err:?}");
+        assert!(
+            matches!(err, DriverError::Config(_)),
+            "expected Config error, got {err:?}"
+        );
     }
 }
