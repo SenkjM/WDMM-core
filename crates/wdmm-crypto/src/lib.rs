@@ -5,8 +5,8 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
-pub mod vault;
 pub mod rclone;
+pub mod vault;
 
 pub use vault::CredentialVault;
 
@@ -50,8 +50,8 @@ impl CredentialEncoder {
         data: &std::collections::HashMap<String, String>,
         passphrase: &str,
     ) -> Result<Vec<u8>> {
-        let json = serde_json::to_vec(data)
-            .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
+        let json =
+            serde_json::to_vec(data).map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
         CredentialVault::encrypt(&json, passphrase)
     }
 
@@ -61,8 +61,7 @@ impl CredentialEncoder {
         passphrase: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
         let plaintext = CredentialVault::decrypt(encrypted, passphrase)?;
-        serde_json::from_slice(&plaintext)
-            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
+        serde_json::from_slice(&plaintext).map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
     }
 }
 
