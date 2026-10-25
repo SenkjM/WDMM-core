@@ -10,42 +10,18 @@
 //! - `123`           (wdmm_drivers::Pan123Driver) — list/get/mkdir/rename/remove/content
 //! - `aliyundrive`   (wdmm_drivers::AliyunDriver) — list/get/mkdir/rename/remove/content reads
 //! - `open115`       (wdmm_drivers::Open115Driver) — list/get/mkdir/rename/remove/content
-//! - `terabox`       (wdmm_drivers::TeraboxDriver) — ✓ list/get/mkdir/rename/remove (Wave C)
+//! - `terabox`       (wdmm_drivers::TeraboxDriver) — list/get/mkdir/rename/remove (Wave C)
+//! - `netease_music` (wdmm_drivers::NeteaseMusicDriver) — list/get/remove (Wave C)
 //!
-//! Remaining stubs:
-//! - netease_music — NetEase Cloud Music; excluded from public release (§9)
+//! All drivers now implemented. This module remains for future stubs.
 
-use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
-use async_trait::async_trait;
+#![allow(dead_code)]
+
+use crate::driver::DriverError;
 
 /// Shared helper: build the standard "not yet implemented" driver error.
+#[allow(dead_code)]
 fn todo_err(name: &str) -> DriverError {
     DriverError::Other(format!("TODO: {} driver not yet implemented", name))
 }
 
-macro_rules! impl_stub_driver {
-    ($struct_name:ident, $label:literal) => {
-        pub struct $struct_name;
-
-        #[async_trait]
-        impl CloudDriver for $struct_name {
-            async fn list(&self, _path: &str) -> Result<Vec<CloudFileItem>> {
-                Err(todo_err($label))
-            }
-            async fn get(&self, _path: &str) -> Result<CloudFileItem> {
-                Err(todo_err($label))
-            }
-            async fn mkdir(&self, _path: &str) -> Result<()> {
-                Err(todo_err($label))
-            }
-            async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-                Err(todo_err($label))
-            }
-            async fn remove(&self, _path: &str) -> Result<()> {
-                Err(todo_err($label))
-            }
-        }
-    };
-}
-
-impl_stub_driver!(NeteaseMusicDriver, "netease_music");

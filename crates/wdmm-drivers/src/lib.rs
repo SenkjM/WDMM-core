@@ -1,16 +1,14 @@
 //! `wdmm-drivers` — CloudDriver trait + implementations.
 //!
 //! Implemented drivers (production paths):
-//! - `WebDavDriver`    — WebDAV list/get/mkdir/rename/remove/put_content/get_content
-//! - `CtFileDriver`    — CtFile list/get/mkdir/rename/remove/put_content/get_content/range
-//! - `BaiduDriver`     — Baidu NetDisk list/get/mkdir/rename/remove/content reads
-//! - `Pan123Driver`    — 123 Pan list/get/mkdir/rename/remove/get_content/range
-//! - `AliyunDriver`    — Aliyun Drive list/get/mkdir/rename/remove/content reads
-//! - `Open115Driver`   — 115 Network list/get/mkdir/rename/remove/get_content/range
-//! - `TeraboxDriver`   — Terabox cookie API list/get/mkdir/rename/remove (Wave C)
-//!
-//! Stubbed drivers (Round 3+): each returns a loud TODO error.
-//! - netease_music.
+//! - `WebDavDriver`       — WebDAV list/get/mkdir/rename/remove/put_content/get_content
+//! - `CtFileDriver`       — CtFile list/get/mkdir/rename/remove/put_content/get_content/range
+//! - `BaiduDriver`        — Baidu NetDisk list/get/mkdir/rename/remove/content reads
+//! - `Pan123Driver`       — 123 Pan list/get/mkdir/rename/remove/get_content/range
+//! - `AliyunDriver`       — Aliyun Drive list/get/mkdir/rename/remove/content reads
+//! - `Open115Driver`      — 115 Network list/get/mkdir/rename/remove/get_content/range
+//! - `TeraboxDriver`      — Terabox cookie API list/get/mkdir/rename/remove (Wave C)
+//! - `NeteaseMusicDriver` — NeteaseMusic cloud list/get/remove (Wave C)
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -19,6 +17,7 @@ pub mod aliyun;
 pub mod baidu;
 pub mod ctfile;
 pub mod driver;
+pub mod netease_music;
 pub mod open115;
 pub mod pan123;
 pub mod stubs;
@@ -29,9 +28,9 @@ pub use aliyun::{AliyunConfig, AliyunDriver};
 pub use baidu::{BaiduConfig, BaiduDriver};
 pub use ctfile::{CtFileConfig, CtFileDriver};
 pub use driver::{CloudDriver, CloudFileItem, ContentDeliveryKind, DriverError, Result};
+pub use netease_music::{NeteaseMusicConfig, NeteaseMusicDriver};
 pub use open115::{Open115Config, Open115Driver};
 pub use pan123::{Pan123Config, Pan123Driver};
-pub use stubs::NeteaseMusicDriver;
 pub use terabox::{TeraboxConfig, TeraboxDriver};
 pub use webdav::WebDavDriver;
 
@@ -139,7 +138,16 @@ impl DriverRegistry {
                 }
                 Ok(Box::new(TeraboxDriver::new(cfg)?))
             }
-            "netease_music" => Ok(Box::new(NeteaseMusicDriver)),
+            "netease_music" => {
+                let cookie = config["cookie"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::Config("netease_music: missing cookie".into()))?;
+                let mut cfg = NeteaseMusicConfig::new(cookie);
+                if let Some(n) = config["song_limit"].as_u64() {
+                    cfg.song_limit = n as u32;
+                }
+                Ok(Box::new(NeteaseMusicDriver::new(cfg)?))
+            }
             _ => Err(DriverError::UnsupportedProvider(provider_type.to_string())),
         }
     }
@@ -226,7 +234,12 @@ mod tests {
             serde_json::json!({"cookie": "ndus=test"})
         )
         .is_ok());
-        assert!(DriverRegistry::create_driver("netease_music", serde_json::json!({})).is_ok());
+        // netease_music requires cookie with __csrf and MUSIC_U
+        assert!(DriverRegistry::create_driver(
+            "netease_music",
+            serde_json::json!({"cookie": "__csrf=abc; MUSIC_U=xyz"})
+        )
+        .is_ok());
     }
 
     #[test]
@@ -235,5 +248,36 @@ mod tests {
             Err(DriverError::Config(_)) => {}
             other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
         }
+    }
+
+    #[test]
+    fn registry_netease_music_requires_cookie() {
+        // Missing cookie entirely
+        match DriverRegistry::create_driver("netease_music", serde_json::json!({})) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        // Missing __csrf
+        match DriverRegistry::create_driver(
+            "netease_music",
+            serde_json::json!({"cookie": "MUSIC_U=xyz"})
+        ) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        // Missing MUSIC_U
+        match DriverRegistry::create_driver(
+            "netease_music",
+            serde_json::json!({"cookie": "__csrf=abc"})
+        ) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        // Both present
+        assert!(DriverRegistry::create_driver(
+            "netease_music",
+            serde_json::json!({"cookie": "__csrf=abc; MUSIC_U=xyz"})
+        )
+        .is_ok());
     }
 }
