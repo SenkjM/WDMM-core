@@ -1,4 +1,4 @@
-//! `wdmm-storage` — rusqlite library DB (schema v5, music + manga library).
+//! `wdmm-storage` — rusqlite library DB (schema v6, music + manga library).
 //!
 //! Schema v1 (Round 4): base tables.
 //! Schema v2 (Round 5): artists/albums tables, extended `tracks` columns,
@@ -10,6 +10,7 @@
 //! Schema v4 (Wave D): replace manga stubs with real `mangas` / `manga_pages` /
 //!   `manga_progress` / `deleted_mangas` tables.
 //! Schema v5: CUE sheet support (`cue_albums`, `cue_slices` tables).
+//! Schema v6: Music tombstones (`deleted_tracks`) + sync state cursors (`sync_state`).
 
 #![forbid(unsafe_code)]
 
@@ -106,6 +107,30 @@ pub struct DeletedManga {
     pub deleted_at: String,
     /// `1` once the tombstone has been pushed to the sync server.
     pub pushed: i64,
+}
+
+/// Tombstone appended to `deleted_tracks` when a music track is deleted (v6).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeletedTrack {
+    pub source_name: String,
+    pub remote_path: String,
+    pub rev: i64,
+    /// RFC-3339 timestamp string.
+    pub deleted_at: String,
+    /// `1` once the tombstone has been pushed to the sync server.
+    pub pushed: i64,
+}
+
+/// Sync cursor state for a remote key (v6).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyncState {
+    pub remote_key: String,
+    pub last_seq: i64,
+    pub base_up_to: i64,
+    /// JSON object string (stored as TEXT in DB).
+    pub parts: String,
+    /// RFC-3339 timestamp string.
+    pub updated_at: String,
 }
 
 /// A CUE sheet album (v5).
@@ -476,6 +501,34 @@ impl LibraryDatabase {
             )?;
             conn.execute(
                 "INSERT OR IGNORE INTO _schema_version (version) VALUES (5)",
+                [],
+            )?;
+        }
+
+        // ── v6 migration: music tombstones + sync state ───────────────────────
+        if current_ver < 6 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS deleted_tracks (
+                  source_name TEXT NOT NULL,
+                  remote_path TEXT NOT NULL,
+                  rev INTEGER NOT NULL,
+                  deleted_at TEXT NOT NULL,
+                  pushed INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY (source_name, remote_path)
+                );
+
+                CREATE TABLE IF NOT EXISTS sync_state (
+                  remote_key TEXT PRIMARY KEY,
+                  last_seq INTEGER NOT NULL DEFAULT 0,
+                  base_up_to INTEGER NOT NULL DEFAULT 0,
+                  parts TEXT NOT NULL DEFAULT '{}',
+                  updated_at TEXT NOT NULL
+                );
+                "#,
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (6)",
                 [],
             )?;
         }
@@ -1545,6 +1598,7 @@ impl LibraryDatabase {
         tx.execute("DELETE FROM manga_progress", [])?;
         tx.execute("DELETE FROM mangas", [])?;
         tx.execute("DELETE FROM deleted_mangas", [])?;
+        tx.execute("DELETE FROM deleted_tracks", [])?;
         tx.execute("DELETE FROM deleted", [])?;
 
         tx.commit()?;
@@ -1561,6 +1615,7 @@ impl LibraryDatabase {
         tx.execute("DELETE FROM cue_slices", [])?;
         tx.execute("DELETE FROM cue_albums", [])?;
         tx.execute("DELETE FROM tracks", [])?;
+        tx.execute("DELETE FROM deleted_tracks", [])?;
         tx.execute("DELETE FROM deleted", [])?;
 
         tx.commit()?;
@@ -1685,6 +1740,176 @@ impl LibraryDatabase {
             }
             None => Ok(0),
         }
+    }
+
+    // ── Deleted tracks (v6 tombstones) ────────────────────────────────────────
+
+    pub fn upsert_deleted_track(&self, track: &DeletedTrack) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_tracks
+             (source_name, remote_path, rev, deleted_at, pushed)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &track.source_name,
+                &track.remote_path,
+                track.rev,
+                &track.deleted_at,
+                track.pushed,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_deleted_track(
+        &self,
+        source_name: &str,
+        remote_path: &str,
+    ) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM deleted_tracks WHERE source_name = ?1 AND remote_path = ?2",
+            params![source_name, remote_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_deleted_tracks(&self) -> StorageResult<Vec<DeletedTrack>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_name, remote_path, rev, deleted_at, pushed
+             FROM deleted_tracks ORDER BY rev ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DeletedTrack {
+                source_name: row.get(0)?,
+                remote_path: row.get(1)?,
+                rev: row.get(2)?,
+                deleted_at: row.get(3)?,
+                pushed: row.get(4)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    pub fn list_unpushed_deleted_tracks(&self) -> StorageResult<Vec<DeletedTrack>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_name, remote_path, rev, deleted_at, pushed
+             FROM deleted_tracks WHERE pushed = 0 ORDER BY rev ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DeletedTrack {
+                source_name: row.get(0)?,
+                remote_path: row.get(1)?,
+                rev: row.get(2)?,
+                deleted_at: row.get(3)?,
+                pushed: row.get(4)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    pub fn mark_deleted_tracks_pushed(&self, revs: &[i64]) -> StorageResult<()> {
+        if revs.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for rev in revs {
+            tx.execute(
+                "UPDATE deleted_tracks SET pushed = 1 WHERE rev = ?1",
+                params![rev],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn purge_deleted_tracks_up_to(&self, up_to: i64) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM deleted_tracks WHERE pushed = 1 AND rev <= ?1",
+            params![up_to],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn tombstoned_remote_paths(&self, source_name: &str) -> StorageResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT remote_path FROM deleted_tracks WHERE source_name = ?1",
+        )?;
+        let rows = stmt.query_map(params![source_name], |row| row.get(0))?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    // ── Sync state (v6 cursors) ───────────────────────────────────────────────
+
+    pub fn get_sync_state(&self, remote_key: &str) -> StorageResult<Option<SyncState>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT remote_key, last_seq, base_up_to, parts, updated_at
+             FROM sync_state WHERE remote_key = ?1",
+            params![remote_key],
+            |row| {
+                Ok(SyncState {
+                    remote_key: row.get(0)?,
+                    last_seq: row.get(1)?,
+                    base_up_to: row.get(2)?,
+                    parts: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StorageError::from)
+    }
+
+    pub fn save_sync_state(&self, state: &SyncState) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state
+             (remote_key, last_seq, base_up_to, parts, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &state.remote_key,
+                state.last_seq,
+                state.base_up_to,
+                &state.parts,
+                &state.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_sync_state(&self, prefix: Option<&str>) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        match prefix {
+            None => {
+                conn.execute("DELETE FROM sync_state", [])?;
+            }
+            Some(p) => {
+                let pattern = format!("{}%", p);
+                conn.execute(
+                    "DELETE FROM sync_state WHERE remote_key LIKE ?1",
+                    params![pattern],
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1857,7 +2082,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
 
     #[test]
@@ -2667,5 +2892,220 @@ mod tests {
 
         // Playlists survive
         assert_eq!(db.list_playlists().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_v6() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 6);
+
+        let conn = db.conn.lock().unwrap();
+        let exists = |name: &str| -> bool {
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+                > 0
+        };
+        assert!(exists("deleted_tracks"));
+        assert!(exists("sync_state"));
+    }
+
+    #[test]
+    fn deleted_tracks_crud() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let t1 = DeletedTrack {
+            source_name: "source1".into(),
+            remote_path: "/music/a.flac".into(),
+            rev: 1,
+            deleted_at: now.clone(),
+            pushed: 0,
+        };
+
+        db.upsert_deleted_track(&t1).unwrap();
+        let all = db.list_deleted_tracks().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].source_name, "source1");
+        assert_eq!(all[0].rev, 1);
+
+        let unpushed = db.list_unpushed_deleted_tracks().unwrap();
+        assert_eq!(unpushed.len(), 1);
+
+        db.mark_deleted_tracks_pushed(&[1]).unwrap();
+        let unpushed = db.list_unpushed_deleted_tracks().unwrap();
+        assert_eq!(unpushed.len(), 0);
+
+        let purged = db.purge_deleted_tracks_up_to(1).unwrap();
+        assert_eq!(purged, 1);
+        assert_eq!(db.list_deleted_tracks().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn deleted_tracks_clear() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let t1 = DeletedTrack {
+            source_name: "source1".into(),
+            remote_path: "/music/a.flac".into(),
+            rev: 1,
+            deleted_at: now.clone(),
+            pushed: 0,
+        };
+        db.upsert_deleted_track(&t1).unwrap();
+        assert_eq!(db.list_deleted_tracks().unwrap().len(), 1);
+
+        db.clear_deleted_track("source1", "/music/a.flac").unwrap();
+        assert_eq!(db.list_deleted_tracks().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn deleted_tracks_tombstoned_paths() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        db.upsert_deleted_track(&DeletedTrack {
+            source_name: "src1".into(),
+            remote_path: "/a.mp3".into(),
+            rev: 1,
+            deleted_at: now.clone(),
+            pushed: 0,
+        })
+        .unwrap();
+
+        db.upsert_deleted_track(&DeletedTrack {
+            source_name: "src1".into(),
+            remote_path: "/b.mp3".into(),
+            rev: 2,
+            deleted_at: now.clone(),
+            pushed: 0,
+        })
+        .unwrap();
+
+        let paths = db.tombstoned_remote_paths("src1").unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"/a.mp3".to_string()));
+        assert!(paths.contains(&"/b.mp3".to_string()));
+    }
+
+    #[test]
+    fn clear_library_index_clears_deleted_tracks() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        db.upsert_deleted_track(&DeletedTrack {
+            source_name: "src1".into(),
+            remote_path: "/music/x.flac".into(),
+            rev: 1,
+            deleted_at: now.clone(),
+            pushed: 0,
+        })
+        .unwrap();
+        assert_eq!(db.list_deleted_tracks().unwrap().len(), 1);
+
+        db.clear_library_index().unwrap();
+        assert_eq!(db.list_deleted_tracks().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sync_state_crud() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let state = SyncState {
+            remote_key: "library:source1".into(),
+            last_seq: 10,
+            base_up_to: 5,
+            parts: r#"{"a":1}"#.into(),
+            updated_at: now.clone(),
+        };
+
+        db.save_sync_state(&state).unwrap();
+        let loaded = db.get_sync_state("library:source1").unwrap();
+        assert!(loaded.is_some());
+        let s = loaded.unwrap();
+        assert_eq!(s.last_seq, 10);
+        assert_eq!(s.base_up_to, 5);
+        assert_eq!(s.parts, r#"{"a":1}"#);
+
+        let missing = db.get_sync_state("missing").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn sync_state_clear() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        db.save_sync_state(&SyncState {
+            remote_key: "library:s1".into(),
+            last_seq: 1,
+            base_up_to: 0,
+            parts: "{}".into(),
+            updated_at: now.clone(),
+        })
+        .unwrap();
+
+        db.save_sync_state(&SyncState {
+            remote_key: "manga:s2".into(),
+            last_seq: 2,
+            base_up_to: 0,
+            parts: "{}".into(),
+            updated_at: now.clone(),
+        })
+        .unwrap();
+
+        // Clear by prefix
+        db.clear_sync_state(Some("library:")).unwrap();
+        assert!(db.get_sync_state("library:s1").unwrap().is_none());
+        assert!(db.get_sync_state("manga:s2").unwrap().is_some());
+
+        // Clear all
+        db.clear_sync_state(None).unwrap();
+        assert!(db.get_sync_state("manga:s2").unwrap().is_none());
+    }
+
+    #[test]
+    fn deleted_tracks_json_roundtrip() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let track = DeletedTrack {
+            source_name: "src".into(),
+            remote_path: "/path.mp3".into(),
+            rev: 42,
+            deleted_at: now.clone(),
+            pushed: 1,
+        };
+
+        let json = serde_json::to_string(&track).unwrap();
+        let parsed: DeletedTrack = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_name, "src");
+        assert_eq!(parsed.rev, 42);
+        assert_eq!(parsed.pushed, 1);
+    }
+
+    #[test]
+    fn sync_state_json_roundtrip() {
+        let now = Utc::now().to_rfc3339();
+
+        let state = SyncState {
+            remote_key: "library:x".into(),
+            last_seq: 100,
+            base_up_to: 50,
+            parts: r#"{"foo":"bar"}"#.into(),
+            updated_at: now.clone(),
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: SyncState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.remote_key, "library:x");
+        assert_eq!(parsed.last_seq, 100);
+        assert_eq!(parsed.base_up_to, 50);
+        assert_eq!(parsed.parts, r#"{"foo":"bar"}"#);
     }
 }
