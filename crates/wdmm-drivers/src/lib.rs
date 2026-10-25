@@ -107,7 +107,7 @@ impl DriverRegistry {
                 }
                 Ok(Box::new(Pan123Driver::new(cfg)?))
             }
-            "aliyundrive" | "aliyun" => {
+            "aliyundrive" | "aliyun" | "aliyundrive_open" => {
                 let token = config["access_token"]
                     .as_str()
                     .ok_or_else(|| DriverError::Config("aliyun: missing access_token".into()))?;
@@ -123,7 +123,7 @@ impl DriverRegistry {
                 }
                 Ok(Box::new(AliyunDriver::new(cfg)?))
             }
-            "115" | "open115" => {
+            "115" | "open115" | "115open" => {
                 let token = config["access_token"]
                     .as_str()
                     .ok_or_else(|| DriverError::Config("115: missing access_token".into()))?;
