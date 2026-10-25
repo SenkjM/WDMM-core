@@ -2028,6 +2028,37 @@ pub extern "C" fn wdmm_track_delete(id: *const c_char) -> FfiString {
     }
 }
 
+/// Delete all tracks for a given source/account. Returns `"ok"`.
+#[no_mangle]
+pub extern "C" fn wdmm_track_delete_by_source(source: *const c_char) -> FfiString {
+    let source_str = match ptr_to_str(source) {
+        Some(s) => s,
+        None => return FfiString::from("error:null source pointer"),
+    };
+    match global_library_db().delete_tracks_by_account(source_str) {
+        Ok(_) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Clear all library data except accounts and non-library KV keys. Returns `"ok"`.
+#[no_mangle]
+pub extern "C" fn wdmm_library_clear_all() -> FfiString {
+    match global_library_db().clear_library_all() {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Clear library index (tracks, CUE, tombstones). Returns `"ok"`.
+#[no_mangle]
+pub extern "C" fn wdmm_library_clear_index() -> FfiString {
+    match global_library_db().clear_library_index() {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 /// Import tracks, playlists, and playlist_entries from an old sqflite
 /// database (one-shot — skipped if KV flag `sqflite_imported = 1` is set).
 ///
@@ -2308,6 +2339,111 @@ pub extern "C" fn wdmm_user_folder_set_items(
     }
     match global_library_db().set_user_folder_items(fid, &items) {
         Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── CUE sheet FFI (v5) ────────────────────────────────────────────────────────
+
+/// Upsert a CUE album from JSON. Returns `"ok"` or `"error:<message>"`.
+///
+/// Expected JSON shape:
+/// ```json
+/// {
+///   "cue_id": "...",
+///   "source_name": "...",
+///   "cue_remote_path": "...",
+///   "title": "...",
+///   "performer": "...",
+///   "cache_group_id": null,
+///   "created_at": "2024-01-01T00:00:00Z"
+/// }
+/// ```
+#[no_mangle]
+pub extern "C" fn wdmm_cue_album_upsert(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let album: wdmm_storage::CueAlbum = match serde_json::from_str(s) {
+        Ok(a) => a,
+        Err(e) => return FfiString::from(format!("error:parse CueAlbum: {e}")),
+    };
+    match global_library_db().upsert_cue_album(&album) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Upsert a CUE slice from JSON. Returns `"ok"` or `"error:<message>"`.
+///
+/// Expected JSON shape: see `CueSlice` struct fields.
+#[no_mangle]
+pub extern "C" fn wdmm_cue_slice_upsert(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let slice: wdmm_storage::CueSlice = match serde_json::from_str(s) {
+        Ok(sl) => sl,
+        Err(e) => return FfiString::from(format!("error:parse CueSlice: {e}")),
+    };
+    match global_library_db().upsert_cue_slice(&slice) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a CUE slice by music_id. Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_cue_slice_delete(music_id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(music_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null music_id pointer"),
+    };
+    match global_library_db().delete_cue_slice(id) {
+        Ok(_) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a CUE album and its slices. Returns `"ok"` or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_cue_album_delete(
+    source_name: *const c_char,
+    cue_remote_path: *const c_char,
+) -> FfiString {
+    let src = match ptr_to_str(source_name) {
+        Some(s) => s,
+        None => return FfiString::from("error:null source_name pointer"),
+    };
+    let path = match ptr_to_str(cue_remote_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null cue_remote_path pointer"),
+    };
+    match global_library_db().delete_cue_album(src, path) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Count remaining slices for a CUE album. Returns the count as a decimal string
+/// (e.g. `"5"`), or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_cue_remaining_slices(
+    source_name: *const c_char,
+    cue_remote_path: *const c_char,
+) -> FfiString {
+    let src = match ptr_to_str(source_name) {
+        Some(s) => s,
+        None => return FfiString::from("error:null source_name pointer"),
+    };
+    let path = match ptr_to_str(cue_remote_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null cue_remote_path pointer"),
+    };
+    match global_library_db().remaining_slices_for_cue(src, path) {
+        Ok(count) => FfiString::from(count.to_string()),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }

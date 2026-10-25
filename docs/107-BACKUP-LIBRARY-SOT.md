@@ -7,7 +7,7 @@
 Core (`wdmm-storage` + `wdmm-sync`) already handles the following library operations:
 
 - **Accounts**: Insert, list, delete cloud accounts (WebDAV, cloud drivers)
-- **Tracks**: Upsert, list, delete tracks (via `wdmm_track_*` FFI)
+- **Tracks**: Upsert, list, delete tracks (via `wdmm_track_*` FFI), delete by account/source
 - **Playlists**: Create, update, list, delete playlists and entries
 - **Manga**: Insert, list manga + pages + reading progress
 - **DMR Preferences**: Upsert, list, replace DMR device preferences (`dmr_prefs` table)
@@ -15,6 +15,8 @@ Core (`wdmm-storage` + `wdmm-sync`) already handles the following library operat
   - **Create**: JSON sections (codec 0) written to `.wdmm` archive
   - **Restore**: Dual-read supporting both Core JSON sections AND Android binary sections (codec 1, nested WDMMCV01/WDMMPL01)
 - **User Folders**: Create, list, delete user folder hierarchy + items
+- **CUE Sheets** (v5): Upsert, delete CUE albums and slices
+- **Library Clear Operations**: Clear all library data (tracks/playlists/mangas) or index-only (tracks/CUE/tombstones)
 
 ### Android SoT via sqflite `LibraryDatabase`
 
@@ -36,22 +38,26 @@ This allows seamless cross-platform restore: Desktop can restore Android backups
 
 ## Migration Blockers
 
-### Cutover TODOs Observed in Android
+### Remaining Gaps for Full Library SoT
 
-The following operations are marked as TODOs for Core migration in Android codebase:
+The following gaps remain before Android can fully switch to Core as library source of truth:
 
-1. **`wdmm_track_delete_by_source`**: Delete all tracks for a given account/source
-2. **`wdmm_library_clear_all`**: Clear entire library (all tracks, accounts, playlists)
-3. **`wdmm_library_clear_index`**: Clear library index/search cache
-4. **CUE slice delete**: Delete CUE-sheet track slices through Rust FFI
+1. **Dual-write parity**: Android must write to both sqflite and Core during migration phase
+2. **Tombstones + sync_state**: Android's `deleted` table and music sync cursors (`sync_state`) not yet ported to Core
+3. **Album/artist aggregation**: Core has tables but no track → album/artist auto-aggregation logic yet
+4. **Search indexes**: FTS or optimized search indexes (current Core uses basic LIKE queries)
+5. **Migration validation**: Comprehensive testing of sqflite → Core data migration at scale
 
-Once these are implemented in Core and exposed via FFI, Android can switch to Core for backup creation.
+Once these are resolved, Android can:
+- Switch backup **create** to read from Core's Rust DB (removing sqflite dependency)
+- Deprecate and remove `music_library_database_impl.dart` / sqflite layer
 
 ## Explicit Status
 
 - ✅ **Dual-read restore**: Complete and tested (both Core JSON and Android binary)
-- ⏸ **Create cutover**: Blocked until Android completes library data migration to Core
-- 📋 **Remaining FFI**: Track delete, library clear, CUE slice management
+- ✅ **Cutover FFI** (v5): `wdmm_track_delete_by_source`, `wdmm_library_clear_all`, `wdmm_library_clear_index`, CUE slice upsert/delete/remaining
+- ⏸ **Create cutover**: Blocked on dual-write validation, tombstones, aggregation logic
+- 📋 **Full SoT migration**: Requires resolving gaps listed above
 
 ## References
 

@@ -1,4 +1,4 @@
-//! `wdmm-storage` — rusqlite library DB (schema v4, music + manga library).
+//! `wdmm-storage` — rusqlite library DB (schema v5, music + manga library).
 //!
 //! Schema v1 (Round 4): base tables.
 //! Schema v2 (Round 5): artists/albums tables, extended `tracks` columns,
@@ -9,11 +9,12 @@
 //!   duplicate-column errors so opening any DB version converges to v3.
 //! Schema v4 (Wave D): replace manga stubs with real `mangas` / `manga_pages` /
 //!   `manga_progress` / `deleted_mangas` tables.
+//! Schema v5: CUE sheet support (`cue_albums`, `cue_slices` tables).
 
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::sync::Mutex;
 use thiserror::Error as ThisError;
 use uuid::Uuid;
@@ -105,6 +106,53 @@ pub struct DeletedManga {
     pub deleted_at: String,
     /// `1` once the tombstone has been pushed to the sync server.
     pub pushed: i64,
+}
+
+/// A CUE sheet album (v5).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CueAlbum {
+    pub cue_id: String,
+    pub source_name: String,
+    pub cue_remote_path: String,
+    pub title: Option<String>,
+    pub performer: Option<String>,
+    pub cache_group_id: Option<String>,
+    /// RFC-3339 timestamp string.
+    pub created_at: String,
+}
+
+/// A CUE sheet slice (virtual track) (v5).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CueSlice {
+    pub music_id: String,
+    pub cue_id: String,
+    pub audio_music_id: String,
+    pub source_name: String,
+    pub remote_path: String,
+    pub file_name: String,
+    pub track_index: i64,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub album: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub track_number: Option<i64>,
+    pub track_total: Option<i64>,
+    pub disc_number: Option<i64>,
+    pub disc_total: Option<i64>,
+    pub year: Option<i64>,
+    pub genre: Option<String>,
+    pub bitrate: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub cover_path: Option<String>,
+    pub audio_remote_path: Option<String>,
+    pub clip_start_ms: Option<i64>,
+    pub clip_end_ms: Option<i64>,
+    pub cache_group_id: Option<String>,
+    pub rev: i64,
+    pub last_downloaded_at: String,
+    pub last_tag_read_at: String,
+    pub remote_missing: i64,
 }
 
 /// A distinct series tag with its derived id.
@@ -369,6 +417,65 @@ impl LibraryDatabase {
             )?;
             conn.execute(
                 "INSERT OR IGNORE INTO _schema_version (version) VALUES (4)",
+                [],
+            )?;
+        }
+
+        // ── v5 migration: CUE sheet support ───────────────────────────────────
+        if current_ver < 5 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS cue_albums (
+                  cue_id TEXT PRIMARY KEY,
+                  source_name TEXT NOT NULL,
+                  cue_remote_path TEXT NOT NULL,
+                  title TEXT,
+                  performer TEXT,
+                  cache_group_id TEXT,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(source_name, cue_remote_path)
+                );
+
+                CREATE TABLE IF NOT EXISTS cue_slices (
+                  music_id TEXT PRIMARY KEY,
+                  cue_id TEXT NOT NULL,
+                  audio_music_id TEXT NOT NULL,
+                  source_name TEXT NOT NULL,
+                  remote_path TEXT NOT NULL,
+                  file_name TEXT NOT NULL,
+                  track_index INTEGER NOT NULL,
+                  title TEXT,
+                  artist TEXT,
+                  album_artist TEXT,
+                  album TEXT,
+                  duration_ms INTEGER,
+                  track_number INTEGER,
+                  track_total INTEGER,
+                  disc_number INTEGER,
+                  disc_total INTEGER,
+                  year INTEGER,
+                  genre TEXT,
+                  bitrate INTEGER,
+                  sample_rate INTEGER,
+                  cover_path TEXT,
+                  audio_remote_path TEXT,
+                  clip_start_ms INTEGER,
+                  clip_end_ms INTEGER,
+                  cache_group_id TEXT,
+                  rev INTEGER NOT NULL DEFAULT 0,
+                  last_downloaded_at TEXT NOT NULL DEFAULT '',
+                  last_tag_read_at TEXT NOT NULL DEFAULT '',
+                  remote_missing INTEGER NOT NULL DEFAULT 0,
+                  UNIQUE(source_name, remote_path),
+                  FOREIGN KEY (cue_id) REFERENCES cue_albums(cue_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cue_slices_cue ON cue_slices(cue_id);
+                CREATE INDEX IF NOT EXISTS idx_cue_albums_source ON cue_albums(source_name);
+                "#,
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (5)",
                 [],
             )?;
         }
@@ -1398,6 +1505,187 @@ impl LibraryDatabase {
         }
         Ok(out)
     }
+
+    // ── Track deletion by account (v5) ────────────────────────────────────────
+
+    /// Delete all tracks for a given account_id. Returns number of rows deleted.
+    pub fn delete_tracks_by_account(&self, account_id: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM tracks WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        Ok(n)
+    }
+
+    // ── Clear operations (v5) ─────────────────────────────────────────────────
+
+    /// Clear all library-persisted data except accounts and non-library KV keys.
+    ///
+    /// Clears: tracks, albums, artists, cue_albums, cue_slices, playlists,
+    /// playlist_entries, user_folders, user_folder_items, mangas, manga_pages,
+    /// manga_progress, deleted_mangas, deleted tombstone table.
+    ///
+    /// Does NOT delete: accounts, kv_store.
+    pub fn clear_library_all(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        // Order matters: child tables first to satisfy FK constraints.
+        tx.execute("DELETE FROM playlist_entries", [])?;
+        tx.execute("DELETE FROM playlists", [])?;
+        tx.execute("DELETE FROM user_folder_items", [])?;
+        tx.execute("DELETE FROM user_folders", [])?;
+        tx.execute("DELETE FROM cue_slices", [])?;
+        tx.execute("DELETE FROM cue_albums", [])?;
+        tx.execute("DELETE FROM tracks", [])?;
+        tx.execute("DELETE FROM albums", [])?;
+        tx.execute("DELETE FROM artists", [])?;
+        tx.execute("DELETE FROM manga_pages", [])?;
+        tx.execute("DELETE FROM manga_progress", [])?;
+        tx.execute("DELETE FROM mangas", [])?;
+        tx.execute("DELETE FROM deleted_mangas", [])?;
+        tx.execute("DELETE FROM deleted", [])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clear library index: tracks, CUE tables, and track tombstones.
+    ///
+    /// Does NOT clear: playlists, user_folders, mangas, accounts.
+    pub fn clear_library_index(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute("DELETE FROM cue_slices", [])?;
+        tx.execute("DELETE FROM cue_albums", [])?;
+        tx.execute("DELETE FROM tracks", [])?;
+        tx.execute("DELETE FROM deleted", [])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── CUE operations (v5) ───────────────────────────────────────────────────
+
+    pub fn upsert_cue_album(&self, album: &CueAlbum) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO cue_albums
+             (cue_id, source_name, cue_remote_path, title, performer, cache_group_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &album.cue_id,
+                &album.source_name,
+                &album.cue_remote_path,
+                &album.title,
+                &album.performer,
+                &album.cache_group_id,
+                &album.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_cue_slice(&self, slice: &CueSlice) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO cue_slices
+             (music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
+              track_index, title, artist, album_artist, album, duration_ms,
+              track_number, track_total, disc_number, disc_total, year, genre,
+              bitrate, sample_rate, cover_path, audio_remote_path,
+              clip_start_ms, clip_end_ms, cache_group_id, rev,
+              last_downloaded_at, last_tag_read_at, remote_missing)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+            params![
+                &slice.music_id,
+                &slice.cue_id,
+                &slice.audio_music_id,
+                &slice.source_name,
+                &slice.remote_path,
+                &slice.file_name,
+                slice.track_index,
+                &slice.title,
+                &slice.artist,
+                &slice.album_artist,
+                &slice.album,
+                slice.duration_ms,
+                slice.track_number,
+                slice.track_total,
+                slice.disc_number,
+                slice.disc_total,
+                slice.year,
+                &slice.genre,
+                slice.bitrate,
+                slice.sample_rate,
+                &slice.cover_path,
+                &slice.audio_remote_path,
+                slice.clip_start_ms,
+                slice.clip_end_ms,
+                &slice.cache_group_id,
+                slice.rev,
+                &slice.last_downloaded_at,
+                &slice.last_tag_read_at,
+                slice.remote_missing,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a CUE slice by music_id. Returns number of rows deleted.
+    pub fn delete_cue_slice(&self, music_id: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM cue_slices WHERE music_id = ?1",
+            params![music_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Delete a CUE album and its slices (CASCADE handles slices).
+    pub fn delete_cue_album(
+        &self,
+        source_name: &str,
+        cue_remote_path: &str,
+    ) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM cue_albums WHERE source_name = ?1 AND cue_remote_path = ?2",
+            params![source_name, cue_remote_path],
+        )?;
+        Ok(())
+    }
+
+    /// Count remaining slices for a CUE album.
+    pub fn remaining_slices_for_cue(
+        &self,
+        source_name: &str,
+        cue_remote_path: &str,
+    ) -> StorageResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        // Find the cue_id first
+        let cue_id: Option<String> = conn
+            .query_row(
+                "SELECT cue_id FROM cue_albums WHERE source_name = ?1 AND cue_remote_path = ?2",
+                params![source_name, cue_remote_path],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        match cue_id {
+            Some(id) => {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM cue_slices WHERE cue_id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                Ok(count)
+            }
+            None => Ok(0),
+        }
+    }
 }
 
 // ── Playlist models (storage-local; identity aligns with wdmm-core) ──────────
@@ -1569,7 +1857,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -2106,5 +2394,196 @@ mod tests {
         assert_eq!(db.get_playlist("pl-v3").unwrap().unwrap().name, "v3 Test");
         db.delete_playlist("pl-v3").unwrap();
         assert!(db.get_playlist("pl-v3").unwrap().is_none());
+    }
+
+    // ── v5 tests: CUE + clear + delete-by-account ────────────────────────────
+
+    #[test]
+    fn cue_crud_and_slice_remaining() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let album = CueAlbum {
+            cue_id: "cue-001".into(),
+            source_name: "nas".into(),
+            cue_remote_path: "/music/album.cue".into(),
+            title: Some("Album Title".into()),
+            performer: Some("Artist".into()),
+            cache_group_id: None,
+            created_at: now.clone(),
+        };
+        db.upsert_cue_album(&album).unwrap();
+
+        let slice1 = CueSlice {
+            music_id: "slice-001".into(),
+            cue_id: "cue-001".into(),
+            audio_music_id: "audio-001".into(),
+            source_name: "nas".into(),
+            remote_path: "/music/track1.mp3".into(),
+            file_name: "track1.mp3".into(),
+            track_index: 1,
+            title: Some("Track 1".into()),
+            artist: Some("Artist".into()),
+            album_artist: None,
+            album: Some("Album Title".into()),
+            duration_ms: Some(180_000),
+            track_number: Some(1),
+            track_total: Some(3),
+            disc_number: Some(1),
+            disc_total: Some(1),
+            year: Some(2024),
+            genre: Some("Rock".into()),
+            bitrate: Some(320),
+            sample_rate: Some(44100),
+            cover_path: None,
+            audio_remote_path: Some("/music/album.flac".into()),
+            clip_start_ms: Some(0),
+            clip_end_ms: Some(180_000),
+            cache_group_id: None,
+            rev: 0,
+            last_downloaded_at: now.clone(),
+            last_tag_read_at: now.clone(),
+            remote_missing: 0,
+        };
+        db.upsert_cue_slice(&slice1).unwrap();
+
+        let slice2 = CueSlice {
+            music_id: "slice-002".into(),
+            remote_path: "/music/track2.mp3".into(),
+            file_name: "track2.mp3".into(),
+            track_index: 2,
+            title: Some("Track 2".into()),
+            ..slice1.clone()
+        };
+        db.upsert_cue_slice(&slice2).unwrap();
+
+        // Remaining slices
+        assert_eq!(
+            db.remaining_slices_for_cue("nas", "/music/album.cue").unwrap(),
+            2
+        );
+
+        // Delete one slice
+        assert_eq!(db.delete_cue_slice("slice-001").unwrap(), 1);
+        assert_eq!(
+            db.remaining_slices_for_cue("nas", "/music/album.cue").unwrap(),
+            1
+        );
+
+        // Delete album (cascades to remaining slice)
+        db.delete_cue_album("nas", "/music/album.cue").unwrap();
+        assert_eq!(
+            db.remaining_slices_for_cue("nas", "/music/album.cue").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn delete_tracks_by_account() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        for (i, acc) in ["acc1", "acc2", "acc1"].iter().enumerate() {
+            db.upsert_track(&LibraryTrack {
+                id: format!("t{}", i),
+                title: format!("Track {}", i),
+                artist: None,
+                remote_path: format!("/m/{}.mp3", i),
+                account_id: acc.to_string(),
+                size: 1000,
+                modified: None,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        assert_eq!(db.list_tracks().unwrap().len(), 3);
+
+        let deleted = db.delete_tracks_by_account("acc1").unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(db.list_tracks().unwrap().len(), 1);
+        assert_eq!(db.list_tracks().unwrap()[0].account_id, "acc2");
+    }
+
+    #[test]
+    fn clear_library_all_keeps_accounts() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now();
+
+        // Insert data across multiple tables
+        db.insert_account(&CloudAccount {
+            id: "acc1".into(),
+            provider_type: "webdav".into(),
+            display_name: "Test".into(),
+            base_url: Some("http://nas".into()),
+            credentials_encrypted: vec![1, 2, 3],
+        })
+        .unwrap();
+
+        db.upsert_track(&LibraryTrack {
+            id: "t1".into(),
+            title: "Song".into(),
+            artist: None,
+            remote_path: "/m/s.mp3".into(),
+            account_id: "acc1".into(),
+            size: 1000,
+            modified: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        db.upsert_playlist(&Playlist {
+            id: "pl1".into(),
+            name: "Playlist".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        db.save_kv("some_key", "some_value").unwrap();
+
+        // Clear library
+        db.clear_library_all().unwrap();
+
+        // Accounts and KV survive
+        assert!(db.get_account("acc1").unwrap().is_some());
+        assert_eq!(db.load_kv("some_key").unwrap(), Some("some_value".into()));
+
+        // Library data gone
+        assert!(db.list_tracks().unwrap().is_empty());
+        assert!(db.list_playlists().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_library_index_keeps_playlists() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now();
+
+        db.upsert_track(&LibraryTrack {
+            id: "t1".into(),
+            title: "Song".into(),
+            artist: None,
+            remote_path: "/m/s.mp3".into(),
+            account_id: "acc1".into(),
+            size: 1000,
+            modified: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        db.upsert_playlist(&Playlist {
+            id: "pl1".into(),
+            name: "Playlist".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        db.clear_library_index().unwrap();
+
+        // Tracks cleared
+        assert!(db.list_tracks().unwrap().is_empty());
+
+        // Playlists survive
+        assert_eq!(db.list_playlists().unwrap().len(), 1);
     }
 }

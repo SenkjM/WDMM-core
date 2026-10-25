@@ -338,6 +338,19 @@ Case-insensitive substring search on title/artist. Returns JSON array.
 ### `extern "C" fn wdmm_track_delete(id: *const c_char) -> FfiString`
 Delete a track by id. Returns `"ok"` or `"error:<message>"`.
 
+### `extern "C" fn wdmm_track_delete_by_source(source: *const c_char) -> FfiString`
+Delete all tracks for a given source/account_id. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_library_clear_all() -> FfiString`
+Clear all library-persisted data except accounts and non-library KV keys.
+Clears: tracks, albums, artists, CUE tables, playlists, user_folders, mangas, tombstones.
+Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_library_clear_index() -> FfiString`
+Clear library index: tracks, CUE tables, and tombstones.
+Keeps: playlists, user_folders, mangas, accounts.
+Returns `"ok"` or `"error:<message>"`.
+
 ### `extern "C" fn wdmm_library_import_from_sqflite(old_db_path: *const c_char) -> FfiString`
 One-shot import from an old sqflite `music_library.db`.
 Returns JSON summary:
@@ -442,6 +455,79 @@ array index if absent; `added_at` defaults to the current Unix timestamp if
 absent. The previous items for `folder_id` are deleted atomically before the
 new ones are inserted (single transaction); other folders are unaffected.
 Returns `"ok"` or `"error:<message>"`.
+
+---
+
+## CUE sheet support (v5)
+
+Process-global library DB must be initialised via `wdmm_library_init` first.
+
+CUE sheets define virtual tracks (slices) from a single audio file. Each slice
+references a parent CUE album. Slices CASCADE-delete when the album is deleted.
+
+### CueAlbum object shape
+```json
+{
+  "cue_id": "...",
+  "source_name": "...",
+  "cue_remote_path": "...",
+  "title": "...",
+  "performer": "...",
+  "cache_group_id": null,
+  "created_at": "2024-01-01T00:00:00Z"
+}
+```
+
+### CueSlice object shape
+```json
+{
+  "music_id": "...",
+  "cue_id": "...",
+  "audio_music_id": "...",
+  "source_name": "...",
+  "remote_path": "...",
+  "file_name": "...",
+  "track_index": 1,
+  "title": "Track 1",
+  "artist": "...",
+  "album_artist": null,
+  "album": "...",
+  "duration_ms": 180000,
+  "track_number": 1,
+  "track_total": 10,
+  "disc_number": 1,
+  "disc_total": 1,
+  "year": 2024,
+  "genre": "Rock",
+  "bitrate": 320,
+  "sample_rate": 44100,
+  "cover_path": null,
+  "audio_remote_path": "/album.flac",
+  "clip_start_ms": 0,
+  "clip_end_ms": 180000,
+  "cache_group_id": null,
+  "rev": 0,
+  "last_downloaded_at": "2024-01-01T00:00:00Z",
+  "last_tag_read_at": "2024-01-01T00:00:00Z",
+  "remote_missing": 0
+}
+```
+
+### `extern "C" fn wdmm_cue_album_upsert(json: *const c_char) -> FfiString`
+Insert or replace a CUE album from JSON. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_cue_slice_upsert(json: *const c_char) -> FfiString`
+Insert or replace a CUE slice from JSON. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_cue_slice_delete(music_id: *const c_char) -> FfiString`
+Delete a CUE slice by music_id. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_cue_album_delete(source_name: *const c_char, cue_remote_path: *const c_char) -> FfiString`
+Delete a CUE album and its slices (CASCADE). Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_cue_remaining_slices(source_name: *const c_char, cue_remote_path: *const c_char) -> FfiString`
+Count remaining slices for a CUE album. Returns the count as a decimal string
+(e.g. `"5"`), or `"error:<message>"`.
 
 ---
 
