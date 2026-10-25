@@ -37,6 +37,9 @@ impl From<rusqlite::Error> for StorageError {
 
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
 
+mod dmr_prefs;
+pub use dmr_prefs::{DmrPrefRow, DmrPrefsDatabase};
+
 /// Summary returned by [`LibraryDatabase::import_from_sqflite`].
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ImportSummary {
@@ -806,6 +809,18 @@ impl LibraryDatabase {
         } else {
             Ok(None)
         }
+    }
+
+    /// Dump all KV pairs (for backup).
+    pub fn list_kv(&self) -> StorageResult<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare("SELECT key, value FROM kv_store ORDER BY key")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn delete_kv(&self, key: &str) -> StorageResult<()> {
