@@ -1087,4 +1087,253 @@ mod tests {
         assert_eq!(tracks[0].remote_path, "/music/song.mp3");
         assert_eq!(tracks[0].duration_ms, 180_000);
     }
+
+    /// Build a WDMMCV01 container with credentials section
+    fn build_cv_container(vault_records_raw: Vec<u8>) -> Vec<u8> {
+        let sections = vec![(5u8, vault_records_raw)]; // section 5 = CREDENTIALS
+        let count = sections.len() as u16;
+        let header_len = 12usize;
+        let table_len = sections.len() * 18;
+        let payload_start = header_len + table_len;
+        let mut payload = Vec::new();
+        let mut table = Vec::with_capacity(table_len);
+        for &(id, ref raw) in &sections {
+            let offset = (payload_start + payload.len()) as u32;
+            let raw_len = raw.len() as u32;
+            let crc = crc32_ieee(raw);
+            table.push(id);
+            table.push(0u8); // codec = raw
+            table.extend_from_slice(&offset.to_le_bytes());
+            table.extend_from_slice(&raw_len.to_le_bytes());
+            table.extend_from_slice(&raw_len.to_le_bytes());
+            table.extend_from_slice(&crc.to_le_bytes());
+            payload.extend_from_slice(raw);
+        }
+        let mut out = Vec::with_capacity(payload_start + payload.len());
+        out.extend_from_slice(b"WDMMCV01");
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&table);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Encode a single record in Android binary format
+    fn encode_record(tags: &[(u8, &[u8])], int_tags: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(tag, value) in tags {
+            out.push(tag);
+            if int_tags.contains(&tag) {
+                // int value: value is big-endian u64 bytes
+                let val = u64::from_be_bytes(value.try_into().unwrap_or([0u8; 8]));
+                out.extend_from_slice(&encode_varint(val));
+            } else {
+                // string/bytes: length-prefixed
+                out.extend_from_slice(&encode_varint(value.len() as u64));
+                out.extend_from_slice(value);
+            }
+        }
+        out.push(0); // end marker
+        out
+    }
+
+    #[test]
+    fn android_binary_cv_restore() {
+        // Build nested WDMMCV01 with one webdav vault record (plaintext password)
+        let vault_id = b"vault_001";
+        let vault_name = b"MyWebDAV";
+        let provider = b"webdav";
+        let url = b"https://dav.example.com";
+        let username = b"user1";
+        let password = b"pass123";
+        let pass_encrypted = 0u64; // plaintext
+
+        let vault_record = encode_record(
+            &[
+                (TAG_VAULT_ID, vault_id),
+                (TAG_VAULT_NAME, vault_name),
+                (TAG_VAULT_PROVIDER, provider),
+                (TAG_VAULT_URL, url),
+                (TAG_VAULT_USERNAME, username),
+                (TAG_VAULT_PASSWORD, password),
+                (TAG_VAULT_PASS_ENCRYPTED, &pass_encrypted.to_be_bytes()),
+            ],
+            &[TAG_VAULT_PASS_ENCRYPTED],
+        );
+
+        let cv_container = build_cv_container(vault_record);
+        let bk_sections = vec![(SEC_CREDENTIALS, cv_container)];
+        let bk = build_bk_container(&bk_sections);
+
+        // Restore
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let msg = restore_backup_bytes(&lib, None, &bk, "").unwrap();
+        assert!(msg.contains("credentials"));
+        assert!(msg.contains("android-binary"));
+
+        // Verify account
+        let accounts = lib.list_accounts().unwrap();
+        assert_eq!(accounts.len(), 1);
+        let acc = &accounts[0];
+        assert_eq!(acc.id, "vault_001");
+        assert_eq!(acc.display_name, "MyWebDAV");
+        assert_eq!(acc.provider_type, "webdav");
+        assert_eq!(acc.base_url.as_deref(), Some("https://dav.example.com"));
+
+        // Verify credentials JSON
+        let creds: serde_json::Value = serde_json::from_slice(&acc.credentials_encrypted).unwrap();
+        assert_eq!(creds["username"].as_str(), Some("user1"));
+        assert_eq!(creds["password"].as_str(), Some("pass123"));
+        assert_eq!(creds["remote_dir"].as_str(), Some("/"));
+    }
+
+    /// Build a WDMMPL01 playlist container
+    fn build_pl_container(meta_raw: Vec<u8>, entries_raw: Vec<u8>) -> Vec<u8> {
+        let sections = vec![(1u8, meta_raw), (9u8, entries_raw)];
+        let count = sections.len() as u16;
+        let header_len = 12usize;
+        let table_len = sections.len() * 18;
+        let payload_start = header_len + table_len;
+        let mut payload = Vec::new();
+        let mut table = Vec::with_capacity(table_len);
+        for &(id, ref raw) in &sections {
+            let offset = (payload_start + payload.len()) as u32;
+            let raw_len = raw.len() as u32;
+            let crc = crc32_ieee(raw);
+            table.push(id);
+            table.push(0u8); // codec = raw
+            table.extend_from_slice(&offset.to_le_bytes());
+            table.extend_from_slice(&raw_len.to_le_bytes());
+            table.extend_from_slice(&raw_len.to_le_bytes());
+            table.extend_from_slice(&crc.to_le_bytes());
+            payload.extend_from_slice(raw);
+        }
+        let mut out = Vec::with_capacity(payload_start + payload.len());
+        out.extend_from_slice(b"WDMMPL01");
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&table);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn android_binary_pl_restore() {
+        // Build WDMMPL01 with META + one entry
+        const TAG_PL_ID: u8 = 9;
+        const TAG_PL_NAME: u8 = 10;
+        const TAG_PL_UPDATED: u8 = 11;
+        const META_INT_TAGS: &[u8] = &[1, 2, 3, 4];
+
+        let pl_id = b"playlist_001";
+        let pl_name = b"MyPlaylist";
+        let updated = b"2026-10-26T12:00:00Z";
+
+        let meta_record = encode_record(
+            &[
+                (TAG_PL_ID, pl_id),
+                (TAG_PL_NAME, pl_name),
+                (TAG_PL_UPDATED, updated),
+            ],
+            META_INT_TAGS,
+        );
+
+        // Build one entry
+        const TAG_ENTRY_MUSIC_ID: u8 = 1;
+        const TAG_ENTRY_SOURCE: u8 = 2;
+        const TAG_ENTRY_PATH: u8 = 3;
+        const TAG_ENTRY_TITLE: u8 = 4;
+        const TAG_ENTRY_DURATION: u8 = 5;
+        const ENTRY_INT_TAGS: &[u8] = &[5, 6, 7, 8];
+
+        let music_id = b"track_001";
+        let source = b"source_001";
+        let path = b"/music/track.mp3";
+        let title = b"Track Title";
+        let duration = 240_000u64;
+
+        let entry_record = encode_record(
+            &[
+                (TAG_ENTRY_MUSIC_ID, music_id),
+                (TAG_ENTRY_SOURCE, source),
+                (TAG_ENTRY_PATH, path),
+                (TAG_ENTRY_TITLE, title),
+                (TAG_ENTRY_DURATION, &duration.to_be_bytes()),
+            ],
+            ENTRY_INT_TAGS,
+        );
+
+        let pl_container = build_pl_container(meta_record, entry_record);
+
+        // Wrap WDMMPL01 as BK section 6 (PLAYLISTS) via tag1=blob
+        const TAG_PL_BLOB: u8 = 1;
+        let mut pl_section = Vec::new();
+        pl_section.push(TAG_PL_BLOB);
+        pl_section.extend_from_slice(&encode_varint(pl_container.len() as u64));
+        pl_section.extend_from_slice(&pl_container);
+        pl_section.push(0); // end marker
+
+        let bk_sections = vec![(SEC_PLAYLISTS, pl_section)];
+        let bk = build_bk_container(&bk_sections);
+
+        // Restore
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let msg = restore_backup_bytes(&lib, None, &bk, "").unwrap();
+        assert!(msg.contains("playlists"));
+        assert!(msg.contains("android-binary"));
+
+        // Verify playlist
+        let playlists = lib.list_playlists().unwrap();
+        assert_eq!(playlists.len(), 1);
+        let pl = &playlists[0];
+        assert_eq!(pl.id, "playlist_001");
+        assert_eq!(pl.name, "MyPlaylist");
+
+        // Verify entry
+        let entries = lib.list_playlist_entries(&pl.id).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.music_id, "track_001");
+        assert_eq!(entry.source_name, "source_001");
+        assert_eq!(entry.remote_path, "/music/track.mp3");
+        assert_eq!(entry.title, "Track Title");
+        assert_eq!(entry.duration_ms, 240_000);
+    }
+
+    #[test]
+    fn aesgcmv1_roundtrip_field() {
+        // Encrypt a field value manually matching Android CredentialVaultCrypto wire
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        use pbkdf2::pbkdf2_hmac;
+        use sha2::Sha256;
+
+        let plaintext = "secret_value";
+        let passphrase = "testpass";
+
+        // Android CredentialVaultCrypto uses 120k iterations for field encryption
+        let salt = b"saltsaltsaltsalt"; // 16 bytes
+        let nonce_bytes = b"noncenonceno"; // 12 bytes
+        let mut key = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, 120_000, &mut key);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let ct = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
+
+        // Build wire format: salt|nonce|ct (ct includes tag at end)
+        let mut wire = Vec::new();
+        wire.extend_from_slice(salt);
+        wire.extend_from_slice(nonce_bytes);
+        wire.extend_from_slice(&ct);
+
+        // Encode as AESGCMv1:base64
+        let encoded = format!(
+            "AESGCMv1:{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wire)
+        );
+
+        // Decrypt via try_decrypt_aesgcmv1
+        let decrypted = try_decrypt_aesgcmv1(&encoded, passphrase).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
 }
