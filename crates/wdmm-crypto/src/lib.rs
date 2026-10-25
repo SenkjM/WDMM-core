@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod netease;
 pub mod rclone;
 pub mod vault;
 
