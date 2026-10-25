@@ -15,6 +15,8 @@ use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
 
+const OPEN115_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/142.0.0.0 OpenList/425.6.30";
+
 use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -57,7 +59,9 @@ impl Open115Driver {
         if config.access_token.is_empty() {
             return Err(DriverError::Config("115: missing access_token".into()));
         }
+        // Download links require the same User-Agent as the Dart driver.
         let client = Client::builder()
+            .user_agent(OPEN115_USER_AGENT)
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
         Ok(Self { config, client })
@@ -65,6 +69,40 @@ impl Open115Driver {
 
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.config.access_token)
+    }
+
+    /// POST form-urlencoded fields with Bearer auth.
+    async fn post_form(&self, url: &str, fields: &[(&str, &str)]) -> Result<Value> {
+        let resp = self.client.post(url)
+            .header("Authorization", self.auth_header())
+            .form(fields).send().await.map_err(|e| DriverError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(DriverError::AuthFailed);
+        }
+        if !resp.status().is_success() { return Err(DriverError::Network(format!("HTTP {}", resp.status()))); }
+        resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
+    }
+
+    async fn list_cid(&self, cid: &str) -> Result<Vec<Value>> {
+        let url = format!("{}/open/ufile/files", self.config.base_url);
+        let mut offset = 0usize;
+        let mut all = Vec::new();
+        let mut previous_page_size = None;
+        loop {
+            let offset_text = offset.to_string();
+            let params = [("cid", cid), ("limit", "200"), ("offset", offset_text.as_str()), ("asc", "1"), ("o", "file_name"), ("showDir", "1")];
+            let json = self.get_json(&url, &params).await?;
+            let page = json["data"].as_array().cloned().unwrap_or_default();
+            let len = page.len();
+            if len == 0 { break; }
+            let count = json["count"].as_u64().or_else(|| json["count"].as_str().and_then(|v| v.parse().ok())).unwrap_or(0) as usize;
+            if previous_page_size == Some(len) && count == 0 { break; }
+            previous_page_size = Some(len);
+            all.extend(page);
+            offset += len;
+            if count > 0 && offset >= count { break; }
+        }
+        Ok(all)
     }
 
     /// GET with Bearer auth and return JSON. Retries once on 429/5xx.
@@ -128,8 +166,7 @@ impl Open115Driver {
         resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
     }
 
-    /// Resolve a path to an item's id. For files returns (fid, false); for
-    /// folders returns (cid_string, true). Lists the parent directory.
+    /// Resolve a path to an item's id. Lists the parent directory.
     async fn path_to_item_id(&self, path: &str) -> Result<(String, bool)> {
         let trimmed = path.trim_end_matches('/');
         let (parent, name) = match trimmed.rfind('/') {
@@ -137,24 +174,12 @@ impl Open115Driver {
             Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
         };
         let cid = self.path_to_cid(parent).await?;
-        let url = format!("{}/open/folder/list", self.config.base_url);
-        let cid_str = cid.to_string();
-        let params = [("cid", cid_str.as_str()), ("limit", "1150")];
-        let json = self.get_json(&url, &params).await?;
-        let items = json["data"].as_array().cloned().unwrap_or_default();
-        let entry = items
-            .iter()
-            .find(|item| item["n"].as_str() == Some(name))
+        let items = self.list_cid(&cid.to_string()).await?;
+        let entry = items.iter().find(|item| item["fn"].as_str() == Some(name))
             .ok_or_else(|| DriverError::NotFound(path.to_string()))?;
-        // Files carry fid; folders carry cid but no fid.
-        if let Some(fid) = entry["fid"].as_str() {
-            return Ok((fid.to_string(), false));
-        }
-        let folder_cid = entry["cid"]
-            .as_u64()
-            .or_else(|| entry["cid"].as_str().and_then(|s| s.parse().ok()))
-            .ok_or_else(|| DriverError::Network("115: missing cid for folder".into()))?;
-        Ok((folder_cid.to_string(), true))
+        let id = entry["fid"].as_str().map(str::to_owned).or_else(|| entry["fid"].as_u64().map(|n| n.to_string()))
+            .ok_or_else(|| DriverError::Network("115: missing fid".into()))?;
+        Ok((id, entry["fc"].as_str() == Some("0")))
     }
 
     /// The 115 Open API uses numeric folder IDs. Resolve a slash-path to a
@@ -168,20 +193,12 @@ impl Open115Driver {
 
         let mut cid: u64 = 0;
         for seg in &segments {
-            let url = format!("{}/open/folder/list", self.config.base_url);
-            let cid_str = cid.to_string();
-            let params = [("cid", cid_str.as_str()), ("limit", "1150")];
-            let json = self.get_json(&url, &params).await?;
-            let items = json["data"].as_array().cloned().unwrap_or_default();
-            let found = items.iter().find(|item| {
-                item["n"].as_str() == Some(seg) && item["fc"].as_str() != Some("0")
-            });
+            let items = self.list_cid(&cid.to_string()).await?;
+            let found = items.iter().find(|item| item["fn"].as_str() == Some(seg) && item["fc"].as_str() == Some("0"));
             match found {
                 Some(item) => {
-                    cid = item["cid"]
-                        .as_u64()
-                        .or_else(|| item["cid"].as_str().and_then(|s| s.parse().ok()))
-                        .ok_or_else(|| DriverError::Network("115: missing cid".into()))?;
+                    cid = item["fid"].as_u64().or_else(|| item["fid"].as_str().and_then(|s| s.parse().ok()))
+                        .ok_or_else(|| DriverError::Network("115: missing fid".into()))?;
                 }
                 None => return Err(DriverError::NotFound(path.to_string())),
             }
@@ -191,18 +208,15 @@ impl Open115Driver {
 
     /// Parse a single 115 list item into a CloudFileItem.
     fn parse_item(item: &Value) -> Option<CloudFileItem> {
-        let name = item["n"].as_str()?.to_string();
-        // In the 115 API: folders carry a `cid` and no `fid`/`sha`; files carry
-        // `fid` and `sha`. Use that to tell them apart.
-        let is_dir = item.get("fid").is_none() && item.get("cid").is_some()
-            && item.get("sha").is_none();
-        let size = item["s"]
+        let name = item["fn"].as_str()?.to_string();
+        let is_dir = item["fc"].as_str() == Some("0");
+        let size = item["fs"]
             .as_u64()
-            .or_else(|| item["s"].as_str().and_then(|s| s.parse().ok()))
+            .or_else(|| item["fs"].as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(0);
-        let mtime = item["te"]
+        let mtime = item["upt"]
             .as_i64()
-            .or_else(|| item["te"].as_str().and_then(|s| s.parse().ok()));
+            .or_else(|| item["upt"].as_str().and_then(|s| s.parse().ok()));
         let modified = mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single());
         Some(CloudFileItem {
             name,
@@ -221,11 +235,7 @@ impl Open115Driver {
 impl CloudDriver for Open115Driver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let cid = self.path_to_cid(path).await?;
-        let url = format!("{}/open/folder/list", self.config.base_url);
-        let cid_str = cid.to_string();
-        let params = [("cid", cid_str.as_str()), ("limit", "1150")];
-        let json = self.get_json(&url, &params).await?;
-        let items = json["data"].as_array().cloned().unwrap_or_default();
+        let items = self.list_cid(&cid.to_string()).await?;
         Ok(items.iter().filter_map(Self::parse_item).collect())
     }
 
@@ -239,36 +249,26 @@ impl CloudDriver for Open115Driver {
 
         // Find the file's fid by listing parent
         let cid = self.path_to_cid(parent).await?;
-        let url = format!("{}/open/folder/list", self.config.base_url);
-        let cid_str = cid.to_string();
-        let params = [("cid", cid_str.as_str()), ("limit", "1150")];
-        let json = self.get_json(&url, &params).await?;
-        let items = json["data"].as_array().cloned().unwrap_or_default();
-        let entry = items
-            .iter()
-            .find(|item| item["n"].as_str() == Some(name))
+        let items = self.list_cid(&cid.to_string()).await?;
+        let entry = items.iter().find(|item| item["fn"].as_str() == Some(name))
             .ok_or_else(|| DriverError::NotFound(path.to_string()))?;
 
-        let fid = entry["fid"]
-            .as_str()
-            .ok_or_else(|| DriverError::Network("115: missing fid".into()))?;
-        let size = entry["s"]
+        let size = entry["fs"]
             .as_u64()
-            .or_else(|| entry["s"].as_str().and_then(|s| s.parse().ok()))
+            .or_else(|| entry["fs"].as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(0);
-        let mtime = entry["te"]
+        let mtime = entry["upt"]
             .as_i64()
-            .or_else(|| entry["te"].as_str().and_then(|s| s.parse().ok()));
+            .or_else(|| entry["upt"].as_str().and_then(|s| s.parse().ok()));
         let modified = mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single());
 
-        // Fetch download URL
-        let dl_url = format!("{}/open/file/downurl", self.config.base_url);
-        let dl_params = [("pick_code", fid)];
-        let dl_json = self.get_json(&dl_url, &dl_params).await?;
-
-        // The 115 downurl response: {"state": true, "data": {"url": {"url": "https://..."}}}
-        let raw_url = dl_json["data"]["url"]["url"]
+        let pick_code = entry["pc"]
             .as_str()
+            .ok_or_else(|| DriverError::Network("115: missing pick_code".into()))?;
+        let dl_url = format!("{}/open/ufile/downurl", self.config.base_url);
+        let dl_json = self.post_form(&dl_url, &[("pick_code", &pick_code)]).await?;
+        let raw_url = dl_json["data"].as_object().and_then(|m| m.values().next())
+            .and_then(|v| v["url"]["url"].as_str())
             .ok_or_else(|| DriverError::Network("115: missing download url".into()))?
             .to_string();
 
@@ -278,7 +278,7 @@ impl CloudDriver for Open115Driver {
             size,
             modified,
             raw_url: Some(raw_url),
-            raw_headers: vec![],
+            raw_headers: vec![("User-Agent".into(), OPEN115_USER_AGENT.into())],
             delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
             local_path: None,
         })
@@ -298,12 +298,9 @@ impl CloudDriver for Open115Driver {
             return Err(DriverError::Config("115 mkdir: empty folder name".into()));
         }
         let parent_cid = self.path_to_cid(parent_path).await?;
-        let url = format!("{}/open/folder/create", self.config.base_url);
-        self.post_json(
-            &url,
-            &serde_json::json!({ "pid": parent_cid.to_string(), "cname": name }),
-        )
-        .await?;
+        let url = format!("{}/open/folder/add", self.config.base_url);
+        let pid = parent_cid.to_string();
+        self.post_form(&url, &[("pid", &pid), ("file_name", name)]).await?;
         Ok(())
     }
 
@@ -312,19 +309,19 @@ impl CloudDriver for Open115Driver {
     /// Uses `POST /open/file/edit` with `fid` and `file_name`. The `fid` field
     /// also accepts folder cids for the 115 Open Platform.
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
-        let (id, _is_dir) = self.path_to_item_id(old_path).await?;
-        let new_name = new_path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| DriverError::Config("115 rename: empty new name".into()))?;
-        let url = format!("{}/open/file/edit", self.config.base_url);
-        self.post_json(
-            &url,
-            &serde_json::json!({ "fid": id, "file_name": new_name }),
-        )
-        .await?;
+        let (id, _) = self.path_to_item_id(old_path).await?;
+        let (new_parent, new_name) = split_parent_name(new_path)?;
+        let old_parent = split_parent_name(old_path)?.0;
+        if new_parent != old_parent {
+            let parent_id = self.path_to_cid(new_parent).await?.to_string();
+            let url = format!("{}/open/ufile/move", self.config.base_url);
+            self.post_form(&url, &[("file_ids", &id), ("to_cid", &parent_id)]).await?;
+        }
+        let old_name = old_path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if old_name != new_name {
+            let url = format!("{}/open/ufile/update", self.config.base_url);
+            self.post_form(&url, &[("file_id", &id), ("file_name", new_name)]).await?;
+        }
         Ok(())
     }
 
@@ -332,12 +329,47 @@ impl CloudDriver for Open115Driver {
     ///
     /// Uses `POST /open/rbfile/delete` with `fid[]` containing the item id.
     async fn remove(&self, path: &str) -> Result<()> {
-        let (id, _is_dir) = self.path_to_item_id(path).await?;
-        let url = format!("{}/open/rbfile/delete", self.config.base_url);
-        self.post_json(&url, &serde_json::json!({ "fid[]": id }))
-            .await?;
+        let (id, is_dir) = self.path_to_item_id(path).await?;
+        let parent_id = self.path_to_cid(split_parent_name(path)?.0).await?.to_string();
+        let url = format!("{}/open/ufile/delete", self.config.base_url);
+        let ids = id;
+        let _ = is_dir;
+        self.post_form(&url, &[("file_ids", &ids), ("parent_id", &parent_id)]).await?;
         Ok(())
     }
+
+    async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
+        let item = self.get(path).await?;
+        let url = item.raw_url.ok_or_else(|| DriverError::Network("115: missing download url".into()))?;
+        let mut request = self.client.get(url);
+        for (name, value) in item.raw_headers { request = request.header(name, value); }
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND { return Err(DriverError::NotFound(path.into())); }
+        if !response.status().is_success() { return Err(DriverError::Network(format!("GET failed: {}", response.status()))); }
+        Ok(response.bytes().await?.to_vec())
+    }
+
+    async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
+        let item = self.get(path).await?;
+        let url = item.raw_url.ok_or_else(|| DriverError::Network("115: missing download url".into()))?;
+        let range = end.map(|e| format!("bytes={start}-{e}")).unwrap_or_else(|| format!("bytes={start}-"));
+        let mut request = self.client.get(url).header(reqwest::header::RANGE, range);
+        for (name, value) in item.raw_headers { request = request.header(name, value); }
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND { return Err(DriverError::NotFound(path.into())); }
+        if !response.status().is_success() { return Err(DriverError::Network(format!("GET range failed: {}", response.status()))); }
+        Ok(response.bytes().await?.to_vec())
+    }
+}
+
+fn split_parent_name(path: &str) -> Result<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, name) = match trimmed.rfind('/') {
+        None | Some(0) => ("/", trimmed.trim_start_matches('/')),
+        Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
+    };
+    if name.is_empty() { return Err(DriverError::Config("115: empty path name".into())); }
+    Ok((parent, name))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -360,13 +392,7 @@ mod tests {
 
     #[test]
     fn parse_item_file() {
-        let v = serde_json::json!({
-            "fid": "fid123",
-            "n": "track.mp3",
-            "s": 5_000_000u64,
-            "sha": "abc123",
-            "te": 1700000000i64
-        });
+        let v = serde_json::json!({"fid":"fid123","pid":"0","fc":"1","fn":"track.mp3","pc":"pick123","fs":5_000_000u64,"upt":1700000000i64});
         let item = Open115Driver::parse_item(&v).unwrap();
         assert_eq!(item.name, "track.mp3");
         assert!(!item.is_dir);
@@ -376,12 +402,7 @@ mod tests {
 
     #[test]
     fn parse_item_folder() {
-        let v = serde_json::json!({
-            "cid": "999",
-            "n": "Music",
-            "s": 0u64,
-            "te": 1700000000i64
-        });
+        let v = serde_json::json!({"fid":"999","pid":"0","fc":"0","fn":"Music","fs":0u64,"upt":1700000000i64});
         let item = Open115Driver::parse_item(&v).unwrap();
         assert_eq!(item.name, "Music");
         assert!(item.is_dir);
@@ -424,6 +445,11 @@ mod tests {
                     idx += 1;
                     let mut buf = vec![0u8; 4096];
                     let _ = sock.read(&mut buf).await;
+                    let request = String::from_utf8_lossy(&buf);
+                    assert!(request.contains("/open/ufile/files") || request.contains("/open/folder/add") || request.contains("/open/ufile/update") || request.contains("/open/ufile/delete"), "unexpected Open115 endpoint: {request}");
+                    if request.starts_with("POST ") {
+                        assert!(request.to_ascii_lowercase().contains("content-type: application/x-www-form-urlencoded"), "expected form request: {request}");
+                    }
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -438,41 +464,16 @@ mod tests {
 
     #[tokio::test]
     async fn list_parses_mock_response() {
-        // path "/" → cid=0 already known; one GET to /open/folder/list
-        let body = serde_json::json!({
-            "state": true,
-            "data": [
-                {
-                    "fid": "fid1",
-                    "n": "song.mp3",
-                    "s": 4_000_000u64,
-                    "sha": "deadbeef",
-                    "te": 1700000000i64
-                },
-                {
-                    "cid": "888",
-                    "n": "Albums",
-                    "s": 0u64,
-                    "te": 1700000000i64
-                }
-            ]
-        })
-        .to_string();
-
+        let body = serde_json::json!({"state":true,"data":[{"fid":"fid1","pid":"0","fc":"1","fn":"song.mp3","pc":"pc1","fs":4000000u64,"upt":1700000000i64},{"fid":"888","pid":"0","fc":"0","fn":"Albums","pc":"","fs":0u64,"upt":1700000000i64}],"count":2}).to_string();
         let port = start_mock_server(vec![body]).await;
         tokio::task::yield_now().await;
-
         let mut cfg = Open115Config::new("test_token");
         cfg.base_url = format!("http://127.0.0.1:{}", port);
         let driver = Open115Driver::new(cfg).unwrap();
-
         let items = driver.list("/").await.expect("list should succeed");
         assert_eq!(items.len(), 2);
-        let song = items.iter().find(|i| i.name == "song.mp3").unwrap();
-        assert!(!song.is_dir);
-        assert_eq!(song.size, 4_000_000);
-        let albums = items.iter().find(|i| i.name == "Albums").unwrap();
-        assert!(albums.is_dir);
+        assert!(items.iter().any(|item| item.name == "Albums" && item.is_dir));
+        assert!(items.iter().any(|item| item.name == "song.mp3" && item.size == 4_000_000));
     }
 
     #[tokio::test]
@@ -502,7 +503,7 @@ mod tests {
 
     // ── Write-op mock tests ───────────────────────────────────────────────────
 
-    /// mkdir at root level — parent cid=0 is known, single POST to /open/folder/create.
+    /// mkdir at root level uses the form-encoded Dart endpoint.
     #[tokio::test]
     async fn mkdir_root_level() {
         let resp = serde_json::json!({
@@ -521,21 +522,11 @@ mod tests {
         driver.mkdir("/NewAlbum").await.expect("mkdir should succeed");
     }
 
-    /// rename a root-level file — one GET (list cid=0) + one POST to /open/file/edit.
+    /// rename a root-level file — list then form POST to `/open/ufile/update`.
     #[tokio::test]
     async fn rename_root_file() {
         // response 1: list cid=0 to find fid of "song.mp3"
-        let list_resp = serde_json::json!({
-            "state": true,
-            "data": [{
-                "fid": "fid_song",
-                "n": "song.mp3",
-                "s": 1_000_000u64,
-                "sha": "abc",
-                "te": 1700000000i64
-            }]
-        })
-        .to_string();
+        let list_resp = serde_json::json!({"state":true,"data":[{"fid":"fid_song","pid":"0","fc":"1","fn":"song.mp3","pc":"pick_song","fs":1000000u64,"upt":1700000000i64}],"count":1}).to_string();
         // response 2: POST /open/file/edit → ok
         let edit_resp =
             serde_json::json!({ "state": true, "file_id": "fid_song", "file_name": "renamed.mp3" })
@@ -554,18 +545,12 @@ mod tests {
             .expect("rename should succeed");
     }
 
-    /// remove a root-level file — one GET (list cid=0) + one POST to /open/rbfile/delete.
+    /// remove a root-level file — list then form POST to `/open/ufile/delete`.
     #[tokio::test]
     async fn remove_root_file() {
         let list_resp = serde_json::json!({
             "state": true,
-            "data": [{
-                "fid": "fid_del",
-                "n": "old.mp3",
-                "s": 500_000u64,
-                "sha": "def",
-                "te": 1700000000i64
-            }]
+            "data": [{"fid":"fid_del","pid":"0","fc":"1","fn":"old.mp3","pc":"pick_del","fs":500000u64,"upt":1700000000i64}], "count": 1
         })
         .to_string();
         let del_resp = serde_json::json!({ "state": true }).to_string();
