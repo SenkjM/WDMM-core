@@ -566,6 +566,525 @@ pub extern "C" fn wdmm_webdav_remove(
     }
 }
 
+// ── Generic Driver FFI ────────────────────────────────────────────────────────
+
+/// List directory entries via DriverRegistry.
+///
+/// Returns JSON array matching `wdmm_webdav_list` shape:
+/// ```json
+/// [{"name":"file.mp3","path":"/path/file.mp3","is_dir":false,"size":1234,"modified":"2024-01-02T03:04:05Z"}]
+/// ```
+/// or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_driver_list(
+    provider_type: *const c_char,
+    config_json: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let provider = match ptr_to_str(provider_type) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid provider_type"),
+    };
+    let config_raw = match ptr_to_str(config_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid config_json"),
+    };
+    let config: serde_json::Value = match serde_json::from_str(config_raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:config parse: {e}")),
+    };
+    let path = ptr_to_str(path).unwrap_or("/");
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(provider, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let items = match rt().block_on(wdmm_drivers::CloudDriver::list(&*driver, path)) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let parent = path.trim_end_matches('/');
+    let parent = if parent.is_empty() { "" } else { parent };
+
+    let arr: Vec<serde_json::Value> = items
+        .into_iter()
+        .map(|it| {
+            let joined = if parent.is_empty() {
+                format!("/{}", it.name.trim_start_matches('/'))
+            } else {
+                format!("{}/{}", parent, it.name.trim_start_matches('/'))
+            };
+            serde_json::json!({
+                "name": it.name,
+                "path": joined,
+                "is_dir": it.is_dir,
+                "size": it.size,
+                "modified": it.modified.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    match serde_json::to_string(&arr) {
+        Ok(s) => FfiString::from(s),
+        Err(e) => FfiString::from(format!("error:serde: {e}")),
+    }
+}
+
+/// Create a directory via DriverRegistry. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_driver_mkdir(
+    provider_type: *const c_char,
+    config_json: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let provider = match ptr_to_str(provider_type) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid provider_type"),
+    };
+    let config_raw = match ptr_to_str(config_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid config_json"),
+    };
+    let config: serde_json::Value = match serde_json::from_str(config_raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:config parse: {e}")),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(provider, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::CloudDriver::mkdir(&*driver, path)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Rename/move via DriverRegistry. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_driver_rename(
+    provider_type: *const c_char,
+    config_json: *const c_char,
+    old_path: *const c_char,
+    new_path: *const c_char,
+) -> FfiString {
+    let provider = match ptr_to_str(provider_type) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid provider_type"),
+    };
+    let config_raw = match ptr_to_str(config_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid config_json"),
+    };
+    let config: serde_json::Value = match serde_json::from_str(config_raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:config parse: {e}")),
+    };
+    let old_path = match ptr_to_str(old_path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid old_path"),
+    };
+    let new_path = match ptr_to_str(new_path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid new_path"),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(provider, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::CloudDriver::rename(&*driver, old_path, new_path)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Remove a file/directory via DriverRegistry. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_driver_remove(
+    provider_type: *const c_char,
+    config_json: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let provider = match ptr_to_str(provider_type) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid provider_type"),
+    };
+    let config_raw = match ptr_to_str(config_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid config_json"),
+    };
+    let config: serde_json::Value = match serde_json::from_str(config_raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:config parse: {e}")),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(provider, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::CloudDriver::remove(&*driver, path)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get file/directory metadata via DriverRegistry.
+///
+/// Returns JSON with `CloudFileItem` fields:
+/// ```json
+/// {"name":"file.mp3","is_dir":false,"size":1234,"modified":"2024-01-02T03:04:05Z",
+///  "delivery":"NetworkDirect","raw_url":"https://…","raw_headers":[["Authorization","Bearer …"]]}
+/// ```
+/// or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_driver_get(
+    provider_type: *const c_char,
+    config_json: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let provider = match ptr_to_str(provider_type) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid provider_type"),
+    };
+    let config_raw = match ptr_to_str(config_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid config_json"),
+    };
+    let config: serde_json::Value = match serde_json::from_str(config_raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:config parse: {e}")),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(provider, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let item = match rt().block_on(wdmm_drivers::CloudDriver::get(&*driver, path)) {
+        Ok(i) => i,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let delivery_str = match item.delivery {
+        wdmm_drivers::ContentDeliveryKind::NetworkDirect => "NetworkDirect",
+        wdmm_drivers::ContentDeliveryKind::LocalStream => "LocalStream",
+        wdmm_drivers::ContentDeliveryKind::LocalFile => "LocalFile",
+        _ => "Unknown",
+    };
+
+    let obj = serde_json::json!({
+        "name": item.name,
+        "is_dir": item.is_dir,
+        "size": item.size,
+        "modified": item.modified.map(|t| t.to_rfc3339()),
+        "delivery": delivery_str,
+        "raw_url": item.raw_url,
+        "raw_headers": item.raw_headers,
+        "local_path": item.local_path.as_ref().map(|p| p.display().to_string()),
+    });
+
+    match serde_json::to_string(&obj) {
+        Ok(s) => FfiString::from(s),
+        Err(e) => FfiString::from(format!("error:serde: {e}")),
+    }
+}
+
+// ── Account-based FFI ─────────────────────────────────────────────────────────
+
+/// List directory entries for an account by ID.
+///
+/// Returns JSON array matching `wdmm_webdav_list` shape or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_list_dir(
+    account_id: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = ptr_to_str(path).unwrap_or("/");
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let items = match rt().block_on(wdmm_drivers::CloudDriver::list(&*driver, path)) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let parent = path.trim_end_matches('/');
+    let parent = if parent.is_empty() { "" } else { parent };
+
+    let arr: Vec<serde_json::Value> = items
+        .into_iter()
+        .map(|it| {
+            let joined = if parent.is_empty() {
+                format!("/{}", it.name.trim_start_matches('/'))
+            } else {
+                format!("{}/{}", parent, it.name.trim_start_matches('/'))
+            };
+            serde_json::json!({
+                "name": it.name,
+                "path": joined,
+                "is_dir": it.is_dir,
+                "size": it.size,
+                "modified": it.modified.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    match serde_json::to_string(&arr) {
+        Ok(s) => FfiString::from(s),
+        Err(e) => FfiString::from(format!("error:serde: {e}")),
+    }
+}
+
+/// Create a directory for an account. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_mkdir(
+    account_id: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::CloudDriver::mkdir(&*driver, path)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Rename/move for an account. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_rename(
+    account_id: *const c_char,
+    old_path: *const c_char,
+    new_path: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let old_path = match ptr_to_str(old_path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid old_path"),
+    };
+    let new_path = match ptr_to_str(new_path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid new_path"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::CloudDriver::rename(&*driver, old_path, new_path)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Remove a file/directory for an account. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_remove(
+    account_id: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::CloudDriver::remove(&*driver, path)) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get file/directory metadata for an account.
+///
+/// Returns JSON with `CloudFileItem` fields or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_get_entry(
+    account_id: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let item = match rt().block_on(wdmm_drivers::CloudDriver::get(&*driver, path)) {
+        Ok(i) => i,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let delivery_str = match item.delivery {
+        wdmm_drivers::ContentDeliveryKind::NetworkDirect => "NetworkDirect",
+        wdmm_drivers::ContentDeliveryKind::LocalStream => "LocalStream",
+        wdmm_drivers::ContentDeliveryKind::LocalFile => "LocalFile",
+        _ => "Unknown",
+    };
+
+    let obj = serde_json::json!({
+        "name": item.name,
+        "is_dir": item.is_dir,
+        "size": item.size,
+        "modified": item.modified.map(|t| t.to_rfc3339()),
+        "delivery": delivery_str,
+        "raw_url": item.raw_url,
+        "raw_headers": item.raw_headers,
+        "local_path": item.local_path.as_ref().map(|p| p.display().to_string()),
+    });
+
+    match serde_json::to_string(&obj) {
+        Ok(s) => FfiString::from(s),
+        Err(e) => FfiString::from(format!("error:serde: {e}")),
+    }
+}
+
+/// Helper: build driver config JSON from account credentials + base_url.
+fn build_driver_config(account: &wdmm_core::models::CloudAccount) -> Result<serde_json::Value, String> {
+    // Parse credentials_encrypted as UTF-8 JSON object (plaintext store)
+    let creds_str = std::str::from_utf8(&account.credentials_encrypted)
+        .map_err(|e| format!("credentials not UTF-8: {e}"))?;
+    let mut creds: serde_json::Value = serde_json::from_str(creds_str)
+        .map_err(|e| format!("credentials not valid JSON: {e}"))?;
+
+    // WebDAV: build config from base_url + credentials
+    if account.provider_type == "webdav" {
+        let url = account.base_url.as_deref().unwrap_or("");
+        if url.is_empty() {
+            return Err("webdav: missing base_url".into());
+        }
+        let username = creds["username"].as_str().unwrap_or("");
+        let password = creds["password"].as_str().unwrap_or("");
+        return Ok(serde_json::json!({
+            "url": url,
+            "username": username,
+            "password": password,
+        }));
+    }
+
+    // Other providers: use credentials as config; inject base_url if missing and account.base_url set
+    if !creds.is_object() {
+        return Err("credentials must be a JSON object".into());
+    }
+    if creds.get("url").is_none() && creds.get("base_url").is_none() {
+        if let Some(ref base_url) = account.base_url {
+            creds["base_url"] = serde_json::Value::String(base_url.clone());
+        }
+    }
+
+    Ok(creds)
+}
+
 // ── Proxy FFI ─────────────────────────────────────────────────────────────────
 //
 // The proxy is a process-global singleton, like the OpenAPI server. It starts
