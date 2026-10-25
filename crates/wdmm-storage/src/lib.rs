@@ -2479,6 +2479,88 @@ mod tests {
     }
 
     #[test]
+    fn cue_json_roundtrip_schema() {
+        /// Documents the expected CueAlbum/CueSlice JSON field set and validates
+        /// roundtrip: upsert → remaining_slices → delete.
+        /// This test serves as a parity harness for Android dual-write — the
+        /// JSON shapes built by Android helpers must match this schema.
+        use serde_json::json;
+
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now();
+
+        // CueAlbum JSON shape (snake_case)
+        let album_json = json!({
+            "cue_id": "cue-test",
+            "source_name": "test-source",
+            "cue_remote_path": "/path/album.cue",
+            "title": "Test Album",
+            "performer": "Test Artist",
+            "cache_group_id": "cache-grp-001",
+            "created_at": now.to_rfc3339(),
+        });
+
+        let album = serde_json::from_value::<CueAlbum>(album_json.clone()).unwrap();
+        db.upsert_cue_album(&album).unwrap();
+
+        // CueSlice JSON shape (snake_case, all fields)
+        let slice_json = json!({
+            "music_id": "slice-test-001",
+            "cue_id": "cue-test",
+            "audio_music_id": "audio-test-001",
+            "source_name": "test-source",
+            "remote_path": "/path/track01.mp3",
+            "file_name": "track01.mp3",
+            "track_index": 1,
+            "title": "Track 1",
+            "artist": "Track Artist",
+            "album_artist": "Album Artist",
+            "album": "Test Album",
+            "duration_ms": 240_000,
+            "track_number": 1,
+            "track_total": 10,
+            "disc_number": 1,
+            "disc_total": 1,
+            "year": 2024,
+            "genre": "Rock",
+            "bitrate": 320,
+            "sample_rate": 44100,
+            "cover_path": "/path/thumb.jpg",
+            "audio_remote_path": "/path/album.flac",
+            "clip_start_ms": 0,
+            "clip_end_ms": 240_000,
+            "cache_group_id": "cache-grp-001",
+            "rev": 12345,
+            "last_downloaded_at": now.to_rfc3339(),
+            "last_tag_read_at": now.to_rfc3339(),
+            "remote_missing": 0,
+        });
+
+        let slice = serde_json::from_value::<CueSlice>(slice_json.clone()).unwrap();
+        db.upsert_cue_slice(&slice).unwrap();
+
+        // Verify fields are present and correct types
+        assert_eq!(slice.music_id, "slice-test-001");
+        assert_eq!(slice.track_index, 1);
+        assert_eq!(slice.audio_music_id, "audio-test-001");
+        assert_eq!(slice.title, Some("Track 1".into()));
+
+        // Verify remaining_slices works
+        assert_eq!(
+            db.remaining_slices_for_cue("test-source", "/path/album.cue").unwrap(),
+            1
+        );
+
+        // Delete and verify
+        db.delete_cue_slice("slice-test-001").unwrap();
+        assert_eq!(
+            db.remaining_slices_for_cue("test-source", "/path/album.cue").unwrap(),
+            0
+        );
+        db.delete_cue_album("test-source", "/path/album.cue").unwrap();
+    }
+
+    #[test]
     fn delete_tracks_by_account() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
 
