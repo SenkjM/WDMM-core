@@ -2171,24 +2171,44 @@ fn compare_tracks(
         if !exists {
             HashMap::new()
         } else {
-            // Prefer source_name if present, else use account_id
-            let mut stmt = old
-                .prepare(
-                    "SELECT remote_path, \
-                     COALESCE(\
-                       (SELECT source_name FROM tracks WHERE ROWID = t.ROWID), \
-                       account_id\
-                     ) as src, \
-                     title, COALESCE(duration_ms, 0) \
-                     FROM tracks t"
-                )
-                .or_else(|_| {
-                    // Fallback if source_name doesn't exist
-                    old.prepare(
-                        "SELECT remote_path, account_id as src, title, \
-                         COALESCE(duration_ms, 0) FROM tracks"
-                    )
-                })
+            // Detect columns via PRAGMA table_info
+            let mut has_source_name = false;
+            let mut has_account_id = false;
+            {
+                let mut stmt = old.prepare("PRAGMA table_info(tracks)")
+                    .map_err(|e| StorageError::Database(format!("PRAGMA table_info: {e}")))?;
+                let rows = stmt.query_map([], |row| {
+                    let col_name: String = row.get(1)?;
+                    Ok(col_name)
+                })?;
+                for r in rows {
+                    if let Ok(name) = r {
+                        if name == "source_name" {
+                            has_source_name = true;
+                        } else if name == "account_id" {
+                            has_account_id = true;
+                        }
+                    }
+                }
+            }
+
+            // Build SQL based on detected columns
+            let sql = if has_source_name {
+                "SELECT remote_path, source_name, title, COALESCE(duration_ms, 0) FROM tracks"
+            } else if has_account_id {
+                "SELECT remote_path, account_id, title, COALESCE(duration_ms, 0) FROM tracks"
+            } else {
+                // No usable source column; return empty map
+                return Ok(TableDiff {
+                    left_count: 0,
+                    right_count: 0,
+                    only_left: vec![],
+                    only_right: vec![],
+                    field_mismatches: vec![],
+                });
+            };
+
+            let mut stmt = old.prepare(sql)
                 .map_err(|e| StorageError::Database(format!("tracks prepare: {e}")))?;
 
             let rows = stmt
@@ -2197,7 +2217,7 @@ fn compare_tracks(
                     let src: String = row.get(1).unwrap_or_default();
                     let title: String = row.get(2).unwrap_or_default();
                     let duration_ms: i64 = row.get(3).unwrap_or(0);
-                    let key = format!("{}\0{}", src, remote_path);
+                    let key = format!("{}|{}", src, remote_path);
                     Ok((key, (src, title, duration_ms)))
                 })
                 .map_err(|e| StorageError::Database(format!("tracks query: {e}")))?;
@@ -2223,7 +2243,7 @@ fn compare_tracks(
             let account_id: String = row.get(1)?;
             let title: String = row.get(2)?;
             let duration_ms: i64 = row.get(3)?;
-            let key = format!("{}\0{}", account_id, remote_path);
+            let key = format!("{}|{}", account_id, remote_path);
             Ok((key, (account_id, title, duration_ms)))
         })?;
         let mut map = HashMap::new();
@@ -3478,32 +3498,25 @@ mod tests {
     }
 
     #[test]
-    fn compare_with_sqflite_empty_databases() {
-        let old_path = std::path::Path::new(":memory:");
-        let dest_path = std::path::Path::new(":memory:");
+    fn compare_with_sqflite_match() {
+        use std::fs;
 
-        // Create an empty sqflite-style DB with v6 schema
-        let old_conn = Connection::open(old_path).unwrap();
-        old_conn
+        // Create temp files
+        let temp_dir = std::env::temp_dir();
+        let left_path = temp_dir.join(format!("test_left_{}.db", uuid::Uuid::new_v4()));
+        let right_path = temp_dir.join(format!("test_right_{}.db", uuid::Uuid::new_v4()));
+
+        // Create left DB with Android-ish schema (source_name)
+        let left_conn = Connection::open(&left_path).unwrap();
+        left_conn
             .execute_batch(
                 r#"
                 CREATE TABLE tracks (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    artist TEXT,
+                    music_id TEXT PRIMARY KEY,
+                    source_name TEXT NOT NULL,
                     remote_path TEXT NOT NULL,
-                    account_id TEXT NOT NULL,
-                    size INTEGER NOT NULL DEFAULT 0,
-                    modified INTEGER,
-                    created_at INTEGER NOT NULL,
-                    album_id TEXT,
-                    artist_id TEXT,
-                    duration_ms INTEGER,
-                    genre TEXT,
-                    track_number INTEGER,
-                    disc_number INTEGER,
-                    year INTEGER,
-                    mime_type TEXT
+                    title TEXT NOT NULL,
+                    duration_ms INTEGER
                 );
                 CREATE TABLE deleted_tracks (
                     source_name TEXT NOT NULL,
@@ -3524,12 +3537,274 @@ mod tests {
             )
             .unwrap();
 
-        let dest = LibraryDatabase::open(dest_path).unwrap();
+        // Insert sample data
+        left_conn
+            .execute(
+                "INSERT INTO tracks (music_id, source_name, remote_path, title, duration_ms) \
+                 VALUES ('id1', 'wd-main', '/music/track1.flac', 'Track One', 180000)",
+                [],
+            )
+            .unwrap();
+        left_conn
+            .execute(
+                "INSERT INTO deleted_tracks (source_name, remote_path, rev, deleted_at, pushed) \
+                 VALUES ('wd-main', '/music/deleted.mp3', 100, '2024-01-02T03:04:05.000Z', 0)",
+                [],
+            )
+            .unwrap();
+        left_conn
+            .execute(
+                "INSERT INTO sync_state (remote_key, last_seq, base_up_to, parts, updated_at) \
+                 VALUES ('library:x', 42, 10, '{\"a\":1}', '2024-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        drop(left_conn);
 
-        // Can't compare :memory: databases - skip this test for now
-        // Instead, just verify the method exists and compiles
-        // In real usage, paths will be actual files
-        drop(old_conn);
-        drop(dest);
+        // Create Core LibraryDatabase on right path
+        let right_db = LibraryDatabase::open(&right_path).unwrap();
+
+        // Upsert matching track (account_id = source_name)
+        right_db
+            .upsert_track(&LibraryTrack {
+                id: "id1".to_string(),
+                title: "Track One".to_string(),
+                artist: None,
+                remote_path: "/music/track1.flac".to_string(),
+                account_id: "wd-main".to_string(),
+                size: 0,
+                modified: None,
+                album_id: None,
+                artist_id: None,
+                duration_ms: 180000,
+                genre: None,
+                track_number: None,
+                disc_number: None,
+                year: None,
+                mime_type: None,
+            })
+            .unwrap();
+
+        // Upsert matching DeletedTrack
+        right_db
+            .upsert_deleted_track(&DeletedTrack {
+                source_name: "wd-main".to_string(),
+                remote_path: "/music/deleted.mp3".to_string(),
+                rev: 100,
+                deleted_at: "2024-01-02T03:04:05.000Z".to_string(),
+                pushed: 0,
+            })
+            .unwrap();
+
+        // Upsert matching SyncState
+        right_db
+            .save_sync_state(&SyncState {
+                remote_key: "library:x".to_string(),
+                last_seq: 42,
+                base_up_to: 10,
+                parts: "{\"a\":1}".to_string(),
+                updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+            })
+            .unwrap();
+
+        // Compare
+        let report = LibraryDatabase::compare_with_sqflite(&left_path, &right_db).unwrap();
+
+        assert!(report.ok, "report should be ok: {:?}", report);
+        assert_eq!(report.tracks.left_count, 1);
+        assert_eq!(report.tracks.right_count, 1);
+        assert!(report.tracks.only_left.is_empty());
+        assert!(report.tracks.only_right.is_empty());
+        assert!(report.tracks.field_mismatches.is_empty());
+
+        assert_eq!(report.deleted_tracks.left_count, 1);
+        assert_eq!(report.deleted_tracks.right_count, 1);
+        assert!(report.deleted_tracks.only_left.is_empty());
+        assert!(report.deleted_tracks.only_right.is_empty());
+        assert!(report.deleted_tracks.field_mismatches.is_empty());
+
+        assert_eq!(report.sync_state.left_count, 1);
+        assert_eq!(report.sync_state.right_count, 1);
+        assert!(report.sync_state.only_left.is_empty());
+        assert!(report.sync_state.only_right.is_empty());
+        assert!(report.sync_state.field_mismatches.is_empty());
+
+        // Clean up
+        drop(right_db);
+        let _ = fs::remove_file(&left_path);
+        let _ = fs::remove_file(&right_path);
+    }
+
+    #[test]
+    fn compare_with_sqflite_mismatch() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let left_path = temp_dir.join(format!("test_left_{}.db", uuid::Uuid::new_v4()));
+        let right_path = temp_dir.join(format!("test_right_{}.db", uuid::Uuid::new_v4()));
+
+        // Create left DB
+        let left_conn = Connection::open(&left_path).unwrap();
+        left_conn
+            .execute_batch(
+                r#"
+                CREATE TABLE tracks (
+                    music_id TEXT PRIMARY KEY,
+                    source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    duration_ms INTEGER
+                );
+                CREATE TABLE deleted_tracks (
+                    source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    rev INTEGER NOT NULL,
+                    deleted_at TEXT NOT NULL,
+                    pushed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source_name, remote_path)
+                );
+                CREATE TABLE sync_state (
+                    remote_key TEXT PRIMARY KEY,
+                    last_seq INTEGER NOT NULL DEFAULT 0,
+                    base_up_to INTEGER NOT NULL DEFAULT 0,
+                    parts TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+
+        // Insert track + extra tombstone
+        left_conn
+            .execute(
+                "INSERT INTO tracks (music_id, source_name, remote_path, title, duration_ms) \
+                 VALUES ('id1', 'wd-main', '/music/track1.flac', 'Track One', 180000)",
+                [],
+            )
+            .unwrap();
+        left_conn
+            .execute(
+                "INSERT INTO deleted_tracks (source_name, remote_path, rev, deleted_at, pushed) \
+                 VALUES ('wd-main', '/music/deleted.mp3', 100, '2024-01-02T03:04:05.000Z', 0)",
+                [],
+            )
+            .unwrap();
+        left_conn
+            .execute(
+                "INSERT INTO deleted_tracks (source_name, remote_path, rev, deleted_at, pushed) \
+                 VALUES ('wd-main', '/music/extra.mp3', 200, '2024-01-03T00:00:00.000Z', 1)",
+                [],
+            )
+            .unwrap();
+        left_conn
+            .execute(
+                "INSERT INTO sync_state (remote_key, last_seq, base_up_to, parts, updated_at) \
+                 VALUES ('library:x', 42, 10, '{\"a\":1}', '2024-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        drop(left_conn);
+
+        // Create Core DB with matching track but not the extra tombstone
+        let right_db = LibraryDatabase::open(&right_path).unwrap();
+        right_db
+            .upsert_track(&LibraryTrack {
+                id: "id1".to_string(),
+                title: "Track One".to_string(),
+                artist: None,
+                remote_path: "/music/track1.flac".to_string(),
+                account_id: "wd-main".to_string(),
+                size: 0,
+                modified: None,
+                album_id: None,
+                artist_id: None,
+                duration_ms: 180000,
+                genre: None,
+                track_number: None,
+                disc_number: None,
+                year: None,
+                mime_type: None,
+            })
+            .unwrap();
+        right_db
+            .upsert_deleted_track(&DeletedTrack {
+                source_name: "wd-main".to_string(),
+                remote_path: "/music/deleted.mp3".to_string(),
+                rev: 100,
+                deleted_at: "2024-01-02T03:04:05.000Z".to_string(),
+                pushed: 0,
+            })
+            .unwrap();
+        right_db
+            .save_sync_state(&SyncState {
+                remote_key: "library:x".to_string(),
+                last_seq: 42,
+                base_up_to: 10,
+                parts: "{\"a\":1}".to_string(),
+                updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+            })
+            .unwrap();
+
+        // Compare
+        let report = LibraryDatabase::compare_with_sqflite(&left_path, &right_db).unwrap();
+
+        assert!(!report.ok, "report should be not ok due to extra tombstone");
+        assert_eq!(report.deleted_tracks.left_count, 2);
+        assert_eq!(report.deleted_tracks.right_count, 1);
+        assert_eq!(report.deleted_tracks.only_left.len(), 1);
+        assert!(report.deleted_tracks.only_left[0].contains("extra.mp3"));
+
+        // Clean up
+        drop(right_db);
+        let _ = fs::remove_file(&left_path);
+        let _ = fs::remove_file(&right_path);
+    }
+
+    #[test]
+    fn compare_with_sqflite_missing_table() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let left_path = temp_dir.join(format!("test_left_{}.db", uuid::Uuid::new_v4()));
+        let right_path = temp_dir.join(format!("test_right_{}.db", uuid::Uuid::new_v4()));
+
+        // Create left DB WITHOUT deleted_tracks table
+        let left_conn = Connection::open(&left_path).unwrap();
+        left_conn
+            .execute_batch(
+                r#"
+                CREATE TABLE tracks (
+                    music_id TEXT PRIMARY KEY,
+                    source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    duration_ms INTEGER
+                );
+                CREATE TABLE sync_state (
+                    remote_key TEXT PRIMARY KEY,
+                    last_seq INTEGER NOT NULL DEFAULT 0,
+                    base_up_to INTEGER NOT NULL DEFAULT 0,
+                    parts TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        drop(left_conn);
+
+        // Create Core DB
+        let right_db = LibraryDatabase::open(&right_path).unwrap();
+
+        // Compare
+        let report = LibraryDatabase::compare_with_sqflite(&left_path, &right_db).unwrap();
+
+        // Should succeed with left_count 0 for deleted_tracks, not an error
+        assert_eq!(report.deleted_tracks.left_count, 0);
+        assert_eq!(report.deleted_tracks.right_count, 0);
+
+        // Clean up
+        drop(right_db);
+        let _ = fs::remove_file(&left_path);
+        let _ = fs::remove_file(&right_path);
     }
 }
