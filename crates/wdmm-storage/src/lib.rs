@@ -77,9 +77,15 @@ mod dmr_prefs;
 pub use dmr_prefs::{DmrPrefRow, DmrPrefsDatabase};
 
 /// Summary returned by [`LibraryDatabase::import_from_sqflite`].
+///
+/// The JSON shape is additive: `deleted_tracks` and `sync_state` (v6) were
+/// appended after `entries`. Existing consumers that ignore unknown fields
+/// keep working unchanged.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ImportSummary {
     /// `true` if the KV flag `sqflite_imported = 1` was already set on `dest`.
+    /// For the v6 backfill pass this is also `true` (the tracks were imported
+    /// earlier) while only the tombstone/sync-state counts are non-zero.
     pub already_done: bool,
     /// Number of tracks inserted.
     pub tracks: usize,
@@ -87,6 +93,10 @@ pub struct ImportSummary {
     pub playlists: usize,
     /// Number of playlist entries inserted.
     pub entries: usize,
+    /// Number of tombstone rows (`deleted_tracks`) imported (v6).
+    pub deleted_tracks: usize,
+    /// Number of sync cursor rows (`sync_state`) imported (v6).
+    pub sync_state: usize,
 }
 
 /// A manga item stored in the library.
@@ -1027,10 +1037,23 @@ impl LibraryDatabase {
 
     /// One-shot import from an old sqflite `music_library.db`.
     ///
-    /// Opens `old_db_path` read-only and copies tracks, playlists, and playlist
-    /// entries into `dest`. If the KV flag `sqflite_imported = 1` is already set
-    /// on `dest` the function returns early with `already_done: true` and makes
-    /// no changes.
+    /// Opens `old_db_path` read-only and copies **five** surfaces into `dest`:
+    /// tracks, playlists, playlist entries, music tombstones (`deleted_tracks`),
+    /// and sync cursors (`sync_state`). The v6 tombstone/sync-state tables are
+    /// read defensively — a missing table yields zero rows rather than an error.
+    ///
+    /// Two KV flags track progress:
+    /// * `sqflite_imported` — set after the v1..v5 import (tracks/playlists/entries).
+    /// * `sqflite_imported_v6` — set after the tombstones + sync_state import.
+    ///
+    /// Behaviour by flag state:
+    /// * both set → full no-op, `already_done: true`, all counts `0`.
+    /// * only `sqflite_imported` set → **v6 backfill**: import *only*
+    ///   `deleted_tracks` + `sync_state` (devices that already ran the older
+    ///   import have the tracks but empty Core tombstones/cursors). Returns
+    ///   `already_done: true` with `tracks`/`playlists`/`entries` = 0 and
+    ///   non-zero `deleted_tracks`/`sync_state`. Sets `sqflite_imported_v6`.
+    /// * neither set → full import of all five surfaces, then sets **both** flags.
     ///
     /// The read is defensive: if expected columns are absent (old schema), the
     /// row is skipped and import continues.
@@ -1038,8 +1061,11 @@ impl LibraryDatabase {
         old_db_path: &std::path::Path,
         dest: &LibraryDatabase,
     ) -> StorageResult<ImportSummary> {
-        // ── Early-exit if already imported ────────────────────────────────────
-        if dest.load_kv("sqflite_imported")?.as_deref() == Some("1") {
+        let imported = dest.load_kv("sqflite_imported")?.as_deref() == Some("1");
+        let imported_v6 = dest.load_kv("sqflite_imported_v6")?.as_deref() == Some("1");
+
+        // ── Full no-op once both imports have run ─────────────────────────────
+        if imported && imported_v6 {
             return Ok(ImportSummary {
                 already_done: true,
                 ..Default::default()
@@ -1060,8 +1086,11 @@ impl LibraryDatabase {
 
         let now = chrono::Utc::now().timestamp();
 
-        // ── Read old tracks ───────────────────────────────────────────────────
-        let tracks: Vec<wdmm_core::models::LibraryTrack> = {
+        // The three legacy surfaces are only read on the first (full) import.
+        // On the v6 backfill pass they were already copied, so we skip them.
+        let tracks: Vec<wdmm_core::models::LibraryTrack> = if imported {
+            Vec::new()
+        } else {
             let mut stmt = old.prepare(
                 "SELECT id, title, artist, remote_path, account_id, size, modified FROM tracks",
             ).map_err(|e| StorageError::Database(format!("tracks prepare: {e}")))?;
@@ -1095,7 +1124,9 @@ impl LibraryDatabase {
         };
 
         // ── Read old playlists ────────────────────────────────────────────────
-        let playlists: Vec<Playlist> = {
+        let playlists: Vec<Playlist> = if imported {
+            Vec::new()
+        } else {
             let mut stmt = old
                 .prepare("SELECT id, name, created_at, updated_at FROM playlists")
                 .map_err(|e| StorageError::Database(format!("playlists prepare: {e}")))?;
@@ -1125,7 +1156,9 @@ impl LibraryDatabase {
         };
 
         // ── Read old playlist_entries ─────────────────────────────────────────
-        let entries: Vec<PlaylistEntry> = {
+        let entries: Vec<PlaylistEntry> = if imported {
+            Vec::new()
+        } else {
             let mut stmt = old
                 .prepare(
                     "SELECT playlist_id, position, music_id, source_name, remote_path, title, duration_ms \
@@ -1157,10 +1190,126 @@ impl LibraryDatabase {
             out
         };
 
+        // ── Read old deleted_tracks (v6 tombstones — defensive) ───────────────
+        let deleted_tracks: Vec<DeletedTrack> = {
+            let exists: bool = old
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='deleted_tracks'",
+                    [],
+                    |row| row.get::<_, i64>(0).map(|c| c > 0),
+                )
+                .unwrap_or(false);
+
+            if !exists {
+                Vec::new()
+            } else {
+                let mut stmt = old
+                    .prepare(
+                        "SELECT source_name, remote_path, rev, deleted_at, pushed FROM deleted_tracks",
+                    )
+                    .map_err(|e| StorageError::Database(format!("deleted_tracks prepare: {e}")))?;
+
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(DeletedTrack {
+                            source_name: row.get::<_, String>(0).unwrap_or_default(),
+                            remote_path: row.get::<_, String>(1).unwrap_or_default(),
+                            rev: row.get::<_, i64>(2).unwrap_or(0),
+                            deleted_at: row
+                                .get::<_, Option<String>>(3)
+                                .unwrap_or(None)
+                                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                            pushed: row.get::<_, i64>(4).unwrap_or(0),
+                        })
+                    })
+                    .map_err(|e| StorageError::Database(format!("deleted_tracks query: {e}")))?;
+
+                let mut out = Vec::new();
+                for r in rows {
+                    match r {
+                        Ok(t) => out.push(t),
+                        Err(_) => {} // skip malformed rows defensively
+                    }
+                }
+                out
+            }
+        };
+
+        // ── Read old sync_state (v6 cursors — defensive) ──────────────────────
+        let sync_states: Vec<SyncState> = {
+            let exists: bool = old
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_state'",
+                    [],
+                    |row| row.get::<_, i64>(0).map(|c| c > 0),
+                )
+                .unwrap_or(false);
+
+            if !exists {
+                Vec::new()
+            } else {
+                // `updated_at` may be absent in older sync_state schemas; fall
+                // back to the current time rather than dropping the row.
+                let has_updated_at: bool = {
+                    let mut stmt = old
+                        .prepare("PRAGMA table_info(sync_state)")
+                        .map_err(|e| StorageError::Database(format!("sync_state pragma: {e}")))?;
+                    let mut found = false;
+                    let mut rows = stmt
+                        .query([])
+                        .map_err(|e| StorageError::Database(format!("sync_state pragma: {e}")))?;
+                    while let Some(row) = rows.next().map_err(|e| {
+                        StorageError::Database(format!("sync_state pragma row: {e}"))
+                    })? {
+                        if row.get::<_, String>(1).unwrap_or_default() == "updated_at" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                };
+
+                let sql = if has_updated_at {
+                    "SELECT remote_key, last_seq, base_up_to, parts, updated_at FROM sync_state"
+                } else {
+                    "SELECT remote_key, last_seq, base_up_to, parts, NULL FROM sync_state"
+                };
+                let mut stmt = old
+                    .prepare(sql)
+                    .map_err(|e| StorageError::Database(format!("sync_state prepare: {e}")))?;
+
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(SyncState {
+                            remote_key: row.get::<_, String>(0).unwrap_or_default(),
+                            last_seq: row.get::<_, i64>(1).unwrap_or(0),
+                            base_up_to: row.get::<_, i64>(2).unwrap_or(0),
+                            parts: row.get::<_, String>(3).unwrap_or_else(|_| "{}".to_string()),
+                            updated_at: row
+                                .get::<_, Option<String>>(4)
+                                .unwrap_or(None)
+                                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                        })
+                    })
+                    .map_err(|e| StorageError::Database(format!("sync_state query: {e}")))?;
+
+                let mut out = Vec::new();
+                for r in rows {
+                    match r {
+                        Ok(s) => out.push(s),
+                        Err(_) => {} // skip malformed rows defensively
+                    }
+                }
+                out
+            }
+        };
+
         // ── Write everything to dest in one logical batch ─────────────────────
         let track_count = tracks.len();
         let playlist_count = playlists.len();
         let entry_count = entries.len();
+        let deleted_track_count = deleted_tracks.len();
+        let sync_state_count = sync_states.len();
 
         for t in &tracks {
             dest.upsert_track(t)?;
@@ -1181,17 +1330,29 @@ impl LibraryDatabase {
             dest.set_playlist_entries(&pid, &ents)?;
         }
 
-        // Mark as done.
+        // v6 surfaces — upsert tombstones and sync cursors.
+        for t in &deleted_tracks {
+            dest.upsert_deleted_track(t)?;
+        }
+        for s in &sync_states {
+            dest.save_sync_state(s)?;
+        }
+
+        // Mark the completed stages. On a backfill pass the legacy flag is
+        // already set, so this write is a harmless idempotent overwrite.
         dest.save_kv("sqflite_imported", "1")?;
+        dest.save_kv("sqflite_imported_v6", "1")?;
 
         // suppress unused-variable warning for `now`
         let _ = now;
 
         Ok(ImportSummary {
-            already_done: false,
+            already_done: imported,
             tracks: track_count,
             playlists: playlist_count,
             entries: entry_count,
+            deleted_tracks: deleted_track_count,
+            sync_state: sync_state_count,
         })
     }
 
@@ -2831,6 +2992,21 @@ mod tests {
                     title       TEXT    NOT NULL,
                     duration_ms INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS deleted_tracks (
+                    source_name TEXT    NOT NULL,
+                    remote_path TEXT    NOT NULL,
+                    rev         INTEGER NOT NULL,
+                    deleted_at  TEXT    NOT NULL,
+                    pushed      INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source_name, remote_path)
+                );
+                CREATE TABLE IF NOT EXISTS sync_state (
+                    remote_key TEXT PRIMARY KEY,
+                    last_seq   INTEGER NOT NULL DEFAULT 0,
+                    base_up_to INTEGER NOT NULL DEFAULT 0,
+                    parts      TEXT    NOT NULL DEFAULT '{}',
+                    updated_at TEXT    NOT NULL
+                );
 
                 INSERT INTO tracks VALUES ('t1','Song One','Artist A','/m/1.mp3','acc1',1000,NULL);
                 INSERT INTO tracks VALUES ('t2','Song Two','Artist B','/m/2.mp3','acc1',2000,NULL);
@@ -2842,6 +3018,11 @@ mod tests {
                 INSERT INTO playlist_entries VALUES ('pl1',0,'t1','acc1','/m/1.mp3','Song One',180000);
                 INSERT INTO playlist_entries VALUES ('pl1',1,'t2','acc1','/m/2.mp3','Song Two',240000);
                 INSERT INTO playlist_entries VALUES ('pl2',0,'t3','acc2','/m/3.mp3','Song Three',300000);
+
+                INSERT INTO deleted_tracks VALUES ('acc1','/m/gone1.mp3',101,'2024-01-02T03:04:05.000Z',0);
+                INSERT INTO deleted_tracks VALUES ('acc2','/m/gone2.mp3',102,'2024-01-03T03:04:05.000Z',1);
+
+                INSERT INTO sync_state VALUES ('library:x',42,10,'{"a":1}','2024-01-01T00:00:00.000Z');
                 "#,
             )
             .expect("seed old db");
@@ -2855,19 +3036,182 @@ mod tests {
         assert_eq!(summary.tracks, 3);
         assert_eq!(summary.playlists, 2);
         assert_eq!(summary.entries, 3);
+        assert_eq!(summary.deleted_tracks, 2);
+        assert_eq!(summary.sync_state, 1);
 
         // Verify data landed.
         assert_eq!(dest.list_tracks().unwrap().len(), 3);
         assert_eq!(dest.list_playlists().unwrap().len(), 2);
         assert_eq!(dest.list_playlist_entries("pl1").unwrap().len(), 2);
 
-        // Second call must be a no-op.
+        // Verify tombstones + sync cursors landed (v6 roundtrip).
+        let tombs = dest.list_deleted_tracks().unwrap();
+        assert_eq!(tombs.len(), 2);
+        let t1 = tombs
+            .iter()
+            .find(|t| t.remote_path == "/m/gone1.mp3")
+            .expect("tombstone 1 present");
+        assert_eq!(t1.source_name, "acc1");
+        assert_eq!(t1.rev, 101);
+        assert_eq!(t1.deleted_at, "2024-01-02T03:04:05.000Z");
+        assert_eq!(t1.pushed, 0);
+        let t2 = tombs
+            .iter()
+            .find(|t| t.remote_path == "/m/gone2.mp3")
+            .expect("tombstone 2 present");
+        assert_eq!(t2.pushed, 1);
+
+        let ss = dest
+            .get_sync_state("library:x")
+            .unwrap()
+            .expect("sync_state present");
+        assert_eq!(ss.last_seq, 42);
+        assert_eq!(ss.base_up_to, 10);
+        assert_eq!(ss.parts, "{\"a\":1}");
+        assert_eq!(ss.updated_at, "2024-01-01T00:00:00.000Z");
+
+        // Second call must be a full no-op (both flags set).
         let summary2 = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
         assert!(summary2.already_done);
         assert_eq!(summary2.tracks, 0);
+        assert_eq!(summary2.playlists, 0);
+        assert_eq!(summary2.entries, 0);
+        assert_eq!(summary2.deleted_tracks, 0);
+        assert_eq!(summary2.sync_state, 0);
 
         // Clean up temp file (best-effort).
         let _ = std::fs::remove_file(&old_path);
+    }
+
+    #[test]
+    fn import_from_sqflite_v6_backfill() {
+        use std::fs;
+
+        // Old DB with all five surfaces, but the destination has already run the
+        // pre-v6 import (tracks flag set) with empty Core tombstones/sync_state.
+        let mut old_path = std::env::temp_dir();
+        old_path.push(format!("wdmm_sqflite_backfill_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let old = Connection::open(&old_path).expect("create old db");
+            old.execute_batch(
+                r#"
+                CREATE TABLE tracks (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT,
+                    remote_path TEXT NOT NULL, account_id TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0, modified INTEGER
+                );
+                CREATE TABLE playlists (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE playlist_entries (
+                    playlist_id TEXT NOT NULL, position INTEGER NOT NULL,
+                    music_id TEXT NOT NULL, source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL, title TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE deleted_tracks (
+                    source_name TEXT NOT NULL, remote_path TEXT NOT NULL,
+                    rev INTEGER NOT NULL, deleted_at TEXT NOT NULL,
+                    pushed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source_name, remote_path)
+                );
+                CREATE TABLE sync_state (
+                    remote_key TEXT PRIMARY KEY, last_seq INTEGER NOT NULL DEFAULT 0,
+                    base_up_to INTEGER NOT NULL DEFAULT 0,
+                    parts TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
+                );
+                INSERT INTO tracks VALUES ('t1','Song One','A','/m/1.mp3','acc1',1000,NULL);
+                INSERT INTO deleted_tracks VALUES ('acc1','/m/gone.mp3',7,'2024-02-02T00:00:00.000Z',0);
+                INSERT INTO sync_state VALUES ('library:y',5,1,'{}','2024-02-01T00:00:00.000Z');
+                "#,
+            )
+            .expect("seed old db");
+        }
+
+        let dest = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        // Simulate a device that already ran the pre-v6 import.
+        dest.save_kv("sqflite_imported", "1").unwrap();
+        // Pre-existing track from the earlier import.
+        dest.upsert_track(&wdmm_core::models::LibraryTrack {
+            id: "t1".to_string(),
+            title: "Song One".to_string(),
+            remote_path: "/m/1.mp3".to_string(),
+            account_id: "acc1".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(dest.list_deleted_tracks().unwrap().is_empty());
+        assert!(dest.get_sync_state("library:y").unwrap().is_none());
+
+        // Backfill call: only tombstones + sync_state, already_done = true.
+        let summary = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
+        assert!(summary.already_done);
+        assert_eq!(summary.tracks, 0);
+        assert_eq!(summary.playlists, 0);
+        assert_eq!(summary.entries, 0);
+        assert_eq!(summary.deleted_tracks, 1);
+        assert_eq!(summary.sync_state, 1);
+
+        // Data present.
+        assert_eq!(dest.list_deleted_tracks().unwrap().len(), 1);
+        let ss = dest.get_sync_state("library:y").unwrap().unwrap();
+        assert_eq!(ss.last_seq, 5);
+        // v6 flag now set.
+        assert_eq!(dest.load_kv("sqflite_imported_v6").unwrap().as_deref(), Some("1"));
+
+        // Third call: full no-op, all zero.
+        let summary2 = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
+        assert!(summary2.already_done);
+        assert_eq!(summary2.tracks, 0);
+        assert_eq!(summary2.deleted_tracks, 0);
+        assert_eq!(summary2.sync_state, 0);
+
+        let _ = fs::remove_file(&old_path);
+    }
+
+    #[test]
+    fn import_from_sqflite_missing_v6_tables() {
+        use std::fs;
+
+        // Old DB lacks deleted_tracks / sync_state entirely — import still
+        // succeeds with zero counts (defensive).
+        let mut old_path = std::env::temp_dir();
+        old_path.push(format!("wdmm_sqflite_nov6_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let old = Connection::open(&old_path).expect("create old db");
+            old.execute_batch(
+                r#"
+                CREATE TABLE tracks (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT,
+                    remote_path TEXT NOT NULL, account_id TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0, modified INTEGER
+                );
+                CREATE TABLE playlists (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE playlist_entries (
+                    playlist_id TEXT NOT NULL, position INTEGER NOT NULL,
+                    music_id TEXT NOT NULL, source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL, title TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                "#,
+            )
+            .expect("seed old db");
+        }
+
+        let dest = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let summary = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
+        assert!(!summary.already_done);
+        assert_eq!(summary.deleted_tracks, 0);
+        assert_eq!(summary.sync_state, 0);
+        assert_eq!(dest.load_kv("sqflite_imported_v6").unwrap().as_deref(), Some("1"));
+
+        let _ = fs::remove_file(&old_path);
     }
 
     // ── User folder tests (schema v3) ─────────────────────────────────────────
