@@ -2,11 +2,11 @@
 //!
 //! Implemented drivers (production paths):
 //! - `WebDavDriver`    — WebDAV list/get/mkdir/rename/remove/put_content/get_content
-//! - `CtFileDriver`    — CtFile (城通网盘) list/get + write ops
+//! - `CtFileDriver`    — CtFile list/get/mkdir/rename/remove/put_content/get_content/range
 //! - `BaiduDriver`     — Baidu NetDisk list/get/mkdir/rename/remove/content reads
-//! - `Pan123Driver`    — 123 Pan list/get (write ops TODO)
+//! - `Pan123Driver`    — 123 Pan list/get/mkdir/rename/remove/get_content/range
 //! - `AliyunDriver`    — Aliyun Drive list/get/mkdir/rename/remove/content reads
-//! - `Open115Driver`   — 115 Network list/get (write ops TODO)
+//! - `Open115Driver`   — 115 Network list/get/mkdir/rename/remove/get_content/range
 //!
 //! Stubbed drivers (Round 3+): each returns a loud TODO error.
 //! - terabox, netease_music.

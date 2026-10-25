@@ -7,9 +7,9 @@
 //! - `webdav`        (wdmm_drivers::WebDavDriver)
 //! - `ctfile`        (wdmm_drivers::CtFileDriver)
 //! - `baidu`         (wdmm_drivers::BaiduDriver) — list/get/mkdir/rename/remove/content reads
-//! - `123`           (wdmm_drivers::Pan123Driver) — list/get; write ops TODO
+//! - `123`           (wdmm_drivers::Pan123Driver) — list/get/mkdir/rename/remove/content
 //! - `aliyundrive`   (wdmm_drivers::AliyunDriver) — list/get/mkdir/rename/remove/content reads
-//! - `open115`       (wdmm_drivers::Open115Driver) — list/get; write ops TODO
+//! - `open115`       (wdmm_drivers::Open115Driver) — list/get/mkdir/rename/remove/content
 //!
 //! Remaining stubs:
 //! - terabox       — Official Terabox OpenAPI exists but **detailed endpoint
