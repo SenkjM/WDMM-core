@@ -77,11 +77,18 @@ impl Default for CtFileConfig {
 impl CtFileConfig {
     /// Create config with only the required session token; all other fields use defaults.
     pub fn with_session(session: impl Into<String>) -> Self {
-        Self { session: session.into(), ..Default::default() }
+        Self {
+            session: session.into(),
+            ..Default::default()
+        }
     }
 
     fn namespace(&self) -> &str {
-        if self.cloud_type == "private" { "private" } else { "public" }
+        if self.cloud_type == "private" {
+            "private"
+        } else {
+            "public"
+        }
     }
 
     fn base_url_trimmed(&self) -> &str {
@@ -117,7 +124,9 @@ pub fn parse_ctfile_date(raw: &Value) -> Option<DateTime<Utc>> {
     match raw {
         Value::Number(n) => {
             let ts = n.as_i64()?;
-            if ts <= 0 { return None; }
+            if ts <= 0 {
+                return None;
+            }
             // Values > 1e12 are already milliseconds
             if ts > 1_000_000_000_000 {
                 DateTime::from_timestamp_millis(ts)
@@ -150,9 +159,7 @@ pub fn parse_ctfile_date(raw: &Value) -> Option<DateTime<Utc>> {
 /// This implements the id-prefix dual strategy from the Dart reference:
 /// some endpoints require the raw id, others the stripped numeric id.
 pub fn strip_id_prefix(id: &str) -> &str {
-    if id.len() > 1
-        && matches!(id.as_bytes()[0], b'd' | b'f')
-        && id.as_bytes()[1].is_ascii_digit()
+    if id.len() > 1 && matches!(id.as_bytes()[0], b'd' | b'f') && id.as_bytes()[1].is_ascii_digit()
     {
         &id[1..]
     } else {
@@ -169,7 +176,10 @@ struct CacheEntry<T> {
 
 impl<T> CacheEntry<T> {
     fn new(items: Vec<T>, ttl: Duration) -> Self {
-        Self { items, expires_at: Instant::now() + ttl }
+        Self {
+            items,
+            expires_at: Instant::now() + ttl,
+        }
     }
     fn is_fresh(&self) -> bool {
         Instant::now() < self.expires_at
@@ -195,9 +205,11 @@ impl CtFileClient {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::ACCEPT,
-            "application/json".parse().map_err(|e: reqwest::header::InvalidHeaderValue| {
-                DriverError::Config(e.to_string())
-            })?,
+            "application/json"
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| {
+                    DriverError::Config(e.to_string())
+                })?,
         );
         let client = reqwest::Client::builder()
             .default_headers(headers)
@@ -223,7 +235,9 @@ impl CtFileClient {
     /// Wait until the minimum request interval has elapsed since the last call.
     async fn throttle(&self) {
         let gap_ms = self.config.request_interval_ms;
-        if gap_ms == 0 { return; }
+        if gap_ms == 0 {
+            return;
+        }
         let mut last = self.last_request.lock().await;
         if let Some(prev) = *last {
             let elapsed_ms = prev.elapsed().as_millis() as u64;
@@ -252,7 +266,8 @@ impl CtFileClient {
             }
             self.throttle().await;
 
-            let result = self.client
+            let result = self
+                .client
                 .post(&url)
                 .header("User-Agent", &self.config.user_agent)
                 .json(&body)
@@ -267,18 +282,15 @@ impl CtFileClient {
                 Ok(resp) => {
                     let http_status = resp.status().as_u16();
                     let text = resp.text().await.unwrap_or_default();
-                    let parsed: Value = serde_json::from_str(&text)
-                        .unwrap_or(Value::Null);
+                    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
-                    let api_code = parsed
-                        .get("code")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(200);
+                    let api_code = parsed.get("code").and_then(|v| v.as_u64()).unwrap_or(200);
 
                     if api_code == 401 || http_status == 401 {
                         return Err(DriverError::AuthFailed);
                     }
-                    if api_code == 429 || http_status == 429
+                    if api_code == 429
+                        || http_status == 429
                         || (api_code >= 500 && api_code < 600)
                         || http_status >= 500
                     {
@@ -334,9 +346,7 @@ impl CtFileClient {
 
         match self.call(path, body).await {
             Ok(v) => Ok(v),
-            Err(DriverError::Network(ref msg))
-                if msg.contains("400") || msg.contains("404") =>
-            {
+            Err(DriverError::Network(ref msg)) if msg.contains("400") || msg.contains("404") => {
                 let mut body2 = extra;
                 body2[param_key] = Value::String(fallback.to_string());
                 self.call(path, body2).await
@@ -349,7 +359,11 @@ impl CtFileClient {
 
     /// List subfolders of `folder_id`. Caches results per TTL config.
     pub async fn list_folders(&self, folder_id: &str) -> Result<Vec<CtFileFolder>> {
-        let id = if folder_id.is_empty() { ROOT_ID } else { folder_id };
+        let id = if folder_id.is_empty() {
+            ROOT_ID
+        } else {
+            folder_id
+        };
         let ttl = self.config.list_cache_sec;
         if ttl > 0 {
             let cache = self.folder_cache.lock().await;
@@ -378,10 +392,20 @@ impl CtFileClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = m
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let modified = m.get("date").and_then(|v| parse_ctfile_date(v));
-                if key.is_empty() || name.is_empty() { return None; }
-                Some(CtFileFolder { key, name, modified })
+                if key.is_empty() || name.is_empty() {
+                    return None;
+                }
+                Some(CtFileFolder {
+                    key,
+                    name,
+                    modified,
+                })
             })
             .collect();
 
@@ -397,7 +421,11 @@ impl CtFileClient {
 
     /// List files under `folder_id` with automatic pagination (up to MAX_LIST_PAGES).
     pub async fn list_files(&self, folder_id: &str) -> Result<Vec<CtFileFile>> {
-        let id = if folder_id.is_empty() { ROOT_ID } else { folder_id };
+        let id = if folder_id.is_empty() {
+            ROOT_ID
+        } else {
+            folder_id
+        };
         let ttl = self.config.list_cache_sec;
         if ttl > 0 {
             let cache = self.file_cache.lock().await;
@@ -422,7 +450,9 @@ impl CtFileClient {
             });
             let resp = self.call(&format!("/{}/file/list", ns), body).await?;
             let results = resp["results"].as_array().cloned().unwrap_or_default();
-            if results.is_empty() { break; }
+            if results.is_empty() {
+                break;
+            }
 
             // Detect stall (API returned the same first key twice)
             let first_key = results
@@ -431,7 +461,9 @@ impl CtFileClient {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if page > 0 && first_key == prev_first_key { break; }
+            if page > 0 && first_key == prev_first_key {
+                break;
+            }
             prev_first_key = first_key;
 
             for e in &results {
@@ -442,11 +474,20 @@ impl CtFileClient {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = m
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let size = m.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
                     let modified = m.get("date").and_then(|v| parse_ctfile_date(v));
                     if !key.is_empty() && !name.is_empty() {
-                        all.push(CtFileFile { key, name, size, modified });
+                        all.push(CtFileFile {
+                            key,
+                            name,
+                            size,
+                            modified,
+                        });
                     }
                 }
             }
@@ -469,7 +510,9 @@ impl CtFileClient {
     pub async fn fetch_download_url(&self, file_id: &str) -> Result<String> {
         let ns = self.config.namespace();
         let path = format!("/{}/file/fetch_url", ns);
-        let resp = self.call_with_id(&path, "file_id", file_id, json!({}), true).await?;
+        let resp = self
+            .call_with_id(&path, "file_id", file_id, json!({}), true)
+            .await?;
         // API returns download_url at top level alongside code/message
         let url = resp
             .get("download_url")
@@ -490,7 +533,8 @@ impl CtFileClient {
     pub async fn file_meta(&self, file_id: &str) -> Result<Value> {
         let ns = self.config.namespace();
         let path = format!("/{}/file/meta", ns);
-        self.call_with_id(&path, "file_id", file_id, json!({}), true).await
+        self.call_with_id(&path, "file_id", file_id, json!({}), true)
+            .await
     }
 
     // ─── write ops ────────────────────────────────────────────────────────────
@@ -512,10 +556,18 @@ impl CtFileClient {
                 let raw_id = resp
                     .get("folder_id")
                     .or_else(|| resp.get("id"))
-                    .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string())))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    })
                     .ok_or_else(|| DriverError::Other("folder/create: missing folder_id".into()))?;
                 // Ensure d-prefix
-                let key = if raw_id.starts_with('d') { raw_id } else { format!("d{}", raw_id) };
+                let key = if raw_id.starts_with('d') {
+                    raw_id
+                } else {
+                    format!("d{}", raw_id)
+                };
                 Ok(key)
             }
             Err(DriverError::Network(ref msg)) if msg.contains("403") => {
@@ -530,7 +582,8 @@ impl CtFileClient {
     pub async fn rename_file(&self, file_id: &str, new_name: &str) -> Result<()> {
         let ns = self.config.namespace();
         let path = format!("/{}/file/rename", ns);
-        self.call_with_id(&path, "file_id", file_id, json!({ "name": new_name }), true).await?;
+        self.call_with_id(&path, "file_id", file_id, json!({ "name": new_name }), true)
+            .await?;
         Ok(())
     }
 
@@ -538,7 +591,14 @@ impl CtFileClient {
     pub async fn rename_folder(&self, folder_id: &str, new_name: &str) -> Result<()> {
         let ns = self.config.namespace();
         let path = format!("/{}/folder/rename", ns);
-        self.call_with_id(&path, "folder_id", folder_id, json!({ "name": new_name }), false).await?;
+        self.call_with_id(
+            &path,
+            "folder_id",
+            folder_id,
+            json!({ "name": new_name }),
+            false,
+        )
+        .await?;
         Ok(())
     }
 
@@ -552,7 +612,8 @@ impl CtFileClient {
             file_id,
             json!({ "folder_id": dest_folder_id }),
             true,
-        ).await?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -566,7 +627,8 @@ impl CtFileClient {
             folder_id,
             json!({ "to_folder_id": dest_folder_id }),
             false,
-        ).await?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -574,7 +636,8 @@ impl CtFileClient {
     pub async fn delete_file(&self, file_id: &str) -> Result<()> {
         let ns = self.config.namespace();
         let path = format!("/{}/file/delete", ns);
-        self.call_with_id(&path, "ids", file_id, json!({}), true).await?;
+        self.call_with_id(&path, "ids", file_id, json!({}), true)
+            .await?;
         Ok(())
     }
 
@@ -582,7 +645,8 @@ impl CtFileClient {
     pub async fn delete_folder(&self, folder_id: &str) -> Result<()> {
         let ns = self.config.namespace();
         let path = format!("/{}/folder/delete", ns);
-        self.call_with_id(&path, "folder_id", folder_id, json!({}), false).await?;
+        self.call_with_id(&path, "folder_id", folder_id, json!({}), false)
+            .await?;
         Ok(())
     }
 }
@@ -613,7 +677,9 @@ impl CtFileDriver {
     /// Normalise a path: trim whitespace, leading+trailing slashes, collapse doubles.
     /// Returns "" for root ("/").
     pub fn normalize_path(path: &str) -> String {
-        if path.is_empty() || path == "/" { return String::new(); }
+        if path.is_empty() || path == "/" {
+            return String::new();
+        }
         let trimmed = path.trim().trim_end_matches('/');
         let with_slash = if trimmed.starts_with('/') {
             trimmed.to_string()
@@ -625,19 +691,27 @@ impl CtFileDriver {
         let mut prev_slash = false;
         for ch in with_slash.chars() {
             if ch == '/' {
-                if !prev_slash { result.push(ch); }
+                if !prev_slash {
+                    result.push(ch);
+                }
                 prev_slash = true;
             } else {
                 result.push(ch);
                 prev_slash = false;
             }
         }
-        if result == "/" { String::new() } else { result }
+        if result == "/" {
+            String::new()
+        } else {
+            result
+        }
     }
 
     fn file_name(path: &str) -> String {
         let norm = Self::normalize_path(path);
-        if norm.is_empty() { return String::new(); }
+        if norm.is_empty() {
+            return String::new();
+        }
         norm.rsplit('/').next().unwrap_or("").to_string()
     }
 
@@ -692,32 +766,42 @@ impl CloudDriver for CtFileDriver {
         // First-seen-wins on key conflict — folder entries take priority.
         let mut seen: HashMap<String, CloudFileItem> = HashMap::new();
         for f in &folders {
-            if seen.contains_key(&f.key) { continue; }
-            seen.insert(f.key.clone(), CloudFileItem {
-                name: f.name.clone(),
-                is_dir: true,
-                size: 0,
-                modified: f.modified,
-                raw_url: None,
-                raw_headers: vec![],
-                delivery: crate::driver::ContentDeliveryKind::LocalStream,
-                local_path: None,
-            });
+            if seen.contains_key(&f.key) {
+                continue;
+            }
+            seen.insert(
+                f.key.clone(),
+                CloudFileItem {
+                    name: f.name.clone(),
+                    is_dir: true,
+                    size: 0,
+                    modified: f.modified,
+                    raw_url: None,
+                    raw_headers: vec![],
+                    delivery: crate::driver::ContentDeliveryKind::LocalStream,
+                    local_path: None,
+                },
+            );
         }
         for f in &files {
-            if seen.contains_key(&f.key) { continue; }
+            if seen.contains_key(&f.key) {
+                continue;
+            }
             // file/list can also return d-prefixed (directory) entries
             let is_dir = f.key.starts_with('d');
-            seen.insert(f.key.clone(), CloudFileItem {
-                name: f.name.clone(),
-                is_dir,
-                size: if is_dir { 0 } else { f.size },
-                modified: f.modified,
-                raw_url: None,
-                raw_headers: vec![],
-                delivery: crate::driver::ContentDeliveryKind::LocalStream,
-                local_path: None,
-            });
+            seen.insert(
+                f.key.clone(),
+                CloudFileItem {
+                    name: f.name.clone(),
+                    is_dir,
+                    size: if is_dir { 0 } else { f.size },
+                    modified: f.modified,
+                    raw_url: None,
+                    raw_headers: vec![],
+                    delivery: crate::driver::ContentDeliveryKind::LocalStream,
+                    local_path: None,
+                },
+            );
         }
         Ok(seen.into_values().collect())
     }
@@ -960,13 +1044,19 @@ mod tests {
 
     #[test]
     fn config_namespace_private() {
-        let c = CtFileConfig { cloud_type: "private".into(), ..Default::default() };
+        let c = CtFileConfig {
+            cloud_type: "private".into(),
+            ..Default::default()
+        };
         assert_eq!(c.namespace(), "private");
     }
 
     #[test]
     fn config_base_url_trimmed() {
-        let c = CtFileConfig { base_url: "https://rest.ctfile.com/v1/".into(), ..Default::default() };
+        let c = CtFileConfig {
+            base_url: "https://rest.ctfile.com/v1/".into(),
+            ..Default::default()
+        };
         assert_eq!(c.base_url_trimmed(), "https://rest.ctfile.com/v1");
     }
 
@@ -991,7 +1081,9 @@ mod tests {
 
         tokio::spawn(async move {
             for (status, body) in responses {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut buf = vec![0u8; 8192];
                 let _ = sock.read(&mut buf).await;
                 let resp = format!(
@@ -1013,10 +1105,10 @@ mod tests {
 
     fn make_client(base_url: &str) -> CtFileClient {
         CtFileClient::new(CtFileConfig {
-            session:             "test-session".into(),
-            base_url:            base_url.into(),
+            session: "test-session".into(),
+            base_url: base_url.into(),
             request_interval_ms: 0,
-            list_cache_sec:      0,
+            list_cache_sec: 0,
             ..Default::default()
         })
         .unwrap()
@@ -1024,9 +1116,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_folder_returns_key() {
-        let (_, base) = start_ctfile_mock(vec![
-            (200, r#"{"code":200,"folder_id":"456"}"#),
-        ]).await;
+        let (_, base) = start_ctfile_mock(vec![(200, r#"{"code":200,"folder_id":"456"}"#)]).await;
         let client = make_client(&base);
         let key = client.create_folder("0", "Music").await.unwrap();
         assert!(key.starts_with('d'), "expected d-prefix, got {key}");
@@ -1034,45 +1124,35 @@ mod tests {
 
     #[tokio::test]
     async fn rename_file_ok() {
-        let (_, base) = start_ctfile_mock(vec![
-            (200, r#"{"code":200}"#),
-        ]).await;
+        let (_, base) = start_ctfile_mock(vec![(200, r#"{"code":200}"#)]).await;
         let client = make_client(&base);
         client.rename_file("f123", "new_name.mp3").await.unwrap();
     }
 
     #[tokio::test]
     async fn rename_folder_ok() {
-        let (_, base) = start_ctfile_mock(vec![
-            (200, r#"{"code":200}"#),
-        ]).await;
+        let (_, base) = start_ctfile_mock(vec![(200, r#"{"code":200}"#)]).await;
         let client = make_client(&base);
         client.rename_folder("d456", "NewFolder").await.unwrap();
     }
 
     #[tokio::test]
     async fn move_file_ok() {
-        let (_, base) = start_ctfile_mock(vec![
-            (200, r#"{"code":200}"#),
-        ]).await;
+        let (_, base) = start_ctfile_mock(vec![(200, r#"{"code":200}"#)]).await;
         let client = make_client(&base);
         client.move_file("f789", "d100").await.unwrap();
     }
 
     #[tokio::test]
     async fn delete_file_ok() {
-        let (_, base) = start_ctfile_mock(vec![
-            (200, r#"{"code":200}"#),
-        ]).await;
+        let (_, base) = start_ctfile_mock(vec![(200, r#"{"code":200}"#)]).await;
         let client = make_client(&base);
         client.delete_file("f999").await.unwrap();
     }
 
     #[tokio::test]
     async fn delete_folder_ok() {
-        let (_, base) = start_ctfile_mock(vec![
-            (200, r#"{"code":200}"#),
-        ]).await;
+        let (_, base) = start_ctfile_mock(vec![(200, r#"{"code":200}"#)]).await;
         let client = make_client(&base);
         client.delete_folder("d888").await.unwrap();
     }
@@ -1081,9 +1161,8 @@ mod tests {
     async fn create_folder_idempotent_on_403() {
         // A 403 response — client.call returns Err(Network("CtFile API 403:..."))
         // create_folder should treat this as idempotent success.
-        let (_, base) = start_ctfile_mock(vec![
-            (200, r#"{"code":403,"message":"folder exists"}"#),
-        ]).await;
+        let (_, base) =
+            start_ctfile_mock(vec![(200, r#"{"code":403,"message":"folder exists"}"#)]).await;
         let client = make_client(&base);
         // Should NOT return Err
         let result = client.create_folder("0", "existing").await;
