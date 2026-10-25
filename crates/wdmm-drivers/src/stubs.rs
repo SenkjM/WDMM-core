@@ -6,9 +6,9 @@
 //! Implemented (production):
 //! - `webdav`        (wdmm_drivers::WebDavDriver)
 //! - `ctfile`        (wdmm_drivers::CtFileDriver)
-//! - `baidu`         (wdmm_drivers::BaiduDriver) — list/get; write ops TODO
+//! - `baidu`         (wdmm_drivers::BaiduDriver) — list/get/mkdir/rename/remove/content reads
 //! - `123`           (wdmm_drivers::Pan123Driver) — list/get; write ops TODO
-//! - `aliyundrive`   (wdmm_drivers::AliyunDriver) — ✓ list/get/mkdir/rename/remove (Round 8)
+//! - `aliyundrive`   (wdmm_drivers::AliyunDriver) — list/get/mkdir/rename/remove/content reads
 //! - `open115`       (wdmm_drivers::Open115Driver) — list/get; write ops TODO
 //!
 //! Remaining stubs:

@@ -3,9 +3,9 @@
 //! Implemented drivers (production paths):
 //! - `WebDavDriver`    — WebDAV list/get/mkdir/rename/remove/put_content/get_content
 //! - `CtFileDriver`    — CtFile (城通网盘) list/get + write ops
-//! - `BaiduDriver`     — Baidu NetDisk list/get (write ops TODO)
+//! - `BaiduDriver`     — Baidu NetDisk list/get/mkdir/rename/remove/content reads
 //! - `Pan123Driver`    — 123 Pan list/get (write ops TODO)
-//! - `AliyunDriver`    — Aliyun Drive list/get (write ops TODO)
+//! - `AliyunDriver`    — Aliyun Drive list/get/mkdir/rename/remove/content reads
 //! - `Open115Driver`   — 115 Network list/get (write ops TODO)
 //!
 //! Stubbed drivers (Round 3+): each returns a loud TODO error.
@@ -91,6 +91,7 @@ impl DriverRegistry {
                     .ok_or_else(|| DriverError::Config("aliyun: missing drive_id".into()))?;
                 let mut cfg = AliyunConfig::new(token, drive_id);
                 if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                if let Some(s) = config["remove_way"].as_str() { cfg.remove_way = s.to_string(); }
                 Ok(Box::new(AliyunDriver::new(cfg)?))
             }
             "115" | "open115" => {

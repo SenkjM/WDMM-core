@@ -1,10 +1,8 @@
 //! Baidu NetDisk driver — Baidu PCS OpenAPI.
 //!
 //! Auth: user-supplied OAuth2 access_token. No credentials are embedded in source.
-//! Implements: list(), get() (with raw_url + auth headers),
-//! mkdir() — `/rest/2.0/xpan/file?method=create`,
-//! rename() — `/rest/2.0/xpan/file?method=rename` (same-parent),
-//! remove() — `/rest/2.0/xpan/file?method=delete`.
+//! Implements: list(), get() (with raw_url + download UA headers),
+//! mkdir/rename/remove via filemanager API, get_content/get_content_range.
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -12,6 +10,14 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// User-Agent for API requests (aligned with Dart apiUA).
+const API_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/142.0.0.0 OpenList/425.6.30";
+
+/// User-Agent required for download links (Dart downloadUA).
+const DOWNLOAD_UA: &str = "pan.baidu.com";
 
 /// Configuration for the Baidu NetDisk driver.
 pub struct BaiduConfig {
@@ -70,9 +76,10 @@ impl BaiduDriver {
     }
 
     /// Map Baidu errno values to DriverError.
+    /// Maps {111, -6, 20016} (token errors per Dart) to AuthFailed.
     fn map_errno(errno: i64) -> DriverError {
         match errno {
-            111 | -6 => DriverError::AuthFailed,
+            111 | -6 | 20016 => DriverError::AuthFailed,
             _ => DriverError::Network(format!("Baidu errno {}", errno)),
         }
     }
@@ -98,11 +105,14 @@ impl BaiduDriver {
 
     /// Send a GET request and return JSON. Retries once on 429/5xx.
     async fn get_json(&self, url: &str, params: &[(&str, &str)]) -> Result<Value> {
-        let send = |retry: bool| {
-            let _ = retry;
-            self.client.get(url).query(params).send()
+        let send = || {
+            self.client
+                .get(url)
+                .query(params)
+                .header("User-Agent", API_UA)
+                .send()
         };
-        let resp = send(false).await.map_err(|e| map_http_error(&e))?;
+        let resp = send().await.map_err(|e| map_http_error(&e))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(DriverError::AuthFailed);
@@ -112,17 +122,22 @@ impl BaiduDriver {
         }
         if status.as_u16() == 429 || status.is_server_error() {
             // Single retry
-            let resp2 = send(true).await.map_err(|e| map_http_error(&e))?;
+            let resp2 = send().await.map_err(|e| map_http_error(&e))?;
             let s2 = resp2.status();
             if !s2.is_success() {
                 return Err(DriverError::Network(format!("HTTP {}", s2)));
             }
-            return resp2.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()));
+            return resp2
+                .json::<Value>()
+                .await
+                .map_err(|e| DriverError::Network(e.to_string()));
         }
         if !status.is_success() {
             return Err(DriverError::Network(format!("HTTP {}", status)));
         }
-        resp.json::<Value>().await.map_err(|e| DriverError::Network(e.to_string()))
+        resp.json::<Value>()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))
     }
 
     /// POST with query params and form-encoded body. Retries once on 429/5xx.
@@ -138,6 +153,7 @@ impl BaiduDriver {
             self.client
                 .post(url)
                 .query(query)
+                .header("User-Agent", API_UA)
                 .form(form)
                 .send()
         };
@@ -199,7 +215,34 @@ impl BaiduDriver {
 
     /// Extract the file name from a path.
     fn file_name(path: &str) -> &str {
-        path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
+        path.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+    }
+
+    /// Sanitize dlink by removing access_token query parameter (Dart _sanitizeDlink).
+    fn sanitize_dlink(url: &str) -> String {
+        if url.is_empty() {
+            return url.to_string();
+        }
+        match reqwest::Url::parse(url) {
+            Ok(mut parsed) => {
+                {
+                    let query_pairs: Vec<(String, String)> = parsed
+                        .query_pairs()
+                        .filter(|(k, _)| k != "access_token")
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    parsed.query_pairs_mut().clear();
+                    for (k, v) in query_pairs {
+                        parsed.query_pairs_mut().append_pair(&k, &v);
+                    }
+                }
+                parsed.to_string()
+            }
+            Err(_) => url.to_string(),
+        }
     }
 }
 
@@ -228,11 +271,11 @@ impl CloudDriver for BaiduDriver {
         let mtime = entry["server_mtime"].as_i64();
         let modified = mtime.and_then(|ts| Utc.timestamp_opt(ts, 0).single());
 
-        // Step 2: fetch dlink via filemeta.
+        // Step 2: fetch dlink via filemetas (plural, per Dart).
         let fsids_param = format!("[{}]", fs_id);
         let url = format!("{}/rest/2.0/xpan/multimedia", self.config.base_url);
         let params = [
-            ("method", "filemeta"),
+            ("method", "filemetas"), // plural per Dart
             ("access_token", self.config.access_token.as_str()),
             ("fsids", fsids_param.as_str()),
             ("dlink", "1"),
@@ -250,16 +293,34 @@ impl CloudDriver for BaiduDriver {
             .ok_or_else(|| DriverError::Network("baidu: missing dlink".into()))?
             .to_string();
 
+        // Step 3: HEAD with download UA to follow redirects (Dart pattern).
+        let dlink_with_token = format!("{}&access_token={}", dlink, self.config.access_token);
+        let head_resp = self
+            .client
+            .head(&dlink_with_token)
+            .header("User-Agent", DOWNLOAD_UA)
+            .send()
+            .await
+            .map_err(|e| map_http_error(&e))?;
+
+        // Take Location header if present (redirect), else use original dlink+token.
+        let final_url = head_resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(&dlink_with_token)
+            .to_string();
+
+        // Step 4: sanitize access_token from final URL (Dart sanitizeDlink).
+        let sanitized_url = Self::sanitize_dlink(&final_url);
+
         Ok(CloudFileItem {
             name: name.to_string(),
             is_dir: false,
             size,
             modified,
-            raw_url: Some(dlink),
-            raw_headers: vec![(
-                "Authorization".to_string(),
-                format!("Bearer {}", self.config.access_token),
-            )],
+            raw_url: Some(sanitized_url),
+            raw_headers: vec![("User-Agent".to_string(), DOWNLOAD_UA.to_string())],
             delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
             local_path: None,
         })
@@ -278,7 +339,7 @@ impl CloudDriver for BaiduDriver {
             ("path", path),
             ("isdir", "1"),
             ("size", "0"),
-            ("block_list", "[]"),
+            ("rtype", "3"),
         ];
         let json = self.post_form(&url, &query, &form).await?;
         let errno = json["errno"].as_i64().unwrap_or(0);
@@ -288,25 +349,35 @@ impl CloudDriver for BaiduDriver {
         Ok(())
     }
 
-    /// Rename a file or folder (same-parent name change).
-    ///
-    /// Uses `POST /rest/2.0/xpan/file?method=rename` with
-    /// `filelist=[{"path": old_path, "newname": new_name}]`.
+    /// Rename or move a file or folder using Baidu's filemanager API.
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
-        let new_name = new_path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| DriverError::Config("baidu rename: empty new name".into()))?;
-        let filelist =
-            serde_json::json!([{"path": old_path, "newname": new_name}]).to_string();
+        let new_name = Self::file_name(new_path);
+        if new_name.is_empty() {
+            return Err(DriverError::Config("baidu rename: empty new name".into()));
+        }
+        let (opera, entry) = if Self::parent_dir(old_path) == Self::parent_dir(new_path) {
+            (
+                "rename",
+                serde_json::json!({"path": old_path, "newname": new_name}),
+            )
+        } else {
+            (
+                "move",
+                serde_json::json!({"path": old_path, "dest": Self::parent_dir(new_path), "newname": new_name}),
+            )
+        };
+        let filelist = serde_json::json!([entry]).to_string();
         let url = format!("{}/rest/2.0/xpan/file", self.config.base_url);
         let query = [
-            ("method", "rename"),
+            ("method", "filemanager"),
+            ("opera", opera),
             ("access_token", self.config.access_token.as_str()),
         ];
-        let form = [("filelist", filelist.as_str())];
+        let form = [
+            ("async", "0"),
+            ("filelist", filelist.as_str()),
+            ("ondup", "fail"),
+        ];
         let json = self.post_form(&url, &query, &form).await?;
         let errno = json["errno"].as_i64().unwrap_or(0);
         if errno != 0 {
@@ -315,24 +386,86 @@ impl CloudDriver for BaiduDriver {
         Ok(())
     }
 
-    /// Delete a file or directory (permanent, sync delete).
-    ///
-    /// Uses `POST /rest/2.0/xpan/file?method=delete` with
-    /// `filelist=["path"]&async=0`.
+    /// Uses filemanager `opera=delete`.
     async fn remove(&self, path: &str) -> Result<()> {
         let filelist = serde_json::json!([path]).to_string();
         let url = format!("{}/rest/2.0/xpan/file", self.config.base_url);
         let query = [
-            ("method", "delete"),
+            ("method", "filemanager"),
+            ("opera", "delete"),
             ("access_token", self.config.access_token.as_str()),
         ];
-        let form = [("filelist", filelist.as_str()), ("async", "0")];
+        let form = [
+            ("async", "0"),
+            ("filelist", filelist.as_str()),
+            ("ondup", "fail"),
+        ];
         let json = self.post_form(&url, &query, &form).await?;
         let errno = json["errno"].as_i64().unwrap_or(0);
         if errno != 0 {
             return Err(Self::map_errno(errno));
         }
         Ok(())
+    }
+
+    async fn put_content(&self, path: &str, data: &[u8]) -> Result<()> {
+        let _ = (path, data);
+        Err(DriverError::Other(
+            "baidu: put_content/upload not supported (Dart parity)".into(),
+        ))
+    }
+
+    async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
+        let item = self.get(path).await?;
+        let url = item
+            .raw_url
+            .ok_or_else(|| DriverError::Network("baidu: missing download url".into()))?;
+        let mut req = self.client.get(url);
+        for (key, value) in item.raw_headers {
+            req = req.header(&key, &value);
+        }
+        let resp = req.send().await.map_err(|e| map_http_error(&e))?;
+        if !resp.status().is_success() {
+            return Err(http_status_error(resp.status(), path));
+        }
+        Ok(resp
+            .bytes()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?
+            .to_vec())
+    }
+
+    async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
+        let item = self.get(path).await?;
+        let url = item
+            .raw_url
+            .ok_or_else(|| DriverError::Network("baidu: missing download url".into()))?;
+        let range = end
+            .map(|e| format!("bytes={start}-{e}"))
+            .unwrap_or_else(|| format!("bytes={start}-"));
+        let mut req = self.client.get(url).header(reqwest::header::RANGE, range);
+        for (key, value) in item.raw_headers {
+            req = req.header(&key, &value);
+        }
+        let resp = req.send().await.map_err(|e| map_http_error(&e))?;
+        if !resp.status().is_success() {
+            return Err(http_status_error(resp.status(), path));
+        }
+        Ok(resp
+            .bytes()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?
+            .to_vec())
+    }
+}
+
+fn http_status_error(status: reqwest::StatusCode, path: &str) -> DriverError {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            DriverError::AuthFailed
+        }
+        reqwest::StatusCode::NOT_FOUND => DriverError::NotFound(path.to_string()),
+        _ => DriverError::Network(format!("HTTP {status}")),
     }
 }
 
@@ -363,8 +496,14 @@ mod tests {
 
     #[test]
     fn errno_mapping() {
-        assert!(matches!(BaiduDriver::map_errno(111), DriverError::AuthFailed));
-        assert!(matches!(BaiduDriver::map_errno(-6), DriverError::AuthFailed));
+        assert!(matches!(
+            BaiduDriver::map_errno(111),
+            DriverError::AuthFailed
+        ));
+        assert!(matches!(
+            BaiduDriver::map_errno(-6),
+            DriverError::AuthFailed
+        ));
         match BaiduDriver::map_errno(31304) {
             DriverError::Network(msg) => assert!(msg.contains("31304")),
             other => panic!("expected Network, got {:?}", other),
@@ -401,6 +540,64 @@ mod tests {
         });
         let fi = BaiduDriver::parse_item(&item).unwrap();
         assert!(fi.is_dir);
+    }
+
+    #[test]
+    fn dlink_sanitization_removes_only_access_token() {
+        let url =
+            BaiduDriver::sanitize_dlink("https://download.test/file?a=1&access_token=secret&b=2");
+        assert!(url.contains("a=1"));
+        assert!(url.contains("b=2"));
+        assert!(!url.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn put_content_is_loudly_unsupported() {
+        let driver = BaiduDriver::new(BaiduConfig::new("tok")).unwrap();
+        assert!(
+            matches!(driver.put_content("/x", b"x").await, Err(DriverError::Other(message)) if message.contains("Dart parity"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_directory_rename_uses_filemanager_move() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_task = captured.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            *captured_task.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = r#"{"errno":0}"#;
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let mut cfg = BaiduConfig::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        BaiduDriver::new(cfg)
+            .unwrap()
+            .rename("/a/old", "/b/new")
+            .await
+            .unwrap();
+        let request = captured.lock().unwrap().to_lowercase();
+        assert!(request.contains("method=filemanager"));
+        assert!(request.contains("opera=move"));
+        assert!(
+            request.contains("%22dest%22%3a%22%2fb%22")
+                || request.contains("%22dest%22%3A%22%2Fb%22")
+        );
     }
 
     // ── Mock server tests ──────────────────────────────────────────────────────
@@ -449,7 +646,8 @@ mod tests {
                     "server_mtime": 1700000000
                 }
             ]
-        }).to_string();
+        })
+        .to_string();
 
         let port = start_mock_baidu_list_server(body).await;
         tokio::task::yield_now().await;
@@ -515,7 +713,11 @@ mod tests {
                 if let Ok((mut sock, _)) = listener.accept().await {
                     let body = {
                         let r = responses.lock().unwrap();
-                        if idx < r.len() { r[idx].clone() } else { r.last().cloned().unwrap_or_default() }
+                        if idx < r.len() {
+                            r[idx].clone()
+                        } else {
+                            r.last().cloned().unwrap_or_default()
+                        }
                     };
                     idx += 1;
                     let mut buf = vec![0u8; 8192];
@@ -540,7 +742,8 @@ mod tests {
             "fs_id": 99999,
             "category": 6,
             "path": "/Music/NewAlbum"
-        }).to_string();
+        })
+        .to_string();
         let port = start_mock_baidu_multi_server(vec![body]).await;
         tokio::task::yield_now().await;
 
@@ -548,7 +751,10 @@ mod tests {
         cfg.base_url = format!("http://127.0.0.1:{}", port);
         let driver = BaiduDriver::new(cfg).unwrap();
 
-        driver.mkdir("/Music/NewAlbum").await.expect("mkdir should succeed");
+        driver
+            .mkdir("/Music/NewAlbum")
+            .await
+            .expect("mkdir should succeed");
     }
 
     #[tokio::test]
@@ -572,7 +778,8 @@ mod tests {
         let body = serde_json::json!({
             "errno": 0,
             "info": [{"path": "/Music/new.mp3"}]
-        }).to_string();
+        })
+        .to_string();
         let port = start_mock_baidu_multi_server(vec![body]).await;
         tokio::task::yield_now().await;
 
@@ -607,7 +814,10 @@ mod tests {
         cfg.base_url = format!("http://127.0.0.1:{}", port);
         let driver = BaiduDriver::new(cfg).unwrap();
 
-        driver.remove("/Music/old.mp3").await.expect("remove should succeed");
+        driver
+            .remove("/Music/old.mp3")
+            .await
+            .expect("remove should succeed");
     }
 
     #[tokio::test]
