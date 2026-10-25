@@ -94,7 +94,7 @@ Recognised `provider_type` values and required config fields:
 | `ctfile`                          | `CtFileDriver`    | `session`                             | `cloud_type`, `base_url`, `order_by`, `order_direction`, `user_agent`, `list_cache_sec`, `request_interval_ms` |
 | `baidu`, `baidu_netdisk`          | `BaiduDriver`     | `access_token`                        | `base_url` |
 | `123`, `123_open`, `pan123`       | `Pan123Driver`   | `access_token`                        | `base_url` |
-| `aliyundrive`, `aliyun`           | `AliyunDriver`   | `access_token`, `drive_id`           | `base_url` |
+| `aliyundrive`, `aliyun`           | `AliyunDriver`   | `access_token`, `drive_id`           | `base_url`, `remove_way` |
 | `115`, `open115`                  | `Open115Driver`  | `access_token`                        | `base_url` |
 | `terabox`                         | `TeraboxDriver`   | — (stub)                             | — |
 | `netease_music`                   | `NeteaseMusicDriver` | — (stub)                          | — |
@@ -122,10 +122,14 @@ List/get + write ops.
 ### `struct BaiduDriver` / `struct BaiduConfig`
 `pub fn BaiduConfig::new(access_token: impl Into<String>) -> Self`
 `pub fn BaiduDriver::new(cfg: BaiduConfig) -> Result<Self>`
-List/get (with `raw_url` via dlink + Bearer header) and write ops (Round 10):
-- `mkdir` — `POST /rest/2.0/xpan/file?method=create` with `path`, `isdir=1`, `size=0`, `block_list=[]`.
-- `rename` — `POST /rest/2.0/xpan/file?method=rename` with `filelist=[{"path": old, "newname": new_name}]`; same-parent rename only.
-- `remove` — `POST /rest/2.0/xpan/file?method=delete` with `filelist=["path"]`, `async=0`.
+List/get with a direct dlink from `filemetas`. `get` performs a redirect HEAD using
+`User-Agent: pan.baidu.com`, strips `access_token` from the returned URL, and
+returns `NetworkDirect` with that User-Agent header. `get_content` and
+`get_content_range` GET the URL with the same header. `put_content` returns a
+specific unsupported error because Dart upload is intentionally not ported.
+- `mkdir` — `POST /rest/2.0/xpan/file?method=create` with `path`, `isdir=1`, `size=0`, `rtype=3`.
+- `rename` — `POST /rest/2.0/xpan/file?method=filemanager` with `opera=rename` for same-parent paths or `opera=move` with `dest` and `newname` across directories.
+- `remove` — filemanager `opera=delete` with `filelist=[path]`.
 Auth: `access_token` as query param (Baidu convention). Retries once on 429/5xx.
 
 ### `struct Pan123Driver` / `struct Pan123Config`
@@ -140,10 +144,13 @@ Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 ### `struct AliyunDriver` / `struct AliyunConfig`
 `pub fn AliyunConfig::new(access_token: impl Into<String>, drive_id: impl Into<String>) -> Self`
 `pub fn AliyunDriver::new(cfg: AliyunConfig) -> Result<Self>`
-Requires non-empty `access_token` and `drive_id`.
-List/get (with `raw_url` via `getDownloadUrl`)/mkdir/rename/remove.
-Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
-`rename` supports single-segment renames only (same parent).
+Requires non-empty `access_token` and `drive_id`; `remove_way` defaults to `trash`.
+List/get returns the signed URL from `getDownloadUrl` with no auth headers;
+`get_content` and `get_content_range` fetch it directly. `put_content` returns a
+specific unsupported error because upload is not ported.
+- `rename` uses `/openFile/update` in one directory; across directories it calls `/openFile/move` then `/openFile/update` if the basename changes.
+- `remove_way=trash` (or empty) calls `/openFile/recyclebin`; `remove_way=delete` calls `/openFile/delete`.
+Auth header: `Bearer <access_token>` for API calls. Retries once on 429/5xx.
 
 ### `struct Open115Driver` / `struct Open115Config`
 `pub fn Open115Config::new(access_token: impl Into<String>) -> Self`
