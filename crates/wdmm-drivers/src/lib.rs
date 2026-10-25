@@ -15,6 +15,7 @@
 
 pub mod aliyun;
 pub mod baidu;
+pub mod crypt;
 pub mod ctfile;
 pub mod driver;
 pub mod netease_music;
@@ -26,6 +27,7 @@ pub mod webdav;
 
 pub use aliyun::{AliyunConfig, AliyunDriver};
 pub use baidu::{BaiduConfig, BaiduDriver};
+pub use crypt::{CryptConfig, CryptDriver};
 pub use ctfile::{CtFileConfig, CtFileDriver};
 pub use driver::{CloudDriver, CloudFileItem, ContentDeliveryKind, DriverError, Result};
 pub use netease_music::{NeteaseMusicConfig, NeteaseMusicDriver};
@@ -45,6 +47,9 @@ impl DriverRegistry {
         provider_type: &str,
         config: serde_json::Value,
     ) -> Result<Box<dyn CloudDriver>> {
+        use std::sync::Arc;
+        use wdmm_crypto::rclone::{NameEncoding, NameMode};
+
         match provider_type {
             "webdav" => {
                 let url = config["url"]
@@ -148,6 +153,71 @@ impl DriverRegistry {
                 }
                 Ok(Box::new(NeteaseMusicDriver::new(cfg)?))
             }
+            "crypt" => {
+                let password = config["password"]
+                    .as_str()
+                    .ok_or_else(|| DriverError::Config("crypt: missing password".into()))?;
+                let salt = config["salt"].as_str().unwrap_or("");
+
+                let mut crypt_cfg = CryptConfig::new(password);
+                crypt_cfg.salt = salt.to_string();
+
+                if let Some(s) = config["filename_encryption"].as_str() {
+                    crypt_cfg.filename_encryption = match s {
+                        "off" => NameMode::Off,
+                        "standard" => NameMode::Standard,
+                        "obfuscate" => NameMode::Obfuscate,
+                        _ => return Err(DriverError::Config(format!(
+                            "crypt: invalid filename_encryption: {}",
+                            s
+                        ))),
+                    };
+                }
+
+                if let Some(s) = config["filename_encoding"].as_str() {
+                    crypt_cfg.filename_encoding = match s {
+                        "base32" => NameEncoding::Base32,
+                        "base64" => NameEncoding::Base64,
+                        "base32768" => NameEncoding::Base32768,
+                        _ => return Err(DriverError::Config(format!(
+                            "crypt: invalid filename_encoding: {}",
+                            s
+                        ))),
+                    };
+                }
+
+                if let Some(s) = config["encrypted_suffix"].as_str() {
+                    crypt_cfg.encrypted_suffix = s.to_string();
+                }
+
+                if let Some(b) = config["directory_name_encryption"].as_bool() {
+                    crypt_cfg.directory_name_encryption = b;
+                }
+
+                if let Some(s) = config["source_dir"].as_str() {
+                    crypt_cfg.source_dir = s.to_string();
+                }
+
+                // Recursively create source driver from nested config
+                let source_cfg = config["source"]
+                    .as_object()
+                    .ok_or_else(|| DriverError::Config("crypt: missing source config".into()))?;
+                let source_provider = source_cfg["provider_type"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        DriverError::Config("crypt: source missing provider_type".into())
+                    })?;
+                let empty_config = serde_json::json!({});
+                let source_config = source_cfg
+                    .get("config")
+                    .unwrap_or(&empty_config);
+
+                let source_driver = Self::create_driver(source_provider, source_config.clone())?;
+                // Convert Box<dyn CloudDriver> to Arc<dyn CloudDriver>
+                let source_arc: Arc<dyn CloudDriver> = source_driver.into();
+
+                Ok(Box::new(CryptDriver::with_source(source_arc, crypt_cfg)?))
+            }
             _ => Err(DriverError::UnsupportedProvider(provider_type.to_string())),
         }
     }
@@ -249,6 +319,36 @@ mod tests {
             other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
         }
     }
+
+    #[test]
+    fn registry_crypt_requires_password_and_source() {
+        // Missing password
+        match DriverRegistry::create_driver("crypt", serde_json::json!({})) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        // Missing source
+        match DriverRegistry::create_driver(
+            "crypt",
+            serde_json::json!({"password": "test"}),
+        ) {
+            Err(DriverError::Config(_)) => {}
+            other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
+        }
+        // Valid nested config
+        assert!(DriverRegistry::create_driver(
+            "crypt",
+            serde_json::json!({
+                "password": "test",
+                "source": {
+                    "provider_type": "webdav",
+                    "config": {"url": "http://localhost"}
+                }
+            })
+        )
+        .is_ok());
+    }
+
 
     #[test]
     fn registry_netease_music_requires_cookie() {
