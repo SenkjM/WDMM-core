@@ -96,7 +96,7 @@ Recognised `provider_type` values and required config fields:
 | `123`, `123_open`, `pan123`       | `Pan123Driver`   | `access_token`                        | `base_url` |
 | `aliyundrive`, `aliyun`           | `AliyunDriver`   | `access_token`, `drive_id`           | `base_url`, `remove_way` |
 | `115`, `open115`                  | `Open115Driver`  | `access_token`                        | `base_url` |
-| `terabox`                         | `TeraboxDriver`   | `cookie`                              | `sign_key`, `sign_version`, `skip_sign` |
+| `terabox`                         | `TeraboxDriver`   | `cookie`                              | `base_url` |
 | `netease_music`                   | `NeteaseMusicDriver` | `cookie`                          | `song_limit` |
 | `crypt`                           | `CryptDriver`     | `password`, `source`                  | `salt`, `filename_encryption`, `filename_encoding`, `encrypted_suffix`, `directory_name_encryption`, `source_account_id_name`, `source_dir` |
 
@@ -108,8 +108,8 @@ unknown type.
 ## Driver structs & configs
 
 Each driver is constructed via its `Config` + `Driver::new(config)`, or through
-the registry above. Stub drivers (`TeraboxDriver`, `NeteaseMusicDriver`) are
-unit structs whose every method returns `DriverError::Other("TODO: … not yet implemented")`.
+the registry above. All Wave C stubs (`TeraboxDriver`, `NeteaseMusicDriver`) are
+replaced by real modules; `stubs.rs` is empty pending future providers.
 
 ### `struct WebDavDriver`
 `pub fn new(url: &str, username: &str, password: &str) -> Result<Self>`
@@ -163,15 +163,25 @@ List/get (with `raw_url` via `/open/file/downurl`) + write ops (Round 9):
 Auth header: `Bearer <access_token>`. Retries once on 429/5xx.
 
 ### `struct TeraboxDriver` / `struct TeraboxConfig`
+`pub fn TeraboxConfig::new(cookie: impl Into<String>) -> Self`
 `pub fn TeraboxDriver::new(cfg: TeraboxConfig) -> Result<Self>`
-Cookie-based (not OAuth). Requires `cookie` containing `ndus` + `BDUSS`. List/get only;
-write ops return not-supported. get returns `NetworkDirect` with extracted dlink + cookie header.
-Signature logic: if `skip_sign=true`, uses raw jsToken from `/api/account/info`;
-otherwise signs the dlink URL with `sign_key` + `sign_version` (`c0`, `c3`, or `c4`).
-**HARD BLOCKERS** (documented in terabox.rs):
-- Signature schemes c0/c3/c4 are stub placeholders; real requests fail → cannot verify dlink.
-- No rename/remove/mkdir — these require working signatures.
-Auth: cookie header. No retries beyond Rust default.
+Cookie-based unofficial API (not OAuth). Requires non-empty `cookie`; optional `base_url`
+(default `https://www.terabox.com`).
+- `list` — paginated `GET /api/list` (page size 100).
+- `get` — stat + official dlink via home/info → `/api/download` → redirect; returns
+  `NetworkDirect` with `User-Agent: terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox`.
+- `mkdir` / `rename` / `remove` — `/api/filemanager` (`opera=mkdir|rename|delete`).
+- Sign: RC4-style `teraboxSign(s1,s2)` (KSA+PRGA) from Dart; jsToken refresh on errno
+  `{4000023,450016}`; domain switch on errno `-6`.
+- No `put_content` / crack `/api/filemetas` download API.
+
+**HARD BLOCKERS** (also in `terabox.rs` rustdoc; OK to leave documented):
+- Cookie session API is unofficial / may break without notice.
+- Regional errno `9000` ("not yet available in this area").
+- No OAuth app credentials path confirmed for `openapi.terabox.com` list+multimedia.
+- Upload deliberately out of scope.
+
+Auth: `Cookie` header. Retries limited (Dart `retryLimit` 2).
 
 ### `struct NeteaseMusicDriver` / `struct NeteaseMusicConfig`
 `pub fn NeteaseMusicDriver::new(cfg: NeteaseMusicConfig) -> Result<Self>`
