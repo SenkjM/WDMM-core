@@ -10,17 +10,9 @@
 //! - `123`           (wdmm_drivers::Pan123Driver) — list/get/mkdir/rename/remove/content
 //! - `aliyundrive`   (wdmm_drivers::AliyunDriver) — list/get/mkdir/rename/remove/content reads
 //! - `open115`       (wdmm_drivers::Open115Driver) — list/get/mkdir/rename/remove/content
+//! - `terabox`       (wdmm_drivers::TeraboxDriver) — ✓ list/get/mkdir/rename/remove (Wave C)
 //!
 //! Remaining stubs:
-//! - terabox       — Official Terabox OpenAPI exists but **detailed endpoint
-//!                   docs for list + download URL have not been confirmed**.
-//!                   TODO: once https://developers.terabox.com API reference
-//!                   for `openapi/xpan/file?method=list` and the presigned
-//!                   download URL endpoint (`/xpan/multimedia`) are confirmed
-//!                   with OAuth2 app credentials, implement list/get + write ops
-//!                   following the same pattern as AliyunDriver.
-//!                   Blocked on: confirming pagination API shape and whether
-//!                   `access_token` alone is sufficient (no app-secret in binary).
 //! - netease_music — NetEase Cloud Music; excluded from public release (§9)
 
 use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
@@ -56,5 +48,4 @@ macro_rules! impl_stub_driver {
     };
 }
 
-impl_stub_driver!(TeraboxDriver, "terabox");
 impl_stub_driver!(NeteaseMusicDriver, "netease_music");
