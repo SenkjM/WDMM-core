@@ -2091,6 +2091,36 @@ pub extern "C" fn wdmm_library_import_from_sqflite(old_db_path: *const c_char) -
     }
 }
 
+/// Compare the global library DB against an Android-schema sqflite DB at
+/// `old_db_path`.
+///
+/// Reads the old DB read-only and compares the `tracks`, `deleted_tracks`, and
+/// `sync_state` tables against the global Core library. Neither DB is mutated.
+///
+/// `old_db_path` must be a valid null-terminated UTF-8 path.
+///
+/// Returns a JSON `CompareReport`:
+/// ```json
+/// {"tracks":{"left_count":0,"right_count":0,"only_left":[],"only_right":[],"field_mismatches":[]},
+///  "deleted_tracks":{…},"sync_state":{…},"ok":true}
+/// ```
+/// or `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_library_compare_with_sqflite(old_db_path: *const c_char) -> FfiString {
+    let path_str = match ptr_to_str(old_db_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null path pointer"),
+    };
+    let old_path = std::path::Path::new(path_str);
+    let db = global_library_db();
+    match wdmm_storage::LibraryDatabase::compare_with_sqflite(old_path, db) {
+        Ok(report) => FfiString::from(
+            serde_json::to_string(&report).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── User folders FFI ──────────────────────────────────────────────────────────
 
 /// List direct children of a folder.
@@ -3639,6 +3669,51 @@ mod tests {
         // Either "error:..." or already_done (if prev test left the flag)
         assert!(s.starts_with("error:") || s.contains("already_done"));
         wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn compare_sqflite_empty_old_db() {
+        // Create a real temp old DB with the Android-schema tables, empty.
+        let tmp = std::env::temp_dir().join(format!(
+            "wdmm_ffi_compare_{}.db",
+            std::process::id()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&tmp).expect("create old db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE tracks (
+                    music_id TEXT PRIMARY KEY, source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL, title TEXT NOT NULL, duration_ms INTEGER
+                );
+                CREATE TABLE deleted_tracks (
+                    source_name TEXT NOT NULL, remote_path TEXT NOT NULL,
+                    rev INTEGER NOT NULL, deleted_at TEXT NOT NULL,
+                    pushed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (source_name, remote_path)
+                );
+                CREATE TABLE sync_state (
+                    remote_key TEXT PRIMARY KEY, last_seq INTEGER NOT NULL DEFAULT 0,
+                    base_up_to INTEGER NOT NULL DEFAULT 0,
+                    parts TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .expect("seed old db");
+        }
+
+        let path = CString::new(tmp.to_string_lossy().to_string()).unwrap();
+        let r = wdmm_library_compare_with_sqflite(path.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "compare failed: {s}");
+        let v: serde_json::Value = serde_json::from_str(s).expect("valid JSON report");
+        assert!(v.get("ok").is_some(), "missing ok: {s}");
+        assert!(v.get("tracks").is_some(), "missing tracks: {s}");
+        assert!(v.get("deleted_tracks").is_some(), "missing deleted_tracks: {s}");
+        assert!(v.get("sync_state").is_some(), "missing sync_state: {s}");
+        wdmm_ffi_free_string(r);
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

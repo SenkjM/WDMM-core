@@ -366,6 +366,17 @@ legacy import gets a v6 backfill — only the two new surfaces — returning
 `already_done:true` with `tracks`/`playlists`/`entries` = 0. Once both flags are
 set the call is a full no-op.
 
+### `extern "C" fn wdmm_library_compare_with_sqflite(old_db_path: *const c_char) -> FfiString`
+Compare the global library DB against an Android-schema sqflite DB at
+`old_db_path`. Reads the old DB read-only; compares the `tracks`,
+`deleted_tracks`, and `sync_state` tables. Neither DB is mutated.
+Returns a JSON `CompareReport`:
+```json
+{"tracks":{"left_count":0,"right_count":0,"only_left":[],"only_right":[],"field_mismatches":[]},
+ "deleted_tracks":{…},"sync_state":{…},"ok":true}
+```
+or `"error:<message>"`.
+
 ---
 
 ## User folders

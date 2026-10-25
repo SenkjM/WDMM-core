@@ -28,4 +28,5 @@ futures      = { workspace = true }
 bytes        = { workspace = true }
 
 [dev-dependencies]
-reqwest  = { workspace = true }
+reqwest   = { workspace = true }
+rusqlite  = { workspace = true }
