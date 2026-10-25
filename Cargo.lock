@@ -2000,6 +2000,7 @@ dependencies = [
  "chrono",
  "futures",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "tokio",
  "uuid",
