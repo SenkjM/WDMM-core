@@ -3459,7 +3459,6 @@ mod tests {
 
     #[test]
     fn deleted_tracks_json_roundtrip() {
-        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
         let now = Utc::now().to_rfc3339();
 
         let track = DeletedTrack {
