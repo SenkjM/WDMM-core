@@ -113,6 +113,16 @@ Returns a JSON summary on success:
 ```
 or `"error:<message>"`. Caller must free.
 
+### `extern "C" fn wdmm_webdav_list(webdav_url: *const c_char, webdav_user: *const c_char, webdav_pass: *const c_char, path: *const c_char) -> FfiString`
+List a WebDAV directory (Depth:1 PROPFIND via `WebDavDriver`).
+
+Returns a JSON array on success:
+```json
+[{"name":"Song.mp3","path":"/Music/Song.mp3","is_dir":false,"size":1234,"modified":"2024-01-02T03:04:05Z"}]
+```
+`path` is the request directory joined with each entry `name`. `modified` is
+RFC3339 or `null`. On failure returns `"error:<message>"`. Caller must free.
+
 ---
 
 ## DLNA
