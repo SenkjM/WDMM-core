@@ -12,3 +12,6 @@ crates/wdmm-ffmpeg/vendor/*/ffprobe.exe
 # Local CRLF/LF process copy used when building on Windows
 scripts/fetch-ffmpeg-vendor.lf.sh
 crates/wdmm-ffmpeg/vendor/
+
+# Claude local worktrees (never commit)
+.claude/
