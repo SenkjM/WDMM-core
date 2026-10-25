@@ -64,3 +64,18 @@ Once these are resolved, Android can:
 - `wdmm-sync/src/backup.rs`: Backup create/restore implementation
 - `docs/106-ANDROID-BINARY-COMPATIBILITY.md`: Android binary section format details
 - Android `BackupManager.kt`: Current Android backup creation (sqflite → binary)
+
+## Verification Harness (no-device + on-device)
+
+### No-device (CI / local)
+- **Core**: `cargo test -p wdmm-storage --lib cue_json_roundtrip_schema` — documents CueAlbum/CueSlice JSON field set and upsert → remaining_slices → delete roundtrip.
+- **Android**: `flutter test test/cue_rust_json_parity_test.dart` — asserts `RustLibraryService.cueAlbumJson` / `cueSliceJson` emit the same snake_case keys/types as Core (no FFI/.so required).
+
+### On-device (after dual-write stabilizes)
+- Debug startup still runs `RustLibraryProbe` for track row-count parity (`[RustLibraryProbe] tracks … (match)`).
+- After CUE ingest with `kRustLibraryWriteEnabled`, compare Core `wdmm_cue_remaining_slices(source, cuePath)` against sqflite `remainingSlicesForCue` for the same album; mismatch means dual-write drift.
+
+### Status notes (2026-10-26 continue)
+- Android CUE **upsert** on ingest/scan is dual-written (Rust first, then sqflite); delete/clear paths already dual-written earlier.
+- Music **tombstones** (`deleted_tracks`) + **sync_state** are still Android-only. Core still has only a stub `deleted(id, deleted_at)` plus manga `deleted_mangas`. Porting is schema v6 + CRUD + FFI + client dual-write — not landed this turn.
+- Backup **create** remains sqflite/JSON; do not half-cut.
