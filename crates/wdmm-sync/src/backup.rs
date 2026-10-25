@@ -1,6 +1,8 @@
 //! WDMMBK01 backup archive (+ optional WDMMEN01 passphrase envelope).
 //!
-//! Section payloads are UTF-8 JSON (raw codec) so Core Desktop can round-trip.
+//! Core **create** emits UTF-8 JSON sections (codec 0) for Desktop round-trip.
+//! Core **restore** dual-reads: Android binary sections OR Core JSON sections.
+//! Android writes deflated binary (codec 1) + nested WDMMCV01/WDMMPL01 containers.
 //! Container header matches Android `WmpContainer` (docs/10): magic + section table.
 //! Envelope matches Android `BackupCrypto` (WDMMEN01, PBKDF2 120_000).
 
@@ -67,7 +69,7 @@ pub fn build_bk_container(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
-/// Parse WDMMBK01 → map section id → raw bytes. Unknown codecs rejected.
+/// Parse WDMMBK01 → map section id → raw bytes. Supports codec 0 (raw) and codec 1 (deflate).
 pub fn parse_bk_container(bytes: &[u8]) -> SyncResult<BTreeMap<u8, Vec<u8>>> {
     if bytes.len() < 12 || &bytes[0..8] != MAGIC_BK {
         return Err(SyncError::Other("error:notBackupArchive|not WDMMBK01".into()));
@@ -87,13 +89,35 @@ pub fn parse_bk_container(bytes: &[u8]) -> SyncResult<BTreeMap<u8, Vec<u8>>> {
         let stored_len = u32::from_le_bytes(bytes[off + 6..off + 10].try_into().unwrap()) as usize;
         let raw_len = u32::from_le_bytes(bytes[off + 10..off + 14].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(bytes[off + 14..off + 18].try_into().unwrap());
-        if codec != 0 {
-            return Err(SyncError::Other(format!("unsupported section codec {codec}")));
-        }
-        if offset + stored_len > bytes.len() || stored_len != raw_len {
+
+        if offset + stored_len > bytes.len() {
             return Err(SyncError::Other(format!("section {id} bounds")));
         }
-        let raw = bytes[offset..offset + stored_len].to_vec();
+
+        let stored = &bytes[offset..offset + stored_len];
+        let raw = match codec {
+            0 => stored.to_vec(),
+            1 => {
+                // Android deflate = zlib raw (no header/trailer)
+                use flate2::Decompress;
+                let mut decomp = Decompress::new(false);
+                let mut out = Vec::with_capacity(raw_len);
+                decomp
+                    .decompress_vec(stored, &mut out, flate2::FlushDecompress::Finish)
+                    .map_err(|e| SyncError::Other(format!("section {id} inflate: {e}")))?;
+                if out.len() != raw_len {
+                    return Err(SyncError::Other(format!(
+                        "section {id} length mismatch: got {}, want {raw_len}",
+                        out.len()
+                    )));
+                }
+                out
+            }
+            _ => {
+                return Err(SyncError::Other(format!("unsupported section codec {codec}")));
+            }
+        };
+
         if crc32_ieee(&raw) != crc {
             return Err(SyncError::Other(format!("section {id} CRC mismatch")));
         }
@@ -102,7 +126,199 @@ pub fn parse_bk_container(bytes: &[u8]) -> SyncResult<BTreeMap<u8, Vec<u8>>> {
     Ok(map)
 }
 
-/// Wrap BK bytes in WDMMEN01 envelope (Android BackupCrypto-compatible params).
+// ============================================================================
+// WMP tag/value codec (Android binary sections)
+// ============================================================================
+
+/// Encode varint (LEB128).
+fn encode_varint(mut val: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    while val >= 0x80 {
+        out.push((val as u8 & 0x7F) | 0x80);
+        val >>= 7;
+    }
+    out.push(val as u8);
+    out
+}
+
+/// Decode varint, returning (value, next_offset).
+fn decode_varint(data: &[u8], mut at: usize) -> SyncResult<(u64, usize)> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    loop {
+        if at >= data.len() {
+            return Err(SyncError::Other("truncated varint".into()));
+        }
+        let byte = data[at];
+        at += 1;
+        result |= ((byte & 0x7F) as u64) << shift;
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(SyncError::Other("varint overflow".into()));
+        }
+    }
+    Ok((result, at))
+}
+
+/// Decode one tag/value record from Android binary format.
+/// Returns map of tag → value (int or String), and next offset.
+fn decode_record(
+    data: &[u8],
+    mut at: usize,
+    int_tags: &[u8],
+) -> SyncResult<(BTreeMap<u8, RecordValue>, usize)> {
+    let mut rec = BTreeMap::new();
+    while at < data.len() {
+        let tag = data[at];
+        at += 1;
+        if tag == 0 {
+            // end of record
+            break;
+        }
+        if int_tags.contains(&tag) {
+            let (val, next) = decode_varint(data, at)?;
+            rec.insert(tag, RecordValue::Int(val));
+            at = next;
+        } else {
+            // length-prefixed UTF-8 string or bytes
+            let (len, next) = decode_varint(data, at)?;
+            at = next;
+            let end = at + len as usize;
+            if end > data.len() {
+                return Err(SyncError::Other("record value out of bounds".into()));
+            }
+            let slice = &data[at..end];
+            // Try UTF-8 decode; if it fails treat as bytes
+            if let Ok(s) = std::str::from_utf8(slice) {
+                rec.insert(tag, RecordValue::Str(s.to_string()));
+            } else {
+                rec.insert(tag, RecordValue::Bytes(slice.to_vec()));
+            }
+            at = end;
+        }
+    }
+    Ok((rec, at))
+}
+
+#[derive(Debug, Clone)]
+enum RecordValue {
+    Int(u64),
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
+impl RecordValue {
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            RecordValue::Int(v) => Some(*v as i64),
+            _ => None,
+        }
+    }
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            RecordValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            RecordValue::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+}
+
+/// Decode all records from a section.
+fn decode_records(data: &[u8], int_tags: &[u8]) -> SyncResult<Vec<BTreeMap<u8, RecordValue>>> {
+    let mut records = Vec::new();
+    let mut at = 0;
+    while at < data.len() {
+        let (rec, next) = decode_record(data, at, int_tags)?;
+        if rec.is_empty() {
+            break;
+        }
+        records.push(rec);
+        at = next;
+    }
+    Ok(records)
+}
+
+// Android WMP tag constants
+const TAG_VAULT_ID: u8 = 1;
+const TAG_VAULT_NAME: u8 = 2;
+const TAG_VAULT_PROVIDER: u8 = 3;
+const TAG_VAULT_URL: u8 = 4;
+const TAG_VAULT_USERNAME: u8 = 5;
+const TAG_VAULT_PASSWORD: u8 = 6;
+const TAG_VAULT_PASS_ENCRYPTED: u8 = 7;
+const TAG_VAULT_DRIVER_CONFIG: u8 = 9;
+
+const TAG_TRACK_SOURCE: u8 = 1;
+const TAG_TRACK_REMOTE_PATH: u8 = 2;
+const TAG_TRACK_FILENAME: u8 = 3;
+const TAG_TRACK_TITLE: u8 = 5;
+const TAG_TRACK_ARTIST: u8 = 6;
+const TAG_TRACK_ALBUM: u8 = 8;
+const TAG_TRACK_DURATION_MS: u8 = 9;
+const TAG_TRACK_TRACK_NUM: u8 = 10;
+const TAG_TRACK_DISC_NUM: u8 = 12;
+const TAG_TRACK_YEAR: u8 = 14;
+const TAG_TRACK_GENRE: u8 = 15;
+
+const TRACK_INT_TAGS: &[u8] = &[9, 10, 12, 14]; // durationMs, trackNumber, discNumber, year
+const VAULT_ACCOUNT_INT_TAGS: &[u8] = &[7]; // passwordEncrypted
+
+/// Check if bytes look like UTF-8 JSON (starts with `{` or `[`).
+fn looks_like_json(raw: &[u8]) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    let s = match std::str::from_utf8(raw) {
+        Ok(s) => s.trim_start(),
+        Err(_) => return false,
+    };
+    s.starts_with('{') || s.starts_with('[')
+}
+
+/// AESGCMv1 field decrypt helper (matching Android CredentialVaultCrypto).
+fn try_decrypt_aesgcmv1(encoded: &str, passphrase: &str) -> Option<String> {
+    const PREFIX: &str = "AESGCMv1:";
+    if !encoded.starts_with(PREFIX) {
+        return Some(encoded.to_string());
+    }
+    if passphrase.is_empty() {
+        return None;
+    }
+    let b64 = &encoded[PREFIX.len()..];
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()?;
+    if raw.len() < 16 + 12 + 16 {
+        return None;
+    }
+    let salt = &raw[0..16];
+    let nonce_bytes = &raw[16..28];
+    let rest = &raw[28..];
+    let mac = &rest[rest.len() - 16..];
+    let ct = &rest[..rest.len() - 16];
+
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha256;
+
+    let mut key = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, 120_000, &mut key);
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let mut ciphertext_with_mac = ct.to_vec();
+    ciphertext_with_mac.extend_from_slice(mac);
+    let plaintext = cipher.decrypt(nonce, ciphertext_with_mac.as_slice()).ok()?;
+    String::from_utf8(plaintext).ok()
+}
+
+/// Envelope encrypt (unchanged).
 pub fn envelope_encrypt(plaintext: &[u8], passphrase: &str) -> SyncResult<Vec<u8>> {
     if passphrase.is_empty() {
         return Ok(plaintext.to_vec());
@@ -272,57 +488,190 @@ pub fn restore_backup_bytes(
     let plain = envelope_decrypt(data, passphrase)?;
     let sections = parse_bk_container(&plain)?;
     let mut notes = Vec::new();
+    let mut used_android_binary = false;
 
+    // CREDENTIALS: dual-read Android nested WDMMCV01 OR Core JSON
     if let Some(raw) = sections.get(&SEC_CREDENTIALS) {
-        let arr: Vec<serde_json::Value> = serde_json::from_slice(raw)?;
-        for v in arr {
-            let id = v["id"].as_str().unwrap_or("").to_string();
-            if id.is_empty() {
-                continue;
+        if looks_like_json(raw) {
+            // Core JSON: array of account objects
+            let arr: Vec<serde_json::Value> = serde_json::from_slice(raw)?;
+            for v in arr {
+                let id = v["id"].as_str().unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let creds = if let Some(b64) = v["credentials_b64"].as_str() {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let account = wdmm_core::models::CloudAccount {
+                    id: id.clone(),
+                    provider_type: v["provider_type"].as_str().unwrap_or("webdav").into(),
+                    display_name: v["display_name"].as_str().unwrap_or("").into(),
+                    base_url: v["base_url"].as_str().map(|s| s.to_string()),
+                    credentials_encrypted: creds,
+                };
+                let _ = lib.insert_account(&account);
             }
-            let creds = if let Some(b64) = v["credentials_b64"].as_str() {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let account = wdmm_core::models::CloudAccount {
-                id: id.clone(),
-                provider_type: v["provider_type"].as_str().unwrap_or("webdav").into(),
-                display_name: v["display_name"].as_str().unwrap_or("").into(),
-                base_url: v["base_url"].as_str().map(|s| s.to_string()),
-                credentials_encrypted: creds,
-            };
-            let _ = lib.insert_account(&account);
+        } else if raw.starts_with(b"WDMMCV01") {
+            // Android nested vault: parse WDMMCV01 container
+            used_android_binary = true;
+            let cv_sections = parse_wmp_container(raw, Some(b"CV"))?;
+            if let Some(creds_raw) = cv_sections.get(&5) {
+                // section 5 = CREDENTIALS inside vault
+                let vault_records = decode_records(creds_raw, VAULT_ACCOUNT_INT_TAGS)?;
+                for rec in vault_records {
+                    let id = rec.get(&TAG_VAULT_ID).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let name = rec.get(&TAG_VAULT_NAME).and_then(|v| v.as_str()).unwrap_or("");
+                    let provider = rec.get(&TAG_VAULT_PROVIDER).and_then(|v| v.as_str()).unwrap_or("webdav");
+                    let url = rec.get(&TAG_VAULT_URL).and_then(|v| v.as_str()).unwrap_or("");
+                    let username = rec.get(&TAG_VAULT_USERNAME).and_then(|v| v.as_str()).unwrap_or("");
+                    let password_raw = rec.get(&TAG_VAULT_PASSWORD).and_then(|v| v.as_str()).unwrap_or("");
+                    let pass_encrypted = rec.get(&TAG_VAULT_PASS_ENCRYPTED).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+
+                    // Decrypt password if encrypted
+                    let password = if pass_encrypted && !password_raw.is_empty() {
+                        try_decrypt_aesgcmv1(password_raw, passphrase).unwrap_or_default()
+                    } else {
+                        password_raw.to_string()
+                    };
+
+                    // Build credentials JSON for Core
+                    let creds_json = if provider == "webdav" {
+                        json!({
+                            "username": username,
+                            "password": password,
+                            "remote_dir": "/"
+                        })
+                    } else {
+                        // Cloud driver: parse driverConfig JSON and decrypt fields
+                        let config_str = rec.get(&TAG_VAULT_DRIVER_CONFIG).and_then(|v| v.as_str()).unwrap_or("{}");
+                        let mut config: serde_json::Map<String, serde_json::Value> =
+                            serde_json::from_str(config_str).unwrap_or_default();
+                        // Decrypt AESGCMv1: fields in config
+                        for (_, v) in config.iter_mut() {
+                            if let Some(s) = v.as_str() {
+                                if let Some(decrypted) = try_decrypt_aesgcmv1(s, passphrase) {
+                                    *v = serde_json::Value::String(decrypted);
+                                }
+                            }
+                        }
+                        serde_json::Value::Object(config)
+                    };
+
+                    let account = wdmm_core::models::CloudAccount {
+                        id: id.clone(),
+                        provider_type: provider.to_string(),
+                        display_name: name.to_string(),
+                        base_url: if url.is_empty() { None } else { Some(url.to_string()) },
+                        credentials_encrypted: serde_json::to_vec(&creds_json).unwrap_or_default(),
+                    };
+                    let _ = lib.insert_account(&account);
+                }
+            }
         }
         notes.push("credentials");
     }
 
+    // TRACKS: dual-read Android deflated binary records OR Core JSON
     if let Some(raw) = sections.get(&SEC_LIBRARY_JSON) {
-        if let Ok(tracks) = serde_json::from_slice::<Vec<wdmm_core::models::LibraryTrack>>(raw) {
-            for t in tracks {
-                let _ = lib.upsert_track(&t);
+        if looks_like_json(raw) {
+            // Core JSON
+            if let Ok(tracks) = serde_json::from_slice::<Vec<wdmm_core::models::LibraryTrack>>(raw) {
+                for t in tracks {
+                    let _ = lib.upsert_track(&t);
+                }
             }
-            notes.push("library");
+        } else {
+            // Android binary track records
+            used_android_binary = true;
+            if let Ok(track_records) = decode_records(raw, TRACK_INT_TAGS) {
+                // Map account display names for track source_name lookup
+                let accounts = lib.list_accounts().unwrap_or_default();
+                let account_map: std::collections::HashMap<String, String> = accounts
+                    .iter()
+                    .map(|a| (a.display_name.clone(), a.id.clone()))
+                    .collect();
+
+                for rec in track_records {
+                    let source = rec.get(&TAG_TRACK_SOURCE).and_then(|v| v.as_str()).unwrap_or("");
+                    let remote_path = rec.get(&TAG_TRACK_REMOTE_PATH).and_then(|v| v.as_str()).unwrap_or("");
+                    if remote_path.is_empty() {
+                        continue;
+                    }
+
+                    let title = rec.get(&TAG_TRACK_TITLE).and_then(|v| v.as_str())
+                        .or_else(|| rec.get(&TAG_TRACK_FILENAME).and_then(|v| v.as_str()))
+                        .or_else(|| remote_path.rsplit('/').next())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let account_id = account_map.get(source).cloned().unwrap_or_else(|| source.to_string());
+                    let id = wdmm_core::identity::track_identity(remote_path);
+
+                    let track = wdmm_core::models::LibraryTrack {
+                        id,
+                        account_id,
+                        remote_path: remote_path.to_string(),
+                        title,
+                        artist: rec.get(&TAG_TRACK_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        album_id: None,
+                        artist_id: None,
+                        genre: rec.get(&TAG_TRACK_GENRE).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        duration_ms: rec.get(&TAG_TRACK_DURATION_MS).and_then(|v| v.as_int()).unwrap_or(0),
+                        track_number: rec.get(&TAG_TRACK_TRACK_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
+                        disc_number: rec.get(&TAG_TRACK_DISC_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
+                        year: rec.get(&TAG_TRACK_YEAR).and_then(|v| v.as_int()).map(|n| n as i32),
+                        size: 0,
+                        modified: None,
+                        mime_type: None,
+                    };
+                    let _ = lib.upsert_track(&track);
+                }
+            }
         }
+        notes.push("tracks");
     }
 
+    // PLAYLISTS: dual-read Android WDMMPL01 blobs OR Core JSON
     if let Some(raw) = sections.get(&SEC_PLAYLISTS) {
-        if let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(raw) {
-            for it in items {
-                if let Ok(pl) = serde_json::from_value::<Playlist>(it["playlist"].clone()) {
-                    let _ = lib.upsert_playlist(&pl);
-                    if let Ok(entries) =
-                        serde_json::from_value::<Vec<PlaylistEntry>>(it["entries"].clone())
-                    {
-                        let _ = lib.set_playlist_entries(&pl.id, &entries);
+        if looks_like_json(raw) {
+            // Core JSON
+            if let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(raw) {
+                for it in items {
+                    if let Ok(pl) = serde_json::from_value::<Playlist>(it["playlist"].clone()) {
+                        let _ = lib.upsert_playlist(&pl);
+                        if let Ok(entries) =
+                            serde_json::from_value::<Vec<PlaylistEntry>>(it["entries"].clone())
+                        {
+                            let _ = lib.set_playlist_entries(&pl.id, &entries);
+                        }
                     }
                 }
             }
-            notes.push("playlists");
+        } else {
+            // Android: records with tag 1 = WDMMPL01 blob
+            used_android_binary = true;
+            const TAG_PL_BLOB: u8 = 1;
+            if let Ok(pl_records) = decode_records(raw, &[]) {
+                for rec in pl_records {
+                    if let Some(blob) = rec.get(&TAG_PL_BLOB).and_then(|v| v.as_bytes()) {
+                        if let Ok(pl_data) = decode_playlist_wdmmpl01(blob) {
+                            let _ = lib.upsert_playlist(&pl_data.0);
+                            let _ = lib.set_playlist_entries(&pl_data.0.id, &pl_data.1);
+                        }
+                    }
+                }
+            }
         }
+        notes.push("playlists");
     }
 
     if let Some(raw) = sections.get(&SEC_SETTINGS) {
@@ -374,7 +723,147 @@ pub fn restore_backup_bytes(
         }
     }
 
-    Ok(format!("ok:restored:{}", notes.join(",")))
+    let suffix = if used_android_binary {
+        ",android-binary"
+    } else {
+        ""
+    };
+    Ok(format!("ok:restored:{}{}", notes.join(","), suffix))
+}
+
+/// Parse a generic WMP container (CV/PL/BK) with optional kind check.
+fn parse_wmp_container(
+    bytes: &[u8],
+    expected_kind: Option<&[u8; 2]>,
+) -> SyncResult<BTreeMap<u8, Vec<u8>>> {
+    if bytes.len() < 12 || &bytes[0..4] != b"WDMM" {
+        return Err(SyncError::Other("not a WDMM container".into()));
+    }
+    let kind = &bytes[4..6];
+    if let Some(exp) = expected_kind {
+        if kind != exp {
+            return Err(SyncError::Other(format!(
+                "container kind mismatch: got {}, want {}",
+                String::from_utf8_lossy(kind),
+                String::from_utf8_lossy(exp)
+            )));
+        }
+    }
+    let count = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let table_end = 12 + count * 18;
+    if bytes.len() < table_end {
+        return Err(SyncError::Other("truncated WMP section table".into()));
+    }
+    let mut map = BTreeMap::new();
+    for i in 0..count {
+        let off = 12 + i * 18;
+        let id = bytes[off];
+        let codec = bytes[off + 1];
+        let offset = u32::from_le_bytes(bytes[off + 2..off + 6].try_into().unwrap()) as usize;
+        let stored_len = u32::from_le_bytes(bytes[off + 6..off + 10].try_into().unwrap()) as usize;
+        let raw_len = u32::from_le_bytes(bytes[off + 10..off + 14].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(bytes[off + 14..off + 18].try_into().unwrap());
+
+        if offset + stored_len > bytes.len() {
+            return Err(SyncError::Other(format!("WMP section {id} bounds")));
+        }
+
+        let stored = &bytes[offset..offset + stored_len];
+        let raw = match codec {
+            0 => stored.to_vec(),
+            1 => {
+                use flate2::Decompress;
+                let mut decomp = Decompress::new(false);
+                let mut out = Vec::with_capacity(raw_len);
+                decomp
+                    .decompress_vec(stored, &mut out, flate2::FlushDecompress::Finish)
+                    .map_err(|e| SyncError::Other(format!("WMP section {id} inflate: {e}")))?;
+                if out.len() != raw_len {
+                    return Err(SyncError::Other(format!(
+                        "WMP section {id} length mismatch: got {}, want {raw_len}",
+                        out.len()
+                    )));
+                }
+                out
+            }
+            _ => {
+                return Err(SyncError::Other(format!("unsupported WMP codec {codec}")));
+            }
+        };
+
+        if crc32_ieee(&raw) != crc {
+            return Err(SyncError::Other(format!("WMP section {id} CRC mismatch")));
+        }
+        map.insert(id, raw);
+    }
+    Ok(map)
+}
+
+/// Decode a WDMMPL01 playlist blob → (Playlist, entries).
+fn decode_playlist_wdmmpl01(bytes: &[u8]) -> SyncResult<(Playlist, Vec<PlaylistEntry>)> {
+    let sections = parse_wmp_container(bytes, Some(b"PL"))?;
+    let meta_raw = sections.get(&1).ok_or_else(|| SyncError::Other("missing PL META".into()))?;
+
+    // META: intTags = {1,2,3,4} (kind, seqFrom, seqTo, count), strings = playlistId/name/updatedAt
+    const META_INT_TAGS: &[u8] = &[1, 2, 3, 4];
+    let meta_records = decode_records(meta_raw, META_INT_TAGS)?;
+    let meta = meta_records.first().ok_or_else(|| SyncError::Other("empty PL META".into()))?;
+
+    const TAG_PL_ID: u8 = 9;
+    const TAG_PL_NAME: u8 = 10;
+    const TAG_PL_UPDATED: u8 = 11;
+
+    let id = meta.get(&TAG_PL_ID).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if id.is_empty() {
+        return Err(SyncError::Other("playlist missing id".into()));
+    }
+    let name = meta.get(&TAG_PL_NAME).and_then(|v| v.as_str()).unwrap_or("Unnamed").to_string();
+    let updated_str = meta.get(&TAG_PL_UPDATED).and_then(|v| v.as_str()).unwrap_or("");
+
+    let entries_raw = sections.get(&9).ok_or_else(|| SyncError::Other("missing PL ENTRIES".into()))?;
+    const ENTRY_INT_TAGS: &[u8] = &[5, 6, 7, 8]; // durationMs, cueTrackIndex, coverIndex, remoteMissing
+    let entry_records = decode_records(entries_raw, ENTRY_INT_TAGS)?;
+
+    const TAG_ENTRY_MUSIC_ID: u8 = 1;
+    const TAG_ENTRY_SOURCE: u8 = 2;
+    const TAG_ENTRY_PATH: u8 = 3;
+    const TAG_ENTRY_TITLE: u8 = 4;
+    const TAG_ENTRY_DURATION: u8 = 5;
+    const TAG_ENTRY_CUE_IDX: u8 = 6;
+
+    let mut entries = Vec::new();
+    for (pos, rec) in entry_records.iter().enumerate() {
+        let music_id = rec.get(&TAG_ENTRY_MUSIC_ID).and_then(|v| v.as_str()).unwrap_or("");
+        let source = rec.get(&TAG_ENTRY_SOURCE).and_then(|v| v.as_str()).unwrap_or("");
+        let path = rec.get(&TAG_ENTRY_PATH).and_then(|v| v.as_str()).unwrap_or("");
+        let title = rec.get(&TAG_ENTRY_TITLE).and_then(|v| v.as_str()).unwrap_or("");
+        let duration_ms = rec.get(&TAG_ENTRY_DURATION).and_then(|v| v.as_int());
+        let _cue_idx = rec.get(&TAG_ENTRY_CUE_IDX).and_then(|v| v.as_int());
+
+        entries.push(PlaylistEntry {
+            playlist_id: id.clone(),
+            position: pos as i64,
+            music_id: music_id.to_string(),
+            source_name: source.to_string(),
+            remote_path: path.to_string(),
+            title: title.to_string(),
+            duration_ms: duration_ms.unwrap_or(0),
+        });
+    }
+
+    let updated_dt = chrono::DateTime::parse_from_rfc3339(updated_str)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|| chrono::Utc::now());
+
+    let playlist = Playlist {
+        id: id.clone(),
+        name,
+        created_at: chrono::Utc::now(),
+        updated_at: updated_dt,
+    };
+
+    Ok((playlist, entries))
 }
 
 pub fn write_backup_file(
@@ -512,5 +1001,90 @@ mod tests {
         assert!(msg.contains("settings") || msg.contains("dmr"));
         assert_eq!(lib2.load_kv("sync_interval").unwrap().as_deref(), Some("off"));
         assert_eq!(dmr2.get("u1").unwrap().unwrap().override_name.as_deref(), Some("TV"));
+    }
+
+    #[test]
+    fn android_binary_track_restore() {
+        // Build a minimal WDMMBK01 container with deflated track section
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        // Create account first
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        lib.insert_account(&wdmm_core::models::CloudAccount {
+            id: "test_acc".into(),
+            provider_type: "webdav".into(),
+            display_name: "TestSource".into(),
+            base_url: Some("https://test.example".into()),
+            credentials_encrypted: vec![],
+        }).unwrap();
+
+        // Build binary track records: one track with sourceName=1 remotePath=2 title=5
+        let mut track_bytes = Vec::new();
+        // Record 1: sourceName="TestSource", remotePath="/music/song.mp3", title="MySong"
+        track_bytes.extend_from_slice(&[1]); // tag 1 = sourceName (string)
+        let src = b"TestSource";
+        track_bytes.extend_from_slice(&encode_varint(src.len() as u64));
+        track_bytes.extend_from_slice(src);
+
+        track_bytes.extend_from_slice(&[2]); // tag 2 = remotePath (string)
+        let path = b"/music/song.mp3";
+        track_bytes.extend_from_slice(&encode_varint(path.len() as u64));
+        track_bytes.extend_from_slice(path);
+
+        track_bytes.extend_from_slice(&[5]); // tag 5 = title (string)
+        let title = b"MySong";
+        track_bytes.extend_from_slice(&encode_varint(title.len() as u64));
+        track_bytes.extend_from_slice(title);
+
+        track_bytes.extend_from_slice(&[9]); // tag 9 = durationMs (int)
+        track_bytes.extend_from_slice(&encode_varint(180_000));
+
+        track_bytes.extend_from_slice(&[0]); // end marker
+
+        // Deflate track_bytes
+        let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&track_bytes).unwrap();
+        let deflated = encoder.finish().unwrap();
+
+        // Build WDMMBK01 container: section 2 (TRACKS) = deflated
+        let crc = crc32_ieee(&track_bytes);
+        let mut container = Vec::new();
+        container.extend_from_slice(b"WDMMBK01"); // magic (no space!)
+        container.extend_from_slice(&1u16.to_le_bytes()); // 1 section
+        container.extend_from_slice(&[0, 0]); // reserved
+        // Section table: id=2 codec=1 offset stored_len raw_len crc
+        let offset = 12 + 18; // after header + table
+        container.extend_from_slice(&[2]); // SEC_LIBRARY_JSON
+        container.extend_from_slice(&[1]); // codec deflate
+        container.extend_from_slice(&(offset as u32).to_le_bytes());
+        container.extend_from_slice(&(deflated.len() as u32).to_le_bytes());
+        container.extend_from_slice(&(track_bytes.len() as u32).to_le_bytes());
+        container.extend_from_slice(&crc.to_le_bytes());
+        container.extend_from_slice(&deflated);
+
+        // Wrap in envelope
+        let encrypted = envelope_encrypt(&container, "testpw").unwrap();
+
+        // Restore into fresh DB
+        let lib2 = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        lib2.insert_account(&wdmm_core::models::CloudAccount {
+            id: "test_acc".into(),
+            provider_type: "webdav".into(),
+            display_name: "TestSource".into(),
+            base_url: Some("https://test.example".into()),
+            credentials_encrypted: vec![],
+        }).unwrap();
+
+        let msg = restore_backup_bytes(&lib2, None, &encrypted, "testpw").unwrap();
+        assert!(msg.contains("android-binary"), "Expected android-binary marker, got: {}", msg);
+        assert!(msg.contains("tracks"), "Expected tracks marker, got: {}", msg);
+
+        // Verify track was restored
+        let tracks = lib2.list_tracks().unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "MySong");
+        assert_eq!(tracks[0].remote_path, "/music/song.mp3");
+        assert_eq!(tracks[0].duration_ms, 180_000);
     }
 }
