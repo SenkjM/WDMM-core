@@ -8,6 +8,10 @@ publish      = { workspace = true }
 [dependencies]
 wdmm-core = { workspace = true }
 aes-gcm   = { workspace = true }
+aes       = { workspace = true }
+crypto_secretbox = { workspace = true }
+scrypt    = { workspace = true }
+hex       = { workspace = true }
 pbkdf2    = { workspace = true }
 hmac      = { workspace = true }
 sha2      = { workspace = true }

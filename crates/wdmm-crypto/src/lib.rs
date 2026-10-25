@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod vault;
+pub mod rclone;
 
 pub use vault::CredentialVault;
 
