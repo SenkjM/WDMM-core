@@ -57,13 +57,27 @@ impl DriverRegistry {
                     .as_str()
                     .ok_or_else(|| DriverError::Config("ctfile: missing session token".into()))?;
                 let mut cfg = CtFileConfig::with_session(session);
-                if let Some(s) = config["cloud_type"].as_str() { cfg.cloud_type = s.to_string(); }
-                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
-                if let Some(s) = config["order_by"].as_str() { cfg.order_by = s.to_string(); }
-                if let Some(s) = config["order_direction"].as_str() { cfg.order_direction = s.to_string(); }
-                if let Some(s) = config["user_agent"].as_str() { cfg.user_agent = s.to_string(); }
-                if let Some(n) = config["list_cache_sec"].as_u64() { cfg.list_cache_sec = n; }
-                if let Some(n) = config["request_interval_ms"].as_u64() { cfg.request_interval_ms = n; }
+                if let Some(s) = config["cloud_type"].as_str() {
+                    cfg.cloud_type = s.to_string();
+                }
+                if let Some(s) = config["base_url"].as_str() {
+                    cfg.base_url = s.to_string();
+                }
+                if let Some(s) = config["order_by"].as_str() {
+                    cfg.order_by = s.to_string();
+                }
+                if let Some(s) = config["order_direction"].as_str() {
+                    cfg.order_direction = s.to_string();
+                }
+                if let Some(s) = config["user_agent"].as_str() {
+                    cfg.user_agent = s.to_string();
+                }
+                if let Some(n) = config["list_cache_sec"].as_u64() {
+                    cfg.list_cache_sec = n;
+                }
+                if let Some(n) = config["request_interval_ms"].as_u64() {
+                    cfg.request_interval_ms = n;
+                }
                 Ok(Box::new(CtFileDriver::new(cfg)?))
             }
             "baidu" | "baidu_netdisk" => {
@@ -71,7 +85,9 @@ impl DriverRegistry {
                     .as_str()
                     .ok_or_else(|| DriverError::Config("baidu: missing access_token".into()))?;
                 let mut cfg = BaiduConfig::new(token);
-                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                if let Some(s) = config["base_url"].as_str() {
+                    cfg.base_url = s.to_string();
+                }
                 Ok(Box::new(BaiduDriver::new(cfg)?))
             }
             "123" | "123_open" | "pan123" => {
@@ -79,7 +95,9 @@ impl DriverRegistry {
                     .as_str()
                     .ok_or_else(|| DriverError::Config("123pan: missing access_token".into()))?;
                 let mut cfg = Pan123Config::new(token);
-                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                if let Some(s) = config["base_url"].as_str() {
+                    cfg.base_url = s.to_string();
+                }
                 Ok(Box::new(Pan123Driver::new(cfg)?))
             }
             "aliyundrive" | "aliyun" => {
@@ -90,8 +108,12 @@ impl DriverRegistry {
                     .as_str()
                     .ok_or_else(|| DriverError::Config("aliyun: missing drive_id".into()))?;
                 let mut cfg = AliyunConfig::new(token, drive_id);
-                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
-                if let Some(s) = config["remove_way"].as_str() { cfg.remove_way = s.to_string(); }
+                if let Some(s) = config["base_url"].as_str() {
+                    cfg.base_url = s.to_string();
+                }
+                if let Some(s) = config["remove_way"].as_str() {
+                    cfg.remove_way = s.to_string();
+                }
                 Ok(Box::new(AliyunDriver::new(cfg)?))
             }
             "115" | "open115" => {
@@ -99,7 +121,9 @@ impl DriverRegistry {
                     .as_str()
                     .ok_or_else(|| DriverError::Config("115: missing access_token".into()))?;
                 let mut cfg = Open115Config::new(token);
-                if let Some(s) = config["base_url"].as_str() { cfg.base_url = s.to_string(); }
+                if let Some(s) = config["base_url"].as_str() {
+                    cfg.base_url = s.to_string();
+                }
                 Ok(Box::new(Open115Driver::new(cfg)?))
             }
             "terabox" => Ok(Box::new(TeraboxDriver)),
@@ -133,7 +157,10 @@ mod tests {
     fn registry_unsupported() {
         match DriverRegistry::create_driver("dropbox", serde_json::json!({})) {
             Err(DriverError::UnsupportedProvider(s)) => assert_eq!(s, "dropbox"),
-            other => panic!("expected UnsupportedProvider, got {:?}", other.map(|_| "ok")),
+            other => panic!(
+                "expected UnsupportedProvider, got {:?}",
+                other.map(|_| "ok")
+            ),
         }
     }
 
@@ -152,7 +179,9 @@ mod tests {
         // Both present
         assert!(DriverRegistry::create_driver(
             "aliyundrive",
-            serde_json::json!({"access_token": "tok", "drive_id": "drv"})).is_ok());
+            serde_json::json!({"access_token": "tok", "drive_id": "drv"})
+        )
+        .is_ok());
     }
 
     #[test]
@@ -162,15 +191,23 @@ mod tests {
             other => panic!("expected Config error, got {:?}", other.map(|_| "ok")),
         }
         assert!(DriverRegistry::create_driver(
-            "open115", serde_json::json!({"access_token": "tok"})).is_ok());
+            "open115",
+            serde_json::json!({"access_token": "tok"})
+        )
+        .is_ok());
     }
 
     #[test]
     fn registry_production_drivers_instantiate() {
+        assert!(
+            DriverRegistry::create_driver("baidu", serde_json::json!({"access_token": "tok"}))
+                .is_ok()
+        );
         assert!(DriverRegistry::create_driver(
-            "baidu", serde_json::json!({"access_token": "tok"})).is_ok());
-        assert!(DriverRegistry::create_driver(
-            "123_open", serde_json::json!({"access_token": "tok"})).is_ok());
+            "123_open",
+            serde_json::json!({"access_token": "tok"})
+        )
+        .is_ok());
         // Remaining stubs need no config
         assert!(DriverRegistry::create_driver("terabox", serde_json::json!({})).is_ok());
         assert!(DriverRegistry::create_driver("netease_music", serde_json::json!({})).is_ok());

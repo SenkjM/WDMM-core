@@ -23,8 +23,8 @@
 //!                   `access_token` alone is sufficient (no app-secret in binary).
 //! - netease_music — NetEase Cloud Music; excluded from public release (§9)
 
-use async_trait::async_trait;
 use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+use async_trait::async_trait;
 
 /// Shared helper: build the standard "not yet implemented" driver error.
 fn todo_err(name: &str) -> DriverError {
@@ -58,4 +58,3 @@ macro_rules! impl_stub_driver {
 
 impl_stub_driver!(TeraboxDriver, "terabox");
 impl_stub_driver!(NeteaseMusicDriver, "netease_music");
-
