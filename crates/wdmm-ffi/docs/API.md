@@ -338,7 +338,7 @@ Process-global library DB must be initialised via `wdmm_library_init` first.
 `parent_id` / `folder_id` to address it. Storage represents virtual-root
 children as rows with `parent_id IS NULL`.
 
-**Ref kinds**: `"album"` | `"artist"` | `"track"` (mirrors Android `UserFolderRefKind`).
+**Ref kinds**: `"album"` | `"artist"` | `"genre"` | `"track"` | `"manga"` | `"mangaSeries"` (mirrors Android `UserFolderRefKind`).
 
 ### Folder object shape
 ```json
@@ -408,6 +408,22 @@ Returns `"ok"` or `"error:<message>"`.
 Remove a specific item by `(folder_id, ref_kind, ref_key)`. Returns `"ok"` or
 `"error:<message>"`.
 
+### `extern "C" fn wdmm_user_folder_set_items(folder_id: *const c_char, json_array: *const c_char) -> FfiString`
+Atomically replace **all** items in a folder in one shot. Input is a JSON
+array of item objects:
+```json
+[
+  {"ref_kind":"genre","ref_key":"…","sort_order":0},
+  {"ref_kind":"manga","ref_key":"…","sort_order":1},
+  {"ref_kind":"mangaSeries","ref_key":"…","sort_order":2}
+]
+```
+`folder_id` may be `"root"` (virtual root). `sort_order` defaults to the element's
+array index if absent; `added_at` defaults to the current Unix timestamp if
+absent. The previous items for `folder_id` are deleted atomically before the
+new ones are inserted (single transaction); other folders are unaffected.
+Returns `"ok"` or `"error:<message>"`.
+
 ---
 
 ## Playlists
@@ -472,4 +488,42 @@ Replace **all** entries of a playlist in one shot. Input is a JSON array:
 `position` is assigned by array index (0-based). The previous entries are
 deleted atomically before the new ones are inserted (transaction). Returns
 `"ok"` or `"error:<message>"`.
+
+---
+
+## KV store
+
+Process-global library DB must be initialised via `wdmm_library_init` first.
+
+### `extern "C" fn wdmm_kv_get(key: *const c_char) -> FfiString`
+Get a value from the KV store. Returns the stored string, `"null"` if the key
+is absent, or `"error:<message>"` on failure.
+
+### `extern "C" fn wdmm_kv_set(key: *const c_char, value: *const c_char) -> FfiString`
+Insert or replace a KV entry. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_kv_delete(key: *const c_char) -> FfiString`
+Delete a KV entry. Returns `"ok"` or `"error:<message>"`.
+
+---
+
+## Settings
+
+Portable settings backed by the KV store. `network_last_path` is **session-only**
+(in-process `Mutex<String>`, never written to the KV store) — it resets to `"/"`
+on every process start.
+
+### `extern "C" fn wdmm_settings_get_network_remember_last_path() -> FfiString`
+Returns `"true"`, `"false"` (default if never set), or `"error:<message>"`.
+
+### `extern "C" fn wdmm_settings_set_network_remember_last_path(enabled: i32) -> FfiString`
+Non-zero → `"true"`, `0` → `"false"`. Also strips the legacy key `network_last_path`
+from the KV store. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_settings_get_network_last_path() -> FfiString`
+Returns the current session-only path, or `"/"` if never set this session.
+Never reads from the KV store.
+
+### `extern "C" fn wdmm_settings_set_network_last_path(path: *const c_char) -> FfiString`
+Set the session-only path (in-process only; never persisted). Returns `"ok"`.
 

@@ -118,6 +118,36 @@ Ordered by `position`.
 
 ---
 
+### User folders (schema v3)
+
+**Ref kinds** (canonical Android set): `"album"` | `"artist"` | `"genre"` | `"track"` | `"manga"` | `"mangaSeries"`.
+Storage accepts any non-empty string; the above values are the Android `UserFolderRefKind` enum.
+
+### `fn list_user_folder_children(&self, parent_id: Option<&str>) -> StorageResult<Vec<UserFolder>>`
+Direct children of a folder. `None`, `""`, or `"root"` → virtual root (rows with `parent_id IS NULL`).
+
+### `fn get_user_folder(&self, id: &str) -> StorageResult<Option<UserFolder>>`
+### `fn create_user_folder(&self, folder: &UserFolder) -> StorageResult<()>`
+### `fn rename_user_folder(&self, id: &str, name: &str) -> StorageResult<()>`
+### `fn move_user_folder(&self, id: &str, new_parent_id: Option<&str>) -> StorageResult<()>`
+### `fn delete_user_folder_recursive(&self, id: &str) -> StorageResult<()>`
+BFS child-first delete of folder + all descendants + their items.
+
+### `fn list_user_folder_items(&self, folder_id: &str) -> StorageResult<Vec<UserFolderItem>>`
+Items in a folder ordered by `sort_order`. `folder_id = "root"` is valid.
+
+### `fn add_user_folder_item(&self, item: &UserFolderItem) -> StorageResult<()>`
+INSERT OR REPLACE.
+
+### `fn set_user_folder_items(&self, folder_id: &str, items: &[UserFolderItem]) -> StorageResult<()>`
+Atomic delete-all + re-insert for a single folder in one transaction. Mirrors `set_playlist_entries`.
+Only items for `folder_id` are deleted; other folders are unaffected. The `folder_id` field of each
+element in `items` is ignored — the explicit `folder_id` argument is always used.
+
+### `fn remove_user_folder_item(&self, folder_id: &str, ref_kind: &str, ref_key: &str) -> StorageResult<()>`
+
+---
+
 ### KV store
 
 ### `fn save_kv(&self, key: &str, value: &str) -> StorageResult<()>`

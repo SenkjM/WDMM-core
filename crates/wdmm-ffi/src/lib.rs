@@ -1503,7 +1503,7 @@ pub extern "C" fn wdmm_user_folder_list_items(folder_id: *const c_char) -> FfiSt
 
 /// Add (or update) an item in a folder from JSON.
 ///
-/// Input shape: `{"folder_id":"…","ref_kind":"album|artist|track",
+/// Input shape: `{"folder_id":"…","ref_kind":"album|artist|genre|track|manga|mangaSeries",
 /// "ref_key":"…","sort_order":0}`. `added_at` defaults to now if absent.
 /// Returns `"ok"` or `"error:<message>"`.
 #[no_mangle]
@@ -1566,6 +1566,68 @@ pub extern "C" fn wdmm_user_folder_remove_item(
         None => return FfiString::from("error:null ref_key pointer"),
     };
     match global_library_db().remove_user_folder_item(fid, kind, key) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Atomically replace all items in a folder in one shot.
+///
+/// `folder_id` must be a valid null-terminated UTF-8 C string (`"root"` is
+/// valid for the virtual root). `json_array` is a JSON array of item objects:
+/// ```json
+/// [{"ref_kind":"track","ref_key":"sha1…","sort_order":0,"added_at":1700000000}]
+/// ```
+/// `added_at` defaults to the current Unix timestamp if absent.
+/// `sort_order` defaults to the element's array index if absent.
+///
+/// Previous items for the given `folder_id` are deleted atomically before the
+/// new ones are inserted (single transaction). Other folders are unaffected.
+///
+/// Returns `"ok"` or `"error:<message>"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_set_items(
+    folder_id: *const c_char,
+    json_array: *const c_char,
+) -> FfiString {
+    let fid = match ptr_to_str(folder_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null folder_id pointer"),
+    };
+    let s = match ptr_to_str(json_array) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json_array pointer"),
+    };
+    let arr: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let items_json = match arr.as_array() {
+        Some(a) => a,
+        None => return FfiString::from("error:json_array must be a JSON array"),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut items = Vec::with_capacity(items_json.len());
+    for (i, item) in items_json.iter().enumerate() {
+        let ref_kind = match item["ref_kind"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:item[{i}] missing 'ref_kind'")),
+        };
+        let ref_key = match item["ref_key"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:item[{i}] missing 'ref_key'")),
+        };
+        let sort_order = item["sort_order"].as_i64().unwrap_or(i as i64);
+        let added_at = item["added_at"].as_i64().unwrap_or(now);
+        items.push(wdmm_storage::UserFolderItem {
+            folder_id: fid.to_string(),
+            ref_kind,
+            ref_key,
+            sort_order,
+            added_at,
+        });
+    }
+    match global_library_db().set_user_folder_items(fid, &items) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -1711,6 +1773,135 @@ pub extern "C" fn wdmm_playlist_set_entries(
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
+}
+
+// ── KV store FFI ──────────────────────────────────────────────────────────────
+//
+// Thin wrappers over LibraryDatabase::save_kv / load_kv / delete_kv.
+// The library DB must be initialised via `wdmm_library_init` before these are
+// called; undefined behaviour otherwise.
+
+/// Get a value from the KV store.
+///
+/// Returns the stored string value, the bare string `"null"` if the key is
+/// absent, or `"error:<message>"` on failure. Caller must free the result.
+///
+/// `key` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_kv_get(key: *const c_char) -> FfiString {
+    let k = match ptr_to_str(key) {
+        Some(s) => s,
+        None => return FfiString::from("error:null key pointer"),
+    };
+    match global_library_db().load_kv(k) {
+        Ok(Some(v)) => FfiString::from(v),
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Set a KV value (insert or replace).
+///
+/// Returns `"ok"` or `"error:<message>"`. Caller must free the result.
+/// Both pointers must be valid null-terminated UTF-8 C strings.
+#[no_mangle]
+pub extern "C" fn wdmm_kv_set(key: *const c_char, value: *const c_char) -> FfiString {
+    let k = match ptr_to_str(key) {
+        Some(s) => s,
+        None => return FfiString::from("error:null key pointer"),
+    };
+    let v = match ptr_to_str(value) {
+        Some(s) => s,
+        None => return FfiString::from("error:null value pointer"),
+    };
+    match global_library_db().save_kv(k, v) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a KV entry.
+///
+/// Returns `"ok"` or `"error:<message>"`. Caller must free the result.
+/// `key` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_kv_delete(key: *const c_char) -> FfiString {
+    let k = match ptr_to_str(key) {
+        Some(s) => s,
+        None => return FfiString::from("error:null key pointer"),
+    };
+    match global_library_db().delete_kv(k) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Settings FFI ──────────────────────────────────────────────────────────────
+//
+// Portable settings backed by the KV store.
+//
+// `network_last_path` is intentionally **session-only** (in-process Mutex,
+// never written to the KV store). Android semantics require the path to reset
+// on every app restart; the OnceLock below initialises to `"/"`.
+
+fn session_network_last_path() -> &'static Mutex<String> {
+    static PATH: OnceLock<Mutex<String>> = OnceLock::new();
+    PATH.get_or_init(|| Mutex::new("/".to_string()))
+}
+
+const KEY_NETWORK_REMEMBER_LAST_PATH: &str = "network_remember_last_path";
+
+/// Get the `network_remember_last_path` setting (persisted in KV).
+///
+/// Returns `"true"`, `"false"`, or `"error:<message>"`. Defaults to `"false"`
+/// if the key has never been set. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_settings_get_network_remember_last_path() -> FfiString {
+    match global_library_db().load_kv(KEY_NETWORK_REMEMBER_LAST_PATH) {
+        Ok(Some(v)) => FfiString::from(v),
+        Ok(None) => FfiString::from("false"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Set the `network_remember_last_path` setting (persisted in KV).
+///
+/// `enabled`: non-zero → `"true"`, `0` → `"false"`.
+/// Also strips the legacy key `network_last_path` from the KV store on every call.
+/// Returns `"ok"` or `"error:<message>"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_settings_set_network_remember_last_path(enabled: i32) -> FfiString {
+    let value = if enabled != 0 { "true" } else { "false" };
+    // Strip legacy key unconditionally to clean up stale installs.
+    let _ = global_library_db().delete_kv("network_last_path");
+    match global_library_db().save_kv(KEY_NETWORK_REMEMBER_LAST_PATH, value) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get the session-only `network_last_path` (never persisted to KV).
+///
+/// Returns the current in-process path, or `"/"` if never set this session.
+/// Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_settings_get_network_last_path() -> FfiString {
+    let path = session_network_last_path().lock().unwrap().clone();
+    FfiString::from(path)
+}
+
+/// Set the session-only `network_last_path` (in-process Mutex; never persisted).
+///
+/// `path` must be a valid null-terminated UTF-8 C string.
+/// Returns `"ok"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_settings_set_network_last_path(path: *const c_char) -> FfiString {
+    let p = match ptr_to_str(path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null path pointer"),
+    };
+    *session_network_last_path().lock().unwrap() = p.to_string();
+    FfiString::ok()
 }
 
 // ── JSON → model helpers ──────────────────────────────────────────────────────
@@ -2503,6 +2694,172 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         let arr: serde_json::Value = serde_json::from_str(s).unwrap();
         assert_eq!(arr.as_array().unwrap().len(), 0);
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn kv_ffi_roundtrip() {
+        use std::ffi::CString;
+        let key = CString::new("__test_kv_ffi_key").unwrap();
+        let val = CString::new("hello-kv").unwrap();
+
+        // set
+        let r = wdmm_kv_set(key.as_ptr(), val.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // get — returns the plain string value
+        let r = wdmm_kv_get(key.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "hello-kv");
+        wdmm_ffi_free_string(r);
+
+        // delete
+        let r = wdmm_kv_delete(key.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // get after delete → "null"
+        let r = wdmm_kv_get(key.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null");
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn settings_remember_last_path() {
+        use std::ffi::CString;
+        // enable
+        let r = wdmm_settings_set_network_remember_last_path(1);
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_settings_get_network_remember_last_path();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "true");
+        wdmm_ffi_free_string(r);
+
+        // disable
+        let r = wdmm_settings_set_network_remember_last_path(0);
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_settings_get_network_remember_last_path();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "false");
+        wdmm_ffi_free_string(r);
+
+        // Strip legacy key on set: ensure network_last_path is gone from KV.
+        let legacy = CString::new("network_last_path").unwrap();
+        let _ = wdmm_kv_set(legacy.as_ptr(), CString::new("stale").unwrap().as_ptr());
+        let r = wdmm_settings_set_network_remember_last_path(1);
+        wdmm_ffi_free_string(r);
+        let r = wdmm_kv_get(legacy.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null", "legacy network_last_path must be stripped on set");
+        wdmm_ffi_free_string(r);
+
+        // Reset to a clean state for other tests.
+        let r = wdmm_settings_set_network_remember_last_path(0);
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn settings_session_last_path_not_persisted() {
+        use std::ffi::CString;
+        let new_path = CString::new("/smb/server/share").unwrap();
+        let r = wdmm_settings_set_network_last_path(new_path.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_settings_get_network_last_path();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "/smb/server/share");
+        wdmm_ffi_free_string(r);
+
+        // Confirm the value is NOT persisted to the KV store.
+        let kv_key = CString::new("network_last_path").unwrap();
+        let r = wdmm_kv_get(kv_key.as_ptr());
+        let kv_val = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(kv_val, "null", "session path must not be persisted to KV");
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn user_folder_set_items_ffi() {
+        use std::ffi::CString;
+
+        // Create a dedicated folder to avoid contaminating the shared "root".
+        let create_json = CString::new(
+            r#"{"name":"SetItemsTestFolder","parent_id":null,"sort_order":99}"#,
+        )
+        .unwrap();
+        let r = wdmm_user_folder_create(create_json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert!(!s.starts_with("error:"), "create failed: {s}");
+        let created: serde_json::Value = serde_json::from_str(s).expect("create must return JSON");
+        let fid_str = created["id"].as_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let fid = CString::new(fid_str.clone()).unwrap();
+
+        // Bulk-set: genre + manga + mangaSeries items
+        let json = CString::new(
+            r#"[
+                {"ref_kind":"genre","ref_key":"ffi-genre-1","sort_order":0},
+                {"ref_kind":"manga","ref_key":"ffi-manga-1","sort_order":1},
+                {"ref_kind":"mangaSeries","ref_key":"ffi-ms-1","sort_order":2}
+            ]"#,
+        )
+        .unwrap();
+        let r = wdmm_user_folder_set_items(fid.as_ptr(), json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "set_items failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // List and verify all three expanded ref_kinds are present.
+        let r = wdmm_user_folder_list_items(fid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        let items = arr.as_array().unwrap();
+        assert!(items.iter().any(|it| it["ref_kind"] == "genre" && it["ref_key"] == "ffi-genre-1"),
+            "genre item missing");
+        assert!(items.iter().any(|it| it["ref_kind"] == "manga" && it["ref_key"] == "ffi-manga-1"),
+            "manga item missing");
+        assert!(items.iter().any(|it| it["ref_kind"] == "mangaSeries" && it["ref_key"] == "ffi-ms-1"),
+            "mangaSeries item missing");
+        wdmm_ffi_free_string(r);
+
+        // Bulk-replace: only one album item — previous three must be gone.
+        let json2 = CString::new(
+            r#"[{"ref_kind":"album","ref_key":"ffi-album-set","sort_order":0}]"#,
+        )
+        .unwrap();
+        let r = wdmm_user_folder_set_items(fid.as_ptr(), json2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_user_folder_list_items(fid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        let items2 = arr.as_array().unwrap();
+        assert!(
+            !items2.iter().any(|it| it["ref_key"] == "ffi-genre-1"),
+            "bulk replace did not clear previous items"
+        );
+        assert_eq!(items2.len(), 1, "expected exactly 1 item after replace");
+        assert_eq!(items2[0]["ref_kind"], "album");
+        wdmm_ffi_free_string(r);
+
+        // Cleanup: delete the test folder (cascades to its items).
+        let r = wdmm_user_folder_delete(fid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
         wdmm_ffi_free_string(r);
     }
 }

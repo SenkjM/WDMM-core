@@ -1045,6 +1045,41 @@ impl LibraryDatabase {
         )?;
         Ok(())
     }
+
+    /// Atomically replace all items in a folder (delete-all + re-insert in one
+    /// transaction). Mirrors [`set_playlist_entries`] semantics. Only items
+    /// belonging to `folder_id` are touched; other folders are unaffected.
+    ///
+    /// The `folder_id` field of each item in `items` is ignored — the method
+    /// always binds the explicit `folder_id` argument to avoid cross-folder writes.
+    pub fn set_user_folder_items(
+        &self,
+        folder_id: &str,
+        items: &[UserFolderItem],
+    ) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM user_folder_items WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
+        for item in items {
+            tx.execute(
+                "INSERT INTO user_folder_items
+                 (folder_id, ref_kind, ref_key, sort_order, added_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    folder_id,
+                    &item.ref_kind,
+                    &item.ref_key,
+                    item.sort_order,
+                    item.added_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 // ── Playlist models (storage-local; identity aligns with wdmm-core) ──────────
@@ -1096,8 +1131,9 @@ pub struct UserFolder {
 /// An item reference within a user folder.
 ///
 /// `folder_id` may be `"root"` (the virtual root; no corresponding DB row).
-/// `ref_kind` is one of `"album"`, `"artist"`, or `"track"` (mirrors Android
-/// `UserFolderRefKind`).
+/// `ref_kind` is one of `"album"`, `"artist"`, `"genre"`, `"track"`, `"manga"`,
+/// or `"mangaSeries"` (mirrors Android `UserFolderRefKind`). Storage accepts any
+/// non-empty string; the above values are the canonical Android set.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserFolderItem {
     pub folder_id: String,
