@@ -352,12 +352,19 @@ Keeps: playlists, user_folders, mangas, accounts.
 Returns `"ok"` or `"error:<message>"`.
 
 ### `extern "C" fn wdmm_library_import_from_sqflite(old_db_path: *const c_char) -> FfiString`
-One-shot import from an old sqflite `music_library.db`.
+Import tracks, playlists, playlist_entries, `deleted_tracks` (v6 tombstones), and
+`sync_state` (v6 cursors) from an old sqflite `music_library.db`.
 Returns JSON summary:
 ```json
-{"already_done":false,"tracks":42,"playlists":3,"entries":120}
+{"already_done":false,"tracks":42,"playlists":3,"entries":120,"deleted_tracks":5,"sync_state":2}
 ```
-or `"error:<message>"`. Idempotent (guarded by KV flag `sqflite_imported = 1`).
+or `"error:<message>"`.
+
+Idempotency uses two KV flags: `sqflite_imported` (legacy surfaces) and
+`sqflite_imported_v6` (tombstones + sync_state). A device that already ran the
+legacy import gets a v6 backfill — only the two new surfaces — returning
+`already_done:true` with `tracks`/`playlists`/`entries` = 0. Once both flags are
+set the call is a full no-op.
 
 ---
 

@@ -2059,14 +2059,20 @@ pub extern "C" fn wdmm_library_clear_index() -> FfiString {
     }
 }
 
-/// Import tracks, playlists, and playlist_entries from an old sqflite
-/// database (one-shot — skipped if KV flag `sqflite_imported = 1` is set).
+/// Import tracks, playlists, playlist_entries, music tombstones
+/// (`deleted_tracks`), and sync cursors (`sync_state`) from an old sqflite
+/// database.
+///
+/// Two KV flags gate progress: `sqflite_imported` (legacy tracks/playlists/
+/// entries) and `sqflite_imported_v6` (tombstones + sync_state). Devices that
+/// already ran the legacy import get a v6 backfill (only the two new surfaces);
+/// once both flags are set the call is a full no-op.
 ///
 /// `old_db_path` must be a valid null-terminated UTF-8 path.
 ///
 /// Returns a JSON object:
 /// ```json
-/// {"already_done":false,"tracks":42,"playlists":3,"entries":120}
+/// {"already_done":false,"tracks":42,"playlists":3,"entries":120,"deleted_tracks":5,"sync_state":2}
 /// ```
 /// or `"error:<message>"` on failure. Caller must free the result.
 #[no_mangle]

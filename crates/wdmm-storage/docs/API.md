@@ -29,8 +29,10 @@ Fields: `playlist_id`, `position: i64` (zero-based), `music_id` (SHA-1 track id)
 ## Import summary
 
 ### `struct ImportSummary` (Serialize, Default)
-Fields: `already_done: bool`, `tracks: usize`, `playlists: usize`, `entries: usize`.
-Returned by `import_from_sqflite`.
+Fields: `already_done: bool`, `tracks: usize`, `playlists: usize`, `entries: usize`,
+`deleted_tracks: usize` (v6), `sync_state: usize` (v6).
+Returned by `import_from_sqflite`. The two v6 fields are additive — the JSON
+shape is backward compatible for consumers that ignore unknown keys.
 
 ---
 
@@ -163,7 +165,20 @@ INSERT OR REPLACE.
 ### `fn LibraryDatabase::import_from_sqflite(old_db_path: &Path, dest: &LibraryDatabase) -> StorageResult<ImportSummary>`
 One-shot import from an old sqflite `music_library.db`.
 
-Opens `old_db_path` read-only; copies tracks, playlists, and entries into `dest`.
-Idempotent: returns `ImportSummary { already_done: true, … }` if KV key
-`sqflite_imported = 1` is already set. Sets the flag after a successful import.
-Defensive: malformed rows are skipped.
+Opens `old_db_path` read-only; copies **five** surfaces into `dest`: tracks,
+playlists, playlist entries, music tombstones (`deleted_tracks`, v6), and sync
+cursors (`sync_state`, v6). Defensive: malformed rows are skipped, and a missing
+`deleted_tracks` / `sync_state` table yields zero rows rather than an error. A
+`sync_state` table without an `updated_at` column falls back to the current time.
+
+Two KV flags gate progress:
+- `sqflite_imported` — set after the legacy (v1–v5) import.
+- `sqflite_imported_v6` — set after the tombstones + sync_state import.
+
+Behaviour:
+- both set → full no-op: `already_done: true`, all counts `0`.
+- only `sqflite_imported` set → **v6 backfill**: imports *only* `deleted_tracks` +
+  `sync_state` (devices that already ran the older import have tracks but empty
+  tombstones/cursors). Returns `already_done: true` with `tracks`/`playlists`/
+  `entries` = 0 and non-zero v6 counts; sets `sqflite_imported_v6`.
+- neither set → full import of all five surfaces, then sets **both** flags.
