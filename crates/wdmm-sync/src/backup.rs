@@ -7,6 +7,7 @@
 //! Envelope matches Android `BackupCrypto` (WDMMEN01, PBKDF2 120_000).
 
 use crate::wmp::*;
+use crate::cover::{self, CoverRoots};
 use crate::SyncError;
 use crate::SyncResult;
 use serde_json::json;
@@ -242,10 +243,15 @@ fn json_bytes<T: serde::Serialize>(v: &T) -> SyncResult<Vec<u8>> {
 }
 
 /// Snapshot library + optional DMR prefs into Android-compatible WDMMBK01 binary (+ optional envelope).
+///
+/// When `cover_roots` is `Some`, cover files are read from disk and emitted in COVERS (SEC=3)
+/// and MANGA_COVERS (SEC=15) sections with codec Raw.  When `None`, those sections are omitted
+/// (Android restore tolerates missing COVERS/MANGA_COVERS).
 pub fn build_backup_bytes(
     lib: &LibraryDatabase,
     dmr: Option<&DmrPrefsDatabase>,
     passphrase: &str,
+    cover_roots: Option<&CoverRoots>,
 ) -> SyncResult<Vec<u8>> {
     let mut sections: Vec<(u8, Vec<u8>, Codec)> = Vec::new();
 
@@ -401,7 +407,36 @@ pub fn build_backup_bytes(
         track_records.push(rec);
     }
 
-    sections.push((SEC_TRACKS, encode_records(&track_records, TRACK_INT_TAGS), Codec::Deflate));
+    // 2b. Music cover indices — set TAG_TRACK_COVER_INDEX (tag 26) for regular tracks that
+    //     have a cover file on disk, then emit COVERS section (SEC=3, codec Raw).
+    //     CUE slices (appended after regular tracks) do not carry individual cover indices.
+    if let Some(roots) = cover_roots {
+        let stems: Vec<String> = tracks
+            .iter()
+            .map(|t| {
+                let source = account_map
+                    .get(&t.account_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or(&t.account_id);
+                cover::music_cover_stem(source, &t.remote_path)
+            })
+            .collect();
+        let (cover_bytes, cover_indices) =
+            cover::build_cover_section(&roots.music_covers_dir, &stems);
+        // track_records[0..tracks.len()] are regular tracks; CUE slices follow
+        for (i, maybe_idx) in cover_indices.iter().enumerate() {
+            if let Some(ci) = maybe_idx {
+                track_records[i]
+                    .insert(TAG_TRACK_COVER_INDEX, RecordValue::Int(*ci as u64));
+            }
+        }
+        sections.push((SEC_TRACKS, encode_records(&track_records, TRACK_INT_TAGS), Codec::Deflate));
+        if !cover_bytes.is_empty() {
+            sections.push((SEC_COVERS, cover_bytes, Codec::Raw));
+        }
+    } else {
+        sections.push((SEC_TRACKS, encode_records(&track_records, TRACK_INT_TAGS), Codec::Deflate));
+    }
 
     // 3. CREDENTIALS section (nested WDMMCV01 container, raw codec)
     if !accounts.is_empty() {
@@ -509,7 +544,7 @@ pub fn build_backup_bytes(
     // Reuse albums already loaded for TRACKS cue_remote_path lookup.
     sections.push((SEC_CUEALBUMS, json_bytes(&cue_albums_for_tracks)?, Codec::Deflate));
 
-    // 7. MANGA_LIBRARY section (JSON, deflated)
+    // 7. MANGA_LIBRARY section (JSON, deflated) + optional MANGA_COVERS (SEC=15, Raw)
     let mangas = lib.list_mangas().unwrap_or_default();
     let mut manga_pages = Vec::new();
     for m in &mangas {
@@ -518,15 +553,49 @@ pub fn build_backup_bytes(
         }
     }
     let manga_progress = lib.list_progress().unwrap_or_default();
-    sections.push((
-        SEC_MANGA_LIBRARY,
-        json_bytes(&json!({
-            "mangas": mangas,
-            "pages": manga_pages,
-            "progress": manga_progress,
-        }))?,
-        Codec::Deflate,
-    ));
+
+    if let Some(roots) = cover_roots {
+        let stems: Vec<String> = mangas
+            .iter()
+            .map(|m| cover::manga_cover_stem(&m.id))
+            .collect();
+        let (manga_cover_bytes, manga_cover_indices) =
+            cover::build_cover_section(&roots.manga_covers_dir, &stems);
+        // Embed cover_index in each manga JSON row (stripped at restore before DB upsert)
+        let mangas_json: Vec<serde_json::Value> = mangas
+            .iter()
+            .zip(&manga_cover_indices)
+            .map(|(m, maybe_idx)| {
+                let mut v = serde_json::to_value(m).unwrap_or_default();
+                if let Some(ci) = maybe_idx {
+                    v["cover_index"] = serde_json::Value::Number((*ci).into());
+                }
+                v
+            })
+            .collect();
+        sections.push((
+            SEC_MANGA_LIBRARY,
+            json_bytes(&json!({
+                "mangas": mangas_json,
+                "pages": manga_pages,
+                "progress": manga_progress,
+            }))?,
+            Codec::Deflate,
+        ));
+        if !manga_cover_bytes.is_empty() {
+            sections.push((SEC_MANGA_COVERS, manga_cover_bytes, Codec::Raw));
+        }
+    } else {
+        sections.push((
+            SEC_MANGA_LIBRARY,
+            json_bytes(&json!({
+                "mangas": mangas,
+                "pages": manga_pages,
+                "progress": manga_progress,
+            }))?,
+            Codec::Deflate,
+        ));
+    }
 
     // 8. USER_FOLDERS section (JSON, deflated)
     let roots = lib.list_user_folder_children(None).unwrap_or_default();
@@ -563,9 +632,8 @@ pub fn build_backup_bytes(
         sections.push((SEC_PASS_CHECK, encrypted_token.as_bytes().to_vec(), Codec::Deflate));
     }
 
-    // COVERS / MANGA_COVERS omitted: Core doesn't manage cover files on disk (Desktop/Android do).
-    // Android restore tolerates missing COVERS/MANGA_COVERS (coversRaw null → no local thumbs).
-    // Document in commit / 107.
+    // COVERS (SEC=3) and MANGA_COVERS (SEC=15) are emitted above when cover_roots is Some.
+    // When None, those sections are absent; Android restore tolerates missing cover sections.
 
     let bk = build_wmp_container(&sections, MAGIC_BK);
     envelope_encrypt(&bk, passphrase)
@@ -576,11 +644,14 @@ pub fn restore_backup_bytes(
     dmr: Option<&DmrPrefsDatabase>,
     data: &[u8],
     passphrase: &str,
+    cover_roots: Option<&CoverRoots>,
 ) -> SyncResult<String> {
     let plain = envelope_decrypt(data, passphrase)?;
     let sections = parse_bk_container(&plain)?;
     let mut notes = Vec::new();
     let mut used_android_binary = false;
+    // Collect (stem, cover_index) pairs during binary TRACKS restore for later file writing
+    let mut music_cover_needs: Vec<(String, u32)> = Vec::new();
 
     // CREDENTIALS: dual-read Android nested WDMMCV01 OR Core JSON
     if let Some(raw) = sections.get(&SEC_CREDENTIALS) {
@@ -774,11 +845,40 @@ pub fn restore_backup_bytes(
                             mime_type: None,
                         };
                         let _ = lib.upsert_track(&track);
+                        // Collect cover need for file writing after all tracks are processed
+                        if cover_roots.is_some() {
+                            if let Some(ci) = rec.get(&TAG_TRACK_COVER_INDEX).and_then(|v| v.as_int()) {
+                                let stem = cover::music_cover_stem(source, remote_path);
+                                music_cover_needs.push((stem, ci as u32));
+                            }
+                        }
                     }
                 }
             }
         }
         notes.push("tracks");
+    }
+
+    // Write music cover files if COVERS section present and roots configured.
+    // coverIndex stored in track records maps to the 0-based index in the COVERS section.
+    if let (Some(roots), Some(raw_covers)) = (cover_roots, sections.get(&SEC_COVERS)) {
+        let cover_entries = cover::parse_cover_section(raw_covers);
+        if !cover_entries.is_empty() && std::fs::create_dir_all(&roots.music_covers_dir).is_ok() {
+            let mut wrote_covers = 0usize;
+            for (stem, ci) in &music_cover_needs {
+                if let Some(&(kind, ref blob)) = cover_entries.get(*ci as usize) {
+                    if kind == cover::COVER_KIND_JPEG && !blob.is_empty() {
+                        let path = roots.music_covers_dir.join(stem);
+                        if std::fs::write(&path, blob).is_ok() {
+                            wrote_covers += 1;
+                        }
+                    }
+                }
+            }
+            if wrote_covers > 0 {
+                notes.push("covers");
+            }
+        }
     }
 
     // PLAYLISTS: dual-read Android WDMMPL01 blobs OR Core JSON
@@ -851,10 +951,37 @@ pub fn restore_backup_bytes(
     if let Some(raw) = sections.get(&SEC_MANGA_LIBRARY) {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) {
             if let Some(arr) = v.get("mangas").and_then(|x| x.as_array()) {
+                // Parse manga covers section once, if available
+                let manga_cover_entries = sections
+                    .get(&SEC_MANGA_COVERS)
+                    .map(|r| cover::parse_cover_section(r))
+                    .unwrap_or_default();
+                let mut wrote_manga_covers = 0usize;
                 for m in arr {
+                    // cover_index is present only when the backup was made with cover_roots; serde
+                    // ignores it when deserialising into Manga (which has no such field), so the
+                    // DB upsert never sees it — no explicit stripping needed.
+                    let cover_index = m.get("cover_index").and_then(|v| v.as_u64()).map(|v| v as u32);
                     if let Ok(manga) = serde_json::from_value::<wdmm_storage::Manga>(m.clone()) {
                         let _ = lib.upsert_manga(&manga);
+                        // Write manga cover file
+                        if let (Some(roots), Some(ci)) = (cover_roots, cover_index) {
+                            let stem = cover::manga_cover_stem(&manga.id);
+                            if let Some(&(kind, ref blob)) = manga_cover_entries.get(ci as usize) {
+                                if kind == cover::COVER_KIND_JPEG && !blob.is_empty() {
+                                    if std::fs::create_dir_all(&roots.manga_covers_dir).is_ok() {
+                                        let path = roots.manga_covers_dir.join(&stem);
+                                        if std::fs::write(&path, blob).is_ok() {
+                                            wrote_manga_covers += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
+                }
+                if wrote_manga_covers > 0 {
+                    notes.push("manga_covers");
                 }
             }
             if let Some(arr) = v.get("pages").and_then(|x| x.as_array()) {
@@ -968,8 +1095,9 @@ pub fn write_backup_file(
     dmr: Option<&DmrPrefsDatabase>,
     passphrase: &str,
     out_path: &Path,
+    cover_roots: Option<&CoverRoots>,
 ) -> SyncResult<()> {
-    let bytes = build_backup_bytes(lib, dmr, passphrase)?;
+    let bytes = build_backup_bytes(lib, dmr, passphrase, cover_roots)?;
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SyncError::Other(e.to_string()))?;
     }
@@ -982,9 +1110,10 @@ pub fn restore_backup_file(
     dmr: Option<&DmrPrefsDatabase>,
     passphrase: &str,
     path: &Path,
+    cover_roots: Option<&CoverRoots>,
 ) -> SyncResult<String> {
     let data = std::fs::read(path).map_err(|e| SyncError::Other(e.to_string()))?;
-    restore_backup_bytes(lib, dmr, &data, passphrase)
+    restore_backup_bytes(lib, dmr, &data, passphrase, cover_roots)
 }
 
 fn join_remote(dir: &str, name: &str) -> String {
@@ -1003,11 +1132,13 @@ pub async fn backup_upload(
     driver: Arc<dyn CloudDriver>,
     remote_dir: &str,
     passphrase: &str,
+    cover_roots: Option<&CoverRoots>,
 ) -> SyncResult<String> {
     let bytes = build_backup_bytes(
         lib.as_ref(),
         dmr.as_ref().map(|a| a.as_ref()),
         passphrase,
+        cover_roots,
     )?;
     let _ = driver.mkdir(remote_dir).await;
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
@@ -1042,6 +1173,7 @@ pub async fn backup_download_restore(
     driver: Arc<dyn CloudDriver>,
     remote_file: &str,
     passphrase: &str,
+    cover_roots: Option<&CoverRoots>,
 ) -> SyncResult<String> {
     let bytes = driver
         .get_content(remote_file)
@@ -1052,6 +1184,7 @@ pub async fn backup_download_restore(
         dmr.as_ref().map(|a| a.as_ref()),
         &bytes,
         passphrase,
+        cover_roots,
     )
 }
 
@@ -1091,10 +1224,10 @@ mod tests {
         })
         .unwrap();
         lib.save_kv("sync_interval", "off").unwrap();
-        let bytes = build_backup_bytes(&lib, Some(&dmr), "pw").unwrap();
+        let bytes = build_backup_bytes(&lib, Some(&dmr), "pw", None).unwrap();
         let lib2 = LibraryDatabase::open(Path::new(":memory:")).unwrap();
         let dmr2 = DmrPrefsDatabase::open(Path::new(":memory:")).unwrap();
-        let msg = restore_backup_bytes(&lib2, Some(&dmr2), &bytes, "pw").unwrap();
+        let msg = restore_backup_bytes(&lib2, Some(&dmr2), &bytes, "pw", None).unwrap();
         assert!(msg.contains("settings") || msg.contains("dmr"));
         assert_eq!(lib2.load_kv("sync_interval").unwrap().as_deref(), Some("off"));
         assert_eq!(dmr2.get("u1").unwrap().unwrap().override_name.as_deref(), Some("TV"));
@@ -1173,7 +1306,7 @@ mod tests {
             credentials_encrypted: vec![],
         }).unwrap();
 
-        let msg = restore_backup_bytes(&lib2, None, &encrypted, "testpw").unwrap();
+        let msg = restore_backup_bytes(&lib2, None, &encrypted, "testpw", None).unwrap();
         assert!(msg.contains("android-binary"), "Expected android-binary marker, got: {}", msg);
         assert!(msg.contains("tracks"), "Expected tracks marker, got: {}", msg);
 
@@ -1264,7 +1397,7 @@ mod tests {
 
         // Restore
         let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
-        let msg = restore_backup_bytes(&lib, None, &bk, "").unwrap();
+        let msg = restore_backup_bytes(&lib, None, &bk, "", None).unwrap();
         assert!(msg.contains("credentials"));
         assert!(msg.contains("android-binary"));
 
@@ -1375,7 +1508,7 @@ mod tests {
 
         // Restore
         let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
-        let msg = restore_backup_bytes(&lib, None, &bk, "").unwrap();
+        let msg = restore_backup_bytes(&lib, None, &bk, "", None).unwrap();
         assert!(msg.contains("playlists"));
         assert!(msg.contains("android-binary"));
 
@@ -1439,7 +1572,7 @@ mod tests {
         let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
 
         // Create backup WITH passphrase
-        let bk_bytes = build_backup_bytes(&lib, None, "test_pass").unwrap();
+        let bk_bytes = build_backup_bytes(&lib, None, "test_pass", None).unwrap();
 
         // Decrypt envelope to get BK container
         let bk_container = envelope_decrypt(&bk_bytes, "test_pass").unwrap();
@@ -1466,7 +1599,7 @@ mod tests {
         assert_eq!(note_json["hasPassCheck"].as_bool(), Some(true));
 
         // Create backup WITHOUT passphrase
-        let bk_empty = build_backup_bytes(&lib, None, "").unwrap();
+        let bk_empty = build_backup_bytes(&lib, None, "", None).unwrap();
         let bk_empty_container = envelope_decrypt(&bk_empty, "").unwrap();
         let sections_empty = parse_bk_container(&bk_empty_container).unwrap();
 
@@ -1492,7 +1625,7 @@ mod tests {
         lib.upsert_cue_album(&album).unwrap();
 
         // Create backup
-        let bk_bytes = build_backup_bytes(&lib, None, "").unwrap();
+        let bk_bytes = build_backup_bytes(&lib, None, "", None).unwrap();
         let bk_container = envelope_decrypt(&bk_bytes, "").unwrap();
         let sections = parse_bk_container(&bk_container).unwrap();
 
@@ -1586,7 +1719,7 @@ mod tests {
         lib.upsert_cue_slice(&slice).unwrap();
 
         // Create backup
-        let bk_bytes = build_backup_bytes(&lib, None, "").unwrap();
+        let bk_bytes = build_backup_bytes(&lib, None, "", None).unwrap();
         let bk_container = envelope_decrypt(&bk_bytes, "").unwrap();
         let sections = parse_bk_container(&bk_container).unwrap();
 
@@ -1608,5 +1741,214 @@ mod tests {
         assert_eq!(second.get(&TAG_TRACK_CUE_REMOTE_PATH).and_then(|v| v.as_str()), Some("/music/album.cue"));
         assert_eq!(second.get(&TAG_TRACK_CUE_TRACK_INDEX).and_then(|v| v.as_int()), Some(1));
         assert_eq!(second.get(&TAG_TRACK_AUDIO_MUSIC_ID).and_then(|v| v.as_str()), Some("audio_001"));
+    }
+
+    // ── Cover roundtrip tests ────────────────────────────────────────────────
+
+    fn test_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wdmm_backup_test_{tag}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn covers_roundtrip_music() {
+        use crate::cover::{music_cover_stem, CoverRoots};
+
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        lib.insert_account(&wdmm_core::models::CloudAccount {
+            id: "acc1".into(),
+            provider_type: "webdav".into(),
+            display_name: "MyVault".into(),
+            base_url: None,
+            credentials_encrypted: vec![],
+        }).unwrap();
+        lib.upsert_track(&wdmm_core::models::LibraryTrack {
+            id: "t1".into(),
+            account_id: "acc1".into(),
+            remote_path: "/Music/track.mp3".into(),
+            title: "Track".into(),
+            artist: None, album: None, album_artist: None, genre: None,
+            duration_ms: 1000, track_number: None, disc_number: None,
+            year: None, album_id: None, artist_id: None, size: 0,
+            modified: None, mime_type: None, rev: 0,
+        }).unwrap();
+
+        // Create a fake cover file in the music covers dir
+        let music_dir = test_dir("covers_music_create");
+        let manga_dir = test_dir("covers_manga_create");
+        let stem = music_cover_stem("MyVault", "/Music/track.mp3");
+        let fake_jpeg = b"\xff\xd8\xff\xe0fake_cover_music";
+        std::fs::write(music_dir.join(&stem), fake_jpeg).unwrap();
+
+        let roots = CoverRoots {
+            music_covers_dir: music_dir.clone(),
+            manga_covers_dir: manga_dir.clone(),
+        };
+
+        // Build backup with cover roots
+        let bk = build_backup_bytes(&lib, None, "", Some(&roots)).unwrap();
+
+        // Verify COVERS section present
+        let container = envelope_decrypt(&bk, "").unwrap();
+        let secs = parse_bk_container(&container).unwrap();
+        let covers_raw = secs.get(&SEC_COVERS).expect("COVERS section must be present");
+        assert!(!covers_raw.is_empty(), "COVERS section must not be empty");
+
+        // Verify track record has coverIndex=0
+        let tracks_raw = secs.get(&SEC_TRACKS).unwrap();
+        let recs = decode_records(tracks_raw, TRACK_INT_TAGS).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].get(&TAG_TRACK_COVER_INDEX).and_then(|v| v.as_int()),
+            Some(0),
+            "track record must carry coverIndex=0"
+        );
+
+        // Restore into fresh DB+dir and verify cover file written
+        let lib2 = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let music_dir2 = test_dir("covers_music_restore");
+        let manga_dir2 = test_dir("covers_manga_restore");
+        lib2.insert_account(&wdmm_core::models::CloudAccount {
+            id: "acc1".into(),
+            provider_type: "webdav".into(),
+            display_name: "MyVault".into(),
+            base_url: None,
+            credentials_encrypted: vec![],
+        }).unwrap();
+        let roots2 = CoverRoots {
+            music_covers_dir: music_dir2.clone(),
+            manga_covers_dir: manga_dir2.clone(),
+        };
+        let msg = restore_backup_bytes(&lib2, None, &bk, "", Some(&roots2)).unwrap();
+        assert!(msg.contains("covers"), "restore note should include 'covers', got: {msg}");
+        let restored_cover = std::fs::read(music_dir2.join(&stem)).expect("cover file should be written");
+        assert_eq!(&restored_cover, fake_jpeg);
+    }
+
+    #[test]
+    fn covers_roundtrip_manga() {
+        use crate::cover::{manga_cover_stem, CoverRoots};
+        use wdmm_storage::Manga;
+
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let manga = Manga {
+            id: "manga_abc_12345678".into(),
+            source_name: "src".into(),
+            remote_path: "/manga/test".into(),
+            title: "Test Manga".into(),
+            author: None,
+            series: None,
+            volume: None,
+            chapter_number: None,
+            page_count: 0,
+            cover_relpath: None,
+            format: "cbz".into(),
+            remote_missing: 0,
+            page_turn: None,
+            rev: 0,
+            updated_at: "2024-01-01T00:00:00Z".into(),
+        };
+        lib.upsert_manga(&manga).unwrap();
+
+        let music_dir = test_dir("manga_covers_music_create");
+        let manga_dir = test_dir("manga_covers_create");
+        let stem = manga_cover_stem(&manga.id);
+        let fake_jpeg = b"\xff\xd8\xff\xe0fake_manga_cover";
+        std::fs::write(manga_dir.join(&stem), fake_jpeg).unwrap();
+
+        let roots = CoverRoots {
+            music_covers_dir: music_dir.clone(),
+            manga_covers_dir: manga_dir.clone(),
+        };
+
+        let bk = build_backup_bytes(&lib, None, "", Some(&roots)).unwrap();
+
+        // Verify MANGA_COVERS section present
+        let container = envelope_decrypt(&bk, "").unwrap();
+        let secs = parse_bk_container(&container).unwrap();
+        let mc_raw = secs.get(&SEC_MANGA_COVERS).expect("MANGA_COVERS section must be present");
+        assert!(!mc_raw.is_empty());
+
+        // Verify manga JSON contains cover_index
+        let ml_raw = secs.get(&SEC_MANGA_LIBRARY).unwrap();
+        let ml_val: serde_json::Value = serde_json::from_slice(ml_raw).unwrap();
+        let mangas = ml_val["mangas"].as_array().unwrap();
+        assert_eq!(mangas.len(), 1);
+        assert_eq!(mangas[0]["cover_index"].as_u64(), Some(0));
+
+        // Restore and verify cover file written
+        let lib2 = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let music_dir2 = test_dir("manga_covers_music_restore");
+        let manga_dir2 = test_dir("manga_covers_restore");
+        let roots2 = CoverRoots {
+            music_covers_dir: music_dir2.clone(),
+            manga_covers_dir: manga_dir2.clone(),
+        };
+        let msg = restore_backup_bytes(&lib2, None, &bk, "", Some(&roots2)).unwrap();
+        assert!(msg.contains("manga_covers"), "expected manga_covers note, got: {msg}");
+        let restored = std::fs::read(manga_dir2.join(&stem)).expect("manga cover must be written");
+        assert_eq!(&restored, fake_jpeg);
+
+        // Manga upserted without cover_index in DB (Manga struct has no such field)
+        let mangas2 = lib2.list_mangas().unwrap();
+        assert_eq!(mangas2.len(), 1);
+        assert_eq!(mangas2[0].id, "manga_abc_12345678");
+    }
+
+    #[test]
+    fn covers_omitted_when_roots_not_set() {
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        lib.upsert_track(&wdmm_core::models::LibraryTrack {
+            id: "t1".into(), account_id: "acc".into(),
+            remote_path: "/t.mp3".into(), title: "T".into(),
+            artist: None, album: None, album_artist: None, genre: None,
+            duration_ms: 0, track_number: None, disc_number: None,
+            year: None, album_id: None, artist_id: None, size: 0,
+            modified: None, mime_type: None, rev: 0,
+        }).unwrap();
+
+        // No cover_roots → no COVERS/MANGA_COVERS sections
+        let bk = build_backup_bytes(&lib, None, "", None).unwrap();
+        let container = envelope_decrypt(&bk, "").unwrap();
+        let secs = parse_bk_container(&container).unwrap();
+        assert!(secs.get(&SEC_COVERS).is_none(), "COVERS must be absent when roots not set");
+        assert!(secs.get(&SEC_MANGA_COVERS).is_none(), "MANGA_COVERS must be absent when roots not set");
+
+        // Track record must not carry coverIndex
+        let tracks_raw = secs.get(&SEC_TRACKS).unwrap();
+        let recs = decode_records(tracks_raw, TRACK_INT_TAGS).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].get(&TAG_TRACK_COVER_INDEX).is_none(), "no coverIndex without roots");
+    }
+
+    #[test]
+    fn covers_missing_files_tolerant() {
+        use crate::cover::CoverRoots;
+
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        lib.upsert_track(&wdmm_core::models::LibraryTrack {
+            id: "t1".into(), account_id: "acc".into(),
+            remote_path: "/t.mp3".into(), title: "T".into(),
+            artist: None, album: None, album_artist: None, genre: None,
+            duration_ms: 0, track_number: None, disc_number: None,
+            year: None, album_id: None, artist_id: None, size: 0,
+            modified: None, mime_type: None, rev: 0,
+        }).unwrap();
+
+        // Roots configured but cover file missing → no COVERS section, no coverIndex
+        let music_dir = test_dir("missing_covers_music");
+        let manga_dir = test_dir("missing_covers_manga");
+        let roots = CoverRoots {
+            music_covers_dir: music_dir,
+            manga_covers_dir: manga_dir,
+        };
+        let bk = build_backup_bytes(&lib, None, "", Some(&roots)).unwrap();
+        let container = envelope_decrypt(&bk, "").unwrap();
+        let secs = parse_bk_container(&container).unwrap();
+        assert!(secs.get(&SEC_COVERS).is_none(), "COVERS absent when files missing");
+        let tracks_raw = secs.get(&SEC_TRACKS).unwrap();
+        let recs = decode_records(tracks_raw, TRACK_INT_TAGS).unwrap();
+        assert!(recs[0].get(&TAG_TRACK_COVER_INDEX).is_none(), "no coverIndex when file missing");
     }
 }

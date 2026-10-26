@@ -16,6 +16,12 @@
 mod backup;
 pub use backup::*;
 
+pub mod cover;
+pub use cover::{
+    build_cover_section, manga_cover_stem, music_cover_stem, normalize_remote_path_for_cover,
+    normalize_source_name, parse_cover_section, CoverRoots, COVER_KIND_JPEG,
+};
+
 pub mod wmp;
 mod library_shard;
 mod library_music;
