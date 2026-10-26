@@ -48,7 +48,7 @@ The following gaps remain before Android can fully switch to Core as library sou
 Backup **create** already reads Core (Phase D). Remaining after dual-write validation:
 - Deprecate and remove `music_library_database_impl.dart` / sqflite layer from library query/UI paths
 - ✅ **CUEALBUMS / PASS_CHECK / CUE slices in TRACKS** now emitted from Core create (2026-10-26)
-- COVERS / MANGA_COVERS remain omitted (Core doesn't manage cover files on disk; Android restore tolerates missing cover sections)
+- ~~**COVERS / MANGA_COVERS remain omitted**~~ ✅ **DONE (2026-10-26)**: Core now emits COVERS (SEC=3, raw) and MANGA_COVERS (SEC=15, raw) during backup create when `CoverRoots` is configured; restore writes cover files to the configured dirs. FFI: `wdmm_covers_configure(music_covers_dir, manga_covers_dir)` must be called before `wdmm_backup_create` / `wdmm_backup_restore`. When roots are not set, sections are omitted and Android restore tolerates their absence as before.
 
 ## Explicit Status
 
@@ -67,7 +67,7 @@ Backup **create** already reads Core (Phase D). Remaining after dual-write valid
 ## Verification Harness (no-device + on-device)
 
 ### No-device (CI / local)
-- **Core**: `cargo test -p wdmm-storage --lib cue_json_roundtrip_schema` — documents CueAlbum/CueSlice JSON field set and upsert → remaining_slices → delete roundtrip.
+- **Core**: `cargo test -p wdmm-sync` — includes `backup::tests::covers_roundtrip_music`, `covers_roundtrip_manga`, `covers_omitted_when_roots_not_set`, `covers_missing_files_tolerant` for the Cover SoT, plus `cover::tests::*` for the stem/section helpers.
 - **Android**: `flutter test test/cue_rust_json_parity_test.dart` — asserts `RustLibraryService.cueAlbumJson` / `cueSliceJson` emit the same snake_case keys/types as Core (no FFI/.so required).
 
 ### On-device (after dual-write stabilizes)
@@ -75,7 +75,7 @@ Backup **create** already reads Core (Phase D). Remaining after dual-write valid
 - After CUE ingest with `kRustLibraryWriteEnabled`, compare Core `wdmm_cue_remaining_slices(source, cuePath)` against sqflite `remainingSlicesForCue` for the same album; mismatch means dual-write drift.
 
 ### Status notes (2026-10-26 Phase D)
-- ✅ **Backup create cutover complete**: Core emits Android binary container; Android switched production create to Core FFI
+- ✅ **Cover SoT** (2026-10-26): `wdmm_covers_configure` + COVERS/MANGA_COVERS sections in backup create/restore. Cover stems match Android `music_cover_stem` / `manga_cover_stem` (SHA1 parity, no lowercase). `TAG_TRACK_COVER_INDEX=26`, `cover_index` in manga JSON (stripped on DB upsert).
 - Android CUE **upsert** on ingest/scan is dual-written (Rust first, then sqflite); delete/clear paths already dual-written earlier.
 - Music **tombstones** (`deleted_tracks`) + **sync_state** now landed in Core schema v6 with full FFI CRUD. Android dual-write remains TODO.
 - Album/artist aggregation (schema v7) and FTS5 search (schema v8) are complete.

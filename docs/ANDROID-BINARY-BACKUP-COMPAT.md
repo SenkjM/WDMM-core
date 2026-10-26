@@ -22,16 +22,18 @@ Core **restore** (`restore_backup_bytes`) dual-reads: Android binary sections **
 |------------|---------------|----------------------------------------|------------------------------|
 | 1          | META          | Deflated WMP tag/value records         | Binary only                  |
 | 2          | TRACKS        | Deflated WMP tag/value records         | Binary OR JSON               |
+| 3          | COVERS        | Raw JPEG blobs (kind=0, TLV layout); emitted only when `CoverRoots` configured | Written to music_covers_dir |
 | 5          | CREDENTIALS   | Nested WDMMCV01 vault container (raw)  | Binary OR JSON               |
 | 6          | PLAYLISTS     | WDMMPL01 blob per playlist record (raw)| Binary OR JSON               |
 | 7          | SETTINGS      | Deflated JSON                          | JSON                         |
 | 8          | CUEALBUMS     | Deflated JSON (always emitted)         | JSON                         |
 | 11         | PASS_CHECK    | Deflated UTF-8 AESGCMv1 token (when passphrase set) | UTF-8       |
-| 13         | MANGA_LIBRARY | Deflated JSON                          | JSON                         |
+| 13         | MANGA_LIBRARY | Deflated JSON (with `cover_index` per row when `CoverRoots` set) | JSON (cover_index ignored by Manga struct) |
 | 14         | USER_FOLDERS  | Deflated JSON                          | JSON                         |
+| 15         | MANGA_COVERS  | Raw JPEG blobs (kind=0, TLV layout); emitted only when `CoverRoots` configured | Written to manga_covers_dir |
 | 16         | DMR_PREFS     | Deflated JSON                          | JSON                         |
 
-Sections **not** emitted by Core create: COVERS (3), MANGA_COVERS (15) — Core doesn't manage cover files on disk; Desktop/Android handle those. Android restore already tolerates missing COVERS/MANGA_COVERS (coversRaw null → no local thumbs).
+**Conditional cover sections** — COVERS (3) and MANGA_COVERS (15) are emitted by Core create when `CoverRoots` is configured (i.e. cover directories are known). When `CoverRoots` is not set (the default for headless/server use), these sections are omitted and Android/Desktop handle cover caching independently. Android restore already tolerates missing COVERS/MANGA_COVERS (coversRaw null → no local thumbs).
 
 Restore checks `looks_like_json` for CREDENTIALS, byte-level format detection for TRACKS/PLAYLISTS, and falls back to JSON if binary decode fails.
 
