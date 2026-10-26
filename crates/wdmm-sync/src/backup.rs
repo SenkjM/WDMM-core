@@ -598,6 +598,13 @@ pub fn build_backup_bytes(
         track_records.push(rec);
     }
 
+    // Parent album cue_remote_path by cue_id (one query, not per slice)
+    let cue_albums_for_tracks = lib.list_cue_albums()?;
+    let cue_remote_by_id: std::collections::HashMap<&str, &str> = cue_albums_for_tracks
+        .iter()
+        .map(|a| (a.cue_id.as_str(), a.cue_remote_path.as_str()))
+        .collect();
+
     // CUE slices (virtual tracks)
     for s in &cue_slices {
         let mut rec = BTreeMap::new();
@@ -646,11 +653,8 @@ pub fn build_backup_bytes(
         }
         // CUE-specific tags
         rec.insert(TAG_TRACK_CUE_ID, RecordValue::Str(s.cue_id.clone()));
-        // Look up cue_remote_path from parent album (brief requirement)
-        if let Ok(albums) = lib.list_cue_albums() {
-            if let Some(album) = albums.iter().find(|a| a.cue_id == s.cue_id) {
-                rec.insert(TAG_TRACK_CUE_REMOTE_PATH, RecordValue::Str(album.cue_remote_path.clone()));
-            }
+        if let Some(path) = cue_remote_by_id.get(s.cue_id.as_str()) {
+            rec.insert(TAG_TRACK_CUE_REMOTE_PATH, RecordValue::Str((*path).to_string()));
         }
         rec.insert(TAG_TRACK_CUE_TRACK_INDEX, RecordValue::Int(s.track_index as u64));
         rec.insert(TAG_TRACK_AUDIO_MUSIC_ID, RecordValue::Str(s.audio_music_id.clone()));
@@ -776,8 +780,8 @@ pub fn build_backup_bytes(
     sections.push((SEC_SETTINGS, json_bytes(&kv)?, Codec::Deflate));
 
     // 6. CUEALBUMS section (JSON, deflated) — always emit even if empty (Android does)
-    let cue_albums = lib.list_cue_albums()?;
-    sections.push((SEC_CUEALBUMS, json_bytes(&cue_albums)?, Codec::Deflate));
+    // Reuse albums already loaded for TRACKS cue_remote_path lookup.
+    sections.push((SEC_CUEALBUMS, json_bytes(&cue_albums_for_tracks)?, Codec::Deflate));
 
     // 7. MANGA_LIBRARY section (JSON, deflated)
     let mangas = lib.list_mangas().unwrap_or_default();
