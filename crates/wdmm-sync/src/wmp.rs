@@ -19,6 +19,7 @@ pub const SEC_PLAYLISTS: u8 = 6;
 pub const SEC_SETTINGS: u8 = 7;
 pub const SEC_CUEALBUMS: u8 = 8;
 pub const SEC_PASS_CHECK: u8 = 11;
+pub const SEC_MANGAS: u8 = 12;
 pub const SEC_MANGA_LIBRARY: u8 = 13;
 pub const SEC_USER_FOLDERS: u8 = 14;
 pub const SEC_MANGA_COVERS: u8 = 15;

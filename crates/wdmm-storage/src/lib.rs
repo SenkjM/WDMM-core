@@ -247,6 +247,66 @@ pub fn series_id_for_title(title: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// Normalise a manga remote path for Android-compatible sync.
+///
+/// Trims whitespace, converts `\` to `/`, ensures a leading `/`, and
+/// collapses consecutive `/` characters.  Does NOT lowercase — Android
+/// preserves path case.
+pub fn normalize_manga_remote_path(path: &str) -> String {
+    let replaced = path.trim().replace('\\', "/");
+    let mut out = String::with_capacity(replaced.len() + 1);
+    let mut last_slash = false;
+    for ch in replaced.chars() {
+        if ch == '/' {
+            if !last_slash {
+                out.push(ch);
+            }
+            last_slash = true;
+        } else {
+            out.push(ch);
+            last_slash = false;
+        }
+    }
+    if !out.starts_with('/') {
+        out.insert(0, '/');
+    }
+    out
+}
+
+/// Normalise a manga source name: trim and collapse interior whitespace runs.
+pub fn normalize_manga_source_name(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Derive the manga id from a remote source + path.
+///
+/// Formula: `sha1(utf8("manga") || 0x00 || source || 0x00 || path)` hex.
+/// Matches Android `mangaIdForRemote`.
+pub fn manga_id_for_remote(source: &str, path: &str) -> String {
+    use sha1::Digest as _;
+    let src = normalize_manga_source_name(source);
+    let remote = normalize_manga_remote_path(path);
+    let mut h = sha1::Sha1::new();
+    h.update(b"manga");
+    h.update(b"\x00");
+    h.update(src.as_bytes());
+    h.update(b"\x00");
+    h.update(remote.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Compute the Android `mangaSyncKey` for a manga row.
+///
+/// - `format == "images"` → key is the manga `id` (surrogate; not path-bound)
+/// - all other formats → `source + '\0' + normalize_manga_remote_path(path)`
+pub fn manga_sync_key(id: &str, format: &str, source: &str, path: &str) -> String {
+    if format == "images" {
+        id.to_string()
+    } else {
+        format!("{}\x00{}", source, normalize_manga_remote_path(path))
+    }
+}
+
 pub struct LibraryDatabase {
     conn: Mutex<Connection>,
 }
@@ -2036,26 +2096,27 @@ impl LibraryDatabase {
     }
 
     /// Delete a manga. Cascades to `manga_pages` and `manga_progress`. Appends
-    /// a tombstone row to `deleted_mangas` using `source_name:remote_path` as
-    /// the `sync_key` and the current UTC timestamp for `deleted_at`.
+    /// a tombstone row to `deleted_mangas` using `manga_sync_key` (Android-
+    /// compatible: images format → manga id; containers → source + NUL + path).
     pub fn delete_manga(&self, id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         // Look up the manga to build the tombstone.
-        let (source_name, remote_path, rev) = {
+        let (source_name, remote_path, format, rev) = {
             let mut stmt = conn.prepare(
-                "SELECT source_name, remote_path, rev FROM mangas WHERE id = ?1",
+                "SELECT source_name, remote_path, format, rev FROM mangas WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
             match rows.next()? {
                 Some(r) => (
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
                 ),
                 None => return Err(StorageError::NotFound(id.to_string())),
             }
         };
-        let sync_key = format!("{}:{}", source_name, remote_path);
+        let sync_key = manga_sync_key(id, &format, &source_name, &remote_path);
         let deleted_at = Utc::now().to_rfc3339();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -2148,6 +2209,97 @@ impl LibraryDatabase {
         let mut out = Vec::new();
         for r in rows { out.push(r?); }
         Ok(out)
+    }
+
+    // ── Deleted mangas (tombstones for sync) ──────────────────────────────────
+
+    pub fn list_deleted_mangas(&self) -> StorageResult<Vec<DeletedManga>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT manga_id, source_name, remote_path, sync_key, rev, deleted_at, pushed
+             FROM deleted_mangas ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DeletedManga {
+                manga_id: row.get(0)?,
+                source_name: row.get(1)?,
+                remote_path: row.get(2)?,
+                sync_key: row.get(3)?,
+                rev: row.get(4)?,
+                deleted_at: row.get(5)?,
+                pushed: row.get(6)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    pub fn list_unpushed_deleted_mangas(&self) -> StorageResult<Vec<DeletedManga>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT manga_id, source_name, remote_path, sync_key, rev, deleted_at, pushed
+             FROM deleted_mangas WHERE pushed = 0 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DeletedManga {
+                manga_id: row.get(0)?,
+                source_name: row.get(1)?,
+                remote_path: row.get(2)?,
+                sync_key: row.get(3)?,
+                rev: row.get(4)?,
+                deleted_at: row.get(5)?,
+                pushed: row.get(6)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// Mark deleted_mangas rows as pushed, identified by `rev`.
+    pub fn mark_deleted_mangas_pushed(&self, revs: &[i64]) -> StorageResult<()> {
+        if revs.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for rev in revs {
+            tx.execute(
+                "UPDATE deleted_mangas SET pushed = 1 WHERE rev = ?1",
+                params![rev],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove a single deleted_manga tombstone row by its `sync_key`.
+    pub fn clear_deleted_manga(&self, sync_key: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM deleted_mangas WHERE sync_key = ?1",
+            params![sync_key],
+        )?;
+        Ok(())
+    }
+
+    /// Remove all deleted_manga tombstones (used after a full cloud rebuild).
+    pub fn clear_all_deleted_mangas(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM deleted_mangas", [])?;
+        Ok(())
+    }
+
+    /// Upsert reading progress, preserving the caller's `updated_at` timestamp.
+    ///
+    /// Unlike [`set_progress`] (which stamps `Utc::now()`), this method is
+    /// intended for adopting cloud-side progress entries where the remote
+    /// timestamp must be preserved.
+    pub fn upsert_progress(&self, progress: &MangaProgress) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO manga_progress (manga_id, page_index, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![&progress.manga_id, progress.page_index, &progress.updated_at],
+        )?;
+        Ok(())
     }
 
     /// Return distinct non-null series tags with their derived IDs.
@@ -3298,12 +3450,142 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(sync_key, "nas:/m/a.cbz");
+        assert_eq!(sync_key, "nas\x00/m/a.cbz");
         assert_eq!(pushed, 0);
         drop(conn);
 
         // series tag persists for the remaining manga
         assert_eq!(db.list_series_tags().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn manga_sync_key_variants() {
+        // images format → key is the manga id (surrogate; not path-bound)
+        assert_eq!(manga_sync_key("abc-id", "images", "nas", "/m/a"), "abc-id");
+        // cbz format → source + NUL + normalized path
+        assert_eq!(manga_sync_key("x", "cbz", "nas", "/m/a.cbz"), "nas\x00/m/a.cbz");
+        // path normalization is applied for container formats
+        assert_eq!(manga_sync_key("x", "pdf", "nas", "//m\\a.pdf"), "nas\x00/m/a.pdf");
+    }
+
+    #[test]
+    fn normalize_manga_remote_path_cases() {
+        assert_eq!(normalize_manga_remote_path("/m/a.cbz"), "/m/a.cbz");
+        assert_eq!(normalize_manga_remote_path("m/a.cbz"), "/m/a.cbz");
+        assert_eq!(normalize_manga_remote_path("  /m/a.cbz  "), "/m/a.cbz");
+        assert_eq!(normalize_manga_remote_path("\\m\\a.cbz"), "/m/a.cbz");
+        assert_eq!(normalize_manga_remote_path("//m//a.cbz"), "/m/a.cbz");
+    }
+
+    #[test]
+    fn manga_id_for_remote_stable() {
+        // Deterministic and matches the documented formula.
+        let id = manga_id_for_remote("nas", "/m/a.cbz");
+        assert_eq!(id.len(), 40); // sha1 hex
+        assert_eq!(id, manga_id_for_remote("nas", "/m/a.cbz"));
+        // Different inputs yield different ids.
+        assert_ne!(id, manga_id_for_remote("nas", "/m/b.cbz"));
+        assert_ne!(id, manga_id_for_remote("other", "/m/a.cbz"));
+    }
+
+    fn mk_manga(i: usize, src: &str, path: &str, fmt: &str, rev: i64) -> Manga {
+        let now = Utc::now().to_rfc3339();
+        Manga {
+            id: format!("m-{i}"),
+            source_name: src.into(),
+            remote_path: path.into(),
+            title: format!("Title {i}"),
+            author: Some("Author".into()),
+            series: Some("Saga One".into()),
+            volume: Some("1".into()),
+            chapter_number: Some(format!("{i}")),
+            page_count: 2,
+            cover_relpath: Some("cover.jpg".into()),
+            format: fmt.into(),
+            remote_missing: 0,
+            page_turn: Some("ltr".into()),
+            rev,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn manga_deleted_unpushed_mark_clear() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        // rev=1 cbz row → sync_key = "nas\0/m/a.cbz"
+        db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1)).unwrap();
+        db.delete_manga("m-1").unwrap();
+
+        // list_deleted_mangas
+        let all = db.list_deleted_mangas().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].sync_key, "nas\x00/m/a.cbz");
+        assert_eq!(all[0].rev, Some(1));
+
+        // list_unpushed_deleted_mangas
+        let unpushed = db.list_unpushed_deleted_mangas().unwrap();
+        assert_eq!(unpushed.len(), 1);
+
+        // mark_deleted_mangas_pushed — marks by rev
+        db.mark_deleted_mangas_pushed(&[1]).unwrap();
+        assert_eq!(db.list_unpushed_deleted_mangas().unwrap().len(), 0);
+        assert_eq!(db.list_deleted_mangas().unwrap().len(), 1);
+
+        // clear_deleted_manga by sync_key
+        db.clear_deleted_manga("nas\x00/m/a.cbz").unwrap();
+        assert_eq!(db.list_deleted_mangas().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn manga_deleted_images_format_sync_key_is_id() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_manga(&mk_manga(2, "nas", "/m/img", "images", 2)).unwrap();
+        db.delete_manga("m-2").unwrap();
+        let all = db.list_deleted_mangas().unwrap();
+        assert_eq!(all.len(), 1);
+        // images → sync_key is the manga id, not source\0path
+        assert_eq!(all[0].sync_key, "m-2");
+    }
+
+    #[test]
+    fn manga_deleted_clear_all() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        for i in 1..=3usize {
+            db.upsert_manga(&mk_manga(i, "nas", &format!("/m/{i}.cbz"), "cbz", i as i64))
+                .unwrap();
+            db.delete_manga(&format!("m-{i}")).unwrap();
+        }
+        assert_eq!(db.list_deleted_mangas().unwrap().len(), 3);
+
+        db.clear_all_deleted_mangas().unwrap();
+        assert_eq!(db.list_deleted_mangas().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn upsert_progress_preserves_timestamp() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        // manga_progress has a FK → mangas(id); insert the parent row first.
+        db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1)).unwrap();
+
+        let p1 = MangaProgress {
+            manga_id: "m-1".into(),
+            page_index: 5,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        db.upsert_progress(&p1).unwrap();
+        let got = db.get_progress("m-1").unwrap().unwrap();
+        assert_eq!(got.page_index, 5);
+        assert_eq!(got.updated_at, "2026-01-01T00:00:00Z");
+
+        let p2 = MangaProgress {
+            manga_id: "m-1".into(),
+            page_index: 10,
+            updated_at: "2026-06-01T00:00:00Z".into(),
+        };
+        db.upsert_progress(&p2).unwrap();
+        let got2 = db.get_progress("m-1").unwrap().unwrap();
+        assert_eq!(got2.page_index, 10);
+        assert_eq!(got2.updated_at, "2026-06-01T00:00:00Z");
     }
 
     #[test]

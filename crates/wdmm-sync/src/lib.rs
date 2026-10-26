@@ -20,6 +20,10 @@ pub mod wmp;
 mod library_shard;
 mod library_music;
 pub use library_music::LibrarySyncEngine;
+mod library_manga_shard;
+pub use library_manga_shard::{
+    decode_manga_shard, encode_manga_shard, encode_manga_tomb_shard, DecodedMangaShard, MangaSyncRow,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

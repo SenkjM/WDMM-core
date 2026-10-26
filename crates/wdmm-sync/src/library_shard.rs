@@ -40,6 +40,8 @@ pub const TAG_TOMB_SOURCE: u8 = 1;
 pub const TAG_TOMB_REMOTE_PATH: u8 = 2;
 pub const TAG_TOMB_REV: u8 = 3;
 pub const TAG_TOMB_DELETED_AT: u8 = 4;
+/// Android `WmpTomb.syncKey` — manga uses this; music omits it (None → tag absent).
+pub const TAG_TOMB_SYNC_KEY: u8 = 5;
 
 /// Android `kMetaIntTags`.
 pub const META_INT_TAGS: &[u8] = &[1, 2, 3, 4];
@@ -64,6 +66,11 @@ pub struct TombRecord {
     pub remote_path: String,
     pub rev: i64,
     pub deleted_at: String,
+    /// Android `WmpTomb.syncKey`.  `None` for music (tag 5 omitted on encode,
+    /// absent on decode → None).  Manga sets this to the Android sync key
+    /// string (manga id for `images` format, else `source\0path`).
+    #[serde(default)]
+    pub sync_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +80,7 @@ pub struct DecodedLibraryShard {
     pub tombstones: Vec<TombRecord>,
 }
 
-fn magic_for_kind(kind: i64) -> SyncResult<&'static [u8; 8]> {
+pub(crate) fn magic_for_kind(kind: i64) -> SyncResult<&'static [u8; 8]> {
     match kind {
         WMP_KIND_BASE => Ok(MAGIC_LB),
         WMP_KIND_SEG => Ok(MAGIC_LS),
@@ -82,7 +89,7 @@ fn magic_for_kind(kind: i64) -> SyncResult<&'static [u8; 8]> {
     }
 }
 
-fn expected_kind_bytes(kind: i64) -> SyncResult<&'static [u8; 2]> {
+pub(crate) fn expected_kind_bytes(kind: i64) -> SyncResult<&'static [u8; 2]> {
     match kind {
         WMP_KIND_BASE => Ok(b"LB"),
         WMP_KIND_SEG => Ok(b"LS"),
@@ -91,7 +98,7 @@ fn expected_kind_bytes(kind: i64) -> SyncResult<&'static [u8; 2]> {
     }
 }
 
-fn meta_kind_of_container(bytes: &[u8]) -> i64 {
+pub(crate) fn meta_kind_of_container(bytes: &[u8]) -> i64 {
     if bytes.len() < 6 {
         return -1;
     }
@@ -103,7 +110,7 @@ fn meta_kind_of_container(bytes: &[u8]) -> i64 {
     }
 }
 
-fn encode_meta(meta: &ShardMeta) -> Vec<u8> {
+pub(crate) fn encode_meta(meta: &ShardMeta) -> Vec<u8> {
     let mut rec = BTreeMap::new();
     rec.insert(TAG_META_KIND, RecordValue::Int(meta.kind as u64));
     rec.insert(TAG_META_SEQ_FROM, RecordValue::Int(meta.seq_from as u64));
@@ -114,7 +121,7 @@ fn encode_meta(meta: &ShardMeta) -> Vec<u8> {
     wmp::encode_records(&[rec], META_INT_TAGS)
 }
 
-fn decode_meta(raw: &[u8]) -> SyncResult<ShardMeta> {
+pub(crate) fn decode_meta(raw: &[u8]) -> SyncResult<ShardMeta> {
     let records = wmp::decode_records(raw, META_INT_TAGS)?;
     let rec = records
         .first()
@@ -236,6 +243,10 @@ fn tomb_to_record(t: &TombRecord) -> BTreeMap<u8, RecordValue> {
     rec.insert(TAG_TOMB_REMOTE_PATH, RecordValue::Str(t.remote_path.clone()));
     rec.insert(TAG_TOMB_REV, RecordValue::Int(t.rev as u64));
     rec.insert(TAG_TOMB_DELETED_AT, RecordValue::Str(t.deleted_at.clone()));
+    // TAG_TOMB_SYNC_KEY (5) is written only when present; music leaves it None.
+    if let Some(ref sk) = t.sync_key {
+        rec.insert(TAG_TOMB_SYNC_KEY, RecordValue::Str(sk.clone()));
+    }
     rec
 }
 
@@ -257,6 +268,10 @@ fn record_to_tomb(rec: &BTreeMap<u8, RecordValue>) -> TombRecord {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        sync_key: rec
+            .get(&TAG_TOMB_SYNC_KEY)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     }
 }
 
@@ -414,6 +429,7 @@ mod tests {
             remote_path: "/music/gone.mp3".into(),
             rev: 99,
             deleted_at: "2026-10-26T00:00:00Z".into(),
+            sync_key: None, // music leaves sync_key absent
         }];
         let bytes = encode_tomb_shard("dev", 99, 99, &tombs).unwrap();
         assert!(bytes.starts_with(b"WDMMLT01"));
@@ -422,6 +438,23 @@ mod tests {
         assert_eq!(decoded.tombstones.len(), 1);
         assert_eq!(decoded.tombstones[0].rev, 99);
         assert_eq!(decoded.tombstones[0].remote_path, "/music/gone.mp3");
+        // music tombs must round-trip with sync_key == None
+        assert_eq!(decoded.tombstones[0].sync_key, None);
+    }
+
+    #[test]
+    fn tomb_shard_roundtrip_with_sync_key() {
+        let tombs = vec![TombRecord {
+            source_name: "nas".into(),
+            remote_path: "/manga/a.cbz".into(),
+            rev: 7,
+            deleted_at: "2026-10-26T00:00:00Z".into(),
+            sync_key: Some("nas\x00/manga/a.cbz".into()),
+        }];
+        let bytes = encode_tomb_shard("dev", 7, 7, &tombs).unwrap();
+        let decoded = decode_library_shard(&bytes).unwrap();
+        assert_eq!(decoded.tombstones.len(), 1);
+        assert_eq!(decoded.tombstones[0].sync_key.as_deref(), Some("nas\x00/manga/a.cbz"));
     }
 
     #[test]

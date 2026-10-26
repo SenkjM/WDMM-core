@@ -566,6 +566,7 @@ impl SyncEngine for LibrarySyncEngine {
                 remote_path: row.remote_path.clone(),
                 rev: row.rev,
                 deleted_at: row.deleted_at.clone(),
+                sync_key: None, // music never writes syncKey
             });
         }
         if !resurrected.is_empty() {
