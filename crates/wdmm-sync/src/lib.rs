@@ -24,6 +24,8 @@ mod library_manga_shard;
 pub use library_manga_shard::{
     decode_manga_shard, encode_manga_shard, encode_manga_tomb_shard, DecodedMangaShard, MangaSyncRow,
 };
+mod library_manga;
+pub use library_manga::MangaLibrarySyncEngine;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -522,6 +524,9 @@ pub async fn run_sync_all(
     let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
         .sync_incremental()
         .await?;
+    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+        .sync_incremental()
+        .await?;
     let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
         .sync_incremental()
         .await?;
@@ -537,6 +542,7 @@ pub async fn run_sync_all(
     Ok(serde_json::json!({
         "credentials": summarize(&cred),
         "library":     summarize(&lib),
+        "manga":       summarize(&manga),
         "playlists":   summarize(&pl),
     }))
 }
@@ -908,7 +914,211 @@ mod tests {
         let summary = run_sync_all(Arc::clone(&db), driver, "/sync").await.unwrap();
         assert_eq!(summary["credentials"]["pushed"], 1);
         assert!(summary["library"]["pushed"].as_u64().unwrap() >= 1);
+        assert!(summary["manga"].is_object(), "manga key missing from summary");
         assert_eq!(summary["playlists"]["total"], 0);
+    }
+
+    // ── Manga tests ───────────────────────────────────────────────────────────
+
+    fn mk_manga(n: u32, source: &str, path: &str, fmt: &str, rev: i64) -> wdmm_storage::Manga {
+        use wdmm_storage::manga_id_for_remote;
+        wdmm_storage::Manga {
+            id: manga_id_for_remote(source, path),
+            source_name: source.into(),
+            remote_path: path.into(),
+            title: format!("Manga {n}"),
+            author: None,
+            series: None,
+            volume: None,
+            chapter_number: None,
+            page_count: 10,
+            cover_relpath: None,
+            format: fmt.into(),
+            remote_missing: 0,
+            page_turn: None,
+            rev,
+            updated_at: "2026-10-26T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn manga_sync_pushes_and_pulls() {
+        let driver = Arc::new(MockDriver::new());
+        let db_a = tmp_db();
+
+        let m = mk_manga(1, "nas", "/manga/vol1.cbz", "cbz", 10);
+        db_a.upsert_manga(&m).unwrap();
+
+        let engine_a = MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync");
+        let out_a = engine_a.sync_incremental().await.unwrap();
+        assert!(out_a.iter().any(|o| o.action == SyncAction::Pushed));
+
+        // manifest + segment created under library/manga/
+        let files = driver.files.lock().await;
+        assert!(files.contains_key("/sync/library/manga/index.json"));
+        assert!(files.keys().any(|k| k.contains("/sync/library/manga/seg-")));
+        drop(files);
+
+        // second device pulls
+        let db_b = tmp_db();
+        let engine_b = MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync");
+        let out_b = engine_b.sync_incremental().await.unwrap();
+        assert!(out_b.iter().any(|o| o.action == SyncAction::Pulled));
+
+        let all = db_b.list_mangas().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].title, "Manga 1");
+        assert_eq!(all[0].rev, 10);
+    }
+
+    #[tokio::test]
+    async fn manga_sync_tombstone_removes_peer_row() {
+        // Tests the "images id key" tombstone path: for format=="images", manga_sync_key = id.
+        // Device B has the manga locally (not via sync, since legacy-loose-images are skipped
+        // on adopt). When device A pushes a tombstone with sync_key=id, device B must delete it.
+        let driver = Arc::new(MockDriver::new());
+
+        let path = "/manga/loose";
+        let source = "nas";
+        let db_a = tmp_db();
+        let m = mk_manga(1, source, path, "images", 5);
+        db_a.upsert_manga(&m).unwrap();
+
+        // Device A deletes (writes DeletedManga with sync_key = m.id) then syncs the tombstone.
+        db_a.delete_manga(&m.id).unwrap();
+        MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+            .sync_incremental()
+            .await
+            .unwrap();
+
+        let files = driver.files.lock().await;
+        assert!(
+            files.keys().any(|k| k.contains("/sync/library/manga/del-")),
+            "del-* shard should exist after A publishes tomb"
+        );
+        drop(files);
+
+        // Device B: has the same manga locally (directly inserted, same id ⇒ same sync_key).
+        let db_b = tmp_db();
+        db_b.upsert_manga(&m).unwrap();
+        assert_eq!(db_b.list_mangas().unwrap().len(), 1);
+
+        // Device B adopts deletion via tombstone.
+        MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+            .sync_incremental()
+            .await
+            .unwrap();
+        assert_eq!(
+            db_b.list_mangas().unwrap().len(),
+            0,
+            "peer delete via tomb (images id key) should remove row on db_b"
+        );
+    }
+
+    #[tokio::test]
+    async fn manga_sync_full_rebuild_produces_base_shards() {
+        let driver = Arc::new(MockDriver::new());
+        let db = tmp_db();
+
+        for i in 1u32..=3 {
+            db.upsert_manga(&mk_manga(i, "nas", &format!("/m/{i}.cbz"), "cbz", i as i64))
+                .unwrap();
+        }
+
+        let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        let out = engine.sync_full().await.unwrap();
+        assert!(out.iter().any(|o| o.entity_id == "manga-rebuild"));
+
+        let files = driver.files.lock().await;
+        assert!(files.contains_key("/sync/library/manga/index.json"));
+        // should have lib-* shards, no seg-* or del-* after fresh rebuild
+        assert!(files.keys().any(|k| k.contains("/sync/library/manga/lib-")));
+        assert!(!files.keys().any(|k| k.contains("/sync/library/manga/seg-")));
+        assert!(!files.keys().any(|k| k.contains("/sync/library/manga/del-")));
+        drop(files);
+
+        // manifest segments + tombstones empty
+        let manifest_bytes = driver
+            .get_content("/sync/library/manga/index.json")
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest["format"], "wmp_manga_library_index");
+        let segs = manifest["segments"].as_array().unwrap();
+        let tombs = manifest["tombstones"].as_array().unwrap();
+        assert!(segs.is_empty(), "no segments after rebuild");
+        assert!(tombs.is_empty(), "no tombstones after rebuild");
+    }
+
+    #[tokio::test]
+    async fn manga_progress_lww() {
+        let driver = Arc::new(MockDriver::new());
+        let db = tmp_db();
+
+        // seed a manga so progress.json upload has something
+        let m = mk_manga(1, "nas", "/m/a.cbz", "cbz", 1);
+        db.upsert_manga(&m).unwrap();
+
+        // local progress is newer
+        db.upsert_progress(&wdmm_storage::MangaProgress {
+            manga_id: m.id.clone(),
+            page_index: 5,
+            updated_at: "2026-10-26T10:00:00Z".into(),
+        })
+        .unwrap();
+
+        let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        engine.sync_incremental().await.unwrap();
+
+        // progress.json written
+        let files = driver.files.lock().await;
+        assert!(files.contains_key("/sync/library/manga/progress.json"));
+        drop(files);
+
+        // second device: cloud has page=5, local has page=2 (older timestamp) → cloud wins
+        let db2 = tmp_db();
+        let m2 = mk_manga(1, "nas", "/m/a.cbz", "cbz", 1);
+        db2.upsert_manga(&m2).unwrap();
+        db2.upsert_progress(&wdmm_storage::MangaProgress {
+            manga_id: m2.id.clone(),
+            page_index: 2,
+            updated_at: "2026-10-25T08:00:00Z".into(),
+        })
+        .unwrap();
+
+        let engine2 = MangaLibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync");
+        engine2.sync_incremental().await.unwrap();
+
+        let prog = db2.list_progress().unwrap();
+        let p = prog.iter().find(|p| p.manga_id == m2.id).unwrap();
+        assert_eq!(p.page_index, 5, "cloud progress (page 5) should win over stale local (page 2)");
+    }
+
+    #[tokio::test]
+    async fn run_sync_all_includes_manga() {
+        let db = tmp_db();
+        let driver = Arc::new(MockDriver::new());
+
+        db.insert_account(&CloudAccount {
+            id: "a".into(),
+            provider_type: "webdav".into(),
+            display_name: "A".into(),
+            base_url: None,
+            credentials_encrypted: vec![],
+        })
+        .unwrap();
+        db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1)).unwrap();
+
+        let driver_dyn: Arc<dyn CloudDriver> = driver;
+        let summary = run_sync_all(Arc::clone(&db), driver_dyn, "/sync")
+            .await
+            .unwrap();
+
+        assert!(summary["manga"].is_object());
+        assert!(
+            summary["manga"]["pushed"].as_u64().unwrap() >= 1,
+            "manga pushed expected"
+        );
     }
 
     // silence unused import warnings on platforms where the helper isn't needed
