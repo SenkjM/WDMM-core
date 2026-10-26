@@ -2041,6 +2041,110 @@ pub extern "C" fn wdmm_track_delete_by_source(source: *const c_char) -> FfiStrin
     }
 }
 
+// ── Artist / Album aggregation FFI ────────────────────────────────────────────
+
+/// List all artists as a JSON array.
+/// Returns `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_artist_list() -> FfiString {
+    match global_library_db().list_artists() {
+        Ok(artists) => FfiString::from(
+            serde_json::to_string(&artists).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get a single artist by ID as JSON.
+/// Returns null if not found, or `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_artist_get(id: *const c_char) -> FfiString {
+    let id_str = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().get_artist(id_str) {
+        Ok(Some(artist)) => FfiString::from(
+            serde_json::to_string(&artist).unwrap_or_else(|_| "null".into()),
+        ),
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List all albums as a JSON array.
+/// Returns `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_album_list() -> FfiString {
+    match global_library_db().list_albums() {
+        Ok(albums) => FfiString::from(
+            serde_json::to_string(&albums).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get a single album by ID as JSON.
+/// Returns null if not found, or `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_album_get(id: *const c_char) -> FfiString {
+    let id_str = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null id pointer"),
+    };
+    match global_library_db().get_album(id_str) {
+        Ok(Some(album)) => FfiString::from(
+            serde_json::to_string(&album).unwrap_or_else(|_| "null".into()),
+        ),
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List tracks for a given artist name as a JSON array.
+/// Returns `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_tracks_by_artist(name: *const c_char) -> FfiString {
+    let name_str = match ptr_to_str(name) {
+        Some(s) => s,
+        None => return FfiString::from("error:null name pointer"),
+    };
+    match global_library_db().tracks_by_artist_name(name_str) {
+        Ok(tracks) => FfiString::from(
+            serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List tracks for a given album title as a JSON array.
+/// Returns `"error:<message>"` on failure. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_tracks_by_album(title: *const c_char) -> FfiString {
+    let title_str = match ptr_to_str(title) {
+        Some(s) => s,
+        None => return FfiString::from("error:null title pointer"),
+    };
+    match global_library_db().tracks_by_album_title(title_str) {
+        Ok(tracks) => FfiString::from(
+            serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Rebuild artist and album aggregates from tracks.
+/// Returns `"ok"` on success or `"error:<message>"` on failure.
+#[no_mangle]
+pub extern "C" fn wdmm_library_rebuild_aggregates() -> FfiString {
+    match global_library_db().rebuild_aggregates_from_tracks() {
+        Ok(_) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+// ── Library management FFI ────────────────────────────────────────────────────
+
 /// Clear all library data except accounts and non-library KV keys. Returns `"ok"`.
 #[no_mangle]
 pub extern "C" fn wdmm_library_clear_all() -> FfiString {
@@ -3129,6 +3233,8 @@ fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrac
         modified: None, // callers can omit for now
         album_id: v["album_id"].as_str().map(Into::into),
         artist_id: v["artist_id"].as_str().map(Into::into),
+        album: v["album"].as_str().map(Into::into),
+        album_artist: v["album_artist"].as_str().map(Into::into),
         duration_ms: v["duration_ms"].as_i64().unwrap_or(0),
         genre: v["genre"].as_str().map(Into::into),
         track_number: v["track_number"].as_i64().map(|n| n as i32),
@@ -4852,5 +4958,92 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert_eq!(s, "null");
         wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn artist_album_aggregation_ffi() {
+        // Clear library first
+        let r = wdmm_library_clear_all();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        // Upsert track with album+artist
+        let track_json = CString::new(
+            r#"{"id":"t1","title":"Song One","artist":"Artist A","album":"Album X","album_artist":"Artist A","remote_path":"/music/song1.mp3","account_id":"acc1","size":5000,"duration_ms":180000,"track_number":1,"year":2024}"#,
+        )
+        .unwrap();
+        let r = wdmm_track_upsert(track_json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "track upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // Second track, same artist different album
+        let track2_json = CString::new(
+            r#"{"id":"t2","title":"Song Two","artist":"Artist A","album":"Album Y","remote_path":"/music/song2.mp3","account_id":"acc1","size":6000,"duration_ms":200000,"track_number":2}"#,
+        )
+        .unwrap();
+        let r = wdmm_track_upsert(track2_json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "track2 upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // List artists
+        let r = wdmm_artist_list();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let artists: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(artists.as_array().unwrap().len(), 1);
+        assert_eq!(artists[0]["name"], "Artist A");
+
+        // List albums
+        let r = wdmm_album_list();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let albums: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(albums.as_array().unwrap().len(), 2);
+
+        // Tracks by artist
+        let artist_name = CString::new("Artist A").unwrap();
+        let r = wdmm_tracks_by_artist(artist_name.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let tracks: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(tracks.as_array().unwrap().len(), 2);
+
+        // Tracks by album
+        let album_title = CString::new("Album X").unwrap();
+        let r = wdmm_tracks_by_album(album_title.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let tracks: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(tracks.as_array().unwrap().len(), 1);
+        assert_eq!(tracks[0]["id"], "t1");
+
+        // Delete one track, album should be pruned
+        let id = CString::new("t1").unwrap();
+        let r = wdmm_track_delete(id.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_album_list();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let albums: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(albums.as_array().unwrap().len(), 1);
+
+        // Delete last track, artist should be pruned
+        let id2 = CString::new("t2").unwrap();
+        let r = wdmm_track_delete(id2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_artist_list();
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let artists: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(artists.as_array().unwrap().len(), 0);
     }
 }

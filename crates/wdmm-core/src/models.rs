@@ -31,6 +31,13 @@ pub struct LibraryTrack {
     /// FK to artists.id (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artist_id: Option<String>,
+    // ── v7 denormalized text fields ───────────────────────────────────────────
+    /// Album title (denormalized from metadata for aggregation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// Album artist name (denormalized from metadata for aggregation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_artist: Option<String>,
     /// Duration in milliseconds (0 = unknown).
     #[serde(default)]
     pub duration_ms: i64,

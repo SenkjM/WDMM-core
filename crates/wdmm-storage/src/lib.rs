@@ -1,4 +1,4 @@
-//! `wdmm-storage` — rusqlite library DB (schema v6, music + manga library).
+//! `wdmm-storage` — rusqlite library DB (schema v7, music + manga library).
 //!
 //! Schema v1 (Round 4): base tables.
 //! Schema v2 (Round 5): artists/albums tables, extended `tracks` columns,
@@ -11,6 +11,8 @@
 //!   `manga_progress` / `deleted_mangas` tables.
 //! Schema v5: CUE sheet support (`cue_albums`, `cue_slices` tables).
 //! Schema v6: Music tombstones (`deleted_tracks`) + sync state cursors (`sync_state`).
+//! Schema v7: Denormalized `album` and `album_artist` TEXT columns on `tracks` for
+//!   aggregation; album/artist aggregation derived from track metadata.
 
 #![forbid(unsafe_code)]
 
@@ -577,6 +579,20 @@ impl LibraryDatabase {
             )?;
         }
 
+        // ── v7 migration: denormalized album/album_artist columns on tracks ──
+        if current_ver < 7 {
+            let _ = conn.execute_batch(
+                r#"
+                ALTER TABLE tracks ADD COLUMN album TEXT;
+                ALTER TABLE tracks ADD COLUMN album_artist TEXT;
+                "#,
+            );
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (7)",
+                [],
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -595,14 +611,18 @@ impl LibraryDatabase {
 
     /// Upsert a track (insert or replace all columns).
     pub fn upsert_track(&self, track: &LibraryTrack) -> StorageResult<()> {
+        // Derive artist_id and album_id from text fields if present
+        let (artist_id, album_id) = self.ensure_aggregates_for_track(track)?;
+
         let now = Utc::now().timestamp();
         let modified_ts = track.modified.map(|dt| dt.timestamp());
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO tracks
              (id, title, artist, remote_path, account_id, size, modified, created_at,
-              album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16)",
+              album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
+              album, album_artist)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16, ?17,?18)",
             params![
                 &track.id,
                 &track.title,
@@ -612,14 +632,16 @@ impl LibraryDatabase {
                 track.size as i64,
                 modified_ts,
                 now,
-                &track.album_id,
-                &track.artist_id,
+                &album_id,
+                &artist_id,
                 track.duration_ms,
                 &track.genre,
                 &track.track_number,
                 &track.disc_number,
                 &track.year,
                 &track.mime_type,
+                &track.album,
+                &track.album_artist,
             ],
         )?;
         Ok(())
@@ -634,7 +656,8 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
-                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
+                    album, album_artist
              FROM tracks WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -648,6 +671,8 @@ impl LibraryDatabase {
     pub fn delete_track(&self, id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
+        drop(conn);
+        self.prune_orphan_aggregates()?;
         Ok(())
     }
 
@@ -657,7 +682,8 @@ impl LibraryDatabase {
         let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
-                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
+                    album, album_artist
              FROM tracks
              WHERE title LIKE ?1 ESCAPE '\\' OR artist LIKE ?1 ESCAPE '\\'
              ORDER BY title COLLATE NOCASE",
@@ -742,10 +768,186 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
-                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
+                    album, album_artist
              FROM tracks ORDER BY title COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], row_to_track)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    // ── Album/Artist aggregation (schema v7) ────────────────────────────────────
+
+    /// Generate stable artist ID from normalized name (SHA-1 hex prefixed with "art-").
+    fn artist_id_from_name(name: &str) -> String {
+        use sha1::{Digest, Sha1};
+        let normalized = name.trim().to_lowercase();
+        let hash = Sha1::digest(normalized.as_bytes());
+        format!("art-{:x}", hash)
+    }
+
+    /// Generate stable album ID from (album_title, album_artist_or_artist) pair.
+    fn album_id_from_pair(album_title: &str, artist_name: &str) -> String {
+        use sha1::{Digest, Sha1};
+        let normalized_title = album_title.trim().to_lowercase();
+        let normalized_artist = artist_name.trim().to_lowercase();
+        let combined = format!("{}|{}", normalized_title, normalized_artist);
+        let hash = Sha1::digest(combined.as_bytes());
+        format!("alb-{:x}", hash)
+    }
+
+    /// Ensure artists/albums rows exist for a track based on its text fields.
+    /// Returns (artist_id, album_id) for FK assignment.
+    /// Matching Android: empty/whitespace artist → no artist row, None artist_id.
+    pub fn ensure_aggregates_for_track(
+        &self,
+        track: &LibraryTrack,
+    ) -> StorageResult<(Option<String>, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+
+        // Artist: only create if nonempty after trim
+        let artist_id = if let Some(artist_name) = &track.artist {
+            let trimmed = artist_name.trim();
+            if !trimmed.is_empty() {
+                let id = Self::artist_id_from_name(trimmed);
+                conn.execute(
+                    "INSERT OR IGNORE INTO artists (id, name, sort_name, created_at)
+                     VALUES (?1, ?2, NULL, ?3)",
+                    params![&id, trimmed, now.timestamp()],
+                )?;
+                Some(id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Album: derive from album text + album_artist (fallback to artist)
+        let album_id = if let Some(album_title) = &track.album {
+            let trimmed_title = album_title.trim();
+            if !trimmed_title.is_empty() {
+                let album_artist = track
+                    .album_artist
+                    .as_ref()
+                    .and_then(|aa| {
+                        let t = aa.trim();
+                        if t.is_empty() { None } else { Some(t) }
+                    })
+                    .or_else(|| {
+                        track.artist.as_ref().and_then(|a| {
+                            let t = a.trim();
+                            if t.is_empty() { None } else { Some(t) }
+                        })
+                    })
+                    .unwrap_or("");
+
+                let id = Self::album_id_from_pair(trimmed_title, album_artist);
+                // Upsert album (update year if track has newer year)
+                conn.execute(
+                    "INSERT INTO albums (id, title, artist_id, year, art_url, created_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+                     ON CONFLICT(id) DO UPDATE SET
+                       year = COALESCE(excluded.year, albums.year)",
+                    params![
+                        &id,
+                        trimmed_title,
+                        &artist_id,
+                        &track.year,
+                        now.timestamp()
+                    ],
+                )?;
+                Some(id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok((artist_id, album_id))
+    }
+
+    /// Remove artists/albums that have no referencing tracks.
+    pub fn prune_orphan_aggregates(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Rebuild all artist/album aggregates from current track text fields.
+    /// Clears artists+albums, walks all tracks, re-derives and updates FKs.
+    pub fn rebuild_aggregates_from_tracks(&self) -> StorageResult<()> {
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute("DELETE FROM artists", [])?;
+            conn.execute("DELETE FROM albums", [])?;
+        }
+
+        // Walk all tracks and ensure aggregates
+        let tracks = self.list_tracks()?;
+        for track in tracks {
+            let (artist_id, album_id) = self.ensure_aggregates_for_track(&track)?;
+            // Update the track's FKs
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tracks SET artist_id = ?1, album_id = ?2 WHERE id = ?3",
+                params![&artist_id, &album_id, &track.id],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// List distinct artist names (from artists table, NOCASE sort).
+    pub fn list_distinct_artist_names(&self) -> StorageResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name FROM artists ORDER BY name COLLATE NOCASE")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// List distinct album titles (from albums table, NOCASE sort).
+    pub fn list_distinct_album_titles(&self) -> StorageResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT title FROM albums ORDER BY title COLLATE NOCASE")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// Get tracks by artist name (match on tracks.artist display field).
+    pub fn tracks_by_artist_name(&self, name: &str) -> StorageResult<Vec<LibraryTrack>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist, remote_path, account_id, size, modified,
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
+                    album, album_artist
+             FROM tracks WHERE artist = ?1
+             ORDER BY title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![name], row_to_track)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// Get tracks by album title (match on tracks.album, sorted by disc/track/title).
+    pub fn tracks_by_album_title(&self, title: &str) -> StorageResult<Vec<LibraryTrack>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist, remote_path, account_id, size, modified,
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
+                    album, album_artist
+             FROM tracks WHERE album = ?1
+             ORDER BY disc_number, track_number, title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![title], row_to_track)?;
         rows.map(|r| r.map_err(StorageError::from)).collect()
     }
 
@@ -1125,10 +1327,13 @@ impl LibraryDatabase {
             let size_expr = if has("size") { "size" } else { "0" };
             let modified_expr = if has("modified") { "modified" } else { "NULL" };
             let duration_expr = if has("duration_ms") { "duration_ms" } else { "0" };
+            let album_expr = if has("album") { "album" } else { "NULL" };
+            let album_artist_expr = if has("album_artist") { "album_artist" } else { "NULL" };
 
             let sql = format!(
                 "SELECT {id_col}, {title_expr}, {artist_expr}, remote_path, \
-                 {source_col}, {size_expr}, {modified_expr}, {duration_expr} FROM tracks"
+                 {source_col}, {size_expr}, {modified_expr}, {duration_expr}, \
+                 {album_expr}, {album_artist_expr} FROM tracks"
             );
 
             let mut stmt = old
@@ -1155,6 +1360,8 @@ impl LibraryDatabase {
                             .unwrap_or(None)
                             .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
                         duration_ms: row.get::<_, i64>(7).unwrap_or(0),
+                        album: row.get::<_, Option<String>>(8).unwrap_or(None),
+                        album_artist: row.get::<_, Option<String>>(9).unwrap_or(None),
                         ..Default::default()
                     })
                 })
@@ -1393,6 +1600,11 @@ impl LibraryDatabase {
         // already set, so this write is a harmless idempotent overwrite.
         dest.save_kv("sqflite_imported", "1")?;
         dest.save_kv("sqflite_imported_v6", "1")?;
+
+        // Rebuild aggregates from imported tracks (schema v7).
+        if track_count > 0 {
+            dest.rebuild_aggregates_from_tracks()?;
+        }
 
         // suppress unused-variable warning for `now`
         let _ = now;
@@ -1814,6 +2026,8 @@ impl LibraryDatabase {
             "DELETE FROM tracks WHERE account_id = ?1",
             params![account_id],
         )?;
+        drop(conn);
+        self.prune_orphan_aggregates()?;
         Ok(n)
     }
 
@@ -1861,6 +2075,8 @@ impl LibraryDatabase {
         tx.execute("DELETE FROM cue_slices", [])?;
         tx.execute("DELETE FROM cue_albums", [])?;
         tx.execute("DELETE FROM tracks", [])?;
+        tx.execute("DELETE FROM albums", [])?;
+        tx.execute("DELETE FROM artists", [])?;
         tx.execute("DELETE FROM deleted_tracks", [])?;
         tx.execute("DELETE FROM deleted", [])?;
 
@@ -2288,7 +2504,7 @@ fn row_to_manga(row: &rusqlite::Row<'_>) -> rusqlite::Result<Manga> {
     })
 }
 
-/// Map a rusqlite `Row` (in the v2 column order) to a `LibraryTrack`.
+/// Map a rusqlite `Row` (in the v7 column order) to a `LibraryTrack`.
 fn row_to_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryTrack> {
     let modified_ts: Option<i64> = row.get(6)?;
     let modified = modified_ts.and_then(|ts| DateTime::from_timestamp(ts, 0));
@@ -2308,6 +2524,8 @@ fn row_to_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryTrack> {
         disc_number: row.get(12)?,
         year: row.get(13)?,
         mime_type: row.get(14)?,
+        album: row.get(15)?,
+        album_artist: row.get(16)?,
     })
 }
 
@@ -2743,7 +2961,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
     }
 
     #[test]
@@ -2916,11 +3134,14 @@ mod tests {
             disc_number: Some(1),
             year: Some(2024),
             mime_type: Some("audio/mpeg".into()),
+            album: Some("Album".into()),
+            album_artist: None,
         };
         db.upsert_track(&track).unwrap();
 
         let loaded = db.get_track("t1").unwrap().unwrap();
-        assert_eq!(loaded.album_id.as_deref(), Some("alb1"));
+        // album_id is now derived from album text, not the passed-in value
+        assert!(loaded.album_id.is_some());
         assert_eq!(loaded.duration_ms, 210_000);
         assert_eq!(loaded.genre.as_deref(), Some("Rock"));
         assert_eq!(loaded.track_number, Some(3));
@@ -3856,7 +4077,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -4152,6 +4373,8 @@ mod tests {
                 disc_number: None,
                 year: None,
                 mime_type: None,
+                album: None,
+                album_artist: None,
             })
             .unwrap();
 
@@ -4294,6 +4517,8 @@ mod tests {
                 disc_number: None,
                 year: None,
                 mime_type: None,
+                album: None,
+                album_artist: None,
             })
             .unwrap();
         right_db
@@ -4376,5 +4601,122 @@ mod tests {
         drop(right_db);
         let _ = fs::remove_file(&left_path);
         let _ = fs::remove_file(&right_path);
+    }
+
+    #[test]
+    fn schema_v7_aggregation() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 7);
+
+        // Upsert track with album + album_artist
+        db.upsert_track(&LibraryTrack {
+            id: "t1".into(),
+            title: "Song One".into(),
+            artist: Some("Artist A".into()),
+            album: Some("Album X".into()),
+            album_artist: Some("Artist A".into()),
+            remote_path: "/music/song1.mp3".into(),
+            account_id: "acc1".into(),
+            size: 5000,
+            modified: None,
+            album_id: None,
+            artist_id: None,
+            duration_ms: 180_000,
+            genre: None,
+            track_number: Some(1),
+            disc_number: None,
+            year: Some(2024),
+            mime_type: None,
+        })
+        .unwrap();
+
+        // Second track, same artist different album
+        db.upsert_track(&LibraryTrack {
+            id: "t2".into(),
+            title: "Song Two".into(),
+            artist: Some("Artist A".into()),
+            album: Some("Album Y".into()),
+            album_artist: None,
+            remote_path: "/music/song2.mp3".into(),
+            account_id: "acc1".into(),
+            size: 6000,
+            modified: None,
+            album_id: None,
+            artist_id: None,
+            duration_ms: 200_000,
+            genre: None,
+            track_number: Some(2),
+            disc_number: None,
+            year: None,
+            mime_type: None,
+        })
+        .unwrap();
+
+        // Check aggregates were created
+        let artists = db.list_artists().unwrap();
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].name, "Artist A");
+
+        let albums = db.list_albums().unwrap();
+        assert_eq!(albums.len(), 2);
+
+        // Query by artist name
+        let tracks = db.tracks_by_artist_name("Artist A").unwrap();
+        assert_eq!(tracks.len(), 2);
+
+        // Query by album title
+        let tracks_x = db.tracks_by_album_title("Album X").unwrap();
+        assert_eq!(tracks_x.len(), 1);
+        assert_eq!(tracks_x[0].id, "t1");
+
+        // Delete one track, album should be pruned
+        db.delete_track("t1").unwrap();
+        let albums = db.list_albums().unwrap();
+        assert_eq!(albums.len(), 1);
+
+        // Delete last track, artist should be pruned
+        db.delete_track("t2").unwrap();
+        let artists = db.list_artists().unwrap();
+        assert_eq!(artists.len(), 0);
+        let albums = db.list_albums().unwrap();
+        assert_eq!(albums.len(), 0);
+    }
+
+    #[test]
+    fn rebuild_aggregates_from_tracks() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        // Insert tracks directly without triggering aggregation
+        let conn = db.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO tracks (id, title, artist, album, album_artist, remote_path, account_id, size, modified, duration_ms, created_at)
+             VALUES ('t1', 'Song One', 'Artist A', 'Album X', NULL, '/music/song1.mp3', 'acc1', 5000, NULL, 180000, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tracks (id, title, artist, album, album_artist, remote_path, account_id, size, modified, duration_ms, created_at)
+             VALUES ('t2', 'Song Two', 'Artist A', 'Album Y', NULL, '/music/song2.mp3', 'acc1', 6000, NULL, 200000, ?1)",
+            params![now],
+        )
+        .unwrap();
+        drop(conn);
+
+        // No aggregates yet
+        assert_eq!(db.list_artists().unwrap().len(), 0);
+        assert_eq!(db.list_albums().unwrap().len(), 0);
+
+        // Rebuild
+        db.rebuild_aggregates_from_tracks().unwrap();
+
+        // Now we have aggregates
+        assert_eq!(db.list_artists().unwrap().len(), 1);
+        assert_eq!(db.list_albums().unwrap().len(), 2);
+
+        // And the tracks have FKs set
+        let track = db.get_track("t1").unwrap().unwrap();
+        assert!(track.artist_id.is_some());
+        assert!(track.album_id.is_some());
     }
 }

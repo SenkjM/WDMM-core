@@ -45,7 +45,7 @@ This allows seamless cross-platform restore: Desktop can restore Android backups
 The following gaps remain before Android can fully switch to Core as library source of truth:
 
 1. **Dual-write parity**: Android must write to both sqflite and Core during migration phase
-2. **Album/artist aggregation**: Core has tables but no track → album/artist auto-aggregation logic yet
+2. ~~**Album/artist aggregation**: Core has tables but no track → album/artist auto-aggregation logic yet~~ ✅ **DONE (schema v7)**: Implemented in Phase A with stable hash-based IDs, automatic upsert on track insert, orphan pruning on delete, and rebuild helper
 3. **Search indexes**: FTS or optimized search indexes (current Core uses basic LIKE queries)
 4. **Migration validation**: Comprehensive testing of sqflite → Core data migration at scale
 

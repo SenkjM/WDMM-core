@@ -261,6 +261,7 @@ const TAG_TRACK_REMOTE_PATH: u8 = 2;
 const TAG_TRACK_FILENAME: u8 = 3;
 const TAG_TRACK_TITLE: u8 = 5;
 const TAG_TRACK_ARTIST: u8 = 6;
+const TAG_TRACK_ALBUM_ARTIST: u8 = 7;
 const TAG_TRACK_ALBUM: u8 = 8;
 const TAG_TRACK_DURATION_MS: u8 = 9;
 const TAG_TRACK_TRACK_NUM: u8 = 10;
@@ -624,6 +625,8 @@ pub fn restore_backup_bytes(
                         artist: rec.get(&TAG_TRACK_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
                         album_id: None,
                         artist_id: None,
+                        album: rec.get(&TAG_TRACK_ALBUM).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        album_artist: rec.get(&TAG_TRACK_ALBUM_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
                         genre: rec.get(&TAG_TRACK_GENRE).and_then(|v| v.as_str()).map(|s| s.to_string()),
                         duration_ms: rec.get(&TAG_TRACK_DURATION_MS).and_then(|v| v.as_int()).unwrap_or(0),
                         track_number: rec.get(&TAG_TRACK_TRACK_NUM).and_then(|v| v.as_int()).map(|n| n as i32),

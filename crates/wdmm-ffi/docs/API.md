@@ -324,7 +324,10 @@ No-op if already initialised. Returns `"ok"` or `"error:<message>"`.
 
 ### `extern "C" fn wdmm_track_upsert(json: *const c_char) -> FfiString`
 Insert or replace a track from JSON. Required fields: `id`, `title`,
-`account_id`, `remote_path`. Returns `"ok"` or `"error:<message>"`.
+`account_id`, `remote_path`. Optional fields include `album` and `album_artist`.
+When `album`, `album_artist`, or `artist` text fields are present, automatically
+derives `artist_id` and `album_id` from stable hashes and upserts into artists/albums.
+Returns `"ok"` or `"error:<message>"`.
 
 ### `extern "C" fn wdmm_track_get(id: *const c_char) -> FfiString`
 Get a track by id as JSON, `"null"` if not found, or `"error:<message>"`.
@@ -336,10 +339,37 @@ List all tracks as a JSON array.
 Case-insensitive substring search on title/artist. Returns JSON array.
 
 ### `extern "C" fn wdmm_track_delete(id: *const c_char) -> FfiString`
-Delete a track by id. Returns `"ok"` or `"error:<message>"`.
+Delete a track by id. Automatically prunes orphaned artists/albums.
+Returns `"ok"` or `"error:<message>"`.
 
 ### `extern "C" fn wdmm_track_delete_by_source(source: *const c_char) -> FfiString`
-Delete all tracks for a given source/account_id. Returns `"ok"` or `"error:<message>"`.
+Delete all tracks for a given source/account_id. Automatically prunes orphaned artists/albums.
+Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_artist_list() -> FfiString`
+List all artists as a JSON array. Returns `"error:<message>"` on failure.
+
+### `extern "C" fn wdmm_artist_get(id: *const c_char) -> FfiString`
+Get a single artist by ID as JSON. Returns `"null"` if not found, or `"error:<message>"`.
+
+### `extern "C" fn wdmm_album_list() -> FfiString`
+List all albums as a JSON array. Returns `"error:<message>"` on failure.
+
+### `extern "C" fn wdmm_album_get(id: *const c_char) -> FfiString`
+Get a single album by ID as JSON. Returns `"null"` if not found, or `"error:<message>"`.
+
+### `extern "C" fn wdmm_tracks_by_artist(name: *const c_char) -> FfiString`
+List tracks for a given artist name (case-insensitive) as a JSON array.
+Returns `"error:<message>"` on failure.
+
+### `extern "C" fn wdmm_tracks_by_album(title: *const c_char) -> FfiString`
+List tracks for a given album title (case-insensitive) as a JSON array,
+ordered by disc_number, track_number, title. Returns `"error:<message>"` on failure.
+
+### `extern "C" fn wdmm_library_rebuild_aggregates() -> FfiString`
+Rebuild artist and album aggregates from all tracks. Clears artists+albums,
+walks all tracks, re-derives aggregates and updates track FKs. Idempotent.
+Returns `"ok"` or `"error:<message>"`.
 
 ### `extern "C" fn wdmm_library_clear_all() -> FfiString`
 Clear all library-persisted data except accounts and non-library KV keys.
@@ -353,7 +383,8 @@ Returns `"ok"` or `"error:<message>"`.
 
 ### `extern "C" fn wdmm_library_import_from_sqflite(old_db_path: *const c_char) -> FfiString`
 Import tracks, playlists, playlist_entries, `deleted_tracks` (v6 tombstones), and
-`sync_state` (v6 cursors) from an old sqflite `music_library.db`.
+`sync_state` (v6 cursors) from an old sqflite `music_library.db`. Reads Android
+`album` and `album_artist` columns if present. Automatically rebuilds aggregates after import.
 Returns JSON summary:
 ```json
 {"already_done":false,"tracks":42,"playlists":3,"entries":120,"deleted_tracks":5,"sync_state":2}

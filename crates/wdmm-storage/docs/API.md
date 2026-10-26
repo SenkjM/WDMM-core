@@ -1,6 +1,6 @@
 # wdmm-storage — Public API
 
-rusqlite library database (schema v2). Tracks, artists, albums, accounts,
+rusqlite library database (schema v7). Tracks, artists, albums, accounts,
 playlists, playlist entries, KV store, and a one-shot sqflite migration.
 
 ---
@@ -40,10 +40,11 @@ shape is backward compatible for consumers that ignore unknown keys.
 
 ### `struct LibraryDatabase`
 Mutex-guarded rusqlite connection. Schema v1 (base) + v2 (artists, albums, extended
-tracks columns, manga stubs). All DDL uses `IF NOT EXISTS` (additive migrations).
+tracks columns, manga stubs) + v7 (album/album_artist TEXT columns on tracks).
+All DDL uses `IF NOT EXISTS` (additive migrations).
 
 ### `fn LibraryDatabase::open(path: &Path) -> StorageResult<Self>`
-Open or create. `:memory:` is valid. Runs full DDL + bumps schema version to 2.
+Open or create. `:memory:` is valid. Runs full DDL + bumps schema version to 7.
 
 ### `fn LibraryDatabase::schema_version(&self) -> StorageResult<i64>`
 
@@ -52,7 +53,10 @@ Open or create. `:memory:` is valid. Runs full DDL + bumps schema version to 2.
 ### Tracks
 
 ### `fn upsert_track(&self, track: &LibraryTrack) -> StorageResult<()>`
-Insert or replace all track columns (including v2 fields).
+Insert or replace all track columns. When `album`, `album_artist`, or `artist` text
+fields are present, automatically derives `artist_id` and `album_id` from stable
+hashes and upserts into artists/albums tables. Album/artist IDs passed in the
+LibraryTrack are ignored when text is present (text is source of truth).
 
 ### `fn insert_track(&self, track: &LibraryTrack) -> StorageResult<()>`
 Backward-compat alias for `upsert_track`.
@@ -63,13 +67,24 @@ Backward-compat alias for `upsert_track`.
 Ordered by `title COLLATE NOCASE`.
 
 ### `fn delete_track(&self, id: &str) -> StorageResult<()>`
+Deletes the track and prunes orphaned artists/albums with zero referencing tracks.
 
 ### `fn search_tracks(&self, query: &str) -> StorageResult<Vec<LibraryTrack>>`
 Case-insensitive LIKE on `title` and `artist`. `%` and `_` in `query` are escaped.
 
+### `fn tracks_by_artist_name(&self, name: &str) -> StorageResult<Vec<LibraryTrack>>`
+Returns all tracks matching the given artist name (case-insensitive).
+
+### `fn tracks_by_album_title(&self, title: &str) -> StorageResult<Vec<LibraryTrack>>`
+Returns all tracks matching the given album title (case-insensitive), ordered by
+disc_number, track_number, title.
+
 ---
 
-### Artists (schema v2)
+### Artists (schema v2, v7 aggregation)
+
+Artist IDs are stable hashes (SHA-1 hex) of normalized artist names, prefixed "art-".
+Artists are automatically created/updated via `upsert_track` when artist text is present.
 
 ### `fn upsert_artist(&self, artist: &LibraryArtist) -> StorageResult<()>`
 ### `fn get_artist(&self, id: &str) -> StorageResult<Option<LibraryArtist>>`
@@ -77,10 +92,16 @@ Case-insensitive LIKE on `title` and `artist`. `%` and `_` in `query` are escape
 Ordered by `name`.
 ### `fn delete_artist(&self, id: &str) -> StorageResult<()>`
 Tracks referencing this artist have their `artist_id` set to NULL (ON DELETE SET NULL).
+### `fn list_distinct_artist_names(&self) -> StorageResult<Vec<String>>`
+Returns all distinct artist names from the artists table, ordered NOCASE.
 
 ---
 
-### Albums (schema v2)
+### Albums (schema v2, v7 aggregation)
+
+Album IDs are stable hashes (SHA-1 hex) of (album_title, album_artist_or_artist) pairs,
+prefixed "alb-". Albums are automatically created/updated via `upsert_track` when album
+text is present. Same album title under different album_artists remain distinct.
 
 ### `fn upsert_album(&self, album: &LibraryAlbum) -> StorageResult<()>`
 ### `fn get_album(&self, id: &str) -> StorageResult<Option<LibraryAlbum>>`
@@ -88,6 +109,24 @@ Tracks referencing this artist have their `artist_id` set to NULL (ON DELETE SET
 Ordered by `title`.
 ### `fn delete_album(&self, id: &str) -> StorageResult<()>`
 Tracks referencing this album have their `album_id` set to NULL.
+### `fn list_distinct_album_titles(&self) -> StorageResult<Vec<String>>`
+Returns all distinct album titles from the albums table, ordered NOCASE.
+
+---
+
+### Aggregation helpers (schema v7)
+
+### `fn ensure_aggregates_for_track(&self, track: &LibraryTrack) -> StorageResult<(Option<String>, Option<String>)>`
+Derives artist_id and album_id from track text fields, upserts into artists/albums tables.
+Returns (artist_id, album_id). Called automatically by `upsert_track`.
+
+### `fn rebuild_aggregates_from_tracks(&self) -> StorageResult<()>`
+Clears artists and albums tables, walks all tracks, re-derives aggregates and updates
+track FKs. Idempotent. Called automatically at end of `import_from_sqflite`.
+
+### `fn prune_orphan_aggregates(&self) -> StorageResult<()>`
+Deletes artists and albums with zero referencing tracks. Called automatically by
+`delete_track` and `delete_tracks_by_account`.
 
 ---
 
