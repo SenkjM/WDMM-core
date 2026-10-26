@@ -3350,6 +3350,44 @@ pub extern "C" fn wdmm_dmr_prefs_delete(usn: *const c_char) -> FfiString {
 
 // ── Backup archive FFI (WDMMBK01 / WDMMEN01) ──────────────────────────────────
 
+/// Process-global cover roots set by [`wdmm_covers_configure`].
+static COVER_ROOTS: OnceLock<Mutex<Option<wdmm_sync::CoverRoots>>> = OnceLock::new();
+
+fn global_cover_roots() -> &'static Mutex<Option<wdmm_sync::CoverRoots>> {
+    COVER_ROOTS.get_or_init(|| Mutex::new(None))
+}
+
+/// Configure the cover image directories used during backup create/restore.
+///
+/// Both paths must be valid UTF-8.  Pass NULL or empty string for either
+/// argument to clear the roots (covers will be omitted from subsequent
+/// backups and not written during restore).
+///
+/// Returns `"ok"` on success or `"error:<reason>"` on failure.
+#[no_mangle]
+pub extern "C" fn wdmm_covers_configure(
+    music_covers_dir: *const c_char,
+    manga_covers_dir: *const c_char,
+) -> FfiString {
+    let music = ptr_to_str(music_covers_dir).unwrap_or("").trim().to_string();
+    let manga = ptr_to_str(manga_covers_dir).unwrap_or("").trim().to_string();
+    let new_roots = if music.is_empty() || manga.is_empty() {
+        None
+    } else {
+        Some(wdmm_sync::CoverRoots {
+            music_covers_dir: std::path::PathBuf::from(&music),
+            manga_covers_dir: std::path::PathBuf::from(&manga),
+        })
+    };
+    match global_cover_roots().lock() {
+        Ok(mut guard) => {
+            *guard = new_roots;
+            FfiString::ok()
+        }
+        Err(e) => FfiString::from(format!("error:cover_roots lock poisoned: {e}")),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn wdmm_backup_create(passphrase: *const c_char, out_path: *const c_char) -> FfiString {
     let pass = ptr_to_str(passphrase).unwrap_or("");
@@ -3357,11 +3395,16 @@ pub extern "C" fn wdmm_backup_create(passphrase: *const c_char, out_path: *const
         Some(s) => s,
         None => return FfiString::from("error:null out_path"),
     };
+    let cover_roots = global_cover_roots()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(std::clone::Clone::clone));
     match wdmm_sync::write_backup_file(
         global_library_db().as_ref(),
         Some(global_dmr_prefs_db().as_ref()),
         pass,
         std::path::Path::new(path),
+        cover_roots.as_ref(),
     ) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
@@ -3375,11 +3418,16 @@ pub extern "C" fn wdmm_backup_restore(passphrase: *const c_char, path: *const c_
         Some(s) => s,
         None => return FfiString::from("error:null path"),
     };
+    let cover_roots = global_cover_roots()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(std::clone::Clone::clone));
     match wdmm_sync::restore_backup_file(
         global_library_db().as_ref(),
         Some(global_dmr_prefs_db().as_ref()),
         pass,
         std::path::Path::new(path),
+        cover_roots.as_ref(),
     ) {
         Ok(msg) => FfiString::from(msg),
         Err(e) => FfiString::from(format!("error:{e}")),
@@ -3408,7 +3456,11 @@ pub extern "C" fn wdmm_backup_upload(
     };
     let lib = std::sync::Arc::clone(global_library_db());
     let dmr = Some(std::sync::Arc::clone(global_dmr_prefs_db()));
-    match rt().block_on(wdmm_sync::backup_upload(lib, dmr, driver, dir, pass)) {
+    let cover_roots = global_cover_roots()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(std::clone::Clone::clone));
+    match rt().block_on(wdmm_sync::backup_upload(lib, dmr, driver, dir, pass, cover_roots.as_ref())) {
         Ok(path) => FfiString::from(path),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -3466,7 +3518,11 @@ pub extern "C" fn wdmm_backup_download_restore(
     };
     let lib = std::sync::Arc::clone(global_library_db());
     let dmr = Some(std::sync::Arc::clone(global_dmr_prefs_db()));
-    match rt().block_on(wdmm_sync::backup_download_restore(lib, dmr, driver, remote, pass)) {
+    let cover_roots = global_cover_roots()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(std::clone::Clone::clone));
+    match rt().block_on(wdmm_sync::backup_download_restore(lib, dmr, driver, remote, pass, cover_roots.as_ref())) {
         Ok(msg) => FfiString::from(msg),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
