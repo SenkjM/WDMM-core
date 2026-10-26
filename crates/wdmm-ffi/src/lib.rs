@@ -2597,6 +2597,77 @@ pub extern "C" fn wdmm_cue_remaining_slices(
     }
 }
 
+/// Get a track (or CUE slice) by source name (`account_id`) and remote path.
+///
+/// Looks up `tracks` first; if found, returns the `LibraryTrack` as JSON. If no
+/// track matches, looks up `cue_slices`; if a slice matches, returns the
+/// `CueSlice` as JSON. Callers discriminate the two shapes by key presence:
+/// a `LibraryTrack` carries `id` / `account_id`; a `CueSlice` carries
+/// `music_id` / `cue_id`. Returns the literal `"null"` when neither matches,
+/// or `"error:<message>"` on storage error.
+#[no_mangle]
+pub extern "C" fn wdmm_track_get_by_source_path(
+    account_id: *const c_char,
+    remote_path: *const c_char,
+) -> FfiString {
+    let acct = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null account_id pointer"),
+    };
+    let path = match ptr_to_str(remote_path) {
+        Some(s) => s,
+        None => return FfiString::from("error:null remote_path pointer"),
+    };
+    let db = global_library_db();
+    match db.get_track_by_source_path(acct, path) {
+        Ok(Some(t)) => FfiString::from(
+            serde_json::to_string(&t).unwrap_or_else(|_| "null".into()),
+        ),
+        Ok(None) => match db.get_cue_slice_by_source_path(acct, path) {
+            Ok(Some(slice)) => FfiString::from(
+                serde_json::to_string(&slice).unwrap_or_else(|_| "null".into()),
+            ),
+            Ok(None) => FfiString::from("null"),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Get the CUE album that owns the slice with the given `music_id`.
+/// Returns the `CueAlbum` as JSON, the literal `"null"` if not found, or
+/// `"error:<message>"` on storage error.
+#[no_mangle]
+pub extern "C" fn wdmm_cue_album_for_slice(music_id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(music_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null music_id pointer"),
+    };
+    match global_library_db().cue_album_for_slice(id) {
+        Ok(Some(album)) => FfiString::from(
+            serde_json::to_string(&album).unwrap_or_else(|_| "null".into()),
+        ),
+        Ok(None) => FfiString::from("null"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List all CUE slices for a CUE album by `cue_id`, ordered by `track_index`.
+/// Returns a JSON array of `CueSlice` (may be `[]`), or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_cue_slices_for_cue(cue_id: *const c_char) -> FfiString {
+    let id = match ptr_to_str(cue_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:null cue_id pointer"),
+    };
+    match global_library_db().list_cue_slices_for_cue(id) {
+        Ok(slices) => FfiString::from(
+            serde_json::to_string(&slices).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── Playlists FFI ─────────────────────────────────────────────────────────────
 
 /// List all playlists. Returns a JSON array or `"error:<message>"`.
@@ -5181,5 +5252,111 @@ mod tests {
         wdmm_ffi_free_string(r);
         let artists: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(artists.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn track_get_by_source_path_ffi() {
+        // Arrange: insert a track (unique IDs — no clear needed)
+        let track_json = CString::new(
+            r#"{"id":"ffi-src-1","title":"FFI Source Track","remote_path":"/src/track.mp3","account_id":"acc-ffi","size":2000,"duration_ms":90000}"#,
+        )
+        .unwrap();
+        let r = wdmm_track_upsert(track_json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // Hit — should return track JSON with "id" key
+        let acct = CString::new("acc-ffi").unwrap();
+        let path = CString::new("/src/track.mp3").unwrap();
+        let r = wdmm_track_get_by_source_path(acct.as_ptr(), path.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!s.starts_with("error:"), "unexpected error: {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["id"], "ffi-src-1");
+        assert_eq!(v["account_id"], "acc-ffi");
+
+        // Miss — returns "null"
+        let path_miss = CString::new("/src/missing.mp3").unwrap();
+        let r = wdmm_track_get_by_source_path(acct.as_ptr(), path_miss.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null");
+        wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn cue_album_for_slice_and_slices_for_cue_ffi() {
+        // Arrange: insert album + 2 slices (unique IDs — no clear needed)
+        let album_json = CString::new(
+            r#"{"cue_id":"cue-ffi-1","source_name":"nas-ffi","cue_remote_path":"/ffi/disc.cue","title":"FFI Disc","performer":"FFI Artist","cache_group_id":null,"created_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let r = wdmm_cue_album_upsert(album_json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "album upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        for (mid_str, idx_val) in [("slice-ffi-1", 1i64), ("slice-ffi-2", 2i64)].iter() {
+            let start = (idx_val - 1) * 60_000;
+            let end = idx_val * 60_000;
+            let slice_json = CString::new(format!(
+                r#"{{"music_id":"{mid_str}","cue_id":"cue-ffi-1","audio_music_id":"audio-ffi","source_name":"nas-ffi","remote_path":"/ffi/t{idx_val}.virtual","file_name":"t{idx_val}","track_index":{idx_val},"title":"T{idx_val}","artist":null,"album_artist":null,"album":"FFI Disc","duration_ms":60000,"track_number":{idx_val},"track_total":2,"disc_number":null,"disc_total":null,"year":null,"genre":null,"bitrate":null,"sample_rate":null,"cover_path":null,"audio_remote_path":"/ffi/disc.flac","clip_start_ms":{start},"clip_end_ms":{end},"cache_group_id":null,"rev":0,"last_downloaded_at":"2024-01-01T00:00:00Z","last_tag_read_at":"2024-01-01T00:00:00Z","remote_missing":0}}"#,
+            ))
+            .unwrap();
+            let r = wdmm_cue_slice_upsert(slice_json.as_ptr());
+            let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+            assert_eq!(s, "ok", "slice upsert failed: {s}");
+            wdmm_ffi_free_string(r);
+        }
+
+        // wdmm_cue_album_for_slice — hit
+        let mid = CString::new("slice-ffi-1").unwrap();
+        let r = wdmm_cue_album_for_slice(mid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!s.starts_with("error:"), "unexpected error: {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["cue_id"], "cue-ffi-1");
+        assert_eq!(v["title"], "FFI Disc");
+
+        // wdmm_cue_album_for_slice — miss
+        let mid_miss = CString::new("no-such-slice").unwrap();
+        let r = wdmm_cue_album_for_slice(mid_miss.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "null");
+        wdmm_ffi_free_string(r);
+
+        // wdmm_cue_slices_for_cue — count + track_index order
+        let cid = CString::new("cue-ffi-1").unwrap();
+        let r = wdmm_cue_slices_for_cue(cid.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!s.starts_with("error:"), "unexpected error: {s}");
+        let slices: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let arr = slices.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["track_index"], 1);
+        assert_eq!(arr[1]["track_index"], 2);
+
+        // wdmm_cue_slices_for_cue — unknown cue_id returns []
+        let cid_miss = CString::new("no-cue").unwrap();
+        let r = wdmm_cue_slices_for_cue(cid_miss.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let empty: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(empty.as_array().unwrap().is_empty());
+
+        // wdmm_track_get_by_source_path falls through to cue_slice when no track
+        let acct = CString::new("nas-ffi").unwrap();
+        let slice_path = CString::new("/ffi/t1.virtual").unwrap();
+        let r = wdmm_track_get_by_source_path(acct.as_ptr(), slice_path.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!s.starts_with("error:"), "unexpected error: {s}");
+        let sv: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // CueSlice discriminant: has "music_id" and "cue_id"
+        assert!(sv.get("music_id").is_some(), "expected CueSlice JSON, got: {s}");
+        assert_eq!(sv["cue_id"], "cue-ffi-1");
     }
 }

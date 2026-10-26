@@ -588,6 +588,23 @@ Delete a CUE album and its slices (CASCADE). Returns `"ok"` or `"error:<message>
 Count remaining slices for a CUE album. Returns the count as a decimal string
 (e.g. `"5"`), or `"error:<message>"`.
 
+### `extern "C" fn wdmm_track_get_by_source_path(account_id: *const c_char, remote_path: *const c_char) -> FfiString`
+Look up a track or CUE slice by source (`account_id` / `source_name`) and
+`remote_path`. Checks `tracks` first; if found, returns `LibraryTrack` JSON
+(discriminant: `id` + `account_id` keys). If no track matches, checks
+`cue_slices`; if found, returns `CueSlice` JSON (discriminant: `music_id` +
+`cue_id` keys). Returns literal `"null"` when neither matches, or
+`"error:<message>"` on storage error.
+
+### `extern "C" fn wdmm_cue_album_for_slice(music_id: *const c_char) -> FfiString`
+Return the `CueAlbum` that owns the slice with the given `music_id`, as JSON.
+Returns `"null"` if not found, or `"error:<message>"`.
+
+### `extern "C" fn wdmm_cue_slices_for_cue(cue_id: *const c_char) -> FfiString`
+Return all `CueSlice` rows for `cue_id` as a JSON array, ordered by
+`track_index ASC`. Returns `[]` when the cue has no slices, or
+`"error:<message>"`.
+
 ---
 
 ## Playlists

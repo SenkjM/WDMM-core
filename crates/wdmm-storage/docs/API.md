@@ -64,6 +64,22 @@ Backward-compat alias for `upsert_track`.
 
 ### `fn get_track(&self, id: &str) -> StorageResult<Option<LibraryTrack>>`
 
+### `fn get_track_by_source_path(&self, account_id: &str, remote_path: &str) -> StorageResult<Option<LibraryTrack>>`
+Look up a track by `account_id` (Android `source_name`) and `remote_path`. Same
+columns as `get_track`. Returns `None` when no row matches.
+
+### `fn get_cue_slice_by_source_path(&self, source_name: &str, remote_path: &str) -> StorageResult<Option<CueSlice>>`
+Look up a CUE slice by `source_name` and `remote_path` (same columns as
+`list_cue_slices` rows). Returns `None` when no row matches.
+
+### `fn cue_album_for_slice(&self, slice_music_id: &str) -> StorageResult<Option<CueAlbum>>`
+Resolve the `cue_id` of the slice with `music_id == slice_music_id`, then load the
+owning `cue_albums` row. Returns `None` if the slice or album does not exist.
+
+### `fn list_cue_slices_for_cue(&self, cue_id: &str) -> StorageResult<Vec<CueSlice>>`
+All slices for `cue_id`, `ORDER BY track_index ASC`. Empty vec when the cue has
+no slices or the cue_id is unknown.
+
 ### `fn list_tracks(&self) -> StorageResult<Vec<LibraryTrack>>`
 Ordered by `title COLLATE NOCASE`.
 

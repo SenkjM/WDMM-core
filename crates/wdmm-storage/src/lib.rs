@@ -2586,6 +2586,169 @@ impl LibraryDatabase {
         Ok(result)
     }
 
+    /// Get a track by account_id (source name) and remote path.
+    /// Returns `None` if no matching row exists.
+    pub fn get_track_by_source_path(
+        &self,
+        account_id: &str,
+        remote_path: &str,
+    ) -> StorageResult<Option<LibraryTrack>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist, remote_path, account_id, size, modified,
+                    album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
+                    album, album_artist, rev
+             FROM tracks WHERE account_id = ?1 AND remote_path = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![account_id, remote_path])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_track(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a CUE slice by source name and remote path.
+    /// Returns `None` if no matching row exists.
+    pub fn get_cue_slice_by_source_path(
+        &self,
+        source_name: &str,
+        remote_path: &str,
+    ) -> StorageResult<Option<CueSlice>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
+                    track_index, title, artist, album_artist, album, duration_ms,
+                    track_number, track_total, disc_number, disc_total, year, genre,
+                    bitrate, sample_rate, cover_path, audio_remote_path,
+                    clip_start_ms, clip_end_ms, cache_group_id, rev,
+                    last_downloaded_at, last_tag_read_at, remote_missing
+             FROM cue_slices WHERE source_name = ?1 AND remote_path = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![source_name, remote_path])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(CueSlice {
+                music_id: row.get(0)?,
+                cue_id: row.get(1)?,
+                audio_music_id: row.get(2)?,
+                source_name: row.get(3)?,
+                remote_path: row.get(4)?,
+                file_name: row.get(5)?,
+                track_index: row.get(6)?,
+                title: row.get(7)?,
+                artist: row.get(8)?,
+                album_artist: row.get(9)?,
+                album: row.get(10)?,
+                duration_ms: row.get(11)?,
+                track_number: row.get(12)?,
+                track_total: row.get(13)?,
+                disc_number: row.get(14)?,
+                disc_total: row.get(15)?,
+                year: row.get(16)?,
+                genre: row.get(17)?,
+                bitrate: row.get(18)?,
+                sample_rate: row.get(19)?,
+                cover_path: row.get(20)?,
+                audio_remote_path: row.get(21)?,
+                clip_start_ms: row.get(22)?,
+                clip_end_ms: row.get(23)?,
+                cache_group_id: row.get(24)?,
+                rev: row.get(25)?,
+                last_downloaded_at: row.get(26)?,
+                last_tag_read_at: row.get(27)?,
+                remote_missing: row.get(28)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get the CUE album that owns the slice with the given `music_id`.
+    /// Resolves `cue_id` from `cue_slices`, then loads from `cue_albums`.
+    pub fn cue_album_for_slice(&self, slice_music_id: &str) -> StorageResult<Option<CueAlbum>> {
+        let conn = self.conn.lock().unwrap();
+        let cue_id: Option<String> = conn
+            .query_row(
+                "SELECT cue_id FROM cue_slices WHERE music_id = ?1",
+                params![slice_music_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(cue_id) = cue_id else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT cue_id, source_name, cue_remote_path, title, performer, cache_group_id, created_at
+                 FROM cue_albums WHERE cue_id = ?1",
+                params![cue_id],
+                |row| {
+                    Ok(CueAlbum {
+                        cue_id: row.get(0)?,
+                        source_name: row.get(1)?,
+                        cue_remote_path: row.get(2)?,
+                        title: row.get(3)?,
+                        performer: row.get(4)?,
+                        cache_group_id: row.get(5)?,
+                        created_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// List all slices for a CUE album by `cue_id`, ordered by `track_index ASC`.
+    pub fn list_cue_slices_for_cue(&self, cue_id: &str) -> StorageResult<Vec<CueSlice>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
+                    track_index, title, artist, album_artist, album, duration_ms,
+                    track_number, track_total, disc_number, disc_total, year, genre,
+                    bitrate, sample_rate, cover_path, audio_remote_path,
+                    clip_start_ms, clip_end_ms, cache_group_id, rev,
+                    last_downloaded_at, last_tag_read_at, remote_missing
+             FROM cue_slices WHERE cue_id = ?1 ORDER BY track_index ASC",
+        )?;
+        let rows = stmt.query_map(params![cue_id], |row| {
+            Ok(CueSlice {
+                music_id: row.get(0)?,
+                cue_id: row.get(1)?,
+                audio_music_id: row.get(2)?,
+                source_name: row.get(3)?,
+                remote_path: row.get(4)?,
+                file_name: row.get(5)?,
+                track_index: row.get(6)?,
+                title: row.get(7)?,
+                artist: row.get(8)?,
+                album_artist: row.get(9)?,
+                album: row.get(10)?,
+                duration_ms: row.get(11)?,
+                track_number: row.get(12)?,
+                track_total: row.get(13)?,
+                disc_number: row.get(14)?,
+                disc_total: row.get(15)?,
+                year: row.get(16)?,
+                genre: row.get(17)?,
+                bitrate: row.get(18)?,
+                sample_rate: row.get(19)?,
+                cover_path: row.get(20)?,
+                audio_remote_path: row.get(21)?,
+                clip_start_ms: row.get(22)?,
+                clip_end_ms: row.get(23)?,
+                cache_group_id: row.get(24)?,
+                rev: row.get(25)?,
+                last_downloaded_at: row.get(26)?,
+                last_tag_read_at: row.get(27)?,
+                remote_missing: row.get(28)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
     // ── Deleted tracks (v6 tombstones) ────────────────────────────────────────
 
     pub fn upsert_deleted_track(&self, track: &DeletedTrack) -> StorageResult<()> {
@@ -5360,5 +5523,190 @@ mod tests {
         let track = db.get_track("t1").unwrap().unwrap();
         assert!(track.artist_id.is_some());
         assert!(track.album_id.is_some());
+    }
+
+    #[test]
+    fn get_track_by_source_path_hit_and_miss() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_track(&LibraryTrack {
+            id: "t-src-1".into(),
+            title: "Source Track".into(),
+            artist: None,
+            album: None,
+            album_artist: None,
+            remote_path: "/music/source.mp3".into(),
+            account_id: "acc-src".into(),
+            size: 1000,
+            modified: None,
+            album_id: None,
+            artist_id: None,
+            duration_ms: 120_000,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            mime_type: None,
+            rev: 0,
+        })
+        .unwrap();
+
+        // Hit
+        let result = db
+            .get_track_by_source_path("acc-src", "/music/source.mp3")
+            .unwrap();
+        assert!(result.is_some());
+        let t = result.unwrap();
+        assert_eq!(t.id, "t-src-1");
+        assert_eq!(t.account_id, "acc-src");
+        assert_eq!(t.remote_path, "/music/source.mp3");
+
+        // Miss — wrong path
+        assert!(db
+            .get_track_by_source_path("acc-src", "/music/other.mp3")
+            .unwrap()
+            .is_none());
+        // Miss — wrong account
+        assert!(db
+            .get_track_by_source_path("other-acc", "/music/source.mp3")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn get_cue_slice_by_source_path_hit_and_miss() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let album = CueAlbum {
+            cue_id: "cue-sp-1".into(),
+            source_name: "nas".into(),
+            cue_remote_path: "/music/album.cue".into(),
+            title: Some("SP Album".into()),
+            performer: None,
+            cache_group_id: None,
+            created_at: now.clone(),
+        };
+        db.upsert_cue_album(&album).unwrap();
+
+        let slice = CueSlice {
+            music_id: "slice-sp-1".into(),
+            cue_id: "cue-sp-1".into(),
+            audio_music_id: "audio-sp-1".into(),
+            source_name: "nas".into(),
+            remote_path: "/music/track1.cue_virtual".into(),
+            file_name: "track1".into(),
+            track_index: 1,
+            title: Some("SP Track 1".into()),
+            artist: None,
+            album_artist: None,
+            album: Some("SP Album".into()),
+            duration_ms: Some(200_000),
+            track_number: Some(1),
+            track_total: Some(2),
+            disc_number: None,
+            disc_total: None,
+            year: None,
+            genre: None,
+            bitrate: None,
+            sample_rate: None,
+            cover_path: None,
+            audio_remote_path: Some("/music/album.flac".into()),
+            clip_start_ms: Some(0),
+            clip_end_ms: Some(200_000),
+            cache_group_id: None,
+            rev: 0,
+            last_downloaded_at: now.clone(),
+            last_tag_read_at: now.clone(),
+            remote_missing: 0,
+        };
+        db.upsert_cue_slice(&slice).unwrap();
+
+        // Hit
+        let result = db
+            .get_cue_slice_by_source_path("nas", "/music/track1.cue_virtual")
+            .unwrap();
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert_eq!(s.music_id, "slice-sp-1");
+        assert_eq!(s.cue_id, "cue-sp-1");
+
+        // Miss
+        assert!(db
+            .get_cue_slice_by_source_path("nas", "/music/nonexistent")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cue_album_for_slice_and_list_slices_for_cue() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let album = CueAlbum {
+            cue_id: "cue-lsc-1".into(),
+            source_name: "wd".into(),
+            cue_remote_path: "/cue/disc.cue".into(),
+            title: Some("Disc Title".into()),
+            performer: Some("Performer".into()),
+            cache_group_id: None,
+            created_at: now.clone(),
+        };
+        db.upsert_cue_album(&album).unwrap();
+
+        for i in 1u32..=3 {
+            db.upsert_cue_slice(&CueSlice {
+                music_id: format!("slice-lsc-{i}"),
+                cue_id: "cue-lsc-1".into(),
+                audio_music_id: "audio-lsc".into(),
+                source_name: "wd".into(),
+                remote_path: format!("/cue/track{i}.virtual"),
+                file_name: format!("track{i}"),
+                track_index: i as i64,
+                title: Some(format!("Track {i}")),
+                artist: None,
+                album_artist: None,
+                album: Some("Disc Title".into()),
+                duration_ms: Some(60_000),
+                track_number: Some(i as i64),
+                track_total: Some(3),
+                disc_number: None,
+                disc_total: None,
+                year: None,
+                genre: None,
+                bitrate: None,
+                sample_rate: None,
+                cover_path: None,
+                audio_remote_path: Some("/cue/disc.flac".into()),
+                clip_start_ms: Some((i as i64 - 1) * 60_000),
+                clip_end_ms: Some(i as i64 * 60_000),
+                cache_group_id: None,
+                rev: 0,
+                last_downloaded_at: now.clone(),
+                last_tag_read_at: now.clone(),
+                remote_missing: 0,
+            })
+            .unwrap();
+        }
+
+        // cue_album_for_slice — hit
+        let found = db.cue_album_for_slice("slice-lsc-2").unwrap();
+        assert!(found.is_some());
+        let a = found.unwrap();
+        assert_eq!(a.cue_id, "cue-lsc-1");
+        assert_eq!(a.title.as_deref(), Some("Disc Title"));
+
+        // cue_album_for_slice — miss
+        assert!(db.cue_album_for_slice("no-such-slice").unwrap().is_none());
+
+        // list_cue_slices_for_cue — count and order
+        let slices = db.list_cue_slices_for_cue("cue-lsc-1").unwrap();
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].track_index, 1);
+        assert_eq!(slices[1].track_index, 2);
+        assert_eq!(slices[2].track_index, 3);
+
+        // list_cue_slices_for_cue — unknown cue_id returns empty vec
+        let empty = db.list_cue_slices_for_cue("no-such-cue").unwrap();
+        assert!(empty.is_empty());
     }
 }
