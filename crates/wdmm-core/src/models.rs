@@ -53,6 +53,10 @@ pub struct LibraryTrack {
     /// MIME type (e.g. "audio/mpeg").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    // ── v9 field ──────────────────────────────────────────────────────────────
+    /// Revision (for library sync merge).
+    #[serde(default)]
+    pub rev: i64,
 }
 
 /// An album in the music library. Schema v2.

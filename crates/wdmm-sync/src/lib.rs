@@ -16,6 +16,11 @@
 mod backup;
 pub use backup::*;
 
+pub mod wmp;
+mod library_shard;
+mod library_music;
+pub use library_music::LibrarySyncEngine;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -290,137 +295,8 @@ impl SyncEngine for CredentialSyncEngine {
 
 // ── Library Sync ──────────────────────────────────────────────────────────────
 
-/// Wire payload for `library.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemoteTrack {
-    id: String,
-    title: String,
-    artist: Option<String>,
-    remote_path: String,
-    account_id: String,
-    size: u64,
-    modified: Option<i64>,
-}
-
-impl From<&LibraryTrack> for RemoteTrack {
-    fn from(t: &LibraryTrack) -> Self {
-        Self {
-            id: t.id.clone(),
-            title: t.title.clone(),
-            artist: t.artist.clone(),
-            remote_path: t.remote_path.clone(),
-            account_id: t.account_id.clone(),
-            size: t.size,
-            modified: t.modified.map(|dt| dt.timestamp()),
-        }
-    }
-}
-
-impl From<&RemoteTrack> for LibraryTrack {
-    fn from(r: &RemoteTrack) -> Self {
-        let modified = r
-            .modified
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        LibraryTrack {
-            id: r.id.clone(),
-            title: r.title.clone(),
-            artist: r.artist.clone(),
-            remote_path: r.remote_path.clone(),
-            account_id: r.account_id.clone(),
-            size: r.size,
-            modified,
-            ..Default::default()
-        }
-    }
-}
-
-/// Library sync engine — syncs track metadata to/from remote storage.
-pub struct LibrarySyncEngine {
-    db: Arc<LibraryDatabase>,
-    store: Arc<dyn RemoteStore>,
-    remote_dir: String,
-}
-
-impl LibrarySyncEngine {
-    pub fn new(
-        db: Arc<LibraryDatabase>,
-        driver: Arc<dyn CloudDriver>,
-        remote_dir: impl Into<String>,
-    ) -> Self {
-        Self {
-            db,
-            store: Arc::new(DriverStore { driver }),
-            remote_dir: remote_dir.into(),
-        }
-    }
-
-    fn file_path(&self) -> String {
-        join_path(&self.remote_dir, "library.json")
-    }
-
-    async fn fetch_remote(&self) -> SyncResult<Vec<RemoteTrack>> {
-        match self.store.read(&self.file_path()).await? {
-            None => Ok(vec![]),
-            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        }
-    }
-
-    async fn push_all(&self, tracks: &[LibraryTrack]) -> SyncResult<()> {
-        self.store.ensure_dir(&self.remote_dir).await?;
-        let remote: Vec<RemoteTrack> = tracks.iter().map(RemoteTrack::from).collect();
-        let bytes = serde_json::to_vec(&remote)?;
-        self.store.write(&self.file_path(), &bytes).await
-    }
-}
-
-#[async_trait]
-impl SyncEngine for LibrarySyncEngine {
-    async fn sync_incremental(&self) -> SyncResult<Vec<SyncOutcome>> {
-        let local = self.db.list_tracks()?;
-        let remote = self.fetch_remote().await?;
-
-        // Pull: remote tracks not locally known → insert.
-        let local_ids: Vec<String> = local.iter().map(|t| t.id.clone()).collect();
-        let mut outcomes = Vec::new();
-        for r in &remote {
-            if !local_ids.iter().any(|id| id == &r.id) {
-                let track = LibraryTrack::from(r);
-                self.db.insert_track(&track)?;
-                outcomes.push(SyncOutcome {
-                    entity_id: r.id.clone(),
-                    action: SyncAction::Pulled,
-                    rev: RevClock::new(r.modified.unwrap_or(1).max(1) as u64),
-                });
-            }
-        }
-
-        // Push: full snapshot.
-        if !local.is_empty() {
-            self.push_all(&local).await?;
-        }
-        let remote_ids: Vec<&str> = remote.iter().map(|r| r.id.as_str()).collect();
-        for t in &local {
-            let was_remote = remote_ids.contains(&t.id.as_str());
-            outcomes.push(SyncOutcome {
-                entity_id: t.id.clone(),
-                action: if was_remote {
-                    SyncAction::NoChange
-                } else {
-                    SyncAction::Pushed
-                },
-                rev: RevClock::new(1),
-            });
-        }
-
-        info!("library sync: {} local, {} remote", local.len(), remote.len());
-        Ok(outcomes)
-    }
-
-    async fn sync_full(&self) -> SyncResult<Vec<SyncOutcome>> {
-        self.sync_incremental().await
-    }
-}
+// Library sync engine lives in `library_music` (shard+tombstone protocol).
+// Toy `library.json` path removed.
 
 // ── Playlist Sync ─────────────────────────────────────────────────────────────
 
@@ -674,7 +550,7 @@ mod tests {
 
     /// In-memory `CloudDriver` used by sync unit tests — no network.
     struct MockDriver {
-        files: AsyncMutex<Map<String, Vec<u8>>>,
+        pub files: AsyncMutex<Map<String, Vec<u8>>>,
         dirs: AsyncMutex<std::collections::HashSet<String>>,
     }
 
@@ -802,33 +678,142 @@ mod tests {
 
     #[tokio::test]
     async fn library_sync_pushes_tracks() {
+        use wdmm_core::models::LibraryTrack;
         let db = tmp_db();
         let driver = Arc::new(MockDriver::new());
 
         let track = LibraryTrack {
-            id: "track1".into(),
+            id: wdmm_core::identity::track_identity("/music/song.mp3"),
             title: "Song".into(),
             artist: Some("Artist".into()),
             remote_path: "/music/song.mp3".into(),
             account_id: "acc1".into(),
             size: 12345,
             modified: None,
+            rev: 100,
             ..Default::default()
         };
         db.insert_track(&track).unwrap();
 
         let engine = LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
         let outcomes = engine.sync_incremental().await.unwrap();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].action, SyncAction::Pushed);
+        assert!(outcomes.iter().any(|o| o.action == SyncAction::Pushed));
+
+        // Manifest + segment under library/music/
+        let files = driver.files.lock().await;
+        assert!(files.contains_key("/sync/library/music/index.json"));
+        assert!(files.keys().any(|k| k.contains("/sync/library/music/seg-")));
+        drop(files);
 
         // Second device pulls.
         let db2 = tmp_db();
         let engine2 = LibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync");
         let outcomes2 = engine2.sync_incremental().await.unwrap();
         assert!(outcomes2.iter().any(|o| o.action == SyncAction::Pulled));
-        let loaded = db2.get_track("track1").unwrap().unwrap();
+        let loaded = db2
+            .get_track(&wdmm_core::identity::track_identity("/music/song.mp3"))
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.title, "Song");
+        assert_eq!(loaded.rev, 100);
+    }
+
+    #[tokio::test]
+    async fn library_sync_tombstone_peer_deletes() {
+        use wdmm_core::models::LibraryTrack;
+        use wdmm_storage::DeletedTrack;
+
+        let driver = Arc::new(MockDriver::new());
+        let path = "/music/gone.mp3";
+        let id = wdmm_core::identity::track_identity(path);
+
+        // Device A has the track, syncs it up.
+        let db_a = tmp_db();
+        db_a
+            .insert_track(&LibraryTrack {
+                id: id.clone(),
+                title: "Gone".into(),
+                remote_path: path.into(),
+                account_id: "nas".into(),
+                rev: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+            .sync_incremental()
+            .await
+            .unwrap();
+
+        // Device B pulls.
+        let db_b = tmp_db();
+        LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+            .sync_incremental()
+            .await
+            .unwrap();
+        assert!(db_b.get_track(&id).unwrap().is_some());
+
+        // Device A deletes locally and publishes tomb.
+        db_a.delete_track(&id).unwrap();
+        db_a
+            .upsert_deleted_track(&DeletedTrack {
+                source_name: "nas".into(),
+                remote_path: path.into(),
+                rev: 60,
+                deleted_at: "2026-10-26T00:00:00Z".into(),
+                pushed: 0,
+            })
+            .unwrap();
+        LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+            .sync_incremental()
+            .await
+            .unwrap();
+        let files = driver.files.lock().await;
+        assert!(files.keys().any(|k| k.contains("/sync/library/music/del-")));
+        drop(files);
+
+        // Device B adopts deletion.
+        LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+            .sync_incremental()
+            .await
+            .unwrap();
+        assert!(db_b.get_track(&id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn library_sync_full_rebuild_base_shards() {
+        use wdmm_core::models::LibraryTrack;
+        let db = tmp_db();
+        let driver = Arc::new(MockDriver::new());
+        for i in 0..3 {
+            let path = format!("/music/t{i}.mp3");
+            db.insert_track(&LibraryTrack {
+                id: wdmm_core::identity::track_identity(&path),
+                title: format!("T{i}"),
+                remote_path: path,
+                account_id: "a".into(),
+                rev: 10 + i,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        // Seed a segment first
+        LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync")
+            .sync_incremental()
+            .await
+            .unwrap();
+        // Full rebuild
+        LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync")
+            .sync_full()
+            .await
+            .unwrap();
+        let files = driver.files.lock().await;
+        let index: serde_json::Value =
+            serde_json::from_slice(files.get("/sync/library/music/index.json").unwrap()).unwrap();
+        assert_eq!(index["format"], "wmp_library_index");
+        assert!(index["segments"].as_array().unwrap().is_empty());
+        assert!(index["tombstones"].as_array().unwrap().is_empty());
+        assert!(!index["base"]["shards"].as_array().unwrap().is_empty());
+        assert!(files.keys().any(|k| k.contains("/sync/library/music/lib-")));
     }
 
     #[tokio::test]
@@ -911,13 +896,14 @@ mod tests {
             account_id: "a".into(),
             size: 0,
             modified: None,
+            rev: 1,
             ..Default::default()
         })
         .unwrap();
 
         let summary = run_sync_all(Arc::clone(&db), driver, "/sync").await.unwrap();
         assert_eq!(summary["credentials"]["pushed"], 1);
-        assert_eq!(summary["library"]["pushed"], 1);
+        assert!(summary["library"]["pushed"].as_u64().unwrap() >= 1);
         assert_eq!(summary["playlists"]["total"], 0);
     }
 

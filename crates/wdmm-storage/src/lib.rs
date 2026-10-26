@@ -610,6 +610,19 @@ impl LibraryDatabase {
             )?;
         }
 
+        // ── v9 migration: track.rev column for library sync merge ──
+        if current_ver < 9 {
+            let _ = conn.execute_batch(
+                r#"
+                ALTER TABLE tracks ADD COLUMN rev INTEGER NOT NULL DEFAULT 0;
+                "#,
+            );
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (9)",
+                [],
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -638,8 +651,8 @@ impl LibraryDatabase {
             "INSERT OR REPLACE INTO tracks
              (id, title, artist, remote_path, account_id, size, modified, created_at,
               album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-              album, album_artist)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16, ?17,?18)",
+              album, album_artist, rev)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16, ?17,?18,?19)",
             params![
                 &track.id,
                 &track.title,
@@ -659,6 +672,7 @@ impl LibraryDatabase {
                 &track.mime_type,
                 &track.album,
                 &track.album_artist,
+                track.rev,
             ],
         )?;
         drop(conn);
@@ -719,7 +733,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist
+                    album, album_artist, rev
              FROM tracks WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -793,7 +807,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT t.id, t.title, t.artist, t.remote_path, t.account_id, t.size, t.modified,
                     t.album_id, t.artist_id, t.duration_ms, t.genre, t.track_number, t.disc_number, t.year, t.mime_type,
-                    t.album, t.album_artist
+                    t.album, t.album_artist, t.rev
              FROM tracks_fts fts
              JOIN tracks t ON fts.track_id = t.id
              WHERE tracks_fts MATCH ?1
@@ -810,7 +824,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist
+                    album, album_artist, rev
              FROM tracks
              WHERE title LIKE ?1 ESCAPE '\\'
                 OR artist LIKE ?1 ESCAPE '\\'
@@ -899,7 +913,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist
+                    album, album_artist, rev
              FROM tracks ORDER BY title COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], row_to_track)?;
@@ -1062,7 +1076,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist
+                    album, album_artist, rev
              FROM tracks WHERE artist = ?1
              ORDER BY title COLLATE NOCASE",
         )?;
@@ -1076,7 +1090,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist
+                    album, album_artist, rev
              FROM tracks WHERE album = ?1
              ORDER BY disc_number, track_number, title COLLATE NOCASE",
         )?;
@@ -1462,11 +1476,12 @@ impl LibraryDatabase {
             let duration_expr = if has("duration_ms") { "duration_ms" } else { "0" };
             let album_expr = if has("album") { "album" } else { "NULL" };
             let album_artist_expr = if has("album_artist") { "album_artist" } else { "NULL" };
+            let rev_expr = if has("rev") { "rev" } else { "0" };
 
             let sql = format!(
                 "SELECT {id_col}, {title_expr}, {artist_expr}, remote_path, \
                  {source_col}, {size_expr}, {modified_expr}, {duration_expr}, \
-                 {album_expr}, {album_artist_expr} FROM tracks"
+                 {album_expr}, {album_artist_expr}, {rev_expr} FROM tracks"
             );
 
             let mut stmt = old
@@ -1495,6 +1510,7 @@ impl LibraryDatabase {
                         duration_ms: row.get::<_, i64>(7).unwrap_or(0),
                         album: row.get::<_, Option<String>>(8).unwrap_or(None),
                         album_artist: row.get::<_, Option<String>>(9).unwrap_or(None),
+                        rev: row.get::<_, i64>(10).unwrap_or(0),
                         ..Default::default()
                     })
                 })
@@ -2740,6 +2756,7 @@ fn row_to_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryTrack> {
         mime_type: row.get(14)?,
         album: row.get(15)?,
         album_artist: row.get(16)?,
+        rev: row.get(17)?,
     })
 }
 
@@ -3175,7 +3192,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
     }
 
     #[test]
@@ -3350,6 +3367,7 @@ mod tests {
             mime_type: Some("audio/mpeg".into()),
             album: Some("Album".into()),
             album_artist: None,
+            rev: 0,
         };
         db.upsert_track(&track).unwrap();
 
@@ -4415,7 +4433,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -4713,6 +4731,7 @@ mod tests {
                 mime_type: None,
                 album: None,
                 album_artist: None,
+                rev: 0,
             })
             .unwrap();
 
@@ -4857,6 +4876,7 @@ mod tests {
                 mime_type: None,
                 album: None,
                 album_artist: None,
+                rev: 0,
             })
             .unwrap();
         right_db
@@ -4944,7 +4964,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -4965,6 +4985,7 @@ mod tests {
             disc_number: None,
             year: Some(2024),
             mime_type: None,
+            rev: 0,
         })
         .unwrap();
 
@@ -4987,6 +5008,7 @@ mod tests {
             disc_number: None,
             year: None,
             mime_type: None,
+            rev: 0,
         })
         .unwrap();
 

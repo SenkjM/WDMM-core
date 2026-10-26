@@ -56,7 +56,7 @@ in the wire format so it survives text round-trips.
 ## Library sync engine
 
 ### `struct LibrarySyncEngine`
-Syncs `LibraryTrack` records to/from `{remote_dir}/library.json`.
+Syncs `LibraryTrack` records via Android-compatible shard+tombstone under `{remote_dir}/library/music/` (`index.json`, `lib-`/`seg-`/`del-*.wdmm`).
 
 ### `fn LibrarySyncEngine::new(db: Arc<LibraryDatabase>, driver: Arc<dyn CloudDriver>, remote_dir: impl Into<String>) -> Self`
 

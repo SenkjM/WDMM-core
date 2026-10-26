@@ -6,6 +6,7 @@
 //! Container header matches Android `WmpContainer` (docs/10): magic + section table.
 //! Envelope matches Android `BackupCrypto` (WDMMEN01, PBKDF2 120_000).
 
+use crate::wmp::*;
 use crate::SyncError;
 use crate::SyncResult;
 use serde_json::json;
@@ -15,91 +16,12 @@ use std::sync::Arc;
 use wdmm_drivers::{CloudDriver, CloudFileItem};
 use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase, Playlist, PlaylistEntry};
 
-/// Android WmpSections ids we emit/consume.
-const SEC_META: u8 = 1;
-const SEC_TRACKS: u8 = 2;
-const SEC_COVERS: u8 = 3;
-const SEC_CREDENTIALS: u8 = 5;
-const SEC_PLAYLISTS: u8 = 6;
-const SEC_SETTINGS: u8 = 7;
-const SEC_CUEALBUMS: u8 = 8;
-const SEC_PASS_CHECK: u8 = 11;
-const SEC_MANGA_LIBRARY: u8 = 13;
-const SEC_USER_FOLDERS: u8 = 14;
-const SEC_MANGA_COVERS: u8 = 15;
-const SEC_DMR_PREFS: u8 = 16;
-// Legacy name for restore dual-read
-const SEC_LIBRARY_JSON: u8 = SEC_TRACKS;
-
-const MAGIC_BK: &[u8; 8] = b"WDMMBK01";
-const MAGIC_EN: &[u8; 8] = b"WDMMEN01";
-const MAGIC_CV: &[u8; 8] = b"WDMMCV01";
-const MAGIC_PL: &[u8; 8] = b"WDMMPL01";
 const PBKDF2_ITERS_ENVELOPE: u32 = 120_000;
 
-fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (!(crc & 1)).wrapping_add(1); // 0 or 0xFFFFFFFF
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
+// Legacy section alias for restore dual-read
+const SEC_LIBRARY_JSON: u8 = SEC_TRACKS;
 
-/// Codec for a section: 0=raw, 1=deflate.
-#[derive(Debug, Clone, Copy)]
-enum Codec {
-    Raw = 0,
-    Deflate = 1,
-}
-
-/// Build a raw (unencrypted) WDMMBK01/WDMMCV01/WDMMPL01 container from section id → (payload, codec).
-fn build_wmp_container(sections: &[(u8, Vec<u8>, Codec)], magic: &[u8; 8]) -> Vec<u8> {
-    use flate2::write::DeflateEncoder;
-    use std::io::Write;
-
-    let count = sections.len() as u16;
-    let header_len = 12usize;
-    let table_len = sections.len() * 18;
-    let payload_start = header_len + table_len;
-    let mut payload = Vec::new();
-    let mut table = Vec::with_capacity(table_len);
-
-    for &(id, ref raw, codec) in sections {
-        let offset = (payload_start + payload.len()) as u32;
-        let raw_len = raw.len() as u32;
-        let crc = crc32_ieee(raw);
-
-        let (stored, codec_byte) = match codec {
-            Codec::Raw => (raw.clone(), 0u8),
-            Codec::Deflate => {
-                let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder.write_all(raw).expect("deflate write");
-                let compressed = encoder.finish().expect("deflate finish");
-                (compressed, 1u8)
-            }
-        };
-
-        table.push(id);
-        table.push(codec_byte);
-        table.extend_from_slice(&offset.to_le_bytes());
-        table.extend_from_slice(&(stored.len() as u32).to_le_bytes()); // storedLen
-        table.extend_from_slice(&raw_len.to_le_bytes()); // rawLen
-        table.extend_from_slice(&crc.to_le_bytes());
-        payload.extend_from_slice(&stored);
-    }
-
-    let mut out = Vec::with_capacity(payload_start + payload.len());
-    out.extend_from_slice(magic);
-    out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // flags
-    out.extend_from_slice(&table);
-    out.extend_from_slice(&payload);
-    out
-}
+const MAGIC_EN: &[u8; 8] = b"WDMMEN01";
 
 /// Build a raw (unencrypted) WDMMBK01 container from section id → payload bytes (codec 0 raw).
 /// Legacy API for tests; new code should use build_wmp_container with explicit codec.
@@ -116,211 +38,11 @@ pub fn parse_bk_container(bytes: &[u8]) -> SyncResult<BTreeMap<u8, Vec<u8>>> {
     if bytes.len() < 12 || &bytes[0..8] != MAGIC_BK {
         return Err(SyncError::Other("error:notBackupArchive|not WDMMBK01".into()));
     }
-    let count = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-    let _flags = u16::from_le_bytes([bytes[10], bytes[11]]);
-    let table_end = 12 + count * 18;
-    if bytes.len() < table_end {
-        return Err(SyncError::Other("truncated section table".into()));
-    }
-    let mut map = BTreeMap::new();
-    for i in 0..count {
-        let off = 12 + i * 18;
-        let id = bytes[off];
-        let codec = bytes[off + 1];
-        let offset = u32::from_le_bytes(bytes[off + 2..off + 6].try_into().unwrap()) as usize;
-        let stored_len = u32::from_le_bytes(bytes[off + 6..off + 10].try_into().unwrap()) as usize;
-        let raw_len = u32::from_le_bytes(bytes[off + 10..off + 14].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(bytes[off + 14..off + 18].try_into().unwrap());
-
-        if offset + stored_len > bytes.len() {
-            return Err(SyncError::Other(format!("section {id} bounds")));
-        }
-
-        let stored = &bytes[offset..offset + stored_len];
-        let raw = match codec {
-            0 => stored.to_vec(),
-            1 => {
-                // Android deflate = zlib raw (no header/trailer)
-                use flate2::Decompress;
-                let mut decomp = Decompress::new(false);
-                let mut out = Vec::with_capacity(raw_len);
-                decomp
-                    .decompress_vec(stored, &mut out, flate2::FlushDecompress::Finish)
-                    .map_err(|e| SyncError::Other(format!("section {id} inflate: {e}")))?;
-                if out.len() != raw_len {
-                    return Err(SyncError::Other(format!(
-                        "section {id} length mismatch: got {}, want {raw_len}",
-                        out.len()
-                    )));
-                }
-                out
-            }
-            _ => {
-                return Err(SyncError::Other(format!("unsupported section codec {codec}")));
-            }
-        };
-
-        if crc32_ieee(&raw) != crc {
-            return Err(SyncError::Other(format!("section {id} CRC mismatch")));
-        }
-        map.insert(id, raw);
-    }
-    Ok(map)
+    parse_wmp_container(bytes, Some(b"BK"))
 }
 
-// ============================================================================
-// WMP tag/value codec (Android binary sections)
-// ============================================================================
+// Tag constants (backup-specific); encode/decode live in crate::wmp.
 
-/// Encode varint (LEB128).
-fn encode_varint(mut val: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    while val >= 0x80 {
-        out.push((val as u8 & 0x7F) | 0x80);
-        val >>= 7;
-    }
-    out.push(val as u8);
-    out
-}
-
-/// Decode varint, returning (value, next_offset).
-fn decode_varint(data: &[u8], mut at: usize) -> SyncResult<(u64, usize)> {
-    let mut result = 0u64;
-    let mut shift = 0;
-    loop {
-        if at >= data.len() {
-            return Err(SyncError::Other("truncated varint".into()));
-        }
-        let byte = data[at];
-        at += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if (byte & 0x80) == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 63 {
-            return Err(SyncError::Other("varint overflow".into()));
-        }
-    }
-    Ok((result, at))
-}
-
-/// Decode one tag/value record from Android binary format.
-/// Returns map of tag → value (int or String), and next offset.
-fn decode_record(
-    data: &[u8],
-    mut at: usize,
-    int_tags: &[u8],
-) -> SyncResult<(BTreeMap<u8, RecordValue>, usize)> {
-    let mut rec = BTreeMap::new();
-    while at < data.len() {
-        let tag = data[at];
-        at += 1;
-        if tag == 0 {
-            // end of record
-            break;
-        }
-        if int_tags.contains(&tag) {
-            let (val, next) = decode_varint(data, at)?;
-            rec.insert(tag, RecordValue::Int(val));
-            at = next;
-        } else {
-            // length-prefixed UTF-8 string or bytes
-            let (len, next) = decode_varint(data, at)?;
-            at = next;
-            let end = at + len as usize;
-            if end > data.len() {
-                return Err(SyncError::Other("record value out of bounds".into()));
-            }
-            let slice = &data[at..end];
-            // Try UTF-8 decode; if it fails treat as bytes
-            if let Ok(s) = std::str::from_utf8(slice) {
-                rec.insert(tag, RecordValue::Str(s.to_string()));
-            } else {
-                rec.insert(tag, RecordValue::Bytes(slice.to_vec()));
-            }
-            at = end;
-        }
-    }
-    Ok((rec, at))
-}
-
-#[derive(Debug, Clone)]
-enum RecordValue {
-    Int(u64),
-    Str(String),
-    Bytes(Vec<u8>),
-}
-
-impl RecordValue {
-    fn as_int(&self) -> Option<i64> {
-        match self {
-            RecordValue::Int(v) => Some(*v as i64),
-            _ => None,
-        }
-    }
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            RecordValue::Str(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-    fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            RecordValue::Bytes(b) => Some(b.as_slice()),
-            _ => None,
-        }
-    }
-}
-
-/// Encode records (tag/value pairs) into Android binary format.
-fn encode_records(records: &[BTreeMap<u8, RecordValue>], int_tags: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for rec in records {
-        for (&tag, val) in rec {
-            out.push(tag);
-            if int_tags.contains(&tag) {
-                if let RecordValue::Int(v) = val {
-                    out.extend_from_slice(&encode_varint(*v));
-                }
-            } else {
-                match val {
-                    RecordValue::Str(s) => {
-                        out.extend_from_slice(&encode_varint(s.len() as u64));
-                        out.extend_from_slice(s.as_bytes());
-                    }
-                    RecordValue::Bytes(b) => {
-                        out.extend_from_slice(&encode_varint(b.len() as u64));
-                        out.extend_from_slice(b);
-                    }
-                    RecordValue::Int(_) => {
-                        // Tag not in int_tags but value is int — encode as varint-prefixed empty
-                        out.extend_from_slice(&encode_varint(0));
-                    }
-                }
-            }
-        }
-        out.push(0); // end marker
-    }
-    out
-}
-
-/// Decode all records from a section.
-fn decode_records(data: &[u8], int_tags: &[u8]) -> SyncResult<Vec<BTreeMap<u8, RecordValue>>> {
-    let mut records = Vec::new();
-    let mut at = 0;
-    while at < data.len() {
-        let (rec, next) = decode_record(data, at, int_tags)?;
-        if rec.is_empty() {
-            break;
-        }
-        records.push(rec);
-        at = next;
-    }
-    Ok(records)
-}
-
-// Android WMP tag constants
 const TAG_META_KIND: u8 = 1;
 const TAG_META_COUNT: u8 = 2;
 const TAG_META_DEVICE_ID: u8 = 5;
@@ -570,6 +292,10 @@ pub fn build_backup_bytes(
         rec.insert(TAG_TRACK_REMOTE_PATH, RecordValue::Str(t.remote_path.clone()));
         let file_name = t.remote_path.rsplit('/').next().unwrap_or(&t.remote_path);
         rec.insert(TAG_TRACK_FILENAME, RecordValue::Str(file_name.to_string()));
+        // Emit rev tag (matches Android which always writes it; tag 4)
+        if t.rev != 0 {
+            rec.insert(TAG_TRACK_REV, RecordValue::Int(t.rev as u64));
+        }
         rec.insert(TAG_TRACK_TITLE, RecordValue::Str(t.title.clone()));
         if let Some(ref s) = t.artist {
             rec.insert(TAG_TRACK_ARTIST, RecordValue::Str(s.clone()));
@@ -1042,6 +768,7 @@ pub fn restore_backup_bytes(
                             track_number: rec.get(&TAG_TRACK_TRACK_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
                             disc_number: rec.get(&TAG_TRACK_DISC_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
                             year: rec.get(&TAG_TRACK_YEAR).and_then(|v| v.as_int()).map(|n| n as i32),
+                            rev: rec.get(&TAG_TRACK_REV).and_then(|v| v.as_int()).unwrap_or(0),
                             size: 0,
                             modified: None,
                             mime_type: None,
@@ -1167,74 +894,6 @@ pub fn restore_backup_bytes(
         ""
     };
     Ok(format!("ok:restored:{}{}", notes.join(","), suffix))
-}
-
-/// Parse a generic WMP container (CV/PL/BK) with optional kind check.
-fn parse_wmp_container(
-    bytes: &[u8],
-    expected_kind: Option<&[u8; 2]>,
-) -> SyncResult<BTreeMap<u8, Vec<u8>>> {
-    if bytes.len() < 12 || &bytes[0..4] != b"WDMM" {
-        return Err(SyncError::Other("not a WDMM container".into()));
-    }
-    let kind = &bytes[4..6];
-    if let Some(exp) = expected_kind {
-        if kind != exp {
-            return Err(SyncError::Other(format!(
-                "container kind mismatch: got {}, want {}",
-                String::from_utf8_lossy(kind),
-                String::from_utf8_lossy(exp)
-            )));
-        }
-    }
-    let count = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-    let table_end = 12 + count * 18;
-    if bytes.len() < table_end {
-        return Err(SyncError::Other("truncated WMP section table".into()));
-    }
-    let mut map = BTreeMap::new();
-    for i in 0..count {
-        let off = 12 + i * 18;
-        let id = bytes[off];
-        let codec = bytes[off + 1];
-        let offset = u32::from_le_bytes(bytes[off + 2..off + 6].try_into().unwrap()) as usize;
-        let stored_len = u32::from_le_bytes(bytes[off + 6..off + 10].try_into().unwrap()) as usize;
-        let raw_len = u32::from_le_bytes(bytes[off + 10..off + 14].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(bytes[off + 14..off + 18].try_into().unwrap());
-
-        if offset + stored_len > bytes.len() {
-            return Err(SyncError::Other(format!("WMP section {id} bounds")));
-        }
-
-        let stored = &bytes[offset..offset + stored_len];
-        let raw = match codec {
-            0 => stored.to_vec(),
-            1 => {
-                use flate2::Decompress;
-                let mut decomp = Decompress::new(false);
-                let mut out = Vec::with_capacity(raw_len);
-                decomp
-                    .decompress_vec(stored, &mut out, flate2::FlushDecompress::Finish)
-                    .map_err(|e| SyncError::Other(format!("WMP section {id} inflate: {e}")))?;
-                if out.len() != raw_len {
-                    return Err(SyncError::Other(format!(
-                        "WMP section {id} length mismatch: got {}, want {raw_len}",
-                        out.len()
-                    )));
-                }
-                out
-            }
-            _ => {
-                return Err(SyncError::Other(format!("unsupported WMP codec {codec}")));
-            }
-        };
-
-        if crc32_ieee(&raw) != crc {
-            return Err(SyncError::Other(format!("WMP section {id} CRC mismatch")));
-        }
-        map.insert(id, raw);
-    }
-    Ok(map)
 }
 
 /// Decode a WDMMPL01 playlist blob → (Playlist, entries).
@@ -1875,6 +1534,7 @@ mod tests {
             size: 0,
             modified: None,
             mime_type: None,
+            rev: 0,
         };
         lib.upsert_track(&regular_track).unwrap();
 
