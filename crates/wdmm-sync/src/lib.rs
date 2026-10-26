@@ -1128,6 +1128,11 @@ mod tests {
         );
     }
 
+    // Parity test suite (Chunk B): must-add scenarios from wdmm-sync-parity-spec.md.
+    // Music: 2 (rev win), 3B (tomb loses), 4 (resurrect), 5A/B (cursor), 6 (zero-byte), 8 (rev gap).
+    // Manga: 10A/B (images pages + tomb id), 11 (container tomb), 12B/C (progress), 13 (legacy skip), 14 (rebuild clear).
+    include!("parity_tests.rs");
+
     // silence unused import warnings on platforms where the helper isn't needed
     #[allow(dead_code)]
     fn _keep_mutex(_m: &Mutex<()>) {}
