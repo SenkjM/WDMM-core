@@ -18,8 +18,9 @@ pub use backup::*;
 
 pub mod cover;
 pub use cover::{
-    build_cover_section, manga_cover_stem, music_cover_stem, normalize_remote_path_for_cover,
-    normalize_source_name, parse_cover_section, CoverRoots, COVER_KIND_JPEG,
+    build_cover_section, detect_image_kind, manga_cover_stem, music_cover_stem,
+    normalize_remote_path_for_cover, normalize_source_name, parse_cover_section, CoverRoots,
+    COVER_KIND_JPEG, COVER_KIND_NONE, COVER_KIND_PNG, COVER_KIND_WEBP,
 };
 
 pub mod wmp;

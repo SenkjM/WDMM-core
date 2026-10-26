@@ -24,9 +24,10 @@
 //! [u32 le len]
 //! [bytes × len]
 //! ```
-//! Defined kinds: `0` = JPEG cover blob.  Entries are indexed 0..N-1; the `coverIndex` integer
-//! tag (TAG 26) in a track record and the `cover_index` field in a manga JSON row are 0-based
-//! indices into that sequence.
+//! Defined kinds: `0` = none, `1` = WebP, `2` = JPEG, `3` = PNG — matching Android
+//! `WmpImageKind`.  Entries are indexed 0..N-1; the `coverIndex` integer tag (TAG 26) in a
+//! track record and the `cover_index` field in a manga JSON row are 0-based indices into that
+//! sequence.
 
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
@@ -43,9 +44,35 @@ pub struct CoverRoots {
 }
 
 // ── Kind constants ────────────────────────────────────────────────────────────
+// Matches Android WmpImageKind: none=0, webp=1, jpeg=2, png=3.
 
-/// TLV kind for a JPEG cover blob entry.
-pub const COVER_KIND_JPEG: u8 = 0;
+/// TLV kind indicating no / unknown image type (Android `WmpImageKind.none`).
+pub const COVER_KIND_NONE: u8 = 0;
+/// TLV kind for a WebP cover blob (Android `WmpImageKind.webp`).
+pub const COVER_KIND_WEBP: u8 = 1;
+/// TLV kind for a JPEG cover blob (Android `WmpImageKind.jpeg`).
+pub const COVER_KIND_JPEG: u8 = 2;
+/// TLV kind for a PNG cover blob (Android `WmpImageKind.png`).
+pub const COVER_KIND_PNG: u8 = 3;
+
+// ── Image kind detection ──────────────────────────────────────────────────────
+
+/// Detect the TLV kind from leading magic bytes, matching Android `WmpImageKind.detect(bytes)`.
+///
+/// Checks (in order): JPEG (`FF D8 FF`), WebP (`RIFF….WEBP`), PNG (`89 PNG CR LF 1A LF`).
+/// Returns `COVER_KIND_NONE` when no magic matches.
+pub fn detect_image_kind(bytes: &[u8]) -> u8 {
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return COVER_KIND_JPEG;
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return COVER_KIND_WEBP;
+    }
+    if bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return COVER_KIND_PNG;
+    }
+    COVER_KIND_NONE
+}
 
 // ── Normalizers ───────────────────────────────────────────────────────────────
 
@@ -153,7 +180,7 @@ pub fn build_cover_section(covers_dir: &Path, stems: &[String]) -> (Vec<u8>, Vec
 
     let mut section: Vec<u8> = Vec::new();
     for blob in &blobs {
-        section.push(COVER_KIND_JPEG);
+        section.push(detect_image_kind(blob));
         section.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         section.extend_from_slice(blob);
     }

@@ -407,11 +407,12 @@ pub fn build_backup_bytes(
         track_records.push(rec);
     }
 
-    // 2b. Music cover indices — set TAG_TRACK_COVER_INDEX (tag 26) for regular tracks that
-    //     have a cover file on disk, then emit COVERS section (SEC=3, codec Raw).
-    //     CUE slices (appended after regular tracks) do not carry individual cover indices.
+    // 2b. Music cover indices — set TAG_TRACK_COVER_INDEX (tag 26) on all track_records
+    //     (regular tracks, then CUE slices, in the same order they appear in track_records)
+    //     that have a cover file on disk, then emit COVERS section (SEC=3, codec Raw).
     if let Some(roots) = cover_roots {
-        let stems: Vec<String> = tracks
+        // One stem per track_record entry in order: regular tracks first, then CUE slices.
+        let mut all_stems: Vec<String> = tracks
             .iter()
             .map(|t| {
                 let source = account_map
@@ -421,9 +422,12 @@ pub fn build_backup_bytes(
                 cover::music_cover_stem(source, &t.remote_path)
             })
             .collect();
+        for s in &cue_slices {
+            all_stems.push(cover::music_cover_stem(&s.source_name, &s.remote_path));
+        }
         let (cover_bytes, cover_indices) =
-            cover::build_cover_section(&roots.music_covers_dir, &stems);
-        // track_records[0..tracks.len()] are regular tracks; CUE slices follow
+            cover::build_cover_section(&roots.music_covers_dir, &all_stems);
+        // cover_indices is aligned with all_stems which matches track_records order
         for (i, maybe_idx) in cover_indices.iter().enumerate() {
             if let Some(ci) = maybe_idx {
                 track_records[i]
@@ -813,6 +817,13 @@ pub fn restore_backup_bytes(
                             remote_missing: 0,
                         };
                         let _ = lib.upsert_cue_slice(&slice);
+                        // Collect cover need for file writing after all tracks are processed
+                        if cover_roots.is_some() {
+                            if let Some(ci) = rec.get(&TAG_TRACK_COVER_INDEX).and_then(|v| v.as_int()) {
+                                let stem = cover::music_cover_stem(source, remote_path);
+                                music_cover_needs.push((stem, ci as u32));
+                            }
+                        }
                     } else {
                         // Regular track
                         let title = rec.get(&TAG_TRACK_TITLE).and_then(|v| v.as_str())
@@ -867,7 +878,7 @@ pub fn restore_backup_bytes(
             let mut wrote_covers = 0usize;
             for (stem, ci) in &music_cover_needs {
                 if let Some(&(kind, ref blob)) = cover_entries.get(*ci as usize) {
-                    if kind == cover::COVER_KIND_JPEG && !blob.is_empty() {
+                    if kind != cover::COVER_KIND_NONE && !blob.is_empty() {
                         let path = roots.music_covers_dir.join(stem);
                         if std::fs::write(&path, blob).is_ok() {
                             wrote_covers += 1;
@@ -968,7 +979,7 @@ pub fn restore_backup_bytes(
                         if let (Some(roots), Some(ci)) = (cover_roots, cover_index) {
                             let stem = cover::manga_cover_stem(&manga.id);
                             if let Some(&(kind, ref blob)) = manga_cover_entries.get(ci as usize) {
-                                if kind == cover::COVER_KIND_JPEG && !blob.is_empty() {
+                                if kind != cover::COVER_KIND_NONE && !blob.is_empty() {
                                     if std::fs::create_dir_all(&roots.manga_covers_dir).is_ok() {
                                         let path = roots.manga_covers_dir.join(&stem);
                                         if std::fs::write(&path, blob).is_ok() {
@@ -1950,5 +1961,76 @@ mod tests {
         let tracks_raw = secs.get(&SEC_TRACKS).unwrap();
         let recs = decode_records(tracks_raw, TRACK_INT_TAGS).unwrap();
         assert!(recs[0].get(&TAG_TRACK_COVER_INDEX).is_none(), "no coverIndex when file missing");
+    }
+
+    /// Verify that a COVERS section emitted by Android (kind=2 = WmpImageKind::jpeg) is written
+    /// correctly on restore.  Before the WmpImageKind parity fix the restore code filtered on
+    /// `kind == COVER_KIND_JPEG` where COVER_KIND_JPEG was 0 — matching Android's "none" — so
+    /// every cover from a real Android archive was silently dropped.
+    #[test]
+    fn android_kind2_jpeg_covers_restore() {
+        use crate::cover::CoverRoots;
+
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        lib.insert_account(&wdmm_core::models::CloudAccount {
+            id: "acc1".into(),
+            provider_type: "webdav".into(),
+            display_name: "TestVault".into(),
+            base_url: None,
+            credentials_encrypted: vec![],
+        }).unwrap();
+
+        // Real JPEG magic — Android WmpImageKind::detect returns jpeg(2) for FF D8 FF.
+        let jpeg_bytes: &[u8] = b"\xff\xd8\xff\xe0android_kind2_cover";
+
+        // Build a raw COVERS section the way Android would: kind byte = 2 (jpeg).
+        let mut covers_section: Vec<u8> = Vec::new();
+        covers_section.push(cover::COVER_KIND_JPEG); // == 2
+        covers_section.extend_from_slice(&(jpeg_bytes.len() as u32).to_le_bytes());
+        covers_section.extend_from_slice(jpeg_bytes);
+
+        // Build a binary TRACKS payload: one track with TAG_TRACK_COVER_INDEX = 0.
+        let mut track_bytes: Vec<u8> = Vec::new();
+        // TAG_TRACK_SOURCE = 1 (string)
+        track_bytes.push(1u8);
+        track_bytes.extend_from_slice(&encode_varint(b"TestVault".len() as u64));
+        track_bytes.extend_from_slice(b"TestVault");
+        // TAG_TRACK_REMOTE_PATH = 2 (string)
+        track_bytes.push(2u8);
+        track_bytes.extend_from_slice(&encode_varint(b"/Music/kind2test.mp3".len() as u64));
+        track_bytes.extend_from_slice(b"/Music/kind2test.mp3");
+        // TAG_TRACK_TITLE = 5 (string)
+        track_bytes.push(5u8);
+        track_bytes.extend_from_slice(&encode_varint(b"Kind2 Test".len() as u64));
+        track_bytes.extend_from_slice(b"Kind2 Test");
+        // TAG_TRACK_COVER_INDEX = 26 (int tag)
+        track_bytes.push(TAG_TRACK_COVER_INDEX);
+        track_bytes.extend_from_slice(&encode_varint(0u64));
+        track_bytes.push(0u8); // end-of-record marker
+
+        // Wrap in WDMMBK01: TRACKS section deflated, COVERS section raw.
+        let bk = build_wmp_container(
+            &[
+                (SEC_TRACKS, track_bytes, Codec::Deflate),
+                (SEC_COVERS, covers_section, Codec::Raw),
+            ],
+            MAGIC_BK,
+        );
+
+        let music_dir = test_dir("kind2_covers_music");
+        let manga_dir = test_dir("kind2_covers_manga");
+        let roots = CoverRoots {
+            music_covers_dir: music_dir.clone(),
+            manga_covers_dir: manga_dir,
+        };
+
+        let msg = restore_backup_bytes(&lib, None, &bk, "", Some(&roots)).unwrap();
+        assert!(msg.contains("covers"), "restore note must include 'covers', got: {msg}");
+
+        // Verify the cover file was written with the correct bytes.
+        let stem = cover::music_cover_stem("TestVault", "/Music/kind2test.mp3");
+        let written = std::fs::read(music_dir.join(&stem))
+            .expect("cover file must be written for Android kind=2 (JPEG) entry");
+        assert_eq!(&written, jpeg_bytes);
     }
 }
