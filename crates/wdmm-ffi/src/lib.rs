@@ -3250,6 +3250,7 @@ fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrac
         disc_number: v["disc_number"].as_i64().map(|n| n as i32),
         year: v["year"].as_i64().map(|n| n as i32),
         mime_type: v["mime_type"].as_str().map(Into::into),
+        rev: v["rev"].as_i64().unwrap_or(0),
     })
 }
 
