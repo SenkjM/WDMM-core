@@ -179,8 +179,10 @@ fn part_name(prefix: &str, rev: i64) -> String {
     format!("{prefix}{stamp}-{rand:06x}.wdmm")
 }
 
-fn device_id() -> String {
-    "core-device".into()
+fn device_id(db: &LibraryDatabase) -> String {
+    // Persisted in KV (key `wdmm_device_id`); generated as a UUID v4 on first use.
+    // Shared with the music engine so the `deviceId` shard field is stable per device.
+    wdmm_storage::device_id_or_generate(db)
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -283,7 +285,7 @@ impl MangaLibrarySyncEngine {
         let revs: Vec<i64> = rows.iter().map(|r| r.manga.rev).collect();
         let from = *revs.iter().min().unwrap_or(&0);
         let to = *revs.iter().max().unwrap_or(&0);
-        let dev = device_id();
+        let dev = device_id(&self.db);
         let bytes = encode_manga_shard(WMP_KIND_SEG, &dev, from, to, rows)?;
         let file = part_name(SEGMENT_PREFIX, from);
         self.store.ensure_dir(&self.dir()).await?;
@@ -307,7 +309,7 @@ impl MangaLibrarySyncEngine {
         let revs: Vec<i64> = tombs.iter().map(|t| t.rev).collect();
         let from = *revs.iter().min().unwrap_or(&0);
         let to = *revs.iter().max().unwrap_or(&0);
-        let dev = device_id();
+        let dev = device_id(&self.db);
         let bytes = encode_manga_tomb_shard(&dev, from, to, tombs)?;
         let file = part_name(TOMB_PREFIX, from);
         self.store.ensure_dir(&self.dir()).await?;
@@ -332,7 +334,7 @@ impl MangaLibrarySyncEngine {
         let per = mangas_per_shard.clamp(50, 5000);
         let previous = self.read_manifest().await?;
         self.store.ensure_dir(&self.dir()).await?;
-        let dev = device_id();
+        let dev = device_id(&self.db);
         let mut shards: Vec<BaseShardEntry> = Vec::new();
         let mut max_rev = 0i64;
         let slices: Vec<&[MangaSyncRow]> = if rows.is_empty() { vec![] } else { rows.chunks(per).collect() };
@@ -538,7 +540,7 @@ impl MangaLibrarySyncEngine {
             let doc = ProgressDoc {
                 format: FORMAT_PROGRESS.into(),
                 format_version: FORMAT_VERSION_PROGRESS,
-                device_id: "core-device".into(),
+                device_id: device_id(&self.db),
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 entries,
             };

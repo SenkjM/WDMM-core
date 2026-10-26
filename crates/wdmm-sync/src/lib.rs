@@ -554,6 +554,48 @@ pub async fn run_sync_all(
     }))
 }
 
+/// Run a **full** sync (base-shard rebuild for music + manga) and return a JSON
+/// summary. This is the entry point the FFI `wdmm_sync_full` calls.
+///
+/// Each engine's `sync_full` adopts every cloud row, then rewrites the whole
+/// library as fresh base shards (compacting away old segments + tombstones) and
+/// clears the local cursor. Use after a device reset or to compact a fragmented
+/// remote. Credentials and playlists delegate to `sync_full` (which currently
+/// mirrors their incremental pass).
+pub async fn run_sync_full(
+    db: Arc<LibraryDatabase>,
+    driver: Arc<dyn CloudDriver>,
+    remote_dir: &str,
+) -> SyncResult<serde_json::Value> {
+    let cred = CredentialSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+        .sync_full()
+        .await?;
+    let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+        .sync_full()
+        .await?;
+    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+        .sync_full()
+        .await?;
+    let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
+        .sync_full()
+        .await?;
+    let summarize = |outcomes: &[SyncOutcome]| {
+        let (pushed, pulled, conflict) = outcomes.iter().fold((0, 0, 0), |(p, l, c), o| match o.action {
+            SyncAction::Pushed => (p + 1, l, c),
+            SyncAction::Pulled => (p, l + 1, c),
+            SyncAction::Conflict => (p, l, c + 1),
+            SyncAction::NoChange => (p, l, c),
+        });
+        serde_json::json!({ "total": outcomes.len(), "pushed": pushed, "pulled": pulled, "conflict": conflict })
+    };
+    Ok(serde_json::json!({
+        "credentials": summarize(&cred),
+        "library":     summarize(&lib),
+        "manga":       summarize(&manga),
+        "playlists":   summarize(&pl),
+    }))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

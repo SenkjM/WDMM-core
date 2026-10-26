@@ -1441,7 +1441,26 @@ impl LibraryDatabase {
         conn.execute("DELETE FROM kv_store WHERE key = ?1", params![key])?;
         Ok(())
     }
+}
 
+/// KV key that stores this device's stable cloud-sync identity.
+pub const DEVICE_ID_KV_KEY: &str = "wdmm_device_id";
+
+/// Return the persisted device ID from KV, generating and saving a new UUID v4
+/// if the key is absent or empty. Both sync engines share this helper so the
+/// shard `deviceId` fields are consistent across music and manga.
+pub fn device_id_or_generate(db: &LibraryDatabase) -> String {
+    if let Ok(Some(id)) = db.load_kv(DEVICE_ID_KV_KEY) {
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let id = Uuid::new_v4().to_string();
+    let _ = db.save_kv(DEVICE_ID_KV_KEY, &id);
+    id
+}
+
+impl LibraryDatabase {
     // ── sqflite migration ──────────────────────────────────────────────────────
 
     /// One-shot import from an old sqflite `music_library.db`.

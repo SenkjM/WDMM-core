@@ -177,9 +177,10 @@ fn part_name(prefix: &str, rev: i64) -> String {
     format!("{prefix}{stamp}-{rand:06x}.wdmm")
 }
 
-fn device_id(_db: &LibraryDatabase) -> String {
-    // Settings KV device_id may land later; stable placeholder matches inventory.
-    "core-device".into()
+fn device_id(db: &LibraryDatabase) -> String {
+    // Persisted in KV (key `wdmm_device_id`); generated as a UUID v4 on first use.
+    // Shared with the manga engine so the `deviceId` shard field is stable per device.
+    wdmm_storage::device_id_or_generate(db)
 }
 
 /// Music library sync engine (replaces toy library.json).
@@ -546,6 +547,11 @@ impl SyncEngine for LibrarySyncEngine {
         let mut to_publish = Vec::new();
         for row in &pending {
             let key = track_identity_key(&row.source_name, &row.remote_path);
+            // Skip: cloud already has a tomb at >= our rev — republishing is redundant.
+            if cloud.tombs.get(&key).copied().unwrap_or(0) >= row.rev && row.rev > 0 {
+                resurrected.insert(row.rev); // mark pushed, skip re-publish
+                continue;
+            }
             if let Some(live) = local_map.get(&key) {
                 if live.rev > row.rev {
                     resurrected.insert(row.rev);

@@ -405,6 +405,52 @@ pub extern "C" fn wdmm_sync_trigger(
     }
 }
 
+/// Full-rebuild sync — credentials + music library + manga + playlists.
+///
+/// Calls [`wdmm_sync::run_sync_full`], which triggers `sync_full` on every
+/// engine (base-shard rebuild for music and manga; full push/pull for
+/// credentials and playlists). Use to compact a fragmented remote or after a
+/// device reset.
+///
+/// Parameters (all null-terminated UTF-8 C strings):
+/// - `webdav_url`:  WebDAV base URL (e.g. `"https://nas.local/dav/"`)
+/// - `webdav_user`: HTTP Basic username (empty string for no auth)
+/// - `webdav_pass`: HTTP Basic password (empty string for no auth)
+/// - `remote_dir`:  Remote directory used as the sync root (e.g. `"/wdmm_sync"`)
+///
+/// Returns a JSON summary string (see [`wdmm_sync::run_sync_full`]) or
+/// `"error:<message>"`. Caller must free the result.
+///
+/// # Safety
+/// All pointer parameters must be valid null-terminated UTF-8 C strings.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_full(
+    webdav_url: *const c_char,
+    webdav_user: *const c_char,
+    webdav_pass: *const c_char,
+    remote_dir: *const c_char,
+) -> FfiString {
+    let url = match ptr_to_str(webdav_url) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid webdav_url"),
+    };
+    let user = ptr_to_str(webdav_user).unwrap_or("");
+    let pass = ptr_to_str(webdav_pass).unwrap_or("");
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+
+    let db = std::sync::Arc::clone(global_library_db());
+    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let result = rt().block_on(wdmm_sync::run_sync_full(db, driver, dir));
+    match result {
+        Ok(summary) => FfiString::from(summary.to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 
 // ── WebDAV browse FFI ────────────────────────────────────────────────────────
 
