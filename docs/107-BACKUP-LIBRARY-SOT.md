@@ -29,10 +29,10 @@ Android's `BackupService` now uses Core FFI (`RustCoreService.backupCreate`) for
 ### Dual-Read Restore (Complete)
 
 Backup **restore** is fully dual-read: Core can restore both:
-1. **Core JSON sections** (codec 0) — created by Desktop or future Core-based Android
-2. **Android binary sections** (codec 1) — created by current Android sqflite path
+1. **Legacy Core JSON sections** (codec 0) — older Desktop/Core archives
+2. **Android-compatible binary sections** (codec 1 + nested WDMMCV01/WDMMPL01) — current Core create and historical Android sqflite create
 
-This allows seamless cross-platform restore: Desktop can restore Android backups, and vice versa.
+This allows seamless cross-platform restore across old and new archives.
 
 ## Migration Blockers
 
@@ -45,9 +45,9 @@ The following gaps remain before Android can fully switch to Core as library sou
 3. ~~**Search indexes**: FTS or optimized search indexes (current Core uses basic LIKE queries)~~ ✅ **DONE (schema v8)**: Implemented FTS5 full-text search over track title/artist/album/album_artist with automatic index maintenance on upsert/delete/import
 4. **Migration validation**: Comprehensive testing of sqflite → Core data migration at scale
 
-Once these are resolved, Android can:
-- Switch backup **create** to read from Core's Rust DB (removing sqflite dependency)
-- Deprecate and remove `music_library_database_impl.dart` / sqflite layer
+Backup **create** already reads Core (Phase D). Remaining after dual-write validation:
+- Deprecate and remove `music_library_database_impl.dart` / sqflite layer from library query/UI paths
+- Emit CUEALBUMS / COVERS / PASS_CHECK from Core create when APIs/files exist (currently omitted; CUE slices still travel as tracks)
 
 ## Explicit Status
 
@@ -60,8 +60,8 @@ Once these are resolved, Android can:
 ## References
 
 - `wdmm-sync/src/backup.rs`: Backup create/restore implementation
-- `docs/106-ANDROID-BINARY-COMPATIBILITY.md`: Android binary section format details
-- Android `BackupManager.kt`: Current Android backup creation (sqflite → binary)
+- `docs/ANDROID-BINARY-BACKUP-COMPAT.md`: Android binary section format details (create + restore)
+- Android `BackupService.createArchiveBytes` → `RustCoreService.backupCreate` (Phase D)
 
 ## Verification Harness (no-device + on-device)
 
