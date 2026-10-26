@@ -336,7 +336,13 @@ Get a track by id as JSON, `"null"` if not found, or `"error:<message>"`.
 List all tracks as a JSON array.
 
 ### `extern "C" fn wdmm_track_search(query: *const c_char) -> FfiString`
-Case-insensitive substring search on title/artist. Returns JSON array.
+Full-text search over track title/artist/album/album_artist via FTS5 (schema v8).
+Returns a JSON array of matching tracks. Each whitespace-separated token is matched
+as a case-insensitive token prefix with AND logic (e.g., `beat` matches `Beatles`;
+`the beatles` matches tracks with both tokens). Results are ordered by FTS5 relevance
+rank, then title. Fallback behavior: short single-token queries (≤4 chars) use
+case-insensitive LIKE substring matching to preserve substring semantics (e.g.,
+`day` matches `Yesterday`). Returns `"error:<message>"` on failure.
 
 ### `extern "C" fn wdmm_track_delete(id: *const c_char) -> FfiString`
 Delete a track by id. Automatically prunes orphaned artists/albums.
@@ -368,8 +374,12 @@ ordered by disc_number, track_number, title. Returns `"error:<message>"` on fail
 
 ### `extern "C" fn wdmm_library_rebuild_aggregates() -> FfiString`
 Rebuild artist and album aggregates from all tracks. Clears artists+albums,
-walks all tracks, re-derives aggregates and updates track FKs. Idempotent.
-Returns `"ok"` or `"error:<message>"`.
+walks all tracks, re-derives aggregates and updates track FKs. Also rebuilds
+the FTS5 search index. Idempotent. Returns `"ok"` or `"error:<message>"`.
+
+### `extern "C" fn wdmm_library_rebuild_fts() -> FfiString`
+Rebuild the FTS5 search index from all tracks. Clears `tracks_fts` and reindexes
+every row. Idempotent. Returns `"ok"` or `"error:<message>"`.
 
 ### `extern "C" fn wdmm_library_clear_all() -> FfiString`
 Clear all library-persisted data except accounts and non-library KV keys.
@@ -384,8 +394,8 @@ Returns `"ok"` or `"error:<message>"`.
 ### `extern "C" fn wdmm_library_import_from_sqflite(old_db_path: *const c_char) -> FfiString`
 Import tracks, playlists, playlist_entries, `deleted_tracks` (v6 tombstones), and
 `sync_state` (v6 cursors) from an old sqflite `music_library.db`. Reads Android
-`album` and `album_artist` columns if present. Automatically rebuilds aggregates after import.
-Returns JSON summary:
+`album` and `album_artist` columns if present. Automatically rebuilds aggregates
+and FTS5 search index after import. Returns JSON summary:
 ```json
 {"already_done":false,"tracks":42,"playlists":3,"entries":120,"deleted_tracks":5,"sync_state":2}
 ```

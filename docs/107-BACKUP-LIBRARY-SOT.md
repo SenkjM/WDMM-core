@@ -46,7 +46,7 @@ The following gaps remain before Android can fully switch to Core as library sou
 
 1. **Dual-write parity**: Android must write to both sqflite and Core during migration phase
 2. ~~**Album/artist aggregation**: Core has tables but no track → album/artist auto-aggregation logic yet~~ ✅ **DONE (schema v7)**: Implemented in Phase A with stable hash-based IDs, automatic upsert on track insert, orphan pruning on delete, and rebuild helper
-3. **Search indexes**: FTS or optimized search indexes (current Core uses basic LIKE queries)
+3. ~~**Search indexes**: FTS or optimized search indexes (current Core uses basic LIKE queries)~~ ✅ **DONE (schema v8)**: Implemented FTS5 full-text search over track title/artist/album/album_artist with automatic index maintenance on upsert/delete/import
 4. **Migration validation**: Comprehensive testing of sqflite → Core data migration at scale
 
 Once these are resolved, Android can:
@@ -77,8 +77,8 @@ Once these are resolved, Android can:
 - Debug startup still runs `RustLibraryProbe` for track row-count parity (`[RustLibraryProbe] tracks … (match)`).
 - After CUE ingest with `kRustLibraryWriteEnabled`, compare Core `wdmm_cue_remaining_slices(source, cuePath)` against sqflite `remainingSlicesForCue` for the same album; mismatch means dual-write drift.
 
-### Status notes (2026-10-26 schema v6)
+### Status notes (2026-10-26 schema v8)
 - Android CUE **upsert** on ingest/scan is dual-written (Rust first, then sqflite); delete/clear paths already dual-written earlier.
 - Music **tombstones** (`deleted_tracks`) + **sync_state** now landed in Core schema v6 with full FFI CRUD. Android dual-write remains TODO.
-- Album/artist aggregation and FTS search remain deferred.
+- Album/artist aggregation (schema v7) and FTS5 search (schema v8) are complete.
 - Backup **create** remains sqflite/JSON; do not half-cut.

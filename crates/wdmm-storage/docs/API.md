@@ -1,7 +1,7 @@
 # wdmm-storage — Public API
 
-rusqlite library database (schema v7). Tracks, artists, albums, accounts,
-playlists, playlist entries, KV store, and a one-shot sqflite migration.
+rusqlite library database (schema v8). Tracks, artists, albums, accounts,
+playlists, playlist entries, KV store, FTS5 search, and a one-shot sqflite migration.
 
 ---
 
@@ -40,11 +40,11 @@ shape is backward compatible for consumers that ignore unknown keys.
 
 ### `struct LibraryDatabase`
 Mutex-guarded rusqlite connection. Schema v1 (base) + v2 (artists, albums, extended
-tracks columns, manga stubs) + v7 (album/album_artist TEXT columns on tracks).
-All DDL uses `IF NOT EXISTS` (additive migrations).
+tracks columns, manga stubs) + v7 (album/album_artist TEXT columns on tracks) +
+v8 (FTS5 virtual table for track search). All DDL uses `IF NOT EXISTS` (additive migrations).
 
 ### `fn LibraryDatabase::open(path: &Path) -> StorageResult<Self>`
-Open or create. `:memory:` is valid. Runs full DDL + bumps schema version to 7.
+Open or create. `:memory:` is valid. Runs full DDL + bumps schema version to 8.
 
 ### `fn LibraryDatabase::schema_version(&self) -> StorageResult<i64>`
 
@@ -57,6 +57,7 @@ Insert or replace all track columns. When `album`, `album_artist`, or `artist` t
 fields are present, automatically derives `artist_id` and `album_id` from stable
 hashes and upserts into artists/albums tables. Album/artist IDs passed in the
 LibraryTrack are ignored when text is present (text is source of truth).
+Also upserts into the `tracks_fts` FTS5 virtual table for search.
 
 ### `fn insert_track(&self, track: &LibraryTrack) -> StorageResult<()>`
 Backward-compat alias for `upsert_track`.
@@ -67,10 +68,27 @@ Backward-compat alias for `upsert_track`.
 Ordered by `title COLLATE NOCASE`.
 
 ### `fn delete_track(&self, id: &str) -> StorageResult<()>`
-Deletes the track and prunes orphaned artists/albums with zero referencing tracks.
+Deletes the track from `tracks` and `tracks_fts`, then prunes orphaned artists/albums
+with zero referencing tracks.
 
 ### `fn search_tracks(&self, query: &str) -> StorageResult<Vec<LibraryTrack>>`
-Case-insensitive LIKE on `title` and `artist`. `%` and `_` in `query` are escaped.
+Full-text search over `title`, `artist`, `album`, and `album_artist` via the
+FTS5 virtual table `tracks_fts` (schema v8). Each whitespace-separated token is
+treated as a case-insensitive token prefix (e.g. `beat` matches `Beatles`).
+Multiple tokens are AND'd. Results are ordered by FTS5 relevance rank, then
+`title COLLATE NOCASE`.
+
+Fallback behavior (documented): FTS5 matches on token boundaries, so a short
+single-token query (one token, ≤ 4 characters) bypasses FTS and uses a
+case-insensitive LIKE substring scan over all four columns — this preserves the
+previous substring semantics for queries like `day` matching `Yesterday`. If an
+FTS query errors or returns no rows, the LIKE scan is used as a fallback. `%`
+and `_` are escaped in the LIKE path.
+
+### `fn rebuild_fts_from_tracks(&self) -> StorageResult<()>`
+Clear `tracks_fts` and reindex every row of `tracks`. Idempotent. Called
+automatically by `rebuild_aggregates_from_tracks` and at the end of
+`import_from_sqflite`. Also available over FFI as `wdmm_library_rebuild_fts`.
 
 ### `fn tracks_by_artist_name(&self, name: &str) -> StorageResult<Vec<LibraryTrack>>`
 Returns all tracks matching the given artist name (case-insensitive).

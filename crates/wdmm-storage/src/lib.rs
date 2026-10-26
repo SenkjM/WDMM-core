@@ -1,4 +1,4 @@
-//! `wdmm-storage` — rusqlite library DB (schema v7, music + manga library).
+//! `wdmm-storage` — rusqlite library DB (schema v8, music + manga library).
 //!
 //! Schema v1 (Round 4): base tables.
 //! Schema v2 (Round 5): artists/albums tables, extended `tracks` columns,
@@ -13,6 +13,7 @@
 //! Schema v6: Music tombstones (`deleted_tracks`) + sync state cursors (`sync_state`).
 //! Schema v7: Denormalized `album` and `album_artist` TEXT columns on `tracks` for
 //!   aggregation; album/artist aggregation derived from track metadata.
+//! Schema v8: FTS5 full-text search over track title/artist/album/album_artist.
 
 #![forbid(unsafe_code)]
 
@@ -593,6 +594,22 @@ impl LibraryDatabase {
             )?;
         }
 
+        // ── v8 migration: FTS5 full-text search ──
+        if current_ver < 8 {
+            conn.execute_batch(
+                r#"
+                CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
+                  title, artist, album, album_artist, track_id UNINDEXED,
+                  tokenize = 'unicode61'
+                );
+                "#,
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (8)",
+                [],
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -644,6 +661,51 @@ impl LibraryDatabase {
                 &track.album_artist,
             ],
         )?;
+        drop(conn);
+        self.fts_upsert_track(track)?;
+        Ok(())
+    }
+
+    /// Upsert FTS row for a track (delete old row by track_id, insert new).
+    fn fts_upsert_track(&self, track: &LibraryTrack) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        // Delete old FTS entry if exists
+        conn.execute(
+            "DELETE FROM tracks_fts WHERE track_id = ?1",
+            params![&track.id],
+        )?;
+        // Insert new FTS entry
+        conn.execute(
+            "INSERT INTO tracks_fts (title, artist, album, album_artist, track_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &track.title,
+                &track.artist.as_deref().unwrap_or(""),
+                &track.album.as_deref().unwrap_or(""),
+                &track.album_artist.as_deref().unwrap_or(""),
+                &track.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete FTS row for a track.
+    fn fts_delete_track(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tracks_fts WHERE track_id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Rebuild FTS index from all tracks.
+    pub fn rebuild_fts_from_tracks(&self) -> StorageResult<()> {
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute("DELETE FROM tracks_fts", [])?;
+        }
+        let tracks = self.list_tracks()?;
+        for track in tracks {
+            self.fts_upsert_track(&track)?;
+        }
         Ok(())
     }
 
@@ -672,12 +734,77 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
         drop(conn);
+        self.fts_delete_track(id)?;
         self.prune_orphan_aggregates()?;
         Ok(())
     }
 
-    /// Search tracks by title or artist (case-insensitive LIKE).
+    /// Search tracks by title, artist, album, or album_artist using FTS5.
+    /// Falls back to LIKE search on empty query or FTS error.
     pub fn search_tracks(&self, query: &str) -> StorageResult<Vec<LibraryTrack>> {
+        // Empty query returns empty results (matching previous LIKE behavior with empty pattern)
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        // For single-token short queries, use LIKE for substring matching.
+        // FTS5 only matches token prefixes, so "day" matches "Daydream" but not "Yesterday".
+        // Multi-token queries use FTS for better performance.
+        let tokens: Vec<_> = query.split_whitespace().collect();
+        if tokens.len() == 1 && tokens[0].len() <= 4 {
+            // Short single-token query: use LIKE for substring matching
+            return self.search_tracks_like(query);
+        }
+
+        // Try FTS5 search first for multi-token or longer queries
+        match self.search_tracks_fts(query) {
+            Ok(tracks) if !tracks.is_empty() => Ok(tracks),
+            _ => {
+                // Fallback to LIKE search if FTS returns no results or errors
+                self.search_tracks_like(query)
+            }
+        }
+    }
+
+    /// FTS5 search helper. Sanitizes query for FTS MATCH syntax.
+    fn search_tracks_fts(&self, query: &str) -> StorageResult<Vec<LibraryTrack>> {
+        // For FTS5 to match substrings (like "day" in "Yesterday"), we need to use
+        // a more permissive approach. FTS5 matches tokens, so "day*" matches "daydream"
+        // but not "Yesterday" (where "day" is mid-word).
+        //
+        // Strategy: use AND to match all tokens as prefixes anywhere in the indexed text.
+        // Split query into tokens and create: token1* AND token2* AND ...
+        let tokens: Vec<_> = query.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build FTS query: each token as prefix match, AND'd together for multi-token queries
+        let fts_query = tokens
+            .iter()
+            .map(|token| {
+                let escaped = token.replace('"', "\"\"");
+                format!("\"{}\"*", escaped)
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.title, t.artist, t.remote_path, t.account_id, t.size, t.modified,
+                    t.album_id, t.artist_id, t.duration_ms, t.genre, t.track_number, t.disc_number, t.year, t.mime_type,
+                    t.album, t.album_artist
+             FROM tracks_fts fts
+             JOIN tracks t ON fts.track_id = t.id
+             WHERE tracks_fts MATCH ?1
+             ORDER BY rank, t.title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![fts_query], row_to_track)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// LIKE-based search fallback (previous implementation).
+    fn search_tracks_like(&self, query: &str) -> StorageResult<Vec<LibraryTrack>> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
         let mut stmt = conn.prepare(
@@ -685,7 +812,10 @@ impl LibraryDatabase {
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
                     album, album_artist
              FROM tracks
-             WHERE title LIKE ?1 ESCAPE '\\' OR artist LIKE ?1 ESCAPE '\\'
+             WHERE title LIKE ?1 ESCAPE '\\'
+                OR artist LIKE ?1 ESCAPE '\\'
+                OR album LIKE ?1 ESCAPE '\\'
+                OR album_artist LIKE ?1 ESCAPE '\\'
              ORDER BY title COLLATE NOCASE",
         )?;
         let rows = stmt.query_map(params![pattern], row_to_track)?;
@@ -903,6 +1033,9 @@ impl LibraryDatabase {
                 params![&artist_id, &album_id, &track.id],
             )?;
         }
+
+        // Rebuild FTS index
+        self.rebuild_fts_from_tracks()?;
 
         Ok(())
     }
@@ -2027,6 +2160,8 @@ impl LibraryDatabase {
             params![account_id],
         )?;
         drop(conn);
+        // Rebuild FTS to remove deleted tracks
+        self.rebuild_fts_from_tracks()?;
         self.prune_orphan_aggregates()?;
         Ok(n)
     }
@@ -2037,7 +2172,7 @@ impl LibraryDatabase {
     ///
     /// Clears: tracks, albums, artists, cue_albums, cue_slices, playlists,
     /// playlist_entries, user_folders, user_folder_items, mangas, manga_pages,
-    /// manga_progress, deleted_mangas, deleted tombstone table.
+    /// manga_progress, deleted_mangas, deleted tombstone table, FTS.
     ///
     /// Does NOT delete: accounts, kv_store.
     pub fn clear_library_all(&self) -> StorageResult<()> {
@@ -2060,12 +2195,13 @@ impl LibraryDatabase {
         tx.execute("DELETE FROM deleted_mangas", [])?;
         tx.execute("DELETE FROM deleted_tracks", [])?;
         tx.execute("DELETE FROM deleted", [])?;
+        tx.execute("DELETE FROM tracks_fts", [])?;
 
         tx.commit()?;
         Ok(())
     }
 
-    /// Clear library index: tracks, CUE tables, and track tombstones.
+    /// Clear library index: tracks, CUE tables, track tombstones, and FTS.
     ///
     /// Does NOT clear: playlists, user_folders, mangas, accounts.
     pub fn clear_library_index(&self) -> StorageResult<()> {
@@ -2079,6 +2215,7 @@ impl LibraryDatabase {
         tx.execute("DELETE FROM artists", [])?;
         tx.execute("DELETE FROM deleted_tracks", [])?;
         tx.execute("DELETE FROM deleted", [])?;
+        tx.execute("DELETE FROM tracks_fts", [])?;
 
         tx.commit()?;
         Ok(())
@@ -2961,7 +3098,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
     }
 
     #[test]
@@ -3185,6 +3322,130 @@ mod tests {
 
         // No match
         assert!(db.search_tracks("zzz").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_search_tracks() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        let tracks = [
+            ("t1", "Yesterday", Some("The Beatles"), Some("Abbey Road"), None),
+            ("t2", "Tomorrow Never Knows", Some("The Beatles"), Some("Revolver"), None),
+            ("t3", "Daydream", Some("Beatles Solo"), Some("Solo Album"), Some("John Lennon")),
+            ("t4", "Abbey Road Medley", Some("Various"), Some("Covers"), None),
+        ];
+        for (id, title, artist, album, album_artist) in tracks {
+            db.upsert_track(&LibraryTrack {
+                id: id.into(),
+                title: title.into(),
+                artist: artist.map(Into::into),
+                album: album.map(Into::into),
+                album_artist: album_artist.map(Into::into),
+                remote_path: format!("/m/{id}.mp3"),
+                account_id: "acc".into(),
+                size: 1,
+                modified: None,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        // Title match
+        let r = db.search_tracks("Yesterday").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, "t1");
+
+        // Artist match
+        let r = db.search_tracks("beatles").unwrap();
+        assert_eq!(r.len(), 3, "should find 'The Beatles' and 'Beatles Solo'");
+
+        // Album match
+        let r = db.search_tracks("abbey").unwrap();
+        assert_eq!(r.len(), 2, "should find album 'Abbey Road' and title 'Abbey Road Medley'");
+
+        // Album artist match
+        let r = db.search_tracks("lennon").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, "t3");
+
+        // Multi-token search
+        let r = db.search_tracks("the beatles").unwrap();
+        assert_eq!(r.len(), 2, "should find both Beatles tracks");
+
+        // Empty query
+        assert!(db.search_tracks("").unwrap().is_empty());
+        assert!(db.search_tracks("   ").unwrap().is_empty());
+
+        // No match
+        assert!(db.search_tracks("nonexistent").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_delete_track() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        db.upsert_track(&LibraryTrack {
+            id: "t1".into(),
+            title: "Test Track".into(),
+            artist: Some("Artist".into()),
+            remote_path: "/m/t1.mp3".into(),
+            account_id: "acc".into(),
+            size: 1,
+            modified: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Track is searchable
+        let r = db.search_tracks("test").unwrap();
+        assert_eq!(r.len(), 1);
+
+        // Delete track
+        db.delete_track("t1").unwrap();
+
+        // Track is no longer searchable
+        assert!(db.search_tracks("test").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_rebuild() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        db.upsert_track(&LibraryTrack {
+            id: "t1".into(),
+            title: "Track One".into(),
+            artist: Some("Artist".into()),
+            remote_path: "/m/t1.mp3".into(),
+            account_id: "acc".into(),
+            size: 1,
+            modified: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        db.upsert_track(&LibraryTrack {
+            id: "t2".into(),
+            title: "Track Two".into(),
+            artist: Some("Artist".into()),
+            remote_path: "/m/t2.mp3".into(),
+            account_id: "acc".into(),
+            size: 1,
+            modified: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Rebuild FTS
+        db.rebuild_fts_from_tracks().unwrap();
+
+        // Both tracks are searchable
+        let r = db.search_tracks("track").unwrap();
+        assert_eq!(r.len(), 2);
+
+        // Rebuild again (idempotent)
+        db.rebuild_fts_from_tracks().unwrap();
+        let r = db.search_tracks("track").unwrap();
+        assert_eq!(r.len(), 2);
     }
 
     #[test]
@@ -4077,7 +4338,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -4606,7 +4867,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {

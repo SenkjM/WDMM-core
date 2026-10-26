@@ -2143,6 +2143,15 @@ pub extern "C" fn wdmm_library_rebuild_aggregates() -> FfiString {
     }
 }
 
+/// Rebuild FTS index from all tracks. Returns `"ok"`.
+#[no_mangle]
+pub extern "C" fn wdmm_library_rebuild_fts() -> FfiString {
+    match global_library_db().rebuild_fts_from_tracks() {
+        Ok(_) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── Library management FFI ────────────────────────────────────────────────────
 
 /// Clear all library data except accounts and non-library KV keys. Returns `"ok"`.
@@ -3765,6 +3774,76 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert_eq!(s, "null");
         wdmm_ffi_free_string(r);
+    }
+
+    #[test]
+    fn fts_search_comprehensive() {
+        use std::ffi::CString;
+
+        // Upsert tracks with varied metadata
+        let tracks = [
+            (r#"{"id":"ft1","title":"Yesterday","artist":"The Beatles","album":"Help!","album_artist":"The Beatles","remote_path":"/m/1.mp3","account_id":"acc","size":1000}"#),
+            (r#"{"id":"ft2","title":"Tomorrow Never Knows","artist":"The Beatles","album":"Revolver","album_artist":"The Beatles","remote_path":"/m/2.mp3","account_id":"acc","size":1000}"#),
+            (r#"{"id":"ft3","title":"Imagine","artist":"John Lennon","album":"Imagine","album_artist":"John Lennon","remote_path":"/m/3.mp3","account_id":"acc","size":1000}"#),
+            (r#"{"id":"ft4","title":"Abbey Road Medley","artist":"Various","album":"Covers","album_artist":"Various","remote_path":"/m/4.mp3","account_id":"acc","size":1000}"#),
+        ];
+
+        for track_json in &tracks {
+            let json = CString::new(*track_json).unwrap();
+            let r = wdmm_track_upsert(json.as_ptr());
+            let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+            assert_eq!(s, "ok", "upsert failed: {s}");
+            wdmm_ffi_free_string(r);
+        }
+
+        // Search by title
+        let q = CString::new("yesterday").unwrap();
+        let r = wdmm_track_search(q.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        assert_eq!(arr.len(), 1, "should find 1 track with 'yesterday' in title");
+        assert_eq!(arr[0]["id"], "ft1");
+        wdmm_ffi_free_string(r);
+
+        // Search by artist
+        let q = CString::new("beatles").unwrap();
+        let r = wdmm_track_search(q.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        assert_eq!(arr.len(), 2, "should find 2 tracks with 'beatles' in artist");
+        wdmm_ffi_free_string(r);
+
+        // Search by album
+        let q = CString::new("imagine").unwrap();
+        let r = wdmm_track_search(q.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        assert_eq!(arr.len(), 1, "should find 1 track with 'imagine' (title or album)");
+        wdmm_ffi_free_string(r);
+
+        // Search by album_artist
+        let q = CString::new("lennon").unwrap();
+        let r = wdmm_track_search(q.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        assert_eq!(arr.len(), 1, "should find 1 track with 'lennon'");
+        assert_eq!(arr[0]["id"], "ft3");
+        wdmm_ffi_free_string(r);
+
+        // Multi-token search
+        let q = CString::new("the beatles").unwrap();
+        let r = wdmm_track_search(q.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        assert_eq!(arr.len(), 2, "should find both Beatles tracks");
+        wdmm_ffi_free_string(r);
+
+        // Cleanup
+        for id_str in ["ft1", "ft2", "ft3", "ft4"] {
+            let id = CString::new(id_str).unwrap();
+            let r = wdmm_track_delete(id.as_ptr());
+            wdmm_ffi_free_string(r);
+        }
     }
 
     #[test]
