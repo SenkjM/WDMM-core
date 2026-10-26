@@ -47,7 +47,8 @@ The following gaps remain before Android can fully switch to Core as library sou
 
 Backup **create** already reads Core (Phase D). Remaining after dual-write validation:
 - Deprecate and remove `music_library_database_impl.dart` / sqflite layer from library query/UI paths
-- Emit CUEALBUMS / COVERS / PASS_CHECK from Core create when APIs/files exist (currently omitted; CUE slices still travel as tracks)
+- ✅ **CUEALBUMS / PASS_CHECK / CUE slices in TRACKS** now emitted from Core create (2026-10-26)
+- COVERS / MANGA_COVERS remain omitted (Core doesn't manage cover files on disk; Android restore tolerates missing cover sections)
 
 ## Explicit Status
 

@@ -339,17 +339,34 @@ const TAG_VAULT_DRIVER_CONFIG: u8 = 9;
 const TAG_TRACK_SOURCE: u8 = 1;
 const TAG_TRACK_REMOTE_PATH: u8 = 2;
 const TAG_TRACK_FILENAME: u8 = 3;
+const TAG_TRACK_REV: u8 = 4;
 const TAG_TRACK_TITLE: u8 = 5;
 const TAG_TRACK_ARTIST: u8 = 6;
 const TAG_TRACK_ALBUM_ARTIST: u8 = 7;
 const TAG_TRACK_ALBUM: u8 = 8;
 const TAG_TRACK_DURATION_MS: u8 = 9;
 const TAG_TRACK_TRACK_NUM: u8 = 10;
+const TAG_TRACK_TRACK_TOTAL: u8 = 11;
 const TAG_TRACK_DISC_NUM: u8 = 12;
+const TAG_TRACK_DISC_TOTAL: u8 = 13;
 const TAG_TRACK_YEAR: u8 = 14;
 const TAG_TRACK_GENRE: u8 = 15;
+const TAG_TRACK_BITRATE: u8 = 16;
+const TAG_TRACK_SAMPLE_RATE: u8 = 17;
+const TAG_TRACK_CUE_ID: u8 = 18;
+const TAG_TRACK_CUE_REMOTE_PATH: u8 = 19;
+const TAG_TRACK_CUE_TRACK_INDEX: u8 = 20;
+const TAG_TRACK_AUDIO_MUSIC_ID: u8 = 21;
+const TAG_TRACK_AUDIO_REMOTE_PATH: u8 = 22;
+const TAG_TRACK_CLIP_START_MS: u8 = 23;
+const TAG_TRACK_CLIP_END_MS: u8 = 24;
+const TAG_TRACK_CACHE_GROUP_ID: u8 = 25;
+const TAG_TRACK_COVER_INDEX: u8 = 26;
+const TAG_TRACK_LAST_DOWNLOADED_AT: u8 = 28;
+const TAG_TRACK_LAST_TAG_READ_AT: u8 = 29;
 
-const TRACK_INT_TAGS: &[u8] = &[9, 10, 12, 14]; // durationMs, trackNumber, discNumber, year
+// Android kTrackIntTags: 4,9,10,11,12,13,14,16,17,20,23,24,26
+const TRACK_INT_TAGS: &[u8] = &[4, 9, 10, 11, 12, 13, 14, 16, 17, 20, 23, 24, 26];
 const VAULT_ACCOUNT_INT_TAGS: &[u8] = &[7]; // passwordEncrypted
 const META_INT_TAGS: &[u8] = &[1, 2]; // kind, count
 
@@ -519,60 +536,141 @@ pub fn build_backup_bytes(
 
     // 1. META section
     let tracks = lib.list_tracks()?;
+    let cue_slices = lib.list_cue_slices()?;
+    let total_track_count = tracks.len() + cue_slices.len();
+
     let device_id = lib.load_kv("device_id").unwrap_or(None).unwrap_or_else(|| "core".to_string());
     let created_at = chrono::Utc::now().to_rfc3339();
-    let note_json = json!({
+
+    let mut note_json = json!({
         "format": "webdav_media_manager_backup",
         "formatVersion": 7,
         "passwordEncryption": if passphrase.is_empty() { "none" } else { "aes-256-gcm" }
     });
+    if !passphrase.is_empty() {
+        note_json.as_object_mut().unwrap().insert("hasPassCheck".to_string(), serde_json::Value::Bool(true));
+    }
+
     let mut meta_rec = BTreeMap::new();
     meta_rec.insert(TAG_META_KIND, RecordValue::Int(3)); // WmpKind::backup = 3
-    meta_rec.insert(TAG_META_COUNT, RecordValue::Int(tracks.len() as u64));
+    meta_rec.insert(TAG_META_COUNT, RecordValue::Int(total_track_count as u64));
     meta_rec.insert(TAG_META_DEVICE_ID, RecordValue::Str(device_id));
     meta_rec.insert(TAG_META_CREATED_AT, RecordValue::Str(created_at));
     meta_rec.insert(TAG_META_NOTE, RecordValue::Str(serde_json::to_string(&note_json)?));
     sections.push((SEC_META, encode_records(&[meta_rec], META_INT_TAGS), Codec::Deflate));
 
-    // 2. TRACKS section (deflated binary WMP records)
-    let track_records: Vec<BTreeMap<u8, RecordValue>> = tracks
-        .iter()
-        .map(|t| {
-            let mut rec = BTreeMap::new();
-            let source_name = account_map.get(&t.account_id).map(|s| s.as_str()).unwrap_or(&t.account_id);
-            rec.insert(TAG_TRACK_SOURCE, RecordValue::Str(source_name.to_string()));
-            rec.insert(TAG_TRACK_REMOTE_PATH, RecordValue::Str(t.remote_path.clone()));
-            // file_name = last segment of remote_path
-            let file_name = t.remote_path.rsplit('/').next().unwrap_or(&t.remote_path);
-            rec.insert(TAG_TRACK_FILENAME, RecordValue::Str(file_name.to_string()));
-            rec.insert(TAG_TRACK_TITLE, RecordValue::Str(t.title.clone()));
-            if let Some(ref s) = t.artist {
-                rec.insert(TAG_TRACK_ARTIST, RecordValue::Str(s.clone()));
+    // 2. TRACKS section: regular tracks first, then CUE slices (Android order)
+    let mut track_records: Vec<BTreeMap<u8, RecordValue>> = Vec::new();
+
+    // Regular tracks
+    for t in &tracks {
+        let mut rec = BTreeMap::new();
+        let source_name = account_map.get(&t.account_id).map(|s| s.as_str()).unwrap_or(&t.account_id);
+        rec.insert(TAG_TRACK_SOURCE, RecordValue::Str(source_name.to_string()));
+        rec.insert(TAG_TRACK_REMOTE_PATH, RecordValue::Str(t.remote_path.clone()));
+        let file_name = t.remote_path.rsplit('/').next().unwrap_or(&t.remote_path);
+        rec.insert(TAG_TRACK_FILENAME, RecordValue::Str(file_name.to_string()));
+        rec.insert(TAG_TRACK_TITLE, RecordValue::Str(t.title.clone()));
+        if let Some(ref s) = t.artist {
+            rec.insert(TAG_TRACK_ARTIST, RecordValue::Str(s.clone()));
+        }
+        if let Some(ref s) = t.album_artist {
+            rec.insert(TAG_TRACK_ALBUM_ARTIST, RecordValue::Str(s.clone()));
+        }
+        if let Some(ref s) = t.album {
+            rec.insert(TAG_TRACK_ALBUM, RecordValue::Str(s.clone()));
+        }
+        if t.duration_ms > 0 {
+            rec.insert(TAG_TRACK_DURATION_MS, RecordValue::Int(t.duration_ms as u64));
+        }
+        if let Some(v) = t.track_number {
+            rec.insert(TAG_TRACK_TRACK_NUM, RecordValue::Int(v as u64));
+        }
+        if let Some(v) = t.disc_number {
+            rec.insert(TAG_TRACK_DISC_NUM, RecordValue::Int(v as u64));
+        }
+        if let Some(v) = t.year {
+            rec.insert(TAG_TRACK_YEAR, RecordValue::Int(v as u64));
+        }
+        if let Some(ref s) = t.genre {
+            rec.insert(TAG_TRACK_GENRE, RecordValue::Str(s.clone()));
+        }
+        track_records.push(rec);
+    }
+
+    // CUE slices (virtual tracks)
+    for s in &cue_slices {
+        let mut rec = BTreeMap::new();
+        rec.insert(TAG_TRACK_SOURCE, RecordValue::Str(s.source_name.clone()));
+        rec.insert(TAG_TRACK_REMOTE_PATH, RecordValue::Str(s.remote_path.clone()));
+        rec.insert(TAG_TRACK_FILENAME, RecordValue::Str(s.file_name.clone()));
+        rec.insert(TAG_TRACK_REV, RecordValue::Int(s.rev as u64));
+        if let Some(ref t) = s.title {
+            rec.insert(TAG_TRACK_TITLE, RecordValue::Str(t.clone()));
+        }
+        if let Some(ref a) = s.artist {
+            rec.insert(TAG_TRACK_ARTIST, RecordValue::Str(a.clone()));
+        }
+        if let Some(ref aa) = s.album_artist {
+            rec.insert(TAG_TRACK_ALBUM_ARTIST, RecordValue::Str(aa.clone()));
+        }
+        if let Some(ref al) = s.album {
+            rec.insert(TAG_TRACK_ALBUM, RecordValue::Str(al.clone()));
+        }
+        if let Some(d) = s.duration_ms {
+            rec.insert(TAG_TRACK_DURATION_MS, RecordValue::Int(d as u64));
+        }
+        if let Some(tn) = s.track_number {
+            rec.insert(TAG_TRACK_TRACK_NUM, RecordValue::Int(tn as u64));
+        }
+        if let Some(tt) = s.track_total {
+            rec.insert(TAG_TRACK_TRACK_TOTAL, RecordValue::Int(tt as u64));
+        }
+        if let Some(dn) = s.disc_number {
+            rec.insert(TAG_TRACK_DISC_NUM, RecordValue::Int(dn as u64));
+        }
+        if let Some(dt) = s.disc_total {
+            rec.insert(TAG_TRACK_DISC_TOTAL, RecordValue::Int(dt as u64));
+        }
+        if let Some(y) = s.year {
+            rec.insert(TAG_TRACK_YEAR, RecordValue::Int(y as u64));
+        }
+        if let Some(ref g) = s.genre {
+            rec.insert(TAG_TRACK_GENRE, RecordValue::Str(g.clone()));
+        }
+        if let Some(b) = s.bitrate {
+            rec.insert(TAG_TRACK_BITRATE, RecordValue::Int(b as u64));
+        }
+        if let Some(sr) = s.sample_rate {
+            rec.insert(TAG_TRACK_SAMPLE_RATE, RecordValue::Int(sr as u64));
+        }
+        // CUE-specific tags
+        rec.insert(TAG_TRACK_CUE_ID, RecordValue::Str(s.cue_id.clone()));
+        // Look up cue_remote_path from parent album (brief requirement)
+        if let Ok(albums) = lib.list_cue_albums() {
+            if let Some(album) = albums.iter().find(|a| a.cue_id == s.cue_id) {
+                rec.insert(TAG_TRACK_CUE_REMOTE_PATH, RecordValue::Str(album.cue_remote_path.clone()));
             }
-            if let Some(ref s) = t.album_artist {
-                rec.insert(TAG_TRACK_ALBUM_ARTIST, RecordValue::Str(s.clone()));
-            }
-            if let Some(ref s) = t.album {
-                rec.insert(TAG_TRACK_ALBUM, RecordValue::Str(s.clone()));
-            }
-            if t.duration_ms > 0 {
-                rec.insert(TAG_TRACK_DURATION_MS, RecordValue::Int(t.duration_ms as u64));
-            }
-            if let Some(v) = t.track_number {
-                rec.insert(TAG_TRACK_TRACK_NUM, RecordValue::Int(v as u64));
-            }
-            if let Some(v) = t.disc_number {
-                rec.insert(TAG_TRACK_DISC_NUM, RecordValue::Int(v as u64));
-            }
-            if let Some(v) = t.year {
-                rec.insert(TAG_TRACK_YEAR, RecordValue::Int(v as u64));
-            }
-            if let Some(ref s) = t.genre {
-                rec.insert(TAG_TRACK_GENRE, RecordValue::Str(s.clone()));
-            }
-            rec
-        })
-        .collect();
+        }
+        rec.insert(TAG_TRACK_CUE_TRACK_INDEX, RecordValue::Int(s.track_index as u64));
+        rec.insert(TAG_TRACK_AUDIO_MUSIC_ID, RecordValue::Str(s.audio_music_id.clone()));
+        if let Some(ref ar) = s.audio_remote_path {
+            rec.insert(TAG_TRACK_AUDIO_REMOTE_PATH, RecordValue::Str(ar.clone()));
+        }
+        if let Some(cs) = s.clip_start_ms {
+            rec.insert(TAG_TRACK_CLIP_START_MS, RecordValue::Int(cs as u64));
+        }
+        if let Some(ce) = s.clip_end_ms {
+            rec.insert(TAG_TRACK_CLIP_END_MS, RecordValue::Int(ce as u64));
+        }
+        if let Some(ref cg) = s.cache_group_id {
+            rec.insert(TAG_TRACK_CACHE_GROUP_ID, RecordValue::Str(cg.clone()));
+        }
+        rec.insert(TAG_TRACK_LAST_DOWNLOADED_AT, RecordValue::Str(s.last_downloaded_at.clone()));
+        rec.insert(TAG_TRACK_LAST_TAG_READ_AT, RecordValue::Str(s.last_tag_read_at.clone()));
+        track_records.push(rec);
+    }
+
     sections.push((SEC_TRACKS, encode_records(&track_records, TRACK_INT_TAGS), Codec::Deflate));
 
     // 3. CREDENTIALS section (nested WDMMCV01 container, raw codec)
@@ -677,10 +775,9 @@ pub fn build_backup_bytes(
     let kv: BTreeMap<String, String> = lib.list_kv()?.into_iter().collect();
     sections.push((SEC_SETTINGS, json_bytes(&kv)?, Codec::Deflate));
 
-    // 6. CUEALBUMS section (JSON, deflated) — if Core has CUE album API
-    // For now, omit if empty (Core schema doesn't expose cue_albums table via storage API)
-    // Android reads from LibraryDatabase.allCueAlbums(); Core doesn't expose that yet.
-    // Leave empty for now; document in commit message.
+    // 6. CUEALBUMS section (JSON, deflated) — always emit even if empty (Android does)
+    let cue_albums = lib.list_cue_albums()?;
+    sections.push((SEC_CUEALBUMS, json_bytes(&cue_albums)?, Codec::Deflate));
 
     // 7. MANGA_LIBRARY section (JSON, deflated)
     let mangas = lib.list_mangas().unwrap_or_default();
@@ -729,8 +826,16 @@ pub fn build_backup_bytes(
         sections.push((SEC_DMR_PREFS, json_bytes(&dmr_rows)?, Codec::Deflate));
     }
 
-    // COVERS / MANGA_COVERS / PASS_CHECK omitted: Core doesn't manage cover files on disk
-    // (Desktop/Android do). Document in commit / 107.
+    // 10. PASS_CHECK section (UTF-8 AESGCMv1: token, deflated) — only when passphrase non-empty
+    if !passphrase.is_empty() {
+        const PLAIN_TOKEN: &str = "WDMM-BACKUP-PASS-OK\u{0001}";
+        let encrypted_token = encrypt_aesgcmv1(PLAIN_TOKEN, passphrase)?;
+        sections.push((SEC_PASS_CHECK, encrypted_token.as_bytes().to_vec(), Codec::Deflate));
+    }
+
+    // COVERS / MANGA_COVERS omitted: Core doesn't manage cover files on disk (Desktop/Android do).
+    // Android restore tolerates missing COVERS/MANGA_COVERS (coversRaw null → no local thumbs).
+    // Document in commit / 107.
 
     let bk = build_wmp_container(&sections, MAGIC_BK);
     envelope_encrypt(&bk, passphrase)
@@ -864,35 +969,81 @@ pub fn restore_backup_bytes(
                         continue;
                     }
 
-                    let title = rec.get(&TAG_TRACK_TITLE).and_then(|v| v.as_str())
-                        .or_else(|| rec.get(&TAG_TRACK_FILENAME).and_then(|v| v.as_str()))
-                        .or_else(|| remote_path.rsplit('/').next())
-                        .unwrap_or("")
-                        .to_string();
+                    // Check if this is a CUE slice (has cueId tag)
+                    if let Some(cue_id) = rec.get(&TAG_TRACK_CUE_ID).and_then(|v| v.as_str()) {
+                        // This is a CUE slice — restore to cue_slices table
+                        use wdmm_storage::CueSlice;
+                        let title = rec.get(&TAG_TRACK_TITLE).and_then(|v| v.as_str())
+                            .or_else(|| rec.get(&TAG_TRACK_FILENAME).and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                            .to_string();
+                        let file_name = rec.get(&TAG_TRACK_FILENAME).and_then(|v| v.as_str()).unwrap_or("");
+                        let music_id = wdmm_core::identity::track_identity(remote_path);
 
-                    let account_id = account_map.get(source).cloned().unwrap_or_else(|| source.to_string());
-                    let id = wdmm_core::identity::track_identity(remote_path);
+                        let slice = CueSlice {
+                            music_id,
+                            cue_id: cue_id.to_string(),
+                            audio_music_id: rec.get(&TAG_TRACK_AUDIO_MUSIC_ID).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            source_name: source.to_string(),
+                            remote_path: remote_path.to_string(),
+                            file_name: file_name.to_string(),
+                            track_index: rec.get(&TAG_TRACK_CUE_TRACK_INDEX).and_then(|v| v.as_int()).unwrap_or(0),
+                            title: if title.is_empty() { None } else { Some(title) },
+                            artist: rec.get(&TAG_TRACK_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            album_artist: rec.get(&TAG_TRACK_ALBUM_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            album: rec.get(&TAG_TRACK_ALBUM).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            duration_ms: rec.get(&TAG_TRACK_DURATION_MS).and_then(|v| v.as_int()),
+                            track_number: rec.get(&TAG_TRACK_TRACK_NUM).and_then(|v| v.as_int()),
+                            track_total: rec.get(&TAG_TRACK_TRACK_TOTAL).and_then(|v| v.as_int()),
+                            disc_number: rec.get(&TAG_TRACK_DISC_NUM).and_then(|v| v.as_int()),
+                            disc_total: rec.get(&TAG_TRACK_DISC_TOTAL).and_then(|v| v.as_int()),
+                            year: rec.get(&TAG_TRACK_YEAR).and_then(|v| v.as_int()),
+                            genre: rec.get(&TAG_TRACK_GENRE).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            bitrate: rec.get(&TAG_TRACK_BITRATE).and_then(|v| v.as_int()),
+                            sample_rate: rec.get(&TAG_TRACK_SAMPLE_RATE).and_then(|v| v.as_int()),
+                            cover_path: None,
+                            audio_remote_path: rec.get(&TAG_TRACK_AUDIO_REMOTE_PATH).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            clip_start_ms: rec.get(&TAG_TRACK_CLIP_START_MS).and_then(|v| v.as_int()),
+                            clip_end_ms: rec.get(&TAG_TRACK_CLIP_END_MS).and_then(|v| v.as_int()),
+                            cache_group_id: rec.get(&TAG_TRACK_CACHE_GROUP_ID).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            rev: rec.get(&TAG_TRACK_REV).and_then(|v| v.as_int()).unwrap_or(0),
+                            last_downloaded_at: rec.get(&TAG_TRACK_LAST_DOWNLOADED_AT).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            last_tag_read_at: rec.get(&TAG_TRACK_LAST_TAG_READ_AT).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            remote_missing: 0,
+                        };
+                        let _ = lib.upsert_cue_slice(&slice);
+                    } else {
+                        // Regular track
+                        let title = rec.get(&TAG_TRACK_TITLE).and_then(|v| v.as_str())
+                            .or_else(|| rec.get(&TAG_TRACK_FILENAME).and_then(|v| v.as_str()))
+                            .or_else(|| remote_path.rsplit('/').next())
+                            .unwrap_or("")
+                            .to_string();
 
-                    let track = wdmm_core::models::LibraryTrack {
-                        id,
-                        account_id,
-                        remote_path: remote_path.to_string(),
-                        title,
-                        artist: rec.get(&TAG_TRACK_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        album_id: None,
-                        artist_id: None,
-                        album: rec.get(&TAG_TRACK_ALBUM).and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        album_artist: rec.get(&TAG_TRACK_ALBUM_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        genre: rec.get(&TAG_TRACK_GENRE).and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        duration_ms: rec.get(&TAG_TRACK_DURATION_MS).and_then(|v| v.as_int()).unwrap_or(0),
-                        track_number: rec.get(&TAG_TRACK_TRACK_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
-                        disc_number: rec.get(&TAG_TRACK_DISC_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
-                        year: rec.get(&TAG_TRACK_YEAR).and_then(|v| v.as_int()).map(|n| n as i32),
-                        size: 0,
-                        modified: None,
-                        mime_type: None,
-                    };
-                    let _ = lib.upsert_track(&track);
+                        let account_id = account_map.get(source).cloned().unwrap_or_else(|| source.to_string());
+                        let id = wdmm_core::identity::track_identity(remote_path);
+
+                        let track = wdmm_core::models::LibraryTrack {
+                            id,
+                            account_id,
+                            remote_path: remote_path.to_string(),
+                            title,
+                            artist: rec.get(&TAG_TRACK_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            album_id: None,
+                            artist_id: None,
+                            album: rec.get(&TAG_TRACK_ALBUM).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            album_artist: rec.get(&TAG_TRACK_ALBUM_ARTIST).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            genre: rec.get(&TAG_TRACK_GENRE).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            duration_ms: rec.get(&TAG_TRACK_DURATION_MS).and_then(|v| v.as_int()).unwrap_or(0),
+                            track_number: rec.get(&TAG_TRACK_TRACK_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
+                            disc_number: rec.get(&TAG_TRACK_DISC_NUM).and_then(|v| v.as_int()).map(|n| n as i32),
+                            year: rec.get(&TAG_TRACK_YEAR).and_then(|v| v.as_int()).map(|n| n as i32),
+                            size: 0,
+                            modified: None,
+                            mime_type: None,
+                        };
+                        let _ = lib.upsert_track(&track);
+                    }
                 }
             }
         }
@@ -939,6 +1090,30 @@ pub fn restore_backup_bytes(
                 let _ = lib.save_kv(&k, &v);
             }
             notes.push("settings");
+        }
+    }
+
+    // CUEALBUMS: restore CUE album records
+    if let Some(raw) = sections.get(&SEC_CUEALBUMS) {
+        if let Ok(albums) = serde_json::from_slice::<Vec<wdmm_storage::CueAlbum>>(raw) {
+            for album in albums {
+                let _ = lib.upsert_cue_album(&album);
+            }
+            notes.push("cue_albums");
+        }
+    }
+
+    // PASS_CHECK: verify passphrase check token if present (informational only during restore)
+    if let Some(raw) = sections.get(&SEC_PASS_CHECK) {
+        if let Ok(token) = std::str::from_utf8(raw) {
+            if !passphrase.is_empty() {
+                const PLAIN_TOKEN: &str = "WDMM-BACKUP-PASS-OK\u{0001}";
+                if let Some(decrypted) = try_decrypt_aesgcmv1(token, passphrase) {
+                    if decrypted == PLAIN_TOKEN {
+                        notes.push("pass_check_ok");
+                    }
+                }
+            }
         }
     }
 
@@ -1594,5 +1769,180 @@ mod tests {
         // Decrypt via try_decrypt_aesgcmv1
         let decrypted = try_decrypt_aesgcmv1(&encoded, passphrase).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn pass_check_present_with_passphrase() {
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+
+        // Create backup WITH passphrase
+        let bk_bytes = build_backup_bytes(&lib, None, "test_pass").unwrap();
+
+        // Decrypt envelope to get BK container
+        let bk_container = envelope_decrypt(&bk_bytes, "test_pass").unwrap();
+
+        // Parse BK container (already decompresses sections)
+        let sections = parse_bk_container(&bk_container).unwrap();
+
+        // Verify PASS_CHECK section (11) exists and contains AESGCMv1:...
+        let pass_check_raw = sections.get(&SEC_PASS_CHECK).expect("PASS_CHECK section should exist");
+        let token = std::str::from_utf8(pass_check_raw).unwrap();
+        assert!(token.starts_with("AESGCMv1:"), "Token should start with AESGCMv1:");
+
+        // Decrypt and verify
+        const PLAIN_TOKEN: &str = "WDMM-BACKUP-PASS-OK\u{0001}";
+        let decrypted = try_decrypt_aesgcmv1(token, "test_pass").unwrap();
+        assert_eq!(decrypted, PLAIN_TOKEN);
+
+        // Verify META note has hasPassCheck
+        let meta_raw = sections.get(&SEC_META).unwrap();
+        let meta_records = decode_records(meta_raw, META_INT_TAGS).unwrap();
+        let meta_rec = &meta_records[0];
+        let note_str = meta_rec.get(&TAG_META_NOTE).and_then(|v| v.as_str()).unwrap();
+        let note_json: serde_json::Value = serde_json::from_str(note_str).unwrap();
+        assert_eq!(note_json["hasPassCheck"].as_bool(), Some(true));
+
+        // Create backup WITHOUT passphrase
+        let bk_empty = build_backup_bytes(&lib, None, "").unwrap();
+        let bk_empty_container = envelope_decrypt(&bk_empty, "").unwrap();
+        let sections_empty = parse_bk_container(&bk_empty_container).unwrap();
+
+        // Verify PASS_CHECK section does NOT exist
+        assert!(sections_empty.get(&SEC_PASS_CHECK).is_none(), "PASS_CHECK should not exist with empty passphrase");
+    }
+
+    #[test]
+    fn cue_albums_section() {
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+
+        // Insert a CueAlbum
+        use wdmm_storage::CueAlbum;
+        let album = CueAlbum {
+            cue_id: "cue_001".to_string(),
+            source_name: "webdav_test".to_string(),
+            cue_remote_path: "/music/album.cue".to_string(),
+            title: Some("Test Album".to_string()),
+            performer: Some("Test Artist".to_string()),
+            cache_group_id: Some("group_1".to_string()),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        lib.upsert_cue_album(&album).unwrap();
+
+        // Create backup
+        let bk_bytes = build_backup_bytes(&lib, None, "").unwrap();
+        let bk_container = envelope_decrypt(&bk_bytes, "").unwrap();
+        let sections = parse_bk_container(&bk_container).unwrap();
+
+        // Verify CUEALBUMS section (8) exists (already decompressed)
+        let cue_albums_raw = sections.get(&SEC_CUEALBUMS).expect("CUEALBUMS section should exist");
+
+        // Parse as JSON array
+        let albums: Vec<serde_json::Value> = serde_json::from_slice(cue_albums_raw).unwrap();
+        assert_eq!(albums.len(), 1);
+
+        let album_json = &albums[0];
+        assert_eq!(album_json["cue_id"].as_str(), Some("cue_001"));
+        assert_eq!(album_json["source_name"].as_str(), Some("webdav_test"));
+        assert_eq!(album_json["cue_remote_path"].as_str(), Some("/music/album.cue"));
+        assert_eq!(album_json["title"].as_str(), Some("Test Album"));
+        assert_eq!(album_json["performer"].as_str(), Some("Test Artist"));
+    }
+
+    #[test]
+    fn cue_slices_in_tracks() {
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+
+        // Insert a regular track
+        let regular_track = wdmm_core::models::LibraryTrack {
+            id: "track_regular".to_string(),
+            account_id: "webdav_test".to_string(),
+            remote_path: "/music/regular.mp3".to_string(),
+            title: "Regular Track".to_string(),
+            artist: Some("Regular Artist".to_string()),
+            album: None,
+            album_artist: None,
+            genre: None,
+            duration_ms: 180000,
+            track_number: Some(1),
+            disc_number: None,
+            year: None,
+            album_id: None,
+            artist_id: None,
+            size: 0,
+            modified: None,
+            mime_type: None,
+        };
+        lib.upsert_track(&regular_track).unwrap();
+
+        // Insert a CueAlbum
+        use wdmm_storage::{CueAlbum, CueSlice};
+        let album = CueAlbum {
+            cue_id: "cue_001".to_string(),
+            source_name: "webdav_test".to_string(),
+            cue_remote_path: "/music/album.cue".to_string(),
+            title: Some("CUE Album".to_string()),
+            performer: Some("CUE Artist".to_string()),
+            cache_group_id: Some("group_1".to_string()),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        lib.upsert_cue_album(&album).unwrap();
+
+        // Insert a CueSlice
+        let slice = CueSlice {
+            music_id: "slice_001".to_string(),
+            cue_id: "cue_001".to_string(),
+            audio_music_id: "audio_001".to_string(),
+            source_name: "webdav_test".to_string(),
+            remote_path: "/music/virtual_track_01.flac".to_string(),
+            file_name: "virtual_track_01.flac".to_string(),
+            track_index: 1,
+            title: Some("CUE Track 1".to_string()),
+            artist: Some("CUE Artist".to_string()),
+            album_artist: None,
+            album: Some("CUE Album".to_string()),
+            duration_ms: Some(240000),
+            track_number: Some(1),
+            track_total: Some(10),
+            disc_number: None,
+            disc_total: None,
+            year: Some(2024),
+            genre: None,
+            bitrate: Some(1411),
+            sample_rate: Some(44100),
+            cover_path: None,
+            audio_remote_path: Some("/music/audio.flac".to_string()),
+            clip_start_ms: Some(0),
+            clip_end_ms: Some(240000),
+            cache_group_id: Some("group_1".to_string()),
+            rev: 1,
+            last_downloaded_at: "2024-01-01T00:00:00Z".to_string(),
+            last_tag_read_at: "2024-01-01T00:00:00Z".to_string(),
+            remote_missing: 0,
+        };
+        lib.upsert_cue_slice(&slice).unwrap();
+
+        // Create backup
+        let bk_bytes = build_backup_bytes(&lib, None, "").unwrap();
+        let bk_container = envelope_decrypt(&bk_bytes, "").unwrap();
+        let sections = parse_bk_container(&bk_container).unwrap();
+
+        // Verify TRACKS section contains both regular and CUE slice (already decompressed)
+        let tracks_raw = sections.get(&SEC_TRACKS).expect("TRACKS section should exist");
+
+        let track_records = decode_records(tracks_raw, TRACK_INT_TAGS).unwrap();
+        assert_eq!(track_records.len(), 2, "Should have 2 track records (1 regular + 1 CUE slice)");
+
+        // First record should be regular track (no cueId)
+        let first = &track_records[0];
+        assert!(first.get(&TAG_TRACK_CUE_ID).is_none(), "First track should not have cueId");
+        assert_eq!(first.get(&TAG_TRACK_TITLE).and_then(|v| v.as_str()), Some("Regular Track"));
+
+        // Second record should be CUE slice (has cueId)
+        let second = &track_records[1];
+        assert_eq!(second.get(&TAG_TRACK_CUE_ID).and_then(|v| v.as_str()), Some("cue_001"), "Second track should have cueId");
+        assert_eq!(second.get(&TAG_TRACK_TITLE).and_then(|v| v.as_str()), Some("CUE Track 1"));
+        assert_eq!(second.get(&TAG_TRACK_CUE_REMOTE_PATH).and_then(|v| v.as_str()), Some("/music/album.cue"));
+        assert_eq!(second.get(&TAG_TRACK_CUE_TRACK_INDEX).and_then(|v| v.as_int()), Some(1));
+        assert_eq!(second.get(&TAG_TRACK_AUDIO_MUSIC_ID).and_then(|v| v.as_str()), Some("audio_001"));
     }
 }

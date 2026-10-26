@@ -25,12 +25,13 @@ Core **restore** (`restore_backup_bytes`) dual-reads: Android binary sections **
 | 5          | CREDENTIALS   | Nested WDMMCV01 vault container (raw)  | Binary OR JSON               |
 | 6          | PLAYLISTS     | WDMMPL01 blob per playlist record (raw)| Binary OR JSON               |
 | 7          | SETTINGS      | Deflated JSON                          | JSON                         |
-| 8          | CUEALBUMS     | Omitted (Core schema v5+ lacks export) | JSON if present              |
+| 8          | CUEALBUMS     | Deflated JSON (always emitted)         | JSON                         |
+| 11         | PASS_CHECK    | Deflated UTF-8 AESGCMv1 token (when passphrase set) | UTF-8       |
 | 13         | MANGA_LIBRARY | Deflated JSON                          | JSON                         |
 | 14         | USER_FOLDERS  | Deflated JSON                          | JSON                         |
 | 16         | DMR_PREFS     | Deflated JSON                          | JSON                         |
 
-Sections **not** emitted by Core create: COVERS (3), PASS_CHECK (11), MANGA_COVERS (15) — Core doesn't manage cover files on disk; Desktop/Android handle those.
+Sections **not** emitted by Core create: COVERS (3), MANGA_COVERS (15) — Core doesn't manage cover files on disk; Desktop/Android handle those. Android restore already tolerates missing COVERS/MANGA_COVERS (coversRaw null → no local thumbs).
 
 Restore checks `looks_like_json` for CREDENTIALS, byte-level format detection for TRACKS/PLAYLISTS, and falls back to JSON if binary decode fails.
 
@@ -41,8 +42,8 @@ Restore checks `looks_like_json` for CREDENTIALS, byte-level format detection fo
 - String tags: deviceId=5, createdAt=6, note=9
 
 **WMP Track** (section 2, deflated):
-- String tags: sourceName=1, remotePath=2, fileName=3, title=5, artist=6, albumArtist=7, album=8, genre=15
-- Int tags: 9,10,12,14 (durationMs, trackNumber, discNumber, year)
+- String tags: sourceName=1, remotePath=2, fileName=3, title=5, artist=6, albumArtist=7, album=8, genre=15, cueId=18, cueRemotePath=19, audioMusicId=21, audioRemotePath=22, cacheGroupId=25, lastDownloadedAt=28, lastTagReadAt=29
+- Int tags: 4,9,10,11,12,13,14,16,17,20,23,24,26 (rev, durationMs, trackNumber, trackTotal, discNumber, discTotal, year, bitrate, sampleRate, cueTrackIndex, clipStartMs, clipEndMs, coverIndex)
 
 **WDMMCV01 Vault Account** (section 5, nested):
 - String tags: id=1, name=2, providerType=3, url=4, username=5, password=6
@@ -59,6 +60,13 @@ Core encrypts sensitive fields (passwords, cloud driver tokens) with AESGCMv1 be
 - Wire format: `AESGCMv1:<base64(salt16|nonce12|ciphertext|mac16)>`
 - KDF: PBKDF2-HMAC-SHA256, 120k iterations (same as envelope)
 - Core restore decrypts these fields using the backup passphrase
+
+### PASS_CHECK Section
+
+When a backup passphrase is set, Core emits section 11 (PASS_CHECK) containing the encrypted token `"WDMM-BACKUP-PASS-OK\u{0001}"`:
+- Encrypted via `encrypt_aesgcmv1` with the same passphrase
+- Allows Android/Desktop to verify passphrase correctness before full restore
+- META note JSON includes `"hasPassCheck": true` when section present
 
 ## Implementation Notes
 

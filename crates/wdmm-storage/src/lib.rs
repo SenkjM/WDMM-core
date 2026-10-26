@@ -2341,6 +2341,83 @@ impl LibraryDatabase {
         }
     }
 
+    /// List all CUE albums (for backup create).
+    pub fn list_cue_albums(&self) -> StorageResult<Vec<CueAlbum>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT cue_id, source_name, cue_remote_path, title, performer, cache_group_id, created_at
+             FROM cue_albums ORDER BY cue_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CueAlbum {
+                cue_id: row.get(0)?,
+                source_name: row.get(1)?,
+                cue_remote_path: row.get(2)?,
+                title: row.get(3)?,
+                performer: row.get(4)?,
+                cache_group_id: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    /// List all CUE slices (for backup create).
+    pub fn list_cue_slices(&self) -> StorageResult<Vec<CueSlice>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
+                    track_index, title, artist, album_artist, album, duration_ms,
+                    track_number, track_total, disc_number, disc_total, year, genre,
+                    bitrate, sample_rate, cover_path, audio_remote_path,
+                    clip_start_ms, clip_end_ms, cache_group_id, rev,
+                    last_downloaded_at, last_tag_read_at, remote_missing
+             FROM cue_slices ORDER BY cue_id ASC, track_index ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CueSlice {
+                music_id: row.get(0)?,
+                cue_id: row.get(1)?,
+                audio_music_id: row.get(2)?,
+                source_name: row.get(3)?,
+                remote_path: row.get(4)?,
+                file_name: row.get(5)?,
+                track_index: row.get(6)?,
+                title: row.get(7)?,
+                artist: row.get(8)?,
+                album_artist: row.get(9)?,
+                album: row.get(10)?,
+                duration_ms: row.get(11)?,
+                track_number: row.get(12)?,
+                track_total: row.get(13)?,
+                disc_number: row.get(14)?,
+                disc_total: row.get(15)?,
+                year: row.get(16)?,
+                genre: row.get(17)?,
+                bitrate: row.get(18)?,
+                sample_rate: row.get(19)?,
+                cover_path: row.get(20)?,
+                audio_remote_path: row.get(21)?,
+                clip_start_ms: row.get(22)?,
+                clip_end_ms: row.get(23)?,
+                cache_group_id: row.get(24)?,
+                rev: row.get(25)?,
+                last_downloaded_at: row.get(26)?,
+                last_tag_read_at: row.get(27)?,
+                remote_missing: row.get(28)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
     // ── Deleted tracks (v6 tombstones) ────────────────────────────────────────
 
     pub fn upsert_deleted_track(&self, track: &DeletedTrack) -> StorageResult<()> {
