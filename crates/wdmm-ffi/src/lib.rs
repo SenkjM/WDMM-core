@@ -3065,6 +3065,21 @@ pub extern "C" fn wdmm_manga_delete(id: *const c_char) -> FfiString {
     }
 }
 
+/// Clear a single `deleted_mangas` tombstone by its sync key.
+/// `sync_key` must be a valid null-terminated UTF-8 C string.
+/// Returns `"ok"` or `"error:…"`. Caller must free the result.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_manga_clear(sync_key: *const c_char) -> FfiString {
+    let key = match ptr_to_str(sync_key) {
+        Some(s) => s,
+        None => return FfiString::from("error:null sync_key pointer"),
+    };
+    match global_library_db().clear_deleted_manga(key) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 /// List all pages for a manga as a JSON array.
 /// `manga_id` must be a valid null-terminated UTF-8 C string.
 /// Returns `"error:…"` on failure. Caller must free the result.
