@@ -2066,6 +2066,85 @@ impl LibraryDatabase {
         Ok(())
     }
 
+    /// Atomically replace the entire user-folder tree in a single transaction.
+    ///
+    /// This is the cloud-sync snapshot path: wipe all `user_folder_items` and
+    /// `user_folders`, then re-insert the supplied folders and items verbatim,
+    /// keeping their caller-provided ids, parent links, sort order, and
+    /// timestamps.
+    ///
+    /// `parent_id` is normalized the same way as `create_user_folder` /
+    /// `move_user_folder`: `None` / `""` / `"root"` are stored as SQL `NULL`
+    /// (virtual root). Items may reference `folder_id = "root"` (virtual root);
+    /// such rows are kept as-is.
+    ///
+    /// Does not touch `kv` / `folders_changed_at` — the caller (Android) owns
+    /// stamping after mutations.
+    pub fn replace_user_folders(
+        &self,
+        folders: &[UserFolder],
+        items: &[UserFolderItem],
+    ) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM user_folder_items", [])?;
+        tx.execute("DELETE FROM user_folders", [])?;
+        for folder in folders {
+            let normalized = normalize_parent(folder.parent_id.as_deref());
+            tx.execute(
+                "INSERT INTO user_folders (id, name, parent_id, sort_order, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &folder.id,
+                    &folder.name,
+                    normalized,
+                    folder.sort_order,
+                    folder.created_at,
+                ],
+            )?;
+        }
+        for item in items {
+            tx.execute(
+                "INSERT INTO user_folder_items \
+                 (folder_id, ref_kind, ref_key, sort_order, added_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &item.folder_id,
+                    &item.ref_kind,
+                    &item.ref_key,
+                    item.sort_order,
+                    item.added_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return every user folder ordered by `sort_order` then name (for
+    /// roundtrip tests and full-tree inspection — no parent filter).
+    pub fn list_all_user_folders(&self) -> StorageResult<Vec<UserFolder>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, parent_id, sort_order, created_at
+             FROM user_folders ORDER BY sort_order, name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], row_to_folder)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
+    /// Return every user-folder item ordered by `folder_id` then `sort_order`
+    /// (for roundtrip tests and full-tree inspection).
+    pub fn list_all_user_folder_items(&self) -> StorageResult<Vec<UserFolderItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, ref_kind, ref_key, sort_order, added_at
+             FROM user_folder_items ORDER BY folder_id, sort_order",
+        )?;
+        let rows = stmt.query_map([], row_to_folder_item)?;
+        rows.map(|r| r.map_err(StorageError::from)).collect()
+    }
+
     // ── Manga (schema v4) ─────────────────────────────────────────────────────
 
     pub fn list_mangas(&self) -> StorageResult<Vec<Manga>> {
@@ -4621,6 +4700,116 @@ mod tests {
         db.delete_user_folder(&parent.id).unwrap();
         assert!(db.get_user_folder(&child.id).unwrap().is_none());
         assert!(db.list_user_folder_items(&child.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replace_user_folders_roundtrip() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let ts1: i64 = 1_700_000_000;
+        let ts2: i64 = 1_700_010_000;
+
+        // ── First snapshot: two folders, two items ─────────────────────────────
+        let folders = vec![
+            UserFolder {
+                id: "f-root-1".to_string(),
+                name: "Music".to_string(),
+                parent_id: None,          // virtual root
+                sort_order: 0,
+                created_at: ts1,
+            },
+            UserFolder {
+                id: "f-child-1".to_string(),
+                name: "Rock".to_string(),
+                parent_id: Some("f-root-1".to_string()),
+                sort_order: 0,
+                created_at: ts2,
+            },
+        ];
+        let items = vec![
+            UserFolderItem {
+                folder_id: "root".to_string(),
+                ref_kind: "track".to_string(),
+                ref_key: "sha1-abc".to_string(),
+                sort_order: 0,
+                added_at: ts1,
+            },
+            UserFolderItem {
+                folder_id: "f-child-1".to_string(),
+                ref_kind: "album".to_string(),
+                ref_key: "alb-001".to_string(),
+                sort_order: 1,
+                added_at: ts2,
+            },
+        ];
+
+        db.replace_user_folders(&folders, &items).unwrap();
+
+        // Verify folders are present via list_all_user_folders.
+        let all_folders = db.list_all_user_folders().unwrap();
+        assert_eq!(all_folders.len(), 2, "expected 2 folders after first replace");
+        let music = all_folders.iter().find(|f| f.id == "f-root-1").unwrap();
+        assert_eq!(music.name, "Music");
+        assert!(music.parent_id.is_none(), "Music should be at virtual root");
+        assert_eq!(music.created_at, ts1);
+
+        let rock = all_folders.iter().find(|f| f.id == "f-child-1").unwrap();
+        assert_eq!(rock.name, "Rock");
+        assert_eq!(rock.parent_id.as_deref(), Some("f-root-1"));
+        assert_eq!(rock.created_at, ts2);
+
+        // Verify items via list_all_user_folder_items.
+        let all_items = db.list_all_user_folder_items().unwrap();
+        assert_eq!(all_items.len(), 2, "expected 2 items after first replace");
+        assert!(all_items.iter().any(|i| i.folder_id == "root" && i.ref_key == "sha1-abc"));
+        assert!(all_items.iter().any(|i| i.folder_id == "f-child-1" && i.ref_key == "alb-001"));
+
+        // parent_id "root" sentinel normalises to NULL via replace.
+        let folders_root = vec![UserFolder {
+            id: "f-root-2".to_string(),
+            name: "Sentinel".to_string(),
+            parent_id: Some("root".to_string()), // "root" → NULL
+            sort_order: 0,
+            created_at: ts1,
+        }];
+        db.replace_user_folders(&folders_root, &[]).unwrap();
+        let check = db.list_all_user_folders().unwrap();
+        let sentinel = check.iter().find(|f| f.id == "f-root-2").unwrap();
+        assert!(
+            sentinel.parent_id.is_none(),
+            "parent_id 'root' must normalise to NULL"
+        );
+
+        // ── Wipe: replace with empty sets ─────────────────────────────────────
+        db.replace_user_folders(&[], &[]).unwrap();
+        assert!(db.list_all_user_folders().unwrap().is_empty(), "folders should be empty after wipe");
+        assert!(db.list_all_user_folder_items().unwrap().is_empty(), "items should be empty after wipe");
+
+        // ── Second snapshot replaces first ────────────────────────────────────
+        let folders2 = vec![UserFolder {
+            id: "f-new-1".to_string(),
+            name: "NewFolder".to_string(),
+            parent_id: None,
+            sort_order: 0,
+            created_at: ts2,
+        }];
+        let items2 = vec![UserFolderItem {
+            folder_id: "f-new-1".to_string(),
+            ref_kind: "genre".to_string(),
+            ref_key: "genre-jazz".to_string(),
+            sort_order: 0,
+            added_at: ts2,
+        }];
+        db.replace_user_folders(&folders2, &items2).unwrap();
+
+        let all2 = db.list_all_user_folders().unwrap();
+        assert_eq!(all2.len(), 1);
+        assert_eq!(all2[0].id, "f-new-1");
+        // Old folder f-root-1 must be gone.
+        assert!(db.get_user_folder("f-root-1").unwrap().is_none());
+
+        let all_items2 = db.list_all_user_folder_items().unwrap();
+        assert_eq!(all_items2.len(), 1);
+        assert_eq!(all_items2[0].ref_key, "genre-jazz");
     }
 
     #[test]

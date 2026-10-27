@@ -2559,6 +2559,123 @@ pub extern "C" fn wdmm_user_folder_set_items(
     }
 }
 
+/// Parse a JSON value as a Unix timestamp (seconds).
+///
+/// Accepts either a JSON integer (already Unix seconds) or a JSON string in
+/// RFC 3339 / ISO 8601 format (e.g. `"2024-11-01T12:00:00Z"`). Returns `now`
+/// for missing (`Null`) or unrecognised values.
+fn parse_timestamp_field(v: &serde_json::Value, now: i64) -> i64 {
+    if let Some(i) = v.as_i64() {
+        return i;
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return dt.timestamp();
+        }
+    }
+    now
+}
+
+/// Atomically replace the entire user-folder tree from a cloud-sync snapshot.
+///
+/// Input JSON shape:
+/// ```json
+/// {
+///   "folders": [
+///     {"id":"…","parent_id":null|"…","name":"…","sort_order":0,
+///      "created_at": <unix_i64 | ISO8601 string>}
+///   ],
+///   "items": [
+///     {"folder_id":"…"|"root","ref_kind":"…","ref_key":"…","sort_order":0,
+///      "added_at": <unix_i64 | ISO8601 string>}
+///   ]
+/// }
+/// ```
+///
+/// * `parent_id` absent / `null` / `"root"` / `""` → virtual root (SQL NULL).
+/// * `created_at` / `added_at`: Unix i64 **or** ISO 8601 string; missing → now.
+/// * `sort_order`: missing / null → 0.
+///
+/// Returns `"ok"` on success or `"error:<message>"` on failure.
+/// Caller must free the returned string with `wdmm_ffi_free_string`.
+#[no_mangle]
+pub extern "C" fn wdmm_user_folder_replace_snapshot(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let now = chrono::Utc::now().timestamp();
+
+    // ── Parse folders ─────────────────────────────────────────────────────────
+    let folders_json = match v["folders"].as_array() {
+        Some(a) => a,
+        None => return FfiString::from("error:'folders' must be a JSON array"),
+    };
+    let mut folders = Vec::with_capacity(folders_json.len());
+    for (i, f) in folders_json.iter().enumerate() {
+        let id = match f["id"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:folders[{i}] missing 'id'")),
+        };
+        let name = match f["name"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:folders[{i}] missing 'name'")),
+        };
+        // parent_id: null JSON value, absent, "root", or "" all mean virtual root.
+        let parent_id: Option<String> = f["parent_id"].as_str().and_then(|p| {
+            if p.is_empty() || p == "root" { None } else { Some(p.to_string()) }
+        });
+        let sort_order = f["sort_order"].as_i64().unwrap_or(0);
+        let created_at = parse_timestamp_field(&f["created_at"], now);
+        folders.push(wdmm_storage::UserFolder {
+            id,
+            name,
+            parent_id,
+            sort_order,
+            created_at,
+        });
+    }
+
+    // ── Parse items ───────────────────────────────────────────────────────────
+    let items_json = match v["items"].as_array() {
+        Some(a) => a,
+        None => return FfiString::from("error:'items' must be a JSON array"),
+    };
+    let mut items = Vec::with_capacity(items_json.len());
+    for (i, item) in items_json.iter().enumerate() {
+        let folder_id = match item["folder_id"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:items[{i}] missing 'folder_id'")),
+        };
+        let ref_kind = match item["ref_kind"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:items[{i}] missing 'ref_kind'")),
+        };
+        let ref_key = match item["ref_key"].as_str() {
+            Some(s) => s.to_string(),
+            None => return FfiString::from(format!("error:items[{i}] missing 'ref_key'")),
+        };
+        let sort_order = item["sort_order"].as_i64().unwrap_or(0);
+        let added_at = parse_timestamp_field(&item["added_at"], now);
+        items.push(wdmm_storage::UserFolderItem {
+            folder_id,
+            ref_kind,
+            ref_key,
+            sort_order,
+            added_at,
+        });
+    }
+
+    match global_library_db().replace_user_folders(&folders, &items) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── CUE sheet FFI (v5) ────────────────────────────────────────────────────────
 
 /// Upsert a CUE album from JSON. Returns `"ok"` or `"error:<message>"`.
@@ -4909,6 +5026,147 @@ mod tests {
         let r = wdmm_user_folder_delete(fid.as_ptr());
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert_eq!(s, "ok");
+        wdmm_ffi_free_string(r);
+    }
+
+    // ── replace_snapshot FFI ─────────────────────────────────────────────────
+
+    #[test]
+    fn user_folder_replace_snapshot_ffi() {
+        use std::ffi::CString;
+
+        // ── First snapshot: two folders (unix + ISO8601 timestamps), two items ─
+        let snap1 = serde_json::json!({
+            "folders": [
+                {
+                    "id": "snap-f1",
+                    "parent_id": null,
+                    "name": "SnapMusic",
+                    "sort_order": 0,
+                    "created_at": 1_700_000_000_i64
+                },
+                {
+                    "id": "snap-f2",
+                    "parent_id": "snap-f1",
+                    "name": "SnapRock",
+                    "sort_order": 1,
+                    "created_at": "2023-11-15T00:00:00Z"
+                }
+            ],
+            "items": [
+                {
+                    "folder_id": "root",
+                    "ref_kind": "track",
+                    "ref_key": "snap-track-1",
+                    "sort_order": 0,
+                    "added_at": 1_700_000_100_i64
+                },
+                {
+                    "folder_id": "snap-f2",
+                    "ref_kind": "album",
+                    "ref_key": "snap-alb-1",
+                    "sort_order": 0,
+                    "added_at": "2023-11-15T01:00:00Z"
+                }
+            ]
+        }).to_string();
+        let c1 = CString::new(snap1).unwrap();
+        let r = wdmm_user_folder_replace_snapshot(c1.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "snapshot1 failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // Verify snap-f2 is a child of snap-f1.
+        let fid1 = CString::new("snap-f1").unwrap();
+        let r = wdmm_user_folder_list_children(fid1.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        let children = arr.as_array().unwrap();
+        assert_eq!(children.len(), 1, "snap-f1 should have 1 child");
+        assert_eq!(children[0]["id"], "snap-f2");
+        assert_eq!(children[0]["name"], "SnapRock");
+        // ISO8601 timestamp: 2023-11-15T00:00:00Z = 1700006400
+        assert_eq!(
+            children[0]["created_at"].as_i64().unwrap(),
+            1_700_006_400_i64,
+            "ISO8601 timestamp should round-trip as unix seconds"
+        );
+        wdmm_ffi_free_string(r);
+
+        // Verify root item is present.
+        let root_c = CString::new("root").unwrap();
+        let r = wdmm_user_folder_list_items(root_c.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            arr.as_array().unwrap().iter().any(|it| it["ref_key"] == "snap-track-1"),
+            "root should contain snap-track-1"
+        );
+        wdmm_ffi_free_string(r);
+
+        // Verify snap-f2 item.
+        let fid2 = CString::new("snap-f2").unwrap();
+        let r = wdmm_user_folder_list_items(fid2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            arr.as_array().unwrap().iter().any(|it| it["ref_key"] == "snap-alb-1"),
+            "snap-f2 should contain snap-alb-1"
+        );
+        wdmm_ffi_free_string(r);
+
+        // ── Second snapshot (different ids) wipes first ───────────────────────
+        let snap2 = serde_json::json!({
+            "folders": [
+                {"id": "snap-new-1", "parent_id": null, "name": "NewFolder",
+                 "sort_order": 0, "created_at": 1_700_020_000_i64}
+            ],
+            "items": []
+        }).to_string();
+        let c2 = CString::new(snap2).unwrap();
+        let r = wdmm_user_folder_replace_snapshot(c2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "snapshot2 failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // Old snap-f1 must be gone.
+        let r = wdmm_user_folder_list_children(fid1.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            arr.as_array().unwrap().is_empty(),
+            "snap-f1 children must be empty after second snapshot"
+        );
+        wdmm_ffi_free_string(r);
+
+        // Root must have no track item from snapshot 1.
+        let root_c2 = CString::new("root").unwrap();
+        let r = wdmm_user_folder_list_items(root_c2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            !arr.as_array().unwrap().iter().any(|it| it["ref_key"] == "snap-track-1"),
+            "snap-track-1 must be gone after second snapshot"
+        );
+        wdmm_ffi_free_string(r);
+
+        // ── Wipe snapshot (empty arrays) ─────────────────────────────────────
+        let snap_empty = r#"{"folders":[],"items":[]}"#;
+        let c3 = CString::new(snap_empty).unwrap();
+        let r = wdmm_user_folder_replace_snapshot(c3.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "wipe snapshot failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // new-1 must now be gone.
+        let new1 = CString::new("snap-new-1").unwrap();
+        let r = wdmm_user_folder_list_children(new1.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        let arr: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(
+            arr.as_array().unwrap().is_empty(),
+            "snap-new-1 must have no children after wipe"
+        );
         wdmm_ffi_free_string(r);
     }
 
