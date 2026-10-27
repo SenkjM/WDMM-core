@@ -1105,6 +1105,79 @@ pub extern "C" fn wdmm_account_get_entry(
     }
 }
 
+/// Read a byte range `[start, end_inclusive]` from a cloud account file.
+///
+/// `end_inclusive == u64::MAX` means "read to end of file".
+///
+/// On success returns 0 and writes to `*out_buf` a pointer to a Rust-heap
+/// buffer (allocated via [`wdmm_proxy_stream_alloc_buf`], so the caller — or
+/// the proxy stream machinery — frees it with [`wdmm_proxy_stream_free_buf`])
+/// and to `*out_len` the byte count. Returns -1 on any error, with `*out_buf`
+/// left null and `*out_len` 0.
+///
+/// Used by the Desktop DLNA cloud-cast path: the proxy range callback calls
+/// this on a worker thread and forwards the buffer to
+/// [`wdmm_proxy_stream_set_result`]. Mirrors Android
+/// `DlnaCastService.readRange` / `RustProxyStreamBridge`.
+#[no_mangle]
+pub unsafe extern "C" fn wdmm_account_read_range(
+    account_id: *const c_char,
+    path: *const c_char,
+    start: u64,
+    end_inclusive: u64,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    *out_buf = std::ptr::null_mut();
+    *out_len = 0;
+
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let path_str = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return -1,
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return -1,
+        Err(_) => return -1,
+    };
+
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+
+    let end_opt = if end_inclusive == u64::MAX { None } else { Some(end_inclusive) };
+    let data = match rt().block_on(wdmm_drivers::CloudDriver::get_content_range(
+        &*driver, path_str, start, end_opt,
+    )) {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+
+    let len = data.len();
+    if len == 0 {
+        return 0; // empty range is a valid (EOF) result
+    }
+    let buf = wdmm_proxy_stream_alloc_buf(len);
+    if buf.is_null() {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
+    *out_buf = buf;
+    *out_len = len;
+    0
+}
+
 /// Helper: build driver config JSON from account credentials + base_url.
 fn build_driver_config(account: &wdmm_core::models::CloudAccount) -> Result<serde_json::Value, String> {
     // Parse credentials_encrypted as UTF-8 JSON object (plaintext store)
