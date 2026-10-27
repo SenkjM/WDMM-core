@@ -1,10 +1,17 @@
 //! Music library shard codec (Android `LibraryShardCodec` + WMP containers).
 //!
 //! Magics: `WDMMLB01` (base), `WDMMLS01` (seg), `WDMMLT01` (tomb).
-//! Covers are omitted on encode and ignored on decode (Core v1).
+//!
+//! Segment (`seg-*`) and tombstone (`del-*`) shards never carry covers.
+//! Full-rebuild base shards (`lib-*`) may embed `SEC_COVERS` (3) +
+//! `TAG_TRACK_COVER_INDEX` (26) when the caller passes `cover_roots = Some(…)`.
+//! Decode tolerates the section being absent — the pre-cover wire format remains
+//! valid on all receivers.
 
+use crate::cover::{build_cover_section, music_cover_stem, parse_cover_section, CoverRoots};
 use crate::wmp::{
-    self, Codec, RecordValue, MAGIC_LB, MAGIC_LS, MAGIC_LT, SEC_META, SEC_TOMBS, SEC_TRACKS,
+    self, Codec, RecordValue, MAGIC_LB, MAGIC_LS, MAGIC_LT, SEC_COVERS, SEC_META, SEC_TOMBS,
+    SEC_TRACKS,
 };
 use crate::{SyncError, SyncResult};
 use serde::{Deserialize, Serialize};
@@ -35,6 +42,8 @@ pub const TAG_TRACK_TRACK_NUM: u8 = 10;
 pub const TAG_TRACK_DISC_NUM: u8 = 12;
 pub const TAG_TRACK_YEAR: u8 = 14;
 pub const TAG_TRACK_GENRE: u8 = 15;
+/// Index into the `SEC_COVERS` (3) blob array for this track. Absent when no cover.
+pub const TAG_TRACK_COVER_INDEX: u8 = 26;
 
 pub const TAG_TOMB_SOURCE: u8 = 1;
 pub const TAG_TOMB_REMOTE_PATH: u8 = 2;
@@ -78,6 +87,12 @@ pub struct DecodedLibraryShard {
     pub meta: ShardMeta,
     pub tracks: Vec<LibraryTrack>,
     pub tombstones: Vec<TombRecord>,
+    /// Cover blobs from `SEC_COVERS` (3): `(kind_byte, blob_bytes)` per blob.
+    /// Empty when the shard has no cover section (all segs, older base shards).
+    pub covers: Vec<(u8, Vec<u8>)>,
+    /// Per-track cover index into `covers` (parallel to `tracks`).
+    /// `None` when the track has no cover in this shard.
+    pub cover_indices: Vec<Option<u32>>,
 }
 
 pub(crate) fn magic_for_kind(kind: i64) -> SyncResult<&'static [u8; 8]> {
@@ -275,13 +290,22 @@ fn record_to_tomb(rec: &BTreeMap<u8, RecordValue>) -> TombRecord {
     }
 }
 
-/// Encode a base or segment track shard (no covers).
+/// Encode a base or segment track shard.
+///
+/// `cover_roots`: when `Some` **and** `kind == WMP_KIND_BASE`, each track whose
+/// cover file exists on disk gets `TAG_TRACK_COVER_INDEX` (26) and a
+/// `SEC_COVERS` (3) section carrying the deduplicated blobs is appended.
+/// Segment shards (`kind == WMP_KIND_SEG`) never carry covers regardless of
+/// the roots argument — callers must always pass `None` for segs.
+/// When `cover_roots` is `None` or no files are readable, no section 3 is
+/// emitted (parity with the pre-cover wire format).
 pub fn encode_track_shard(
     kind: i64,
     device_id: &str,
     rev_from: i64,
     rev_to: i64,
     tracks: &[LibraryTrack],
+    cover_roots: Option<&CoverRoots>,
 ) -> SyncResult<Vec<u8>> {
     if kind != WMP_KIND_BASE && kind != WMP_KIND_SEG {
         return Err(SyncError::Other("encode_track_shard: kind must be base/seg".into()));
@@ -295,12 +319,32 @@ pub fn encode_track_shard(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let meta_bytes = encode_meta(&meta);
-    let track_recs: Vec<_> = tracks.iter().map(track_to_record).collect();
+
+    // Build COVERS section + per-track indices — only for base shards.
+    let (cover_bytes, cover_indices) = match cover_roots {
+        Some(roots) if kind == WMP_KIND_BASE => {
+            let stems: Vec<String> = tracks
+                .iter()
+                .map(|t| music_cover_stem(&t.account_id, &t.remote_path))
+                .collect();
+            build_cover_section(&roots.music_covers_dir, &stems)
+        }
+        _ => (vec![], vec![None; tracks.len()]),
+    };
+
+    let mut track_recs: Vec<_> = tracks.iter().map(track_to_record).collect();
+    for (rec, idx_opt) in track_recs.iter_mut().zip(cover_indices.iter()) {
+        if let Some(idx) = idx_opt {
+            rec.insert(TAG_TRACK_COVER_INDEX, RecordValue::Int(*idx as u64));
+        }
+    }
     let tracks_bytes = wmp::encode_records(&track_recs, TRACK_INT_TAGS);
-    let sections = [
-        (SEC_META, meta_bytes, Codec::Raw),
-        (SEC_TRACKS, tracks_bytes, Codec::Raw),
-    ];
+
+    let mut sections: Vec<(u8, Vec<u8>, Codec)> =
+        vec![(SEC_META, meta_bytes, Codec::Raw), (SEC_TRACKS, tracks_bytes, Codec::Raw)];
+    if !cover_bytes.is_empty() {
+        sections.push((SEC_COVERS, cover_bytes, Codec::Raw));
+    }
     Ok(wmp::build_wmp_container(&sections, magic_for_kind(kind)?))
 }
 
@@ -329,7 +373,9 @@ pub fn encode_tomb_shard(
     Ok(wmp::build_wmp_container(&sections, MAGIC_LT))
 }
 
-/// Decode any music library shard. Ignores COVERS.
+/// Decode any music library shard. Parses `SEC_COVERS` (3) when present so
+/// callers can apply cover blobs via [`apply_music_cover_blobs`]. Tolerates
+/// shards with no cover section (the normal case for segs and older base shards).
 pub fn decode_library_shard(bytes: &[u8]) -> SyncResult<DecodedLibraryShard> {
     let sections = wmp::parse_wmp_container(bytes, None)?;
     let meta_raw = sections
@@ -357,6 +403,8 @@ pub fn decode_library_shard(bytes: &[u8]) -> SyncResult<DecodedLibraryShard> {
             meta,
             tracks: vec![],
             tombstones: records.iter().map(record_to_tomb).collect(),
+            covers: vec![],
+            cover_indices: vec![],
         });
     }
 
@@ -366,11 +414,62 @@ pub fn decode_library_shard(bytes: &[u8]) -> SyncResult<DecodedLibraryShard> {
     } else {
         wmp::decode_records(raw, TRACK_INT_TAGS)?
     };
+
+    // Parse optional COVERS section (present only on base shards with cover_roots set).
+    let covers = sections
+        .get(&SEC_COVERS)
+        .map(|v| parse_cover_section(v))
+        .unwrap_or_default();
+
+    let cover_indices: Vec<Option<u32>> = records
+        .iter()
+        .map(|rec| {
+            rec.get(&TAG_TRACK_COVER_INDEX)
+                .and_then(|v| v.as_int())
+                .map(|i| i as u32)
+        })
+        .collect();
+
     Ok(DecodedLibraryShard {
         meta,
         tracks: records.iter().map(record_to_track).collect(),
         tombstones: vec![],
+        covers,
+        cover_indices,
     })
+}
+
+/// Write cover blobs for tracks into `roots.music_covers_dir`.
+///
+/// Parity with Android `_storeCover`: for each track whose decoded
+/// `cover_indices` entry points at a blob, write
+/// `<music_covers_dir>/<music_cover_stem(account_id, remote_path)>`.
+/// A file already present is kept — a missing blob must never wipe the local
+/// cache. Missing cover dir, missing blob, or out-of-range index are silently
+/// skipped.
+pub fn apply_music_cover_blobs(
+    roots: &CoverRoots,
+    tracks: &[LibraryTrack],
+    cover_indices: &[Option<u32>],
+    covers: &[(u8, Vec<u8>)],
+) {
+    if tracks.len() != cover_indices.len() {
+        return;
+    }
+    let dir = &roots.music_covers_dir;
+    let _ = std::fs::create_dir_all(dir);
+    for (track, idx_opt) in tracks.iter().zip(cover_indices.iter()) {
+        let Some(idx) = *idx_opt else { continue };
+        let Some((_, blob)) = covers.get(idx as usize) else { continue };
+        if blob.is_empty() {
+            continue;
+        }
+        let stem = music_cover_stem(&track.account_id, &track.remote_path);
+        let path = dir.join(&stem);
+        if !path.exists() {
+            let _ = std::fs::write(&path, blob);
+        }
+    }
 }
 
 /// Identity key: account_id|remote_path (Android sourceName+remotePath).
@@ -401,7 +500,7 @@ mod tests {
     #[test]
     fn track_shard_roundtrip_seg() {
         let tracks = vec![sample_track(42)];
-        let bytes = encode_track_shard(WMP_KIND_SEG, "dev1", 42, 42, &tracks).unwrap();
+        let bytes = encode_track_shard(WMP_KIND_SEG, "dev1", 42, 42, &tracks, None).unwrap();
         assert!(bytes.starts_with(b"WDMMLS01"));
         let decoded = decode_library_shard(&bytes).unwrap();
         assert_eq!(decoded.meta.kind, WMP_KIND_SEG);
@@ -415,7 +514,7 @@ mod tests {
     #[test]
     fn track_shard_roundtrip_base() {
         let tracks = vec![sample_track(1), sample_track(2)];
-        let bytes = encode_track_shard(WMP_KIND_BASE, "dev", 0, 0, &tracks).unwrap();
+        let bytes = encode_track_shard(WMP_KIND_BASE, "dev", 0, 0, &tracks, None).unwrap();
         assert!(bytes.starts_with(b"WDMMLB01"));
         let decoded = decode_library_shard(&bytes).unwrap();
         assert_eq!(decoded.meta.kind, WMP_KIND_BASE);
@@ -460,7 +559,7 @@ mod tests {
     #[test]
     fn kind_mismatch_errors() {
         let tracks = vec![sample_track(1)];
-        let mut bytes = encode_track_shard(WMP_KIND_SEG, "d", 1, 1, &tracks).unwrap();
+        let mut bytes = encode_track_shard(WMP_KIND_SEG, "d", 1, 1, &tracks, None).unwrap();
         // Corrupt META kind to base while magic stays LS
         let sections = wmp::parse_wmp_container(&bytes, None).unwrap();
         let mut meta = decode_meta(sections.get(&SEC_META).unwrap()).unwrap();
@@ -473,5 +572,114 @@ mod tests {
         );
         let err = decode_library_shard(&bytes).unwrap_err();
         assert!(err.to_string().contains("shardKindMismatch"));
+    }
+
+    // ── Cover tests ──────────────────────────────────────────────────────────
+
+    fn music_cover_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wdmm_music_cover_{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cover_jpeg() -> Vec<u8> {
+        let mut v = vec![0xFF_u8, 0xD8, 0xFF, 0xE0];
+        v.extend_from_slice(b"music_cover_data");
+        v
+    }
+
+    #[test]
+    fn seg_encode_never_has_covers_even_with_roots() {
+        let cover_dir = music_cover_dir("seg");
+        let tracks = vec![sample_track(1)];
+        // Pre-write a cover file so encode *could* pick it up if it ignored the kind.
+        let stem = crate::cover::music_cover_stem("nas", "/music/a.mp3");
+        std::fs::write(cover_dir.join(&stem), cover_jpeg()).unwrap();
+
+        let roots = CoverRoots {
+            music_covers_dir: cover_dir,
+            manga_covers_dir: std::env::temp_dir(),
+        };
+        let bytes = encode_track_shard(WMP_KIND_SEG, "dev", 1, 1, &tracks, Some(&roots)).unwrap();
+        let sections = wmp::parse_wmp_container(&bytes, None).unwrap();
+        assert!(
+            !sections.contains_key(&SEC_COVERS),
+            "seg shards must never carry SEC_COVERS"
+        );
+        let decoded = decode_library_shard(&bytes).unwrap();
+        assert!(decoded.covers.is_empty());
+        assert_eq!(decoded.cover_indices, vec![None]);
+    }
+
+    #[test]
+    fn base_encode_no_covers_when_roots_none() {
+        let tracks = vec![sample_track(1)];
+        let bytes = encode_track_shard(WMP_KIND_BASE, "dev", 0, 0, &tracks, None).unwrap();
+        let sections = wmp::parse_wmp_container(&bytes, None).unwrap();
+        assert!(!sections.contains_key(&SEC_COVERS));
+        let decoded = decode_library_shard(&bytes).unwrap();
+        assert!(decoded.covers.is_empty());
+        assert_eq!(decoded.cover_indices, vec![None]);
+    }
+
+    #[test]
+    fn base_encode_with_covers_roundtrip() {
+        let cover_dir = music_cover_dir("base");
+        let tracks = vec![sample_track(1)];
+        let stem = crate::cover::music_cover_stem("nas", "/music/a.mp3");
+        let jpeg = cover_jpeg();
+        std::fs::write(cover_dir.join(&stem), &jpeg).unwrap();
+        let roots = CoverRoots {
+            music_covers_dir: cover_dir.clone(),
+            manga_covers_dir: std::env::temp_dir(),
+        };
+
+        let bytes = encode_track_shard(WMP_KIND_BASE, "dev", 0, 0, &tracks, Some(&roots)).unwrap();
+        let sections = wmp::parse_wmp_container(&bytes, None).unwrap();
+        assert!(
+            sections.contains_key(&SEC_COVERS),
+            "base shard with covers must have SEC_COVERS"
+        );
+
+        let decoded = decode_library_shard(&bytes).unwrap();
+        assert_eq!(decoded.cover_indices.len(), 1);
+        assert_eq!(decoded.cover_indices[0], Some(0));
+        assert_eq!(decoded.covers.len(), 1);
+        assert_eq!(decoded.covers[0].0, crate::cover::COVER_KIND_JPEG);
+        assert_eq!(decoded.covers[0].1, jpeg);
+
+        // Apply into a fresh dir — roundtrip write-back.
+        let apply_dir = music_cover_dir("base_apply");
+        let apply_roots = CoverRoots {
+            music_covers_dir: apply_dir.clone(),
+            manga_covers_dir: std::env::temp_dir(),
+        };
+        apply_music_cover_blobs(&apply_roots, &decoded.tracks, &decoded.cover_indices, &decoded.covers);
+        let written = std::fs::read(apply_dir.join(&stem)).expect("cover must be written");
+        assert_eq!(written, jpeg);
+    }
+
+    #[test]
+    fn decode_base_with_covers_applies_compat() {
+        // Decode of a cover-bearing base still applies blobs when roots set (compat).
+        let cover_dir = music_cover_dir("compat");
+        let tracks = vec![sample_track(1)];
+        let stem = crate::cover::music_cover_stem("nas", "/music/a.mp3");
+        let jpeg = cover_jpeg();
+        std::fs::write(cover_dir.join(&stem), &jpeg).unwrap();
+        let roots = CoverRoots {
+            music_covers_dir: cover_dir,
+            manga_covers_dir: std::env::temp_dir(),
+        };
+        let bytes = encode_track_shard(WMP_KIND_BASE, "dev", 0, 0, &tracks, Some(&roots)).unwrap();
+        let decoded = decode_library_shard(&bytes).unwrap();
+        // applying with a fresh roots dir writes the blob back.
+        let apply_dir = music_cover_dir("compat_apply");
+        let apply_roots = CoverRoots {
+            music_covers_dir: apply_dir.clone(),
+            manga_covers_dir: std::env::temp_dir(),
+        };
+        apply_music_cover_blobs(&apply_roots, &decoded.tracks, &decoded.cover_indices, &decoded.covers);
+        assert_eq!(std::fs::read(apply_dir.join(&stem)).unwrap(), jpeg);
     }
 }

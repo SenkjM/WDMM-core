@@ -2,9 +2,17 @@
 //!
 //! Remote layout: `<remote_dir>/library/manga/{index.json,lib-*,seg-*,del-*,progress.json}`.
 //! Cursor key: `manga:{remote_dir}`.
+//!
+//! Incremental sync never rebuilds.  The manifest base is re-read only when
+//! `base.up_to` advances beyond the saved cursor or the cursor is empty.
+//! Segment and tombstone shards (`seg-*`, `del-*`) never carry covers.
+//! Full sync (`sync_full`) is the only path that rebuilds lib-* base shards;
+//! it may embed covers when [`MangaLibrarySyncEngine::cover_roots`] is `Some`.
 
+use crate::cover::CoverRoots;
 use crate::library_manga_shard::{
-    decode_manga_shard, encode_manga_shard, encode_manga_tomb_shard, MangaSyncRow,
+    apply_manga_cover_blobs, decode_manga_shard, encode_manga_shard, encode_manga_tomb_shard,
+    MangaSyncRow,
 };
 use crate::library_music::{BaseShardEntry, IndexPartEntry, LibraryManifest, ManifestBase};
 use crate::library_shard::{TombRecord, WMP_KIND_BASE, WMP_KIND_SEG};
@@ -192,6 +200,7 @@ pub struct MangaLibrarySyncEngine {
     db: Arc<LibraryDatabase>,
     store: DriverStore,
     remote_dir: String,
+    cover_roots: Option<CoverRoots>,
 }
 
 impl MangaLibrarySyncEngine {
@@ -199,8 +208,14 @@ impl MangaLibrarySyncEngine {
         db: Arc<LibraryDatabase>,
         driver: Arc<dyn CloudDriver>,
         remote_dir: impl Into<String>,
+        cover_roots: Option<CoverRoots>,
     ) -> Self {
-        Self { db, store: DriverStore { driver }, remote_dir: remote_dir.into() }
+        Self {
+            db,
+            store: DriverStore { driver },
+            remote_dir: remote_dir.into(),
+            cover_roots,
+        }
     }
 
     fn dir(&self) -> String {
@@ -252,6 +267,9 @@ impl MangaLibrarySyncEngine {
             let path = join_path(&self.dir(), &shard.file);
             if let Some(bytes) = self.store.read(&path).await? {
                 let decoded = decode_manga_shard(&bytes)?;
+                if let Some(roots) = &self.cover_roots {
+                    apply_manga_cover_blobs(roots, &decoded.rows, &decoded.cover_indices, &decoded.covers);
+                }
                 data_parts.push(decoded.rows);
             }
         }
@@ -286,7 +304,7 @@ impl MangaLibrarySyncEngine {
         let from = *revs.iter().min().unwrap_or(&0);
         let to = *revs.iter().max().unwrap_or(&0);
         let dev = device_id(&self.db);
-        let bytes = encode_manga_shard(WMP_KIND_SEG, &dev, from, to, rows)?;
+        let bytes = encode_manga_shard(WMP_KIND_SEG, &dev, from, to, rows, None)?;
         let file = part_name(SEGMENT_PREFIX, from);
         self.store.ensure_dir(&self.dir()).await?;
         self.store.write(&join_path(&self.dir(), &file), &bytes).await?;
@@ -342,7 +360,7 @@ impl MangaLibrarySyncEngine {
             for r in slice {
                 if r.manga.rev > max_rev { max_rev = r.manga.rev; }
             }
-            let bytes = encode_manga_shard(WMP_KIND_BASE, &dev, 0, 0, slice)?;
+            let bytes = encode_manga_shard(WMP_KIND_BASE, &dev, 0, 0, slice, self.cover_roots.as_ref())?;
             let file = format!(
                 "{SHARD_PREFIX}{:04}-{:06x}.wdmm",
                 i + 1,

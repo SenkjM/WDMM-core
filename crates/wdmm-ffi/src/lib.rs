@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use tokio::runtime::Runtime;
@@ -417,6 +417,9 @@ pub extern "C" fn wdmm_sync_trigger(
 /// - `webdav_user`: HTTP Basic username (empty string for no auth)
 /// - `webdav_pass`: HTTP Basic password (empty string for no auth)
 /// - `remote_dir`:  Remote directory used as the sync root (e.g. `"/wdmm_sync"`)
+/// - `with_covers`: nonzero to embed `SEC_COVERS` (3) cover blobs in the
+///   rebuilt `lib-*` base shards (using the configured cover roots from
+///   [`wdmm_covers_configure`]); `0`/null omits covers.
 ///
 /// Returns a JSON summary string (see [`wdmm_sync::run_sync_full`]) or
 /// `"error:<message>"`. Caller must free the result.
@@ -429,6 +432,7 @@ pub extern "C" fn wdmm_sync_full(
     webdav_user: *const c_char,
     webdav_pass: *const c_char,
     remote_dir: *const c_char,
+    with_covers: c_int,
 ) -> FfiString {
     let url = match ptr_to_str(webdav_url) {
         Some(s) => s,
@@ -438,13 +442,19 @@ pub extern "C" fn wdmm_sync_full(
     let pass = ptr_to_str(webdav_pass).unwrap_or("");
     let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
 
+    let cover_roots = if with_covers != 0 {
+        global_cover_roots().lock().unwrap().clone()
+    } else {
+        None
+    };
+
     let db = std::sync::Arc::clone(global_library_db());
     let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
         Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    let result = rt().block_on(wdmm_sync::run_sync_full(db, driver, dir));
+    let result = rt().block_on(wdmm_sync::run_sync_full(db, driver, dir, cover_roots));
     match result {
         Ok(summary) => FfiString::from(summary.to_string()),
         Err(e) => FfiString::from(format!("error:{e}")),

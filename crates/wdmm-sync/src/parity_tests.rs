@@ -28,7 +28,7 @@ async fn library_sync_higher_rev_wins() {
             ..Default::default()
         })
         .unwrap();
-    LibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -44,7 +44,7 @@ async fn library_sync_higher_rev_wins() {
         ..Default::default()
     })
     .unwrap();
-    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -68,7 +68,7 @@ async fn library_sync_higher_rev_wins() {
         ..Default::default()
     })
     .unwrap();
-    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -107,7 +107,7 @@ async fn library_sync_tombstone_loses_to_live_rev() {
         pushed: 0,
     })
     .unwrap();
-    LibrarySyncEngine::new(Arc::clone(&db_del), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_del), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -130,14 +130,14 @@ async fn library_sync_tombstone_loses_to_live_rev() {
         ..Default::default()
     })
     .unwrap();
-    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
 
     // Device B syncs: merge sees tomb.rev=40 < live.rev=50 → track survives.
     let db_b = tmp_db();
-    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -178,7 +178,7 @@ async fn library_sync_resurrect_suppresses_stale_tomb() {
     })
     .unwrap();
 
-    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -217,14 +217,14 @@ async fn library_sync_cursor_skips_consumed_parts() {
         ..Default::default()
     })
     .unwrap();
-    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
 
     // B first sync → pulls track, cursor saved with parts[seg]=100.
     let db_b = tmp_db();
-    let engine_b = LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync");
+    let engine_b = LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None);
     let out1 = engine_b.sync_incremental().await.unwrap();
     assert!(
         out1.iter().any(|o| o.action == SyncAction::Pulled),
@@ -257,11 +257,11 @@ async fn library_sync_base_up_to_clears_cursor() {
         ..Default::default()
     })
     .unwrap();
-    let engine_a = LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync");
+    let engine_a = LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None);
     engine_a.sync_incremental().await.unwrap();
 
     let db_b = tmp_db();
-    let engine_b = LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync");
+    let engine_b = LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None);
     engine_b.sync_incremental().await.unwrap();
     assert!(db_b.get_track(&id1).unwrap().is_some(), "B should have track1 from first pull");
 
@@ -305,11 +305,11 @@ async fn library_sync_zero_byte_pass_saves_cursor() {
         ..Default::default()
     })
     .unwrap();
-    let engine_a = LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync");
+    let engine_a = LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None);
     engine_a.sync_incremental().await.unwrap();
 
     let db_b = tmp_db();
-    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -350,14 +350,14 @@ async fn library_sync_rev_clock_gap_pin() {
             ..Default::default()
         })
         .unwrap();
-    LibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
 
     // B adopts the cloud track.
     let db_b = tmp_db();
-    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -415,13 +415,13 @@ async fn manga_sync_images_pages_roundtrip() {
     )
     .unwrap();
 
-    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
 
     let db_b = tmp_db();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -456,13 +456,13 @@ async fn manga_sync_images_tomb_uses_id_as_sync_key() {
     // A pushes the manga; B pulls it.
     let db_a = tmp_db();
     db_a.upsert_manga(&m).unwrap();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
 
     let db_b = tmp_db();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -470,7 +470,7 @@ async fn manga_sync_images_tomb_uses_id_as_sync_key() {
 
     // A deletes: manga_sync_key("img-002","images",...) = "img-002" (images → id).
     db_a.delete_manga(&custom_id).unwrap();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -483,7 +483,7 @@ async fn manga_sync_images_tomb_uses_id_as_sync_key() {
     }
 
     // B adopts deletion: tomb sync_key="img-002" matches B's manga id.
-    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -505,7 +505,7 @@ async fn manga_sync_container_tomb_uses_source_path_key() {
     let m_a = mk_manga(99, source, path, "cbz", 8);
     db_a.upsert_manga(&m_a).unwrap();
     db_a.delete_manga(&m_a.id).unwrap();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -524,7 +524,7 @@ async fn manga_sync_container_tomb_uses_source_path_key() {
     assert_eq!(db_b.list_mangas().unwrap().len(), 1);
 
     // B syncs: cloud tomb_rev=8 >= local.rev=8 → delete.
-    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -551,7 +551,7 @@ async fn manga_progress_local_wins() {
         updated_at: "2026-10-25T10:00:00Z".into(),
     })
     .unwrap();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -565,7 +565,7 @@ async fn manga_progress_local_wins() {
         updated_at: "2026-10-25T12:00:00Z".into(),
     })
     .unwrap();
-    MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -612,7 +612,7 @@ async fn manga_progress_exact_tie_no_upload() {
         updated_at: ts.into(),
     })
     .unwrap();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -632,7 +632,7 @@ async fn manga_progress_exact_tie_no_upload() {
         .await
         .unwrap();
 
-    MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -667,14 +667,14 @@ async fn manga_sync_legacy_loose_image_skip() {
     let legacy = mk_manga(1, source, path, "images", 3);
     assert_eq!(legacy.id, manga_id_for_remote(source, path), "mk_manga must produce a legacy row");
     db_a.upsert_manga(&legacy).unwrap();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
 
     // B: empty DB — syncs and must NOT adopt the legacy row.
     let db_b = tmp_db();
-    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+    MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
         .await
         .unwrap();
@@ -696,7 +696,7 @@ async fn manga_sync_full_rebuild_clears_tombs_and_cursor() {
         db.upsert_manga(&mk_manga(i, "nas", &format!("/m/{i}.cbz"), "cbz", i as i64))
             .unwrap();
     }
-    let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+    let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None);
     engine.sync_incremental().await.unwrap();
 
     // Insert an unpushed deletion to confirm sync_full wipes it.

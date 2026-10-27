@@ -2,7 +2,14 @@
 //!
 //! Remote layout: `<remote_dir>/library/music/{index.json,lib-*,seg-*,del-*}`.
 //! Cursor key: `library:{remote_dir}`.
+//!
+//! Incremental sync never rebuilds.  The manifest base is re-read only when
+//! `base.up_to` advances beyond the saved cursor or the cursor is empty.
+//! Segment and tombstone shards (`seg-*`, `del-*`) never carry covers.
+//! Full sync (`sync_full`) is the only path that rebuilds lib-* base shards;
+//! it may embed covers when [`LibrarySyncEngine::cover_roots`] is `Some`.
 
+use crate::cover::CoverRoots;
 use crate::library_shard::{
     self, track_identity_key, TombRecord, WMP_KIND_BASE, WMP_KIND_SEG,
 };
@@ -188,6 +195,7 @@ pub struct LibrarySyncEngine {
     db: Arc<LibraryDatabase>,
     store: DriverStore,
     remote_dir: String,
+    cover_roots: Option<CoverRoots>,
 }
 
 impl LibrarySyncEngine {
@@ -195,11 +203,13 @@ impl LibrarySyncEngine {
         db: Arc<LibraryDatabase>,
         driver: Arc<dyn CloudDriver>,
         remote_dir: impl Into<String>,
+        cover_roots: Option<CoverRoots>,
     ) -> Self {
         Self {
             db,
             store: DriverStore { driver },
             remote_dir: remote_dir.into(),
+            cover_roots,
         }
     }
 
@@ -254,6 +264,14 @@ impl LibrarySyncEngine {
             let path = join_path(&self.dir(), &shard.file);
             if let Some(bytes) = self.store.read(&path).await? {
                 let decoded = library_shard::decode_library_shard(&bytes)?;
+                if let Some(roots) = &self.cover_roots {
+                    library_shard::apply_music_cover_blobs(
+                        roots,
+                        &decoded.tracks,
+                        &decoded.cover_indices,
+                        &decoded.covers,
+                    );
+                }
                 data_parts.push(decoded.tracks);
             }
         }
@@ -265,6 +283,14 @@ impl LibrarySyncEngine {
             let path = join_path(&self.dir(), &seg.file);
             if let Some(bytes) = self.store.read(&path).await? {
                 let decoded = library_shard::decode_library_shard(&bytes)?;
+                if let Some(roots) = &self.cover_roots {
+                    library_shard::apply_music_cover_blobs(
+                        roots,
+                        &decoded.tracks,
+                        &decoded.cover_indices,
+                        &decoded.covers,
+                    );
+                }
                 data_parts.push(decoded.tracks);
             }
         }
@@ -293,7 +319,7 @@ impl LibrarySyncEngine {
         let from = *revs.iter().min().unwrap_or(&0);
         let to = *revs.iter().max().unwrap_or(&0);
         let dev = device_id(&self.db);
-        let bytes = library_shard::encode_track_shard(WMP_KIND_SEG, &dev, from, to, changed)?;
+        let bytes = library_shard::encode_track_shard(WMP_KIND_SEG, &dev, from, to, changed, None)?;
         let file = part_name(SEGMENT_PREFIX, from);
         self.store.ensure_dir(&self.dir()).await?;
         self.store
@@ -355,7 +381,7 @@ impl LibrarySyncEngine {
                     max_rev = t.rev;
                 }
             }
-            let bytes = library_shard::encode_track_shard(WMP_KIND_BASE, &dev, 0, 0, slice)?;
+            let bytes = library_shard::encode_track_shard(WMP_KIND_BASE, &dev, 0, 0, slice, self.cover_roots.as_ref())?;
             let file = format!(
                 "{SHARD_PREFIX}{:04}-{:06x}.wdmm",
                 i + 1,
@@ -633,24 +659,19 @@ impl SyncEngine for LibrarySyncEngine {
         let (cloud, _) = self.read_cloud(&manifest, &HashSet::new()).await?;
         let local_map = self.local_by_key()?;
 
+        // Hoist once — not per cloud track.
+        let pending_tombs = self.db.list_unpushed_deleted_tracks()?;
+
         for t in &cloud.tracks {
             let key = track_identity_key(&t.account_id, &t.remote_path);
             if cloud.tombs.get(&key).copied().unwrap_or(0) >= t.rev && cloud.tombs.contains_key(&key) {
                 // shouldn't be in tracks if tomb won; skip
                 continue;
             }
-            // never resurrect locally tombstoned
-            let pending = self.db.list_unpushed_deleted_tracks()?;
-            let locally_tombstoned = pending.iter().any(|d| {
+            // Never resurrect a track that has a local unpushed tombstone.
+            let locally_tombstoned = pending_tombs.iter().any(|d| {
                 d.source_name == t.account_id && d.remote_path == t.remote_path && d.rev >= t.rev
             });
-            // also check all deleted? Android: never resurrect locally tombstoned — use find
-            // For simplicity: if local missing and we have any deleted_tracks row with >= rev, skip
-            let any_tomb = {
-                // list_unpushed only — also check if track absent due to prior delete
-                false
-            };
-            let _ = any_tomb;
             if locally_tombstoned {
                 continue;
             }

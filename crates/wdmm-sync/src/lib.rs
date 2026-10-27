@@ -528,10 +528,10 @@ pub async fn run_sync_all(
     let cred = CredentialSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
         .sync_incremental()
         .await?;
-    let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+    let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, None)
         .sync_incremental()
         .await?;
-    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, None)
         .sync_incremental()
         .await?;
     let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
@@ -562,18 +562,23 @@ pub async fn run_sync_all(
 /// clears the local cursor. Use after a device reset or to compact a fragmented
 /// remote. Credentials and playlists delegate to `sync_full` (which currently
 /// mirrors their incremental pass).
+///
+/// `cover_roots`: when `Some`, base shards written during the rebuild carry
+/// `SEC_COVERS` (3) with deduplicated cover blobs. Pass `None` (the default)
+/// to skip embedding — covers can be added on a later rebuild.
 pub async fn run_sync_full(
     db: Arc<LibraryDatabase>,
     driver: Arc<dyn CloudDriver>,
     remote_dir: &str,
+    cover_roots: Option<CoverRoots>,
 ) -> SyncResult<serde_json::Value> {
     let cred = CredentialSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
         .sync_full()
         .await?;
-    let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+    let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, cover_roots.clone())
         .sync_full()
         .await?;
-    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, cover_roots)
         .sync_full()
         .await?;
     let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
@@ -611,6 +616,8 @@ mod tests {
     struct MockDriver {
         pub files: AsyncMutex<Map<String, Vec<u8>>>,
         dirs: AsyncMutex<std::collections::HashSet<String>>,
+        /// Paths passed to `get_content` — used by timing tests.
+        pub read_paths: Mutex<Vec<String>>,
     }
 
     impl MockDriver {
@@ -618,6 +625,7 @@ mod tests {
             Self {
                 files: AsyncMutex::new(Map::new()),
                 dirs: AsyncMutex::new(std::collections::HashSet::new()),
+                read_paths: Mutex::new(vec![]),
             }
         }
     }
@@ -681,6 +689,7 @@ mod tests {
             Ok(())
         }
         async fn get_content(&self, path: &str) -> wdmm_drivers::Result<Vec<u8>> {
+            self.read_paths.lock().unwrap().push(path.to_string());
             self.files
                 .lock()
                 .await
@@ -754,7 +763,7 @@ mod tests {
         };
         db.insert_track(&track).unwrap();
 
-        let engine = LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        let engine = LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None);
         let outcomes = engine.sync_incremental().await.unwrap();
         assert!(outcomes.iter().any(|o| o.action == SyncAction::Pushed));
 
@@ -766,7 +775,7 @@ mod tests {
 
         // Second device pulls.
         let db2 = tmp_db();
-        let engine2 = LibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync");
+        let engine2 = LibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync", None);
         let outcomes2 = engine2.sync_incremental().await.unwrap();
         assert!(outcomes2.iter().any(|o| o.action == SyncAction::Pulled));
         let loaded = db2
@@ -798,14 +807,14 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+        LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
             .sync_incremental()
             .await
             .unwrap();
 
         // Device B pulls.
         let db_b = tmp_db();
-        LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+        LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
             .sync_incremental()
             .await
             .unwrap();
@@ -822,7 +831,7 @@ mod tests {
                 pushed: 0,
             })
             .unwrap();
-        LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+        LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
             .sync_incremental()
             .await
             .unwrap();
@@ -831,7 +840,7 @@ mod tests {
         drop(files);
 
         // Device B adopts deletion.
-        LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+        LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
             .sync_incremental()
             .await
             .unwrap();
@@ -856,12 +865,12 @@ mod tests {
             .unwrap();
         }
         // Seed a segment first
-        LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync")
+        LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
             .sync_incremental()
             .await
             .unwrap();
         // Full rebuild
-        LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync")
+        LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
             .sync_full()
             .await
             .unwrap();
@@ -998,7 +1007,7 @@ mod tests {
         let m = mk_manga(1, "nas", "/manga/vol1.cbz", "cbz", 10);
         db_a.upsert_manga(&m).unwrap();
 
-        let engine_a = MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync");
+        let engine_a = MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None);
         let out_a = engine_a.sync_incremental().await.unwrap();
         assert!(out_a.iter().any(|o| o.action == SyncAction::Pushed));
 
@@ -1010,7 +1019,7 @@ mod tests {
 
         // second device pulls
         let db_b = tmp_db();
-        let engine_b = MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync");
+        let engine_b = MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None);
         let out_b = engine_b.sync_incremental().await.unwrap();
         assert!(out_b.iter().any(|o| o.action == SyncAction::Pulled));
 
@@ -1035,7 +1044,7 @@ mod tests {
 
         // Device A deletes (writes DeletedManga with sync_key = m.id) then syncs the tombstone.
         db_a.delete_manga(&m.id).unwrap();
-        MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync")
+        MangaLibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
             .sync_incremental()
             .await
             .unwrap();
@@ -1053,7 +1062,7 @@ mod tests {
         assert_eq!(db_b.list_mangas().unwrap().len(), 1);
 
         // Device B adopts deletion via tombstone.
-        MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync")
+        MangaLibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
             .sync_incremental()
             .await
             .unwrap();
@@ -1074,7 +1083,7 @@ mod tests {
                 .unwrap();
         }
 
-        let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None);
         let out = engine.sync_full().await.unwrap();
         assert!(out.iter().any(|o| o.entity_id == "manga-rebuild"));
 
@@ -1116,7 +1125,7 @@ mod tests {
         })
         .unwrap();
 
-        let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        let engine = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None);
         engine.sync_incremental().await.unwrap();
 
         // progress.json written
@@ -1135,7 +1144,7 @@ mod tests {
         })
         .unwrap();
 
-        let engine2 = MangaLibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync");
+        let engine2 = MangaLibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync", None);
         engine2.sync_incremental().await.unwrap();
 
         let prog = db2.list_progress().unwrap();
@@ -1174,6 +1183,73 @@ mod tests {
     // Music: 2 (rev win), 3B (tomb loses), 4 (resurrect), 5A/B (cursor), 6 (zero-byte), 8 (rev gap).
     // Manga: 10A/B (images pages + tomb id), 11 (container tomb), 12B/C (progress), 13 (legacy skip), 14 (rebuild clear).
     include!("parity_tests.rs");
+
+    /// After one incremental that reads lib-* base shards, a second incremental
+    /// with the same `base.up_to` must NOT re-read those lib-* paths — the cursor
+    /// records them as consumed and they are skipped.
+    #[tokio::test]
+    async fn incremental_stable_base_skips_lib_reads() {
+        let driver = Arc::new(MockDriver::new());
+        let db = tmp_db();
+
+        // Seed a track so device A produces a lib-* base shard via full rebuild.
+        let path = "/music/stable.mp3";
+        db.insert_track(&LibraryTrack {
+            id: wdmm_core::identity::track_identity(path),
+            title: "Stable".into(),
+            remote_path: path.into(),
+            account_id: "nas".into(),
+            rev: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
+            .sync_full()
+            .await
+            .unwrap();
+
+        // A second device: first incremental pulls and reads the lib-* shard.
+        let db2 = tmp_db();
+        LibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync", None)
+            .sync_incremental()
+            .await
+            .unwrap();
+
+        // Snapshot which lib-* paths were read so far.
+        let reads_after_first: Vec<String> = driver
+            .read_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.contains("/library/music/lib-"))
+            .cloned()
+            .collect();
+        assert!(!reads_after_first.is_empty(), "first incremental must read lib-* shards");
+
+        // Second incremental — base.up_to unchanged, cursor is populated.
+        let reads_before = driver.read_paths.lock().unwrap().len();
+        LibrarySyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync", None)
+            .sync_incremental()
+            .await
+            .unwrap();
+        let reads_after = driver.read_paths.lock().unwrap().len();
+
+        let new_lib_reads: Vec<String> = driver
+            .read_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(reads_before)
+            .filter(|p| p.contains("/library/music/lib-"))
+            .cloned()
+            .collect();
+        assert!(
+            new_lib_reads.is_empty(),
+            "second incremental with stable base.up_to must not re-read lib-* shards; \
+             unexpected reads: {new_lib_reads:?} (total new reads: {})",
+            reads_after - reads_before
+        );
+    }
 
     // silence unused import warnings on platforms where the helper isn't needed
     #[allow(dead_code)]
