@@ -2378,6 +2378,30 @@ impl LibraryDatabase {
         Ok(())
     }
 
+    /// Insert or replace a `deleted_mangas` tombstone row.
+    ///
+    /// Mirrors [`upsert_deleted_track`] for the manga tombstone table. The
+    /// `rev` column is nullable; pass `None` when the server-assigned rev is
+    /// not yet known (the row will be assigned one on push).
+    pub fn upsert_deleted_manga(&self, m: &DeletedManga) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_mangas
+             (manga_id, source_name, remote_path, sync_key, rev, deleted_at, pushed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &m.manga_id,
+                &m.source_name,
+                &m.remote_path,
+                &m.sync_key,
+                m.rev,
+                &m.deleted_at,
+                m.pushed,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Remove all deleted_manga tombstones (used after a full cloud rebuild).
     pub fn clear_all_deleted_mangas(&self) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
@@ -3814,6 +3838,51 @@ mod tests {
         // clear_deleted_manga by sync_key
         db.clear_deleted_manga("nas\x00/m/a.cbz").unwrap();
         assert_eq!(db.list_deleted_mangas().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn upsert_deleted_manga_roundtrip() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+
+        // Insert a tombstone directly via upsert (rev = None, pushed = 0).
+        let m = DeletedManga {
+            manga_id: "m-7".into(),
+            source_name: "nas".into(),
+            remote_path: "/m/x.cbz".into(),
+            sync_key: "nas\x00/m/x.cbz".into(),
+            rev: None,
+            deleted_at: "2024-02-03T04:05:06Z".into(),
+            pushed: 0,
+        };
+        db.upsert_deleted_manga(&m).unwrap();
+
+        let all = db.list_deleted_mangas().unwrap();
+        assert_eq!(all.len(), 1);
+        let got = &all[0];
+        assert_eq!(got.manga_id, "m-7");
+        assert_eq!(got.source_name, "nas");
+        assert_eq!(got.remote_path, "/m/x.cbz");
+        assert_eq!(got.sync_key, "nas\x00/m/x.cbz");
+        assert_eq!(got.rev, None);
+        assert_eq!(got.deleted_at, "2024-02-03T04:05:06Z");
+        assert_eq!(got.pushed, 0);
+
+        // Replace it: same sync_key, new rev + pushed = 1.
+        db.upsert_deleted_manga(&DeletedManga {
+            manga_id: "m-7".into(),
+            source_name: "nas".into(),
+            remote_path: "/m/x.cbz".into(),
+            sync_key: "nas\x00/m/x.cbz".into(),
+            rev: Some(42),
+            deleted_at: "2024-02-03T04:05:06Z".into(),
+            pushed: 1,
+        })
+        .unwrap();
+
+        let all = db.list_deleted_mangas().unwrap();
+        assert_eq!(all.len(), 1, "INSERT OR REPLACE must not duplicate the row");
+        assert_eq!(all[0].rev, Some(42));
+        assert_eq!(all[0].pushed, 1);
     }
 
     #[test]

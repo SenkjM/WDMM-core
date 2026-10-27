@@ -2852,6 +2852,18 @@ pub extern "C" fn wdmm_cue_slices_for_cue(cue_id: *const c_char) -> FfiString {
     }
 }
 
+/// List all CUE albums, ordered by `cue_id`. Returns a JSON array of
+/// `CueAlbum` (snake_case fields), or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_list_cue_albums() -> FfiString {
+    match global_library_db().list_cue_albums() {
+        Ok(albums) => FfiString::from(
+            serde_json::to_string(&albums).unwrap_or_else(|_| "[]".into()),
+        ),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── Playlists FFI ─────────────────────────────────────────────────────────────
 
 /// List all playlists. Returns a JSON array or `"error:<message>"`.
@@ -3203,6 +3215,39 @@ pub extern "C" fn wdmm_deleted_manga_clear(sync_key: *const c_char) -> FfiString
         None => return FfiString::from("error:null sync_key pointer"),
     };
     match global_library_db().clear_deleted_manga(key) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// List all `deleted_mangas` tombstones. Returns a JSON array of `DeletedManga`
+/// (snake_case fields, ordered by rowid ASC), or `"error:<message>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_manga_list() -> FfiString {
+    match global_library_db().list_deleted_mangas() {
+        Ok(rows) => match serde_json::to_string(&rows) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:serialize: {e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Upsert a `deleted_mangas` tombstone from JSON. Returns `"ok"` or
+/// `"error:<message>"`.
+///
+/// Expected JSON shape: see `DeletedManga` struct fields.
+#[no_mangle]
+pub extern "C" fn wdmm_deleted_manga_upsert(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null json pointer"),
+    };
+    let m: wdmm_storage::DeletedManga = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:parse DeletedManga: {e}")),
+    };
+    match global_library_db().upsert_deleted_manga(&m) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -5698,5 +5743,80 @@ mod tests {
         // CueSlice discriminant: has "music_id" and "cue_id"
         assert!(sv.get("music_id").is_some(), "expected CueSlice JSON, got: {s}");
         assert_eq!(sv["cue_id"], "cue-ffi-1");
+    }
+
+    // ── Deleted manga FFI tests ──────────────────────────────────────────────
+
+    #[test]
+    fn deleted_manga_ffi_upsert_and_list() {
+        // Upsert a tombstone without a rev (rev = null).
+        let json = CString::new(
+            r#"{"manga_id":"dm-ffi-1","source_name":"nas-dm","remote_path":"/m/x.cbz","sync_key":"nas-dm/m/x.cbz","rev":null,"deleted_at":"2024-03-01T00:00:00Z","pushed":0}"#,
+        )
+        .unwrap();
+        let r = wdmm_deleted_manga_upsert(json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        // list — row is visible
+        let r = wdmm_deleted_manga_list();
+        let list_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!list_s.starts_with("error:"), "list error: {list_s}");
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&list_s).unwrap();
+        let row = arr.iter().find(|v| v["manga_id"] == "dm-ffi-1")
+            .expect("tombstone not found in list");
+        assert_eq!(row["source_name"], "nas-dm");
+        assert_eq!(row["pushed"], 0);
+        assert!(row["rev"].is_null());
+
+        // Replace — assign a rev + mark pushed
+        let json2 = CString::new(
+            r#"{"manga_id":"dm-ffi-1","source_name":"nas-dm","remote_path":"/m/x.cbz","sync_key":"nas-dm/m/x.cbz","rev":77,"deleted_at":"2024-03-01T00:00:00Z","pushed":1}"#,
+        )
+        .unwrap();
+        let r = wdmm_deleted_manga_upsert(json2.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "second upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_deleted_manga_list();
+        let list_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&list_s).unwrap();
+        let updated = arr.iter().filter(|v| v["manga_id"] == "dm-ffi-1").count();
+        assert_eq!(updated, 1, "INSERT OR REPLACE must not duplicate the row");
+        let row = arr.iter().find(|v| v["manga_id"] == "dm-ffi-1").unwrap();
+        assert_eq!(row["rev"], 77);
+        assert_eq!(row["pushed"], 1);
+    }
+
+    // ── CUE album list FFI test ──────────────────────────────────────────────
+
+    #[test]
+    fn list_cue_albums_ffi_non_empty_after_upsert() {
+        // Insert an album with a unique id so the test is independent of ordering.
+        let album_json = CString::new(
+            r#"{"cue_id":"cue-list-ffi-99","source_name":"nas-list","cue_remote_path":"/list/disc.cue","title":"List Disc","performer":null,"cache_group_id":null,"created_at":"2024-06-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let r = wdmm_cue_album_upsert(album_json.as_ptr());
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
+        assert_eq!(s, "ok", "album upsert failed: {s}");
+        wdmm_ffi_free_string(r);
+
+        let r = wdmm_list_cue_albums();
+        let list_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert!(!list_s.starts_with("error:"), "list_cue_albums error: {list_s}");
+        let albums: Vec<serde_json::Value> = serde_json::from_str(&list_s).unwrap();
+        assert!(
+            albums.iter().any(|a| a["cue_id"] == "cue-list-ffi-99"),
+            "inserted album not found in list: {list_s}"
+        );
+        let a = albums.iter().find(|a| a["cue_id"] == "cue-list-ffi-99").unwrap();
+        assert_eq!(a["source_name"], "nas-list");
+        assert_eq!(a["title"], "List Disc");
     }
 }

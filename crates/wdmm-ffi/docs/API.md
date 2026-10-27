@@ -605,6 +605,10 @@ Return all `CueSlice` rows for `cue_id` as a JSON array, ordered by
 `track_index ASC`. Returns `[]` when the cue has no slices, or
 `"error:<message>"`.
 
+### `extern "C" fn wdmm_list_cue_albums() -> FfiString`
+List all CUE albums, ordered by `cue_id`. Returns a JSON array of `CueAlbum`
+(snake_case fields, same shape as the object above), or `"error:<message>"`.
+
 ---
 
 ## Playlists
@@ -799,6 +803,31 @@ Returns `"error:…"` on failure.
 Return distinct non-null series tags as a JSON array of `{"id","title"}` objects,
 ordered alphabetically (case-insensitive). The `id` field is derived via the
 series id formula above. Returns `"error:…"` on failure.
+
+### `extern "C" fn wdmm_deleted_manga_clear(sync_key: *const c_char) -> FfiString`
+Clear a single `deleted_mangas` tombstone by its `sync_key`. Returns `"ok"` or `"error:…"`.
+
+### `extern "C" fn wdmm_deleted_manga_list() -> FfiString`
+List all `deleted_mangas` tombstones, ordered by rowid ASC. Returns a JSON array
+of `DeletedManga` objects, or `"error:<message>"`.
+
+Shape:
+```json
+{
+  "manga_id":    "m-abc",
+  "source_name": "nas-main",
+  "remote_path": "/manga/x.cbz",
+  "sync_key":    "nas-main /manga/x.cbz",
+  "rev":         null,
+  "deleted_at":  "2024-01-01T00:00:00Z",
+  "pushed":      0
+}
+```
+`rev` is `null` until the server assigns one. `pushed` is `0` until the tombstone has been sent to the sync server.
+
+### `extern "C" fn wdmm_deleted_manga_upsert(json: *const c_char) -> FfiString`
+Insert or replace a `deleted_mangas` tombstone from JSON. Returns `"ok"` or
+`"error:<message>"`. Expected JSON shape: see `DeletedManga` above.
 
 ---
 
