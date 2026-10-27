@@ -817,7 +817,7 @@ Shape:
   "manga_id":    "m-abc",
   "source_name": "nas-main",
   "remote_path": "/manga/x.cbz",
-  "sync_key":    "nas-main /manga/x.cbz",
+  "sync_key":    "nas-main\\0/manga/x.cbz"  # \\0 = NUL separator for containers,
   "rev":         null,
   "deleted_at":  "2024-01-01T00:00:00Z",
   "pushed":      0
