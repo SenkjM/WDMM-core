@@ -13,7 +13,7 @@ use crate::cover::{build_cover_section, manga_cover_stem, CoverRoots};
 use crate::library_shard::{
     decode_meta, encode_meta, magic_for_kind, meta_kind_of_container,
     ShardMeta, TombRecord, WMP_KIND_BASE, WMP_KIND_SEG, WMP_KIND_TOMB,
-    META_INT_TAGS, TOMB_INT_TAGS,
+    TOMB_INT_TAGS,
     TAG_TOMB_SOURCE, TAG_TOMB_REMOTE_PATH, TAG_TOMB_REV,
     TAG_TOMB_DELETED_AT, TAG_TOMB_SYNC_KEY,
 };
@@ -94,9 +94,12 @@ fn manga_to_record(row: &MangaSyncRow) -> BTreeMap<u8, RecordValue> {
         rec.insert(TAG_MANGA_CHAPTER_NUMBER, RecordValue::Str(s.clone()));
     }
     rec.insert(TAG_MANGA_PAGE_COUNT, RecordValue::Int(m.page_count as u64));
-    if let Some(ref s) = m.cover_relpath {
-        rec.insert(TAG_MANGA_COVER_RELPATH, RecordValue::Str(s.clone()));
-    }
+    // Non-authoritative wire tag for older peers: stem filename only (not a device path).
+    // Local disk location is always manga_cover_stem(id); ignore this tag on apply.
+    rec.insert(
+        TAG_MANGA_COVER_RELPATH,
+        RecordValue::Str(manga_cover_stem(&m.id)),
+    );
     rec.insert(TAG_MANGA_FORMAT, RecordValue::Str(m.format.clone()));
     rec.insert(TAG_MANGA_REMOTE_MISSING, RecordValue::Int(m.remote_missing as u64));
     if let Some(ref s) = m.page_turn {
@@ -178,10 +181,7 @@ fn record_to_manga_row(rec: &BTreeMap<u8, RecordValue>) -> MangaSyncRow {
             .get(&TAG_MANGA_PAGE_COUNT)
             .and_then(|v| v.as_int())
             .unwrap_or(0),
-        cover_relpath: rec
-            .get(&TAG_MANGA_COVER_RELPATH)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        cover_state: 0, // wire does not carry cover_state; caller updates after blob apply
         format,
         remote_missing: rec
             .get(&TAG_MANGA_REMOTE_MISSING)
@@ -374,17 +374,22 @@ pub fn decode_manga_shard(bytes: &[u8]) -> SyncResult<DecodedMangaShard> {
 /// with `.jpg`).  A file already present is kept — a missing blob must never
 /// wipe the local cache.  Missing cover dir, missing blob, or out-of-range
 /// index are silently skipped.
+///
+/// Returns the manga IDs for which a blob was successfully written (or already
+/// existed on disk); callers should update `cover_state = 2` (Present) for
+/// those IDs.
 pub fn apply_manga_cover_blobs(
     roots: &CoverRoots,
     rows: &[MangaSyncRow],
     cover_indices: &[Option<u32>],
     covers: &[(u8, Vec<u8>)],
-) {
+) -> Vec<String> {
     if rows.len() != cover_indices.len() {
-        return;
+        return vec![];
     }
     let dir = &roots.manga_covers_dir;
     let _ = std::fs::create_dir_all(dir);
+    let mut written_ids = Vec::new();
     for (row, idx_opt) in rows.iter().zip(cover_indices.iter()) {
         let Some(idx) = *idx_opt else { continue };
         let Some((_, blob)) = covers.get(idx as usize) else { continue };
@@ -393,10 +398,13 @@ pub fn apply_manga_cover_blobs(
         }
         let stem = manga_cover_stem(&row.manga.id);
         let path = dir.join(&stem);
-        if !path.exists() {
-            let _ = std::fs::write(&path, blob);
+        if path.exists() {
+            written_ids.push(row.manga.id.clone());
+        } else if std::fs::write(&path, blob).is_ok() {
+            written_ids.push(row.manga.id.clone());
         }
     }
+    written_ids
 }
 
 #[cfg(test)]
@@ -415,7 +423,7 @@ mod tests {
             volume: Some(format!("{rev}")),
             chapter_number: Some(format!("{rev}")),
             page_count: 12,
-            cover_relpath: None,
+            cover_state: 0,
             format: fmt.into(),
             remote_missing: 0,
             page_turn: Some("ltr".into()),

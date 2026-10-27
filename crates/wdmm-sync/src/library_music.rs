@@ -265,12 +265,15 @@ impl LibrarySyncEngine {
             if let Some(bytes) = self.store.read(&path).await? {
                 let decoded = library_shard::decode_library_shard(&bytes)?;
                 if let Some(roots) = &self.cover_roots {
-                    library_shard::apply_music_cover_blobs(
+                    let cover_ids = library_shard::apply_music_cover_blobs(
                         roots,
                         &decoded.tracks,
                         &decoded.cover_indices,
                         &decoded.covers,
                     );
+                    for id in &cover_ids {
+                        let _ = self.db.set_track_cover_state(id, 2);
+                    }
                 }
                 data_parts.push(decoded.tracks);
             }
@@ -284,12 +287,15 @@ impl LibrarySyncEngine {
             if let Some(bytes) = self.store.read(&path).await? {
                 let decoded = library_shard::decode_library_shard(&bytes)?;
                 if let Some(roots) = &self.cover_roots {
-                    library_shard::apply_music_cover_blobs(
+                    let cover_ids = library_shard::apply_music_cover_blobs(
                         roots,
                         &decoded.tracks,
                         &decoded.cover_indices,
                         &decoded.covers,
                     );
+                    for id in &cover_ids {
+                        let _ = self.db.set_track_cover_state(id, 2);
+                    }
                 }
                 data_parts.push(decoded.tracks);
             }

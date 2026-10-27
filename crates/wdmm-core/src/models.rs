@@ -57,6 +57,10 @@ pub struct LibraryTrack {
     /// Revision (for library sync merge).
     #[serde(default)]
     pub rev: i64,
+    // ── v10 field ─────────────────────────────────────────────────────────────
+    /// Cover art availability: 0=Unknown, 1=None, 2=Present.
+    #[serde(default)]
+    pub cover_state: i64,
 }
 
 /// An album in the music library. Schema v2.

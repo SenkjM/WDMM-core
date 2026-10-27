@@ -42,7 +42,7 @@ async fn library_sync_higher_rev_wins() {
         account_id: "nas".into(),
         rev: 80,
         ..Default::default()
-    })
+        })
     .unwrap();
     LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
@@ -66,7 +66,7 @@ async fn library_sync_higher_rev_wins() {
         account_id: "nas".into(),
         rev: 30,
         ..Default::default()
-    })
+        })
     .unwrap();
     LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
         .sync_incremental()
@@ -128,7 +128,7 @@ async fn library_sync_tombstone_loses_to_live_rev() {
         account_id: "nas".into(),
         rev: 50,
         ..Default::default()
-    })
+        })
     .unwrap();
     LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
@@ -166,7 +166,7 @@ async fn library_sync_resurrect_suppresses_stale_tomb() {
         account_id: "nas".into(),
         rev: 50,
         ..Default::default()
-    })
+        })
     .unwrap();
     // Stale pending tomb rev=40 (live.rev > tomb.rev → resurrect path).
     db_a.upsert_deleted_track(&wdmm_storage::DeletedTrack {
@@ -215,7 +215,7 @@ async fn library_sync_cursor_skips_consumed_parts() {
         account_id: "nas".into(),
         rev: 100,
         ..Default::default()
-    })
+        })
     .unwrap();
     LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
         .sync_incremental()
@@ -255,7 +255,7 @@ async fn library_sync_base_up_to_clears_cursor() {
         account_id: "nas".into(),
         rev: 10,
         ..Default::default()
-    })
+        })
     .unwrap();
     let engine_a = LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None);
     engine_a.sync_incremental().await.unwrap();
@@ -273,7 +273,7 @@ async fn library_sync_base_up_to_clears_cursor() {
         account_id: "nas".into(),
         rev: 20,
         ..Default::default()
-    })
+        })
     .unwrap();
     engine_a.sync_full().await.unwrap();
 
@@ -303,7 +303,7 @@ async fn library_sync_zero_byte_pass_saves_cursor() {
         account_id: "nas".into(),
         rev: 10,
         ..Default::default()
-    })
+        })
     .unwrap();
     let engine_a = LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None);
     engine_a.sync_incremental().await.unwrap();
@@ -401,7 +401,7 @@ async fn manga_sync_images_pages_roundtrip() {
         rev: 5,
         page_count: 2,
         author: None, series: None, volume: None, chapter_number: None,
-        cover_relpath: None, remote_missing: 0, page_turn: None,
+        cover_state: 0, remote_missing: 0, page_turn: None,
         updated_at: "2026-10-26T00:00:00Z".into(),
     };
     let db_a = tmp_db();
@@ -449,7 +449,7 @@ async fn manga_sync_images_tomb_uses_id_as_sync_key() {
         rev: 5,
         page_count: 1,
         author: None, series: None, volume: None, chapter_number: None,
-        cover_relpath: None, remote_missing: 0, page_turn: None,
+        cover_state: 0, remote_missing: 0, page_turn: None,
         updated_at: "2026-10-26T00:00:00Z".into(),
     };
 

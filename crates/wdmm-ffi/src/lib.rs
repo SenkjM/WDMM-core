@@ -3566,6 +3566,7 @@ fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrac
         year: v["year"].as_i64().map(|n| n as i32),
         mime_type: v["mime_type"].as_str().map(Into::into),
         rev: v["rev"].as_i64().unwrap_or(0),
+        cover_state: v["cover_state"].as_i64().unwrap_or(0),
     })
 }
 
@@ -5244,7 +5245,7 @@ mod tests {
             "volume": "1",
             "chapter_number": "1",
             "page_count": 2,
-            "cover_relpath": null,
+            "cover_state": 0,
             "format": "cbz",
             "remote_missing": 0,
             "page_turn": "ltr",
@@ -5686,7 +5687,7 @@ mod tests {
             let start = (idx_val - 1) * 60_000;
             let end = idx_val * 60_000;
             let slice_json = CString::new(format!(
-                r#"{{"music_id":"{mid_str}","cue_id":"cue-ffi-1","audio_music_id":"audio-ffi","source_name":"nas-ffi","remote_path":"/ffi/t{idx_val}.virtual","file_name":"t{idx_val}","track_index":{idx_val},"title":"T{idx_val}","artist":null,"album_artist":null,"album":"FFI Disc","duration_ms":60000,"track_number":{idx_val},"track_total":2,"disc_number":null,"disc_total":null,"year":null,"genre":null,"bitrate":null,"sample_rate":null,"cover_path":null,"audio_remote_path":"/ffi/disc.flac","clip_start_ms":{start},"clip_end_ms":{end},"cache_group_id":null,"rev":0,"last_downloaded_at":"2024-01-01T00:00:00Z","last_tag_read_at":"2024-01-01T00:00:00Z","remote_missing":0}}"#,
+                r#"{{"music_id":"{mid_str}","cue_id":"cue-ffi-1","audio_music_id":"audio-ffi","source_name":"nas-ffi","remote_path":"/ffi/t{idx_val}.virtual","file_name":"t{idx_val}","track_index":{idx_val},"title":"T{idx_val}","artist":null,"album_artist":null,"album":"FFI Disc","duration_ms":60000,"track_number":{idx_val},"track_total":2,"disc_number":null,"disc_total":null,"year":null,"genre":null,"bitrate":null,"sample_rate":null,"cover_state":0,"audio_remote_path":"/ffi/disc.flac","clip_start_ms":{start},"clip_end_ms":{end},"cache_group_id":null,"rev":0,"last_downloaded_at":"2024-01-01T00:00:00Z","last_tag_read_at":"2024-01-01T00:00:00Z","remote_missing":0}}"#,
             ))
             .unwrap();
             let r = wdmm_cue_slice_upsert(slice_json.as_ptr());

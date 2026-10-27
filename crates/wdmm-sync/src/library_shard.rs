@@ -249,6 +249,7 @@ fn record_to_track(rec: &BTreeMap<u8, RecordValue>) -> LibraryTrack {
         album_id: None,
         artist_id: None,
         rev: rec.get(&TAG_TRACK_REV).and_then(|v| v.as_int()).unwrap_or(0),
+        cover_state: 0, // wire does not carry cover_state; caller updates after blob apply
     }
 }
 
@@ -447,17 +448,24 @@ pub fn decode_library_shard(bytes: &[u8]) -> SyncResult<DecodedLibraryShard> {
 /// A file already present is kept — a missing blob must never wipe the local
 /// cache. Missing cover dir, missing blob, or out-of-range index are silently
 /// skipped.
+/// Write cover blobs for tracks into `roots.music_covers_dir`.
+///
+/// Returns the track IDs for which a blob was successfully written (or
+/// the cover file already existed on disk); callers should update
+/// `cover_state = 2` (Present) for those IDs in the DB.
+/// A missing blob must never wipe a pre-existing file.
 pub fn apply_music_cover_blobs(
     roots: &CoverRoots,
     tracks: &[LibraryTrack],
     cover_indices: &[Option<u32>],
     covers: &[(u8, Vec<u8>)],
-) {
+) -> Vec<String> {
     if tracks.len() != cover_indices.len() {
-        return;
+        return vec![];
     }
     let dir = &roots.music_covers_dir;
     let _ = std::fs::create_dir_all(dir);
+    let mut written_ids = Vec::new();
     for (track, idx_opt) in tracks.iter().zip(cover_indices.iter()) {
         let Some(idx) = *idx_opt else { continue };
         let Some((_, blob)) = covers.get(idx as usize) else { continue };
@@ -466,10 +474,13 @@ pub fn apply_music_cover_blobs(
         }
         let stem = music_cover_stem(&track.account_id, &track.remote_path);
         let path = dir.join(&stem);
-        if !path.exists() {
-            let _ = std::fs::write(&path, blob);
+        if path.exists() {
+            written_ids.push(track.id.clone());
+        } else if std::fs::write(&path, blob).is_ok() {
+            written_ids.push(track.id.clone());
         }
     }
+    written_ids
 }
 
 /// Identity key: account_id|remote_path (Android sourceName+remotePath).

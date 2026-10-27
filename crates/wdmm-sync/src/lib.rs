@@ -805,7 +805,7 @@ mod tests {
                 account_id: "nas".into(),
                 rev: 50,
                 ..Default::default()
-            })
+        })
             .unwrap();
         LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None)
             .sync_incremental()
@@ -861,7 +861,7 @@ mod tests {
                 account_id: "a".into(),
                 rev: 10 + i,
                 ..Default::default()
-            })
+        })
             .unwrap();
         }
         // Seed a segment first
@@ -990,7 +990,7 @@ mod tests {
             volume: None,
             chapter_number: None,
             page_count: 10,
-            cover_relpath: None,
+            cover_state: 0,
             format: fmt.into(),
             remote_missing: 0,
             page_turn: None,

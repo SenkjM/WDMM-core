@@ -268,7 +268,10 @@ impl MangaLibrarySyncEngine {
             if let Some(bytes) = self.store.read(&path).await? {
                 let decoded = decode_manga_shard(&bytes)?;
                 if let Some(roots) = &self.cover_roots {
-                    apply_manga_cover_blobs(roots, &decoded.rows, &decoded.cover_indices, &decoded.covers);
+                    let cover_ids = apply_manga_cover_blobs(roots, &decoded.rows, &decoded.cover_indices, &decoded.covers);
+                    for id in &cover_ids {
+                        let _ = self.db.set_manga_cover_state(id, 2);
+                    }
                 }
                 data_parts.push(decoded.rows);
             }

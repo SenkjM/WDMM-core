@@ -806,7 +806,7 @@ pub fn restore_backup_bytes(
                             genre: rec.get(&TAG_TRACK_GENRE).and_then(|v| v.as_str()).map(|s| s.to_string()),
                             bitrate: rec.get(&TAG_TRACK_BITRATE).and_then(|v| v.as_int()),
                             sample_rate: rec.get(&TAG_TRACK_SAMPLE_RATE).and_then(|v| v.as_int()),
-                            cover_path: None,
+                            cover_state: 0,
                             audio_remote_path: rec.get(&TAG_TRACK_AUDIO_REMOTE_PATH).and_then(|v| v.as_str()).map(|s| s.to_string()),
                             clip_start_ms: rec.get(&TAG_TRACK_CLIP_START_MS).and_then(|v| v.as_int()),
                             clip_end_ms: rec.get(&TAG_TRACK_CLIP_END_MS).and_then(|v| v.as_int()),
@@ -854,6 +854,7 @@ pub fn restore_backup_bytes(
                             size: 0,
                             modified: None,
                             mime_type: None,
+                            cover_state: 0,
                         };
                         let _ = lib.upsert_track(&track);
                         // Collect cover need for file writing after all tracks are processed
@@ -1679,6 +1680,7 @@ mod tests {
             modified: None,
             mime_type: None,
             rev: 0,
+            cover_state: 0,
         };
         lib.upsert_track(&regular_track).unwrap();
 
@@ -1717,7 +1719,7 @@ mod tests {
             genre: None,
             bitrate: Some(1411),
             sample_rate: Some(44100),
-            cover_path: None,
+            cover_state: 0,
             audio_remote_path: Some("/music/audio.flac".to_string()),
             clip_start_ms: Some(0),
             clip_end_ms: Some(240000),
@@ -1783,6 +1785,7 @@ mod tests {
             duration_ms: 1000, track_number: None, disc_number: None,
             year: None, album_id: None, artist_id: None, size: 0,
             modified: None, mime_type: None, rev: 0,
+            cover_state: 0,
         }).unwrap();
 
         // Create a fake cover file in the music covers dir
@@ -1853,7 +1856,7 @@ mod tests {
             volume: None,
             chapter_number: None,
             page_count: 0,
-            cover_relpath: None,
+            cover_state: 0,
             format: "cbz".into(),
             remote_missing: 0,
             page_turn: None,
@@ -1917,6 +1920,7 @@ mod tests {
             duration_ms: 0, track_number: None, disc_number: None,
             year: None, album_id: None, artist_id: None, size: 0,
             modified: None, mime_type: None, rev: 0,
+            cover_state: 0,
         }).unwrap();
 
         // No cover_roots → no COVERS/MANGA_COVERS sections
@@ -1945,6 +1949,7 @@ mod tests {
             duration_ms: 0, track_number: None, disc_number: None,
             year: None, album_id: None, artist_id: None, size: 0,
             modified: None, mime_type: None, rev: 0,
+            cover_state: 0,
         }).unwrap();
 
         // Roots configured but cover file missing → no COVERS section, no coverIndex

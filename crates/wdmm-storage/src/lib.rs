@@ -14,6 +14,9 @@
 //! Schema v7: Denormalized `album` and `album_artist` TEXT columns on `tracks` for
 //!   aggregation; album/artist aggregation derived from track metadata.
 //! Schema v8: FTS5 full-text search over track title/artist/album/album_artist.
+//! Schema v9 (Round 12): `rev` column on `tracks` for library sync merge.
+//! Schema v10: `cover_state` (0=Unknown,1=None,2=Present) on tracks/mangas/cue_slices;
+//!   removes `cover_relpath` (mangas) and `cover_path` (cue_slices).
 
 #![forbid(unsafe_code)]
 
@@ -114,7 +117,8 @@ pub struct Manga {
     pub volume: Option<String>,
     pub chapter_number: Option<String>,
     pub page_count: i64,
-    pub cover_relpath: Option<String>,
+    /// Cover art availability: 0=Unknown, 1=None, 2=Present.
+    pub cover_state: i64,
     /// Format tag (e.g. `"cbz"`, `"pdf"`, `"images"`, `"unknown"`).
     pub format: String,
     /// Non-zero when the remote source no longer has this file.
@@ -194,7 +198,7 @@ pub struct CueAlbum {
 }
 
 /// A CUE sheet slice (virtual track) (v5).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CueSlice {
     pub music_id: String,
     pub cue_id: String,
@@ -216,7 +220,8 @@ pub struct CueSlice {
     pub genre: Option<String>,
     pub bitrate: Option<i64>,
     pub sample_rate: Option<i64>,
-    pub cover_path: Option<String>,
+    /// Cover art availability: 0=Unknown, 1=None, 2=Present.
+    pub cover_state: i64,
     pub audio_remote_path: Option<String>,
     pub clip_start_ms: Option<i64>,
     pub clip_end_ms: Option<i64>,
@@ -381,6 +386,8 @@ impl LibraryDatabase {
                 disc_number   INTEGER,
                 year          INTEGER,
                 mime_type     TEXT,
+                -- v10 column ──────────────────────────────────────────────────
+                cover_state   INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (album_id)  REFERENCES albums(id)  ON DELETE SET NULL,
                 FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE SET NULL
             );
@@ -451,7 +458,7 @@ impl LibraryDatabase {
                 volume          TEXT,
                 chapter_number  TEXT,
                 page_count      INTEGER NOT NULL DEFAULT 0,
-                cover_relpath   TEXT,
+                cover_state     INTEGER NOT NULL DEFAULT 0,
                 format          TEXT NOT NULL DEFAULT 'unknown',
                 remote_missing  INTEGER NOT NULL DEFAULT 0,
                 page_turn       TEXT,
@@ -589,7 +596,7 @@ impl LibraryDatabase {
                   genre TEXT,
                   bitrate INTEGER,
                   sample_rate INTEGER,
-                  cover_path TEXT,
+                  cover_state INTEGER NOT NULL DEFAULT 0,
                   audio_remote_path TEXT,
                   clip_start_ms INTEGER,
                   clip_end_ms INTEGER,
@@ -683,6 +690,126 @@ impl LibraryDatabase {
             )?;
         }
 
+        // ── v10 migration: cover_state on tracks/mangas/cue_slices ────────────
+        // Fresh CREATE already has cover_state (no cover_relpath/cover_path).
+        // Rebuild only when upgrading a pre-v10 DB that still has the old columns.
+        // Non-empty old path → Present (2); NULL/empty → Unknown (0).
+        if current_ver < 10 {
+            // tracks: add cover_state if missing (fresh CREATE already has it).
+            let track_cols = table_columns(&conn, "tracks").unwrap_or_default();
+            if !track_cols.iter().any(|c| c == "cover_state") {
+                conn.execute(
+                    "ALTER TABLE tracks ADD COLUMN cover_state INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+
+            let manga_cols = table_columns(&conn, "mangas").unwrap_or_default();
+            if manga_cols.iter().any(|c| c == "cover_relpath") {
+                conn.execute_batch(
+                    r#"
+                    CREATE TABLE mangas_v10 (
+                        id              TEXT NOT NULL PRIMARY KEY,
+                        source_name     TEXT NOT NULL,
+                        remote_path     TEXT NOT NULL,
+                        title           TEXT NOT NULL,
+                        author          TEXT,
+                        series          TEXT,
+                        volume          TEXT,
+                        chapter_number  TEXT,
+                        page_count      INTEGER NOT NULL DEFAULT 0,
+                        cover_state     INTEGER NOT NULL DEFAULT 0,
+                        format          TEXT NOT NULL DEFAULT 'unknown',
+                        remote_missing  INTEGER NOT NULL DEFAULT 0,
+                        page_turn       TEXT,
+                        rev             INTEGER NOT NULL DEFAULT 0,
+                        updated_at      TEXT NOT NULL
+                    );
+                    INSERT INTO mangas_v10
+                        SELECT id, source_name, remote_path, title, author, series, volume,
+                               chapter_number, page_count,
+                               CASE WHEN cover_relpath IS NOT NULL AND cover_relpath != '' THEN 2 ELSE 0 END,
+                               format, remote_missing, page_turn, rev, updated_at
+                        FROM mangas;
+                    DROP TABLE mangas;
+                    ALTER TABLE mangas_v10 RENAME TO mangas;
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_mangas_source_path
+                        ON mangas (source_name, remote_path)
+                        WHERE format <> 'images';
+                    "#,
+                )?;
+            } else if !manga_cols.iter().any(|c| c == "cover_state") {
+                conn.execute(
+                    "ALTER TABLE mangas ADD COLUMN cover_state INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+
+            let cue_cols = table_columns(&conn, "cue_slices").unwrap_or_default();
+            if cue_cols.iter().any(|c| c == "cover_path") {
+                conn.execute_batch(
+                    r#"
+                    CREATE TABLE cue_slices_v10 (
+                      music_id TEXT PRIMARY KEY,
+                      cue_id TEXT NOT NULL,
+                      audio_music_id TEXT NOT NULL,
+                      source_name TEXT NOT NULL,
+                      remote_path TEXT NOT NULL,
+                      file_name TEXT NOT NULL,
+                      track_index INTEGER NOT NULL,
+                      title TEXT,
+                      artist TEXT,
+                      album_artist TEXT,
+                      album TEXT,
+                      duration_ms INTEGER,
+                      track_number INTEGER,
+                      track_total INTEGER,
+                      disc_number INTEGER,
+                      disc_total INTEGER,
+                      year INTEGER,
+                      genre TEXT,
+                      bitrate INTEGER,
+                      sample_rate INTEGER,
+                      cover_state INTEGER NOT NULL DEFAULT 0,
+                      audio_remote_path TEXT,
+                      clip_start_ms INTEGER,
+                      clip_end_ms INTEGER,
+                      cache_group_id TEXT,
+                      rev INTEGER NOT NULL DEFAULT 0,
+                      last_downloaded_at TEXT NOT NULL DEFAULT '',
+                      last_tag_read_at TEXT NOT NULL DEFAULT '',
+                      remote_missing INTEGER NOT NULL DEFAULT 0,
+                      UNIQUE(source_name, remote_path),
+                      FOREIGN KEY (cue_id) REFERENCES cue_albums(cue_id) ON DELETE CASCADE
+                    );
+                    INSERT INTO cue_slices_v10
+                        SELECT music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
+                               track_index, title, artist, album_artist, album, duration_ms,
+                               track_number, track_total, disc_number, disc_total, year, genre,
+                               bitrate, sample_rate,
+                               CASE WHEN cover_path IS NOT NULL AND cover_path != '' THEN 2 ELSE 0 END,
+                               audio_remote_path, clip_start_ms, clip_end_ms, cache_group_id, rev,
+                               last_downloaded_at, last_tag_read_at, remote_missing
+                        FROM cue_slices;
+                    DROP TABLE cue_slices;
+                    ALTER TABLE cue_slices_v10 RENAME TO cue_slices;
+                    CREATE INDEX IF NOT EXISTS idx_cue_slices_cue ON cue_slices(cue_id);
+                    "#,
+                )?;
+            } else if !cue_cols.is_empty() && !cue_cols.iter().any(|c| c == "cover_state") {
+                // cue_slices table exists (v5+) but lacks cover_state and cover_path.
+                conn.execute(
+                    "ALTER TABLE cue_slices ADD COLUMN cover_state INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (10)",
+                [],
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -711,8 +838,8 @@ impl LibraryDatabase {
             "INSERT OR REPLACE INTO tracks
              (id, title, artist, remote_path, account_id, size, modified, created_at,
               album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-              album, album_artist, rev)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16, ?17,?18,?19)",
+              album, album_artist, rev, cover_state)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16, ?17,?18,?19,?20)",
             params![
                 &track.id,
                 &track.title,
@@ -733,6 +860,7 @@ impl LibraryDatabase {
                 &track.album,
                 &track.album_artist,
                 track.rev,
+                track.cover_state,
             ],
         )?;
         drop(conn);
@@ -793,7 +921,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist, rev
+                    album, album_artist, rev, cover_state
              FROM tracks WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -867,7 +995,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT t.id, t.title, t.artist, t.remote_path, t.account_id, t.size, t.modified,
                     t.album_id, t.artist_id, t.duration_ms, t.genre, t.track_number, t.disc_number, t.year, t.mime_type,
-                    t.album, t.album_artist, t.rev
+                    t.album, t.album_artist, t.rev, t.cover_state
              FROM tracks_fts fts
              JOIN tracks t ON fts.track_id = t.id
              WHERE tracks_fts MATCH ?1
@@ -884,7 +1012,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist, rev
+                    album, album_artist, rev, cover_state
              FROM tracks
              WHERE title LIKE ?1 ESCAPE '\\'
                 OR artist LIKE ?1 ESCAPE '\\'
@@ -973,7 +1101,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist, rev
+                    album, album_artist, rev, cover_state
              FROM tracks ORDER BY title COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], row_to_track)?;
@@ -1136,7 +1264,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist, rev
+                    album, album_artist, rev, cover_state
              FROM tracks WHERE artist = ?1
              ORDER BY title COLLATE NOCASE",
         )?;
@@ -1150,7 +1278,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist, rev
+                    album, album_artist, rev, cover_state
              FROM tracks WHERE album = ?1
              ORDER BY disc_number, track_number, title COLLATE NOCASE",
         )?;
@@ -1557,10 +1685,17 @@ impl LibraryDatabase {
             let album_artist_expr = if has("album_artist") { "album_artist" } else { "NULL" };
             let rev_expr = if has("rev") { "rev" } else { "0" };
 
+            let has_cover_path = has("cover_path");
+            let cover_state_expr = if has_cover_path {
+                "CASE WHEN cover_path IS NOT NULL AND cover_path != '' THEN 2 ELSE 0 END"
+            } else {
+                "0"
+            };
+
             let sql = format!(
                 "SELECT {id_col}, {title_expr}, {artist_expr}, remote_path, \
                  {source_col}, {size_expr}, {modified_expr}, {duration_expr}, \
-                 {album_expr}, {album_artist_expr}, {rev_expr} FROM tracks"
+                 {album_expr}, {album_artist_expr}, {rev_expr}, {cover_state_expr} FROM tracks"
             );
 
             let mut stmt = old
@@ -1590,6 +1725,7 @@ impl LibraryDatabase {
                         album: row.get::<_, Option<String>>(8).unwrap_or(None),
                         album_artist: row.get::<_, Option<String>>(9).unwrap_or(None),
                         rev: row.get::<_, i64>(10).unwrap_or(0),
+                        cover_state: row.get::<_, i64>(11).unwrap_or(0),
                         ..Default::default()
                     })
                 })
@@ -2151,7 +2287,7 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, source_name, remote_path, title, author, series, volume,
-                    chapter_number, page_count, cover_relpath, format,
+                    chapter_number, page_count, cover_state, format,
                     remote_missing, page_turn, rev, updated_at
              FROM mangas ORDER BY updated_at DESC",
         )?;
@@ -2163,7 +2299,7 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, source_name, remote_path, title, author, series, volume,
-                    chapter_number, page_count, cover_relpath, format,
+                    chapter_number, page_count, cover_state, format,
                     remote_missing, page_turn, rev, updated_at
              FROM mangas WHERE id = ?1",
         )?;
@@ -2180,15 +2316,78 @@ impl LibraryDatabase {
         conn.execute(
             "INSERT OR REPLACE INTO mangas
              (id, source_name, remote_path, title, author, series, volume,
-              chapter_number, page_count, cover_relpath, format,
+              chapter_number, page_count, cover_state, format,
               remote_missing, page_turn, rev, updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 &m.id, &m.source_name, &m.remote_path, &m.title,
                 &m.author, &m.series, &m.volume, &m.chapter_number,
-                m.page_count, &m.cover_relpath, &m.format, m.remote_missing,
+                m.page_count, m.cover_state, &m.format, m.remote_missing,
                 &m.page_turn, m.rev, &m.updated_at,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Update `cover_state` for a single manga row.
+    /// Bumps `rev` only when the value actually changes; no-op otherwise.
+    pub fn set_manga_cover_state(&self, id: &str, cover_state: i64) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let prev: Option<i64> = conn
+            .query_row(
+                "SELECT cover_state FROM mangas WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .ok();
+        if prev == Some(cover_state) {
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE mangas SET cover_state = ?1, rev = rev + 1 WHERE id = ?2",
+            params![cover_state, id],
+        )?;
+        Ok(())
+    }
+
+    /// Update `cover_state` for a single track row.
+    /// Bumps `rev` only when the value actually changes; no-op otherwise.
+    pub fn set_track_cover_state(&self, id: &str, cover_state: i64) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let prev: Option<i64> = conn
+            .query_row(
+                "SELECT cover_state FROM tracks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .ok();
+        if prev == Some(cover_state) {
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE tracks SET cover_state = ?1, rev = rev + 1 WHERE id = ?2",
+            params![cover_state, id],
+        )?;
+        Ok(())
+    }
+
+    /// Update `cover_state` for a single CUE slice row.
+    /// Bumps `rev` only when the value actually changes; no-op otherwise.
+    pub fn set_cue_slice_cover_state(&self, music_id: &str, cover_state: i64) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let prev: Option<i64> = conn
+            .query_row(
+                "SELECT cover_state FROM cue_slices WHERE music_id = ?1",
+                params![music_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if prev == Some(cover_state) {
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE cue_slices SET cover_state = ?1, rev = rev + 1 WHERE music_id = ?2",
+            params![cover_state, music_id],
         )?;
         Ok(())
     }
@@ -2558,7 +2757,7 @@ impl LibraryDatabase {
              (music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
               track_index, title, artist, album_artist, album, duration_ms,
               track_number, track_total, disc_number, disc_total, year, genre,
-              bitrate, sample_rate, cover_path, audio_remote_path,
+              bitrate, sample_rate, cover_state, audio_remote_path,
               clip_start_ms, clip_end_ms, cache_group_id, rev,
               last_downloaded_at, last_tag_read_at, remote_missing)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
@@ -2583,7 +2782,7 @@ impl LibraryDatabase {
                 &slice.genre,
                 slice.bitrate,
                 slice.sample_rate,
-                &slice.cover_path,
+                slice.cover_state,
                 &slice.audio_remote_path,
                 slice.clip_start_ms,
                 slice.clip_end_ms,
@@ -2682,7 +2881,7 @@ impl LibraryDatabase {
             "SELECT music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
                     track_index, title, artist, album_artist, album, duration_ms,
                     track_number, track_total, disc_number, disc_total, year, genre,
-                    bitrate, sample_rate, cover_path, audio_remote_path,
+                    bitrate, sample_rate, cover_state, audio_remote_path,
                     clip_start_ms, clip_end_ms, cache_group_id, rev,
                     last_downloaded_at, last_tag_read_at, remote_missing
              FROM cue_slices ORDER BY cue_id ASC, track_index ASC",
@@ -2709,7 +2908,7 @@ impl LibraryDatabase {
                 genre: row.get(17)?,
                 bitrate: row.get(18)?,
                 sample_rate: row.get(19)?,
-                cover_path: row.get(20)?,
+                cover_state: row.get(20)?,
                 audio_remote_path: row.get(21)?,
                 clip_start_ms: row.get(22)?,
                 clip_end_ms: row.get(23)?,
@@ -2738,7 +2937,7 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, title, artist, remote_path, account_id, size, modified,
                     album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-                    album, album_artist, rev
+                    album, album_artist, rev, cover_state
              FROM tracks WHERE account_id = ?1 AND remote_path = ?2 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![account_id, remote_path])?;
@@ -2761,7 +2960,7 @@ impl LibraryDatabase {
             "SELECT music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
                     track_index, title, artist, album_artist, album, duration_ms,
                     track_number, track_total, disc_number, disc_total, year, genre,
-                    bitrate, sample_rate, cover_path, audio_remote_path,
+                    bitrate, sample_rate, cover_state, audio_remote_path,
                     clip_start_ms, clip_end_ms, cache_group_id, rev,
                     last_downloaded_at, last_tag_read_at, remote_missing
              FROM cue_slices WHERE source_name = ?1 AND remote_path = ?2 LIMIT 1",
@@ -2789,7 +2988,7 @@ impl LibraryDatabase {
                 genre: row.get(17)?,
                 bitrate: row.get(18)?,
                 sample_rate: row.get(19)?,
-                cover_path: row.get(20)?,
+                cover_state: row.get(20)?,
                 audio_remote_path: row.get(21)?,
                 clip_start_ms: row.get(22)?,
                 clip_end_ms: row.get(23)?,
@@ -2845,7 +3044,7 @@ impl LibraryDatabase {
             "SELECT music_id, cue_id, audio_music_id, source_name, remote_path, file_name,
                     track_index, title, artist, album_artist, album, duration_ms,
                     track_number, track_total, disc_number, disc_total, year, genre,
-                    bitrate, sample_rate, cover_path, audio_remote_path,
+                    bitrate, sample_rate, cover_state, audio_remote_path,
                     clip_start_ms, clip_end_ms, cache_group_id, rev,
                     last_downloaded_at, last_tag_read_at, remote_missing
              FROM cue_slices WHERE cue_id = ?1 ORDER BY track_index ASC",
@@ -2872,7 +3071,7 @@ impl LibraryDatabase {
                 genre: row.get(17)?,
                 bitrate: row.get(18)?,
                 sample_rate: row.get(19)?,
-                cover_path: row.get(20)?,
+                cover_state: row.get(20)?,
                 audio_remote_path: row.get(21)?,
                 clip_start_ms: row.get(22)?,
                 clip_end_ms: row.get(23)?,
@@ -3181,7 +3380,7 @@ fn row_to_manga(row: &rusqlite::Row<'_>) -> rusqlite::Result<Manga> {
         volume:         row.get(6)?,
         chapter_number: row.get(7)?,
         page_count:     row.get(8)?,
-        cover_relpath:  row.get(9)?,
+        cover_state:    row.get(9)?,
         format:         row.get(10)?,
         remote_missing: row.get(11)?,
         page_turn:      row.get(12)?,
@@ -3213,6 +3412,7 @@ fn row_to_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryTrack> {
         album: row.get(15)?,
         album_artist: row.get(16)?,
         rev: row.get(17)?,
+        cover_state: row.get(18)?,
     })
 }
 
@@ -3648,7 +3848,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
     }
 
     #[test]
@@ -3689,7 +3889,7 @@ mod tests {
             volume: Some("1".into()),
             chapter_number: Some(format!("{i}")),
             page_count: 2,
-            cover_relpath: Some("cover.jpg".into()),
+            cover_state: 2,
             format: fmt.into(),
             remote_missing: 0,
             page_turn: Some("ltr".into()),
@@ -3804,7 +4004,7 @@ mod tests {
             volume: Some("1".into()),
             chapter_number: Some(format!("{i}")),
             page_count: 2,
-            cover_relpath: Some("cover.jpg".into()),
+            cover_state: 2,
             format: fmt.into(),
             remote_missing: 0,
             page_turn: Some("ltr".into()),
@@ -3999,6 +4199,7 @@ mod tests {
             album: Some("Album".into()),
             album_artist: None,
             rev: 0,
+            cover_state: 0,
         };
         db.upsert_track(&track).unwrap();
 
@@ -4283,6 +4484,7 @@ mod tests {
         // Build old DB in a temp file (open_with_flags requires a real path).
         let mut old_path = std::env::temp_dir();
         old_path.push("wdmm_sqflite_import_test.db");
+        let _ = std::fs::remove_file(&old_path);
 
         {
             let old = Connection::open(&old_path).expect("create old db");
@@ -4937,7 +5139,7 @@ mod tests {
             genre: Some("Rock".into()),
             bitrate: Some(320),
             sample_rate: Some(44100),
-            cover_path: None,
+            cover_state: 0,
             audio_remote_path: Some("/music/album.flac".into()),
             clip_start_ms: Some(0),
             clip_end_ms: Some(180_000),
@@ -5027,7 +5229,7 @@ mod tests {
             "genre": "Rock",
             "bitrate": 320,
             "sample_rate": 44100,
-            "cover_path": "/path/thumb.jpg",
+            "cover_state": 2,
             "audio_remote_path": "/path/album.flac",
             "clip_start_ms": 0,
             "clip_end_ms": 240_000,
@@ -5174,7 +5376,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -5473,6 +5675,7 @@ mod tests {
                 album: None,
                 album_artist: None,
                 rev: 0,
+                cover_state: 0,
             })
             .unwrap();
 
@@ -5618,6 +5821,7 @@ mod tests {
                 album: None,
                 album_artist: None,
                 rev: 0,
+                cover_state: 0,
             })
             .unwrap();
         right_db
@@ -5705,7 +5909,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -5727,6 +5931,7 @@ mod tests {
             year: Some(2024),
             mime_type: None,
             rev: 0,
+            cover_state: 0,
         })
         .unwrap();
 
@@ -5750,6 +5955,7 @@ mod tests {
             year: None,
             mime_type: None,
             rev: 0,
+            cover_state: 0,
         })
         .unwrap();
 
@@ -5843,6 +6049,7 @@ mod tests {
             year: None,
             mime_type: None,
             rev: 0,
+            cover_state: 0,
         })
         .unwrap();
 
@@ -5905,7 +6112,7 @@ mod tests {
             genre: None,
             bitrate: None,
             sample_rate: None,
-            cover_path: None,
+            cover_state: 0,
             audio_remote_path: Some("/music/album.flac".into()),
             clip_start_ms: Some(0),
             clip_end_ms: Some(200_000),
@@ -5971,7 +6178,7 @@ mod tests {
                 genre: None,
                 bitrate: None,
                 sample_rate: None,
-                cover_path: None,
+                cover_state: 0,
                 audio_remote_path: Some("/cue/disc.flac".into()),
                 clip_start_ms: Some((i as i64 - 1) * 60_000),
                 clip_end_ms: Some(i as i64 * 60_000),
@@ -6004,5 +6211,291 @@ mod tests {
         // list_cue_slices_for_cue — unknown cue_id returns empty vec
         let empty = db.list_cue_slices_for_cue("no-such-cue").unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ── v10 cover_state migration tests ──────────────────────────────────────
+
+    /// Build a DB at schema v9 (tracks+rev, mangas with cover_relpath, cue_slices with
+    /// cover_path) via raw SQL, then open it through LibraryDatabase to trigger the
+    /// v10 migration and verify cover_state is set correctly.
+    #[test]
+    fn migrate_v10_cover_columns() {
+        use rusqlite::Connection;
+
+        let mut path = std::env::temp_dir();
+        path.push("wdmm_migrate_v10_cover_test.db");
+        let _ = std::fs::remove_file(&path);
+
+        // Build a schema-v9 database by hand (cover_relpath / cover_path as TEXT).
+        {
+            let conn = Connection::open(&path).expect("create v9 db");
+            conn.execute_batch(r#"
+                CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER PRIMARY KEY);
+                INSERT OR IGNORE INTO _schema_version VALUES (9);
+
+                CREATE TABLE IF NOT EXISTS tracks (
+                    id          TEXT PRIMARY KEY,
+                    title       TEXT NOT NULL DEFAULT '',
+                    artist      TEXT,
+                    remote_path TEXT NOT NULL DEFAULT '',
+                    account_id  TEXT NOT NULL DEFAULT '',
+                    size        INTEGER NOT NULL DEFAULT 0,
+                    modified    INTEGER,
+                    created_at  INTEGER NOT NULL DEFAULT 0,
+                    album_id    TEXT,
+                    artist_id   TEXT,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    genre       TEXT,
+                    track_number INTEGER,
+                    disc_number  INTEGER,
+                    year         INTEGER,
+                    mime_type    TEXT,
+                    album        TEXT,
+                    album_artist TEXT,
+                    rev         INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS mangas (
+                    id              TEXT NOT NULL PRIMARY KEY,
+                    source_name     TEXT NOT NULL,
+                    remote_path     TEXT NOT NULL,
+                    title           TEXT NOT NULL,
+                    author          TEXT,
+                    series          TEXT,
+                    volume          TEXT,
+                    chapter_number  TEXT,
+                    page_count      INTEGER NOT NULL DEFAULT 0,
+                    cover_relpath   TEXT,
+                    format          TEXT NOT NULL DEFAULT 'unknown',
+                    remote_missing  INTEGER NOT NULL DEFAULT 0,
+                    page_turn       TEXT,
+                    rev             INTEGER NOT NULL DEFAULT 0,
+                    updated_at      TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cue_slices (
+                    music_id TEXT PRIMARY KEY,
+                    cue_id TEXT NOT NULL,
+                    audio_music_id TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    track_index INTEGER NOT NULL,
+                    title TEXT,
+                    artist TEXT,
+                    album_artist TEXT,
+                    album TEXT,
+                    duration_ms INTEGER,
+                    track_number INTEGER,
+                    track_total INTEGER,
+                    disc_number INTEGER,
+                    disc_total INTEGER,
+                    year INTEGER,
+                    genre TEXT,
+                    bitrate INTEGER,
+                    sample_rate INTEGER,
+                    cover_path TEXT,
+                    audio_remote_path TEXT,
+                    clip_start_ms INTEGER,
+                    clip_end_ms INTEGER,
+                    cache_group_id TEXT,
+                    rev INTEGER NOT NULL DEFAULT 0,
+                    last_downloaded_at TEXT NOT NULL DEFAULT '',
+                    last_tag_read_at TEXT NOT NULL DEFAULT '',
+                    remote_missing INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS cue_albums (
+                    cue_id TEXT PRIMARY KEY,
+                    source_name TEXT NOT NULL,
+                    cue_remote_path TEXT NOT NULL,
+                    title TEXT,
+                    performer TEXT,
+                    cache_group_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT ''
+                );
+
+                -- manga with non-empty cover_relpath → should become present (2)
+                INSERT INTO mangas VALUES (
+                    'mg-with', 'nas', '/m/a.cbz', 'With Cover', NULL, NULL, NULL, NULL,
+                    10, 'covers/a.jpg', 'cbz', 0, NULL, 5, '2026-01-01T00:00:00Z'
+                );
+                -- manga with NULL cover_relpath → unknown (0)
+                INSERT INTO mangas VALUES (
+                    'mg-null', 'nas', '/m/b.cbz', 'Null Cover', NULL, NULL, NULL, NULL,
+                    5, NULL, 'cbz', 0, NULL, 3, '2026-01-01T00:00:00Z'
+                );
+                -- manga with empty cover_relpath → unknown (0)
+                INSERT INTO mangas VALUES (
+                    'mg-empty', 'nas', '/m/c.cbz', 'Empty Cover', NULL, NULL, NULL, NULL,
+                    5, '', 'cbz', 0, NULL, 1, '2026-01-01T00:00:00Z'
+                );
+
+                INSERT INTO cue_albums VALUES (
+                    'cue-v10', 'nas', '/m/a.cue', 'Album', NULL, NULL, '2026-01-01T00:00:00Z'
+                );
+                -- cue slice with non-empty cover_path → present (2)
+                INSERT INTO cue_slices VALUES (
+                    'sl-with', 'cue-v10', 'aud-1', 'nas', '/sl/t1.virt', 'T1', 1,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, 'covers/t1.jpg', NULL, NULL, NULL, NULL, 0, '', '', 0
+                );
+                -- cue slice with NULL cover_path → unknown (0)
+                INSERT INTO cue_slices VALUES (
+                    'sl-null', 'cue-v10', 'aud-1', 'nas', '/sl/t2.virt', 'T2', 2,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, '', '', 0
+                );
+            "#).expect("seed v9 db");
+        }
+
+        // Open through LibraryDatabase — triggers v10 migration.
+        let db = LibraryDatabase::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 10, "schema must reach v10");
+
+        let mangas = db.list_mangas().unwrap();
+        let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");
+
+        assert_eq!(find("mg-with").cover_state, 2,  "non-empty cover_relpath → present(2)");
+        assert_eq!(find("mg-null").cover_state, 0,  "NULL cover_relpath → unknown(0)");
+        assert_eq!(find("mg-empty").cover_state, 0, "empty cover_relpath → unknown(0)");
+
+        let slices = db.list_cue_slices_for_cue("cue-v10").unwrap();
+        let find_sl = |id: &str| slices.iter().find(|s| s.music_id == id).expect("slice not found");
+
+        assert_eq!(find_sl("sl-with").cover_state, 2, "non-empty cover_path → present(2)");
+        assert_eq!(find_sl("sl-null").cover_state, 0, "NULL cover_path → unknown(0)");
+    }
+
+    /// import_from_sqflite maps a non-empty `cover_path` column to cover_state=2.
+    #[test]
+    fn import_from_sqflite_cover_path_mapping() {
+        use rusqlite::Connection;
+
+        let mut path = std::env::temp_dir();
+        path.push("wdmm_import_cover_path_test.db");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let old = Connection::open(&path).expect("create old db");
+            old.execute_batch(r#"
+                CREATE TABLE IF NOT EXISTS tracks (
+                    id          TEXT PRIMARY KEY,
+                    title       TEXT NOT NULL,
+                    artist      TEXT,
+                    remote_path TEXT NOT NULL,
+                    account_id  TEXT NOT NULL,
+                    size        INTEGER NOT NULL DEFAULT 0,
+                    modified    INTEGER,
+                    cover_path  TEXT
+                );
+                CREATE TABLE IF NOT EXISTS playlists (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS playlist_entries (
+                    playlist_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    music_id TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO tracks VALUES ('t-cov', 'Covered', NULL, '/m/c.mp3', 'acc', 1000, NULL, 'thumbs/c.jpg');
+                INSERT INTO tracks VALUES ('t-none', 'Bare', NULL, '/m/b.mp3', 'acc', 2000, NULL, NULL);
+                INSERT INTO tracks VALUES ('t-empty', 'EmptyCov', NULL, '/m/e.mp3', 'acc', 3000, NULL, '');
+            "#).expect("seed cover_path db");
+        }
+
+        let dest = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        LibraryDatabase::import_from_sqflite(&path, &dest).unwrap();
+
+        let tracks = dest.list_tracks().unwrap();
+        let find = |id: &str| tracks.iter().find(|t| t.id == id).expect("track not found").clone();
+
+        assert_eq!(find("t-cov").cover_state,   2, "non-empty cover_path → present(2)");
+        assert_eq!(find("t-none").cover_state,  0, "NULL cover_path → unknown(0)");
+        assert_eq!(find("t-empty").cover_state, 0, "empty cover_path → unknown(0)");
+    }
+
+    /// cover_state survives upsert→get roundtrip for tracks, slices, mangas; setters work.
+    #[test]
+    fn cover_state_upsert_and_setters_roundtrip() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        // Track
+        let track = LibraryTrack {
+            id: "cs-t1".into(),
+            title: "CS Track".into(),
+            remote_path: "/m/cs.mp3".into(),
+            account_id: "acc".into(),
+            size: 100,
+            cover_state: 2,
+            ..Default::default()
+        };
+        db.upsert_track(&track).unwrap();
+        assert_eq!(db.get_track("cs-t1").unwrap().unwrap().cover_state, 2, "track upsert should keep cover_state=2");
+
+        db.set_track_cover_state("cs-t1", 1).unwrap();
+        assert_eq!(db.get_track("cs-t1").unwrap().unwrap().cover_state, 1, "set_track_cover_state(1) should work");
+
+        // CueSlice
+        let album = CueAlbum {
+            cue_id: "cs-cue".into(),
+            source_name: "nas".into(),
+            cue_remote_path: "/m/cs.cue".into(),
+            title: None,
+            performer: None,
+            cache_group_id: None,
+            created_at: now.clone(),
+        };
+        db.upsert_cue_album(&album).unwrap();
+
+        let slice = CueSlice {
+            music_id: "cs-sl1".into(),
+            cue_id: "cs-cue".into(),
+            audio_music_id: "cs-aud".into(),
+            source_name: "nas".into(),
+            remote_path: "/m/cs_t1.virt".into(),
+            file_name: "t1".into(),
+            track_index: 1,
+            cover_state: 2,
+            rev: 0,
+            last_downloaded_at: now.clone(),
+            last_tag_read_at: now.clone(),
+            ..Default::default()
+        };
+        db.upsert_cue_slice(&slice).unwrap();
+        let got_sl = db.get_cue_slice_by_source_path("nas", "/m/cs_t1.virt").unwrap().unwrap();
+        assert_eq!(got_sl.cover_state, 2, "slice upsert should keep cover_state=2");
+
+        db.set_cue_slice_cover_state("cs-sl1", 0).unwrap();
+        let got_sl2 = db.get_cue_slice_by_source_path("nas", "/m/cs_t1.virt").unwrap().unwrap();
+        assert_eq!(got_sl2.cover_state, 0, "set_cue_slice_cover_state(0) should work");
+
+        // Manga
+        let manga = Manga {
+            id: "cs-mg1".into(),
+            source_name: "nas".into(),
+            remote_path: "/m/cs.cbz".into(),
+            title: "CS Manga".into(),
+            author: None, series: None, volume: None, chapter_number: None,
+            page_count: 5,
+            cover_state: 2,
+            format: "cbz".into(),
+            remote_missing: 0,
+            page_turn: None,
+            rev: 1,
+            updated_at: now.clone(),
+        };
+        db.upsert_manga(&manga).unwrap();
+        assert_eq!(db.get_manga("cs-mg1").unwrap().unwrap().cover_state, 2, "manga upsert should keep cover_state=2");
+
+        db.set_manga_cover_state("cs-mg1", 0).unwrap();
+        assert_eq!(db.get_manga("cs-mg1").unwrap().unwrap().cover_state, 0, "set_manga_cover_state(0) should work");
     }
 }
