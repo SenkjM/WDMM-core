@@ -2228,6 +2228,17 @@ pub extern "C" fn wdmm_library_clear_index() -> FfiString {
     }
 }
 
+/// Wipe manga index (mangas / pages / deleted_mangas / manga sync cursors).
+/// Keeps manga_progress. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_manga_clear_index() -> FfiString {
+    match global_library_db().clear_manga_index() {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+
 /// Import tracks, playlists, playlist_entries, music tombstones
 /// (`deleted_tracks`), and sync cursors (`sync_state`) from an old sqflite
 /// database.

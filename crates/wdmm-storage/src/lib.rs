@@ -2408,6 +2408,25 @@ impl LibraryDatabase {
         Ok(())
     }
 
+    /// Wipe manga index only: mangas, pages, deleted_mangas, and manga sync_state
+    /// cursor rows (`manga:` prefix). Keeps manga_progress (reading position) and
+    /// does not touch music / accounts / playlists.
+    pub fn clear_manga_index(&self) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute("DELETE FROM manga_pages", [])?;
+        tx.execute("DELETE FROM mangas", [])?;
+        tx.execute("DELETE FROM deleted_mangas", [])?;
+        tx.execute(
+            "DELETE FROM sync_state WHERE remote_key LIKE 'manga:%'",
+            [],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     // ── CUE operations (v5) ───────────────────────────────────────────────────
 
     pub fn upsert_cue_album(&self, album: &CueAlbum) -> StorageResult<()> {
