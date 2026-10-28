@@ -2222,18 +2222,24 @@ pub extern "C" fn wdmm_token_rotate() -> FfiString {
 // ── Library DB singleton ──────────────────────────────────────────────────────
 //
 // The FFI exposes a process-global library database. Real Android/Windows
-// integration calls `wdmm_library_init(path)` at app start; falls back to
-// ":memory:" for testing. All track/artist/album operations use this.
+// integration calls `wdmm_library_init(path)` once at app start before any
+// library/KV operation. Production builds panic if the singleton is not
+// initialised; test builds fall back to `:memory:` automatically.
 
 static LIBRARY_DB: OnceLock<std::sync::Arc<LibraryDatabase>> = OnceLock::new();
 
 fn global_library_db() -> &'static std::sync::Arc<LibraryDatabase> {
-    LIBRARY_DB.get_or_init(|| {
+    #[cfg(test)]
+    return LIBRARY_DB.get_or_init(|| {
         std::sync::Arc::new(
             LibraryDatabase::open(std::path::Path::new(":memory:"))
                 .expect("FFI: failed to open in-memory library DB"),
         )
-    })
+    });
+    #[cfg(not(test))]
+    LIBRARY_DB
+        .get()
+        .expect("BUG: wdmm_library_init must be called before any library operations")
 }
 
 /// Initialise the library database at a custom path.
