@@ -173,6 +173,13 @@ impl DriverStore {
             Err(e) => Err(SyncError::from(e)),
         }
     }
+    async fn list_files(&self, dir: &str) -> SyncResult<Vec<String>> {
+        match self.driver.list(dir).await {
+            Ok(items) => Ok(items.into_iter().filter(|i| !i.is_dir).map(|i| i.name).collect()),
+            Err(DriverError::NotFound(_)) => Ok(vec![]),
+            Err(e) => Err(SyncError::from(e)),
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -456,6 +463,84 @@ impl MangaLibrarySyncEngine {
             .collect())
     }
 
+    /// Audit the remote manga library.
+    ///
+    /// Cross-references the remote manifest with the actual remote directory
+    /// listing to find missing shards and unreferenced orphan files.
+    pub async fn audit(&self) -> SyncResult<crate::SyncAuditResult> {
+        let manifest = self.read_manifest().await?;
+        let remote_files: std::collections::HashSet<String> =
+            self.store.list_files(&self.dir()).await?.into_iter().collect();
+
+        let mut referenced = std::collections::HashSet::new();
+        for s in &manifest.base.shards {
+            referenced.insert(s.file.clone());
+        }
+        for p in manifest.segments.iter().chain(manifest.tombstones.iter()) {
+            referenced.insert(p.file.clone());
+        }
+
+        let mut missing: Vec<String> = referenced.iter()
+            .filter(|f| !remote_files.contains(*f))
+            .cloned()
+            .collect();
+        missing.sort();
+
+        let index_name = INDEX_NAME.to_string();
+        let progress_name = PROGRESS_NAME.to_string();
+        let mut orphans: Vec<String> = remote_files.iter()
+            .filter(|f| *f != &index_name && *f != &progress_name && !referenced.contains(*f))
+            .cloned()
+            .collect();
+        orphans.sort();
+
+        let healthy = missing.is_empty() && orphans.is_empty();
+        let summary = if healthy {
+            format!(
+                "healthy — {} base shards, {} segments, {} tombstones",
+                manifest.base.shards.len(),
+                manifest.segments.len(),
+                manifest.tombstones.len(),
+            )
+        } else {
+            format!("{} missing, {} orphans", missing.len(), orphans.len())
+        };
+
+        Ok(crate::SyncAuditResult { missing, orphans, healthy, summary })
+    }
+
+    /// Estimate the cost of a full manga rebuild without network I/O.
+    ///
+    /// `mangas_per_shard` is clamped to `[50, 5000]`; pass 0 for the default (500).
+    pub async fn estimate(&self, mangas_per_shard: usize) -> SyncResult<crate::SyncEstimateResult> {
+        let per = if mangas_per_shard == 0 { DEFAULT_MANGAS_PER_SHARD } else { mangas_per_shard.clamp(50, 5000) };
+        let count = self.db.list_mangas()?.len();
+        let shards = if count == 0 { 0 } else { (count + per - 1) / per };
+        let estimated_bytes = (count as i64) * 300; // ~300 B per manga row
+
+        let manifest = self.read_manifest().await?;
+        let fragment_count = manifest.segments.len() + manifest.tombstones.len();
+        let fragment_bytes: i64 = manifest.segments.iter().chain(manifest.tombstones.iter())
+            .map(|p| p.bytes)
+            .sum();
+
+        Ok(crate::SyncEstimateResult { shards, estimated_bytes, fragment_count, fragment_bytes })
+    }
+
+    /// Delete the given orphan filenames from the remote manga library directory.
+    ///
+    /// Returns the number of files successfully deleted. Individual failures
+    /// are silently ignored (best-effort).
+    pub async fn tidy_orphans(&self, orphans: &[String]) -> SyncResult<usize> {
+        let mut deleted = 0usize;
+        for name in orphans {
+            let path = join_path(&self.dir(), name);
+            if self.store.remove(&path).await.is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
 
     fn row_with_pages(db: &LibraryDatabase, m: &wdmm_storage::Manga) -> SyncResult<MangaSyncRow> {
         let pages = if m.format == "images" {

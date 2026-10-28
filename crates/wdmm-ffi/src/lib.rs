@@ -361,43 +361,51 @@ pub extern "C" fn wdmm_crypto_decrypt(
 
 // ── Sync FFI ─────────────────────────────────────────────────────────────────
 
-/// Trigger a sync run (credentials + library + playlists) against a remote
-/// WebDAV driver.
+/// Helper: look up an account by ID and construct its CloudDriver.
+fn driver_for_account(
+    account_id_str: &str,
+) -> Result<std::sync::Arc<dyn wdmm_drivers::CloudDriver>, FfiString> {
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err(FfiString::from("error:account not found")),
+        Err(e) => return Err(FfiString::from(format!("error:{e}"))),
+    };
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return Err(FfiString::from(format!("error:{e}"))),
+    };
+    match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => Ok(std::sync::Arc::from(d)),
+        Err(e) => Err(FfiString::from(format!("error:driver: {e}"))),
+    }
+}
+
+/// Trigger an incremental sync (credentials + library + manga + playlists).
 ///
 /// Parameters (all null-terminated UTF-8 C strings):
-/// - `webdav_url`:  WebDAV base URL (e.g. `"https://nas.local/dav/"`)
-/// - `webdav_user`: HTTP Basic username (empty string for no auth)
-/// - `webdav_pass`: HTTP Basic password (empty string for no auth)
-/// - `remote_dir`:  Remote directory used as the sync root (e.g. `"/wdmm_sync"`)
+/// - `account_id`: Cloud account ID looked up in the process-global library DB.
+/// - `remote_dir`: Remote sync root directory (e.g. `"/wdmm_sync"`).
 ///
-/// Returns a JSON summary string (see [`wdmm_sync::run_sync_all`]) or
+/// Returns a JSON summary (see [`wdmm_sync::run_sync_all`]) or
 /// `"error:<message>"`. Caller must free the result.
 ///
 /// # Safety
 /// All pointer parameters must be valid null-terminated UTF-8 C strings.
 #[no_mangle]
 pub extern "C" fn wdmm_sync_trigger(
-    webdav_url: *const c_char,
-    webdav_user: *const c_char,
-    webdav_pass: *const c_char,
+    account_id: *const c_char,
     remote_dir: *const c_char,
 ) -> FfiString {
-    let url = match ptr_to_str(webdav_url) {
+    let account_id_str = match ptr_to_str(account_id) {
         Some(s) => s,
-        None => return FfiString::from("error:invalid webdav_url"),
+        None => return FfiString::from("error:invalid account_id"),
     };
-    let user = ptr_to_str(webdav_user).unwrap_or("");
-    let pass = ptr_to_str(webdav_pass).unwrap_or("");
     let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
-
-    // Use the process-global library DB (same as playlist/manga/kv/account FFI).
-    // A throwaway ":memory:" DB made sync a no-op for real app state.
-    let db = std::sync::Arc::clone(global_library_db());
-    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
-        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
     };
-
+    let db = std::sync::Arc::clone(global_library_db());
     let result = rt().block_on(wdmm_sync::run_sync_all(db, driver, dir));
     match result {
         Ok(summary) => FfiString::from(summary.to_string()),
@@ -407,59 +415,258 @@ pub extern "C" fn wdmm_sync_trigger(
 
 /// Full-rebuild sync — credentials + music library + manga + playlists.
 ///
-/// Calls [`wdmm_sync::run_sync_full`], which triggers `sync_full` on every
-/// engine (base-shard rebuild for music and manga; full push/pull for
-/// credentials and playlists). Use to compact a fragmented remote or after a
-/// device reset.
-///
 /// Parameters (all null-terminated UTF-8 C strings):
-/// - `webdav_url`:  WebDAV base URL (e.g. `"https://nas.local/dav/"`)
-/// - `webdav_user`: HTTP Basic username (empty string for no auth)
-/// - `webdav_pass`: HTTP Basic password (empty string for no auth)
-/// - `remote_dir`:  Remote directory used as the sync root (e.g. `"/wdmm_sync"`)
-/// - `with_covers`: nonzero to embed `SEC_COVERS` (3) cover blobs in the
-///   rebuilt `lib-*` base shards (using the configured cover roots from
-///   [`wdmm_covers_configure`]); `0`/null omits covers.
+/// - `account_id`:  Cloud account ID looked up in the process-global library DB.
+/// - `remote_dir`:  Remote sync root directory (e.g. `"/wdmm_sync"`).
+/// - `with_covers`: nonzero to embed cover blobs in the rebuilt base shards
+///   (using cover roots from [`wdmm_covers_configure`]); `0` omits covers.
 ///
-/// Returns a JSON summary string (see [`wdmm_sync::run_sync_full`]) or
+/// Returns a JSON summary (see [`wdmm_sync::run_sync_full`]) or
 /// `"error:<message>"`. Caller must free the result.
 ///
 /// # Safety
 /// All pointer parameters must be valid null-terminated UTF-8 C strings.
 #[no_mangle]
 pub extern "C" fn wdmm_sync_full(
-    webdav_url: *const c_char,
-    webdav_user: *const c_char,
-    webdav_pass: *const c_char,
+    account_id: *const c_char,
     remote_dir: *const c_char,
     with_covers: c_int,
 ) -> FfiString {
-    let url = match ptr_to_str(webdav_url) {
+    let account_id_str = match ptr_to_str(account_id) {
         Some(s) => s,
-        None => return FfiString::from("error:invalid webdav_url"),
+        None => return FfiString::from("error:invalid account_id"),
     };
-    let user = ptr_to_str(webdav_user).unwrap_or("");
-    let pass = ptr_to_str(webdav_pass).unwrap_or("");
     let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
-
     let cover_roots = if with_covers != 0 {
         global_cover_roots().lock().unwrap().clone()
     } else {
         None
     };
-
-    let db = std::sync::Arc::clone(global_library_db());
-    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
-        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
     };
-
+    let db = std::sync::Arc::clone(global_library_db());
     let result = rt().block_on(wdmm_sync::run_sync_full(db, driver, dir, cover_roots));
     match result {
         Ok(summary) => FfiString::from(summary.to_string()),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
+
+/// Audit the music library remote — cross-reference the manifest against the
+/// live remote listing to find missing and orphaned shards.
+///
+/// - `account_id`: Cloud account ID.
+/// - `remote_dir`: Remote sync root (e.g. `"/wdmm_sync"`).
+///
+/// Returns JSON `{"missing":[…],"orphans":[…],"healthy":bool,"summary":"…"}`
+/// or `"error:<message>"`. Caller must free.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_audit_music(
+    account_id: *const c_char,
+    remote_dir: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let db = std::sync::Arc::clone(global_library_db());
+    let engine = wdmm_sync::LibrarySyncEngine::new(db, driver, dir, None);
+    match rt().block_on(engine.audit()) {
+        Ok(r) => FfiString::from(serde_json::json!({
+            "missing": r.missing,
+            "orphans": r.orphans,
+            "healthy": r.healthy,
+            "summary": r.summary,
+        }).to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Audit the manga library remote — cross-reference the manifest against the
+/// live remote listing to find missing and orphaned shards.
+///
+/// - `account_id`: Cloud account ID.
+/// - `remote_dir`: Remote sync root (e.g. `"/wdmm_sync"`).
+///
+/// Returns JSON `{"missing":[…],"orphans":[…],"healthy":bool,"summary":"…"}`
+/// or `"error:<message>"`. Caller must free.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_audit_manga(
+    account_id: *const c_char,
+    remote_dir: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let db = std::sync::Arc::clone(global_library_db());
+    let engine = wdmm_sync::MangaLibrarySyncEngine::new(db, driver, dir, None);
+    match rt().block_on(engine.audit()) {
+        Ok(r) => FfiString::from(serde_json::json!({
+            "missing": r.missing,
+            "orphans": r.orphans,
+            "healthy": r.healthy,
+            "summary": r.summary,
+        }).to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Estimate the network cost of a full music library rebuild.
+///
+/// `tracks_per_shard`: target rows per shard; `0` → default (500).
+///
+/// Returns JSON `{"shards":N,"estimated_bytes":N,"fragment_count":N,
+/// "fragment_bytes":N}` or `"error:<message>"`. Caller must free.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_estimate_music(
+    account_id: *const c_char,
+    remote_dir: *const c_char,
+    tracks_per_shard: c_int,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let n = if tracks_per_shard > 0 { tracks_per_shard as usize } else { 500 };
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let db = std::sync::Arc::clone(global_library_db());
+    let engine = wdmm_sync::LibrarySyncEngine::new(db, driver, dir, None);
+    match rt().block_on(engine.estimate(n)) {
+        Ok(r) => FfiString::from(serde_json::json!({
+            "shards": r.shards,
+            "estimated_bytes": r.estimated_bytes,
+            "fragment_count": r.fragment_count,
+            "fragment_bytes": r.fragment_bytes,
+        }).to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Estimate the network cost of a full manga library rebuild.
+///
+/// `mangas_per_shard`: target rows per shard; `0` → default (200).
+///
+/// Returns JSON `{"shards":N,"estimated_bytes":N,"fragment_count":N,
+/// "fragment_bytes":N}` or `"error:<message>"`. Caller must free.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_estimate_manga(
+    account_id: *const c_char,
+    remote_dir: *const c_char,
+    mangas_per_shard: c_int,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let n = if mangas_per_shard > 0 { mangas_per_shard as usize } else { 200 };
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let db = std::sync::Arc::clone(global_library_db());
+    let engine = wdmm_sync::MangaLibrarySyncEngine::new(db, driver, dir, None);
+    match rt().block_on(engine.estimate(n)) {
+        Ok(r) => FfiString::from(serde_json::json!({
+            "shards": r.shards,
+            "estimated_bytes": r.estimated_bytes,
+            "fragment_count": r.fragment_count,
+            "fragment_bytes": r.fragment_bytes,
+        }).to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete orphan shards from the music library remote.
+///
+/// `orphans_json`: JSON array of filenames from `wdmm_sync_audit_music`.
+/// Returns the count of deleted files as a decimal string, or
+/// `"error:<message>"`. Caller must free.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_tidy_orphans_music(
+    account_id: *const c_char,
+    remote_dir: *const c_char,
+    orphans_json: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let raw = match ptr_to_str(orphans_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null orphans_json"),
+    };
+    let orphans: Vec<String> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let db = std::sync::Arc::clone(global_library_db());
+    let engine = wdmm_sync::LibrarySyncEngine::new(db, driver, dir, None);
+    match rt().block_on(engine.tidy_orphans(&orphans)) {
+        Ok(n) => FfiString::from(n.to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete orphan shards from the manga library remote.
+///
+/// `orphans_json`: JSON array of filenames from `wdmm_sync_audit_manga`.
+/// Returns the count of deleted files as a decimal string, or
+/// `"error:<message>"`. Caller must free.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_tidy_orphans_manga(
+    account_id: *const c_char,
+    remote_dir: *const c_char,
+    orphans_json: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let raw = match ptr_to_str(orphans_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:null orphans_json"),
+    };
+    let orphans: Vec<String> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
+    };
+    let driver = match driver_for_account(account_id_str) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let db = std::sync::Arc::clone(global_library_db());
+    let engine = wdmm_sync::MangaLibrarySyncEngine::new(db, driver, dir, None);
+    match rt().block_on(engine.tidy_orphans(&orphans)) {
+        Ok(n) => FfiString::from(n.to_string()),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+
 
 
 // ── WebDAV browse FFI ────────────────────────────────────────────────────────

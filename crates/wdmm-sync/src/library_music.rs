@@ -168,6 +168,13 @@ impl DriverStore {
             Err(e) => Err(SyncError::from(e)),
         }
     }
+    async fn list_files(&self, dir: &str) -> SyncResult<Vec<String>> {
+        match self.driver.list(dir).await {
+            Ok(items) => Ok(items.into_iter().filter(|i| !i.is_dir).map(|i| i.name).collect()),
+            Err(DriverError::NotFound(_)) => Ok(vec![]),
+            Err(e) => Err(SyncError::from(e)),
+        }
+    }
 }
 
 fn music_dir(remote_dir: &str) -> String {
@@ -502,6 +509,86 @@ impl LibrarySyncEngine {
             .into_iter()
             .map(|t| (track_identity_key(&t.account_id, &t.remote_path), t))
             .collect())
+    }
+
+    /// Audit the remote music library.
+    ///
+    /// Reads the remote manifest and directory listing, then cross-references to
+    /// find shards referenced in the manifest that are missing on the remote, and
+    /// files present on the remote that are not referenced by the manifest.
+    pub async fn audit(&self) -> SyncResult<crate::SyncAuditResult> {
+        let manifest = self.read_manifest().await?;
+        let remote_files: std::collections::HashSet<String> =
+            self.store.list_files(&self.dir()).await?.into_iter().collect();
+
+        // Collect every filename the manifest references (base shards + incremental parts).
+        let mut referenced = std::collections::HashSet::new();
+        for s in &manifest.base.shards {
+            referenced.insert(s.file.clone());
+        }
+        for p in manifest.segments.iter().chain(manifest.tombstones.iter()) {
+            referenced.insert(p.file.clone());
+        }
+
+        let mut missing: Vec<String> = referenced.iter()
+            .filter(|f| !remote_files.contains(*f))
+            .cloned()
+            .collect();
+        missing.sort();
+
+        let index_name = INDEX_NAME.to_string();
+        let mut orphans: Vec<String> = remote_files.iter()
+            .filter(|f| *f != &index_name && !referenced.contains(*f))
+            .cloned()
+            .collect();
+        orphans.sort();
+
+        let healthy = missing.is_empty() && orphans.is_empty();
+        let summary = if healthy {
+            format!(
+                "healthy — {} base shards, {} segments, {} tombstones",
+                manifest.base.shards.len(),
+                manifest.segments.len(),
+                manifest.tombstones.len(),
+            )
+        } else {
+            format!("{} missing, {} orphans", missing.len(), orphans.len())
+        };
+
+        Ok(crate::SyncAuditResult { missing, orphans, healthy, summary })
+    }
+
+    /// Estimate the cost of a full rebuild without doing any network I/O.
+    ///
+    /// `tracks_per_shard` is clamped to `[50, 5000]`; pass 0 for the default (500).
+    pub async fn estimate(&self, tracks_per_shard: usize) -> SyncResult<crate::SyncEstimateResult> {
+        let per = if tracks_per_shard == 0 { DEFAULT_TRACKS_PER_SHARD } else { tracks_per_shard.clamp(50, 5000) };
+        let count = self.db.list_tracks()?.len();
+        let shards = if count == 0 { 0 } else { (count + per - 1) / per };
+        let estimated_bytes = (count as i64) * 250; // ~250 B per track compressed
+
+        let manifest = self.read_manifest().await?;
+        let fragment_count = manifest.segments.len() + manifest.tombstones.len();
+        let fragment_bytes: i64 = manifest.segments.iter().chain(manifest.tombstones.iter())
+            .map(|p| p.bytes)
+            .sum();
+
+        Ok(crate::SyncEstimateResult { shards, estimated_bytes, fragment_count, fragment_bytes })
+    }
+
+    /// Delete the given orphan filenames from the remote music library directory.
+    ///
+    /// Returns the number of files successfully deleted. Individual delete
+    /// failures are silently ignored (best-effort).
+    pub async fn tidy_orphans(&self, orphans: &[String]) -> SyncResult<usize> {
+        let mut deleted = 0usize;
+        for name in orphans {
+            let path = join_path(&self.dir(), name);
+            if self.store.remove(&path).await.is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 }
 

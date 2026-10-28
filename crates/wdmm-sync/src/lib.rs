@@ -100,6 +100,35 @@ pub trait SyncEngine: Send + Sync {
     async fn sync_full(&self) -> SyncResult<Vec<SyncOutcome>>;
 }
 
+/// Result of a remote-library audit (music or manga).
+#[derive(Debug, Clone, Default)]
+pub struct SyncAuditResult {
+    /// Shard/segment/tombstone filenames referenced in the manifest but not
+    /// found on the remote (downloads may have failed or been removed manually).
+    pub missing: Vec<String>,
+    /// Files present on the remote that are not referenced by any manifest
+    /// entry (left-over from aborted writes or old format migrations).
+    pub orphans: Vec<String>,
+    /// True iff both `missing` and `orphans` are empty.
+    pub healthy: bool,
+    /// Human-readable one-line summary (English).
+    pub summary: String,
+}
+
+/// Estimated cost of a full rebuild for one library kind (music or manga).
+#[derive(Debug, Clone, Default)]
+pub struct SyncEstimateResult {
+    /// Number of base shards the rebuild would write.
+    pub shards: usize,
+    /// Rough estimated compressed bytes (≈ 200 B per row × shard item count).
+    pub estimated_bytes: i64,
+    /// Number of incremental segments + tombstones currently on the remote
+    /// (i.e. how many accumulated since the last full rebuild).
+    pub fragment_count: usize,
+    /// Total bytes of all segments + tombstones in the current remote manifest.
+    pub fragment_bytes: i64,
+}
+
 /// Join a base sync directory and a file name, collapsing double slashes.
 fn join_path(base: &str, name: &str) -> String {
     let base = base.trim_end_matches('/');
@@ -107,59 +136,47 @@ fn join_path(base: &str, name: &str) -> String {
     format!("{base}/{name}")
 }
 
-/// A remote-file snapshot used by the engines to decide push vs pull.
-#[async_trait]
-trait RemoteStore: Send + Sync {
-    async fn read(&self, path: &str) -> SyncResult<Option<Vec<u8>>>;
-    async fn write(&self, path: &str, data: &[u8]) -> SyncResult<()>;
-    async fn ensure_dir(&self, path: &str) -> SyncResult<()>;
-    /// List file names (no directories) directly under `dir`.
-    async fn list_files(&self, dir: &str) -> SyncResult<Vec<String>>;
+// ── CloudDriver helpers (used by the credential + playlist engines) ──────────
+//
+// The engines talk to a [`CloudDriver`] directly — no parallel file-store trait.
+// These free functions adapt driver results into the sync-shaped results the
+// engines need: `NotFound` on read → `Ok(None)` (file not yet on remote); a network
+// error on `mkdir` is treated as success (many WebDAV servers return 405 when the
+// collection already exists); `NotFound` on `list` → empty (dir not yet created).
+
+async fn driver_read(driver: &Arc<dyn CloudDriver>, path: &str) -> SyncResult<Option<Vec<u8>>> {
+    match driver.get_content(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(DriverError::NotFound(_)) => Ok(None),
+        Err(e) => Err(SyncError::from(e)),
+    }
 }
 
-/// Adapter that delegates to a `CloudDriver`. `NotFound` on read → `Ok(None)`
-/// (file not yet on remote). `NotFound` on mkdir is ignored (already exists).
-struct DriverStore {
-    driver: Arc<dyn CloudDriver>,
+async fn driver_write(driver: &Arc<dyn CloudDriver>, path: &str, data: &[u8]) -> SyncResult<()> {
+    driver.put_content(path, data).await?;
+    Ok(())
 }
 
-#[async_trait]
-impl RemoteStore for DriverStore {
-    async fn read(&self, path: &str) -> SyncResult<Option<Vec<u8>>> {
-        match self.driver.get_content(path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(DriverError::NotFound(_)) => Ok(None),
-            Err(e) => Err(SyncError::from(e)),
+async fn driver_ensure_dir(driver: &Arc<dyn CloudDriver>, path: &str) -> SyncResult<()> {
+    match driver.mkdir(path).await {
+        Ok(()) => Ok(()),
+        Err(DriverError::Network(_)) => {
+            debug!("mkdir {path}: ignored non-fatal error (likely exists)");
+            Ok(())
         }
+        Err(e) => Err(SyncError::from(e)),
     }
+}
 
-    async fn write(&self, path: &str, data: &[u8]) -> SyncResult<()> {
-        self.driver.put_content(path, data).await?;
-        Ok(())
-    }
-
-    async fn ensure_dir(&self, path: &str) -> SyncResult<()> {
-        match self.driver.mkdir(path).await {
-            Ok(()) => Ok(()),
-            // Many WebDAV servers return 405 when the collection already exists.
-            Err(DriverError::Network(_)) => {
-                debug!("mkdir {path}: ignored non-fatal error (likely exists)");
-                Ok(())
-            }
-            Err(e) => Err(SyncError::from(e)),
-        }
-    }
-
-    async fn list_files(&self, dir: &str) -> SyncResult<Vec<String>> {
-        match self.driver.list(dir).await {
-            Ok(items) => Ok(items
-                .into_iter()
-                .filter(|i| !i.is_dir)
-                .map(|i| i.name)
-                .collect()),
-            Err(DriverError::NotFound(_)) => Ok(vec![]),
-            Err(e) => Err(SyncError::from(e)),
-        }
+async fn driver_list_files(driver: &Arc<dyn CloudDriver>, dir: &str) -> SyncResult<Vec<String>> {
+    match driver.list(dir).await {
+        Ok(items) => Ok(items
+            .into_iter()
+            .filter(|i| !i.is_dir)
+            .map(|i| i.name)
+            .collect()),
+        Err(DriverError::NotFound(_)) => Ok(vec![]),
+        Err(e) => Err(SyncError::from(e)),
     }
 }
 
@@ -214,7 +231,7 @@ impl From<&RemoteAccount> for CloudAccount {
 /// `CloudDriver` store (WebDAV happy path).
 pub struct CredentialSyncEngine {
     db: Arc<LibraryDatabase>,
-    store: Arc<dyn RemoteStore>,
+    driver: Arc<dyn CloudDriver>,
     remote_dir: String,
 }
 
@@ -229,7 +246,7 @@ impl CredentialSyncEngine {
     ) -> Self {
         Self {
             db,
-            store: Arc::new(DriverStore { driver }),
+            driver,
             remote_dir: remote_dir.into(),
         }
     }
@@ -239,17 +256,17 @@ impl CredentialSyncEngine {
     }
 
     async fn fetch_remote(&self) -> SyncResult<Vec<RemoteAccount>> {
-        match self.store.read(&self.file_path()).await? {
+        match driver_read(&self.driver, &self.file_path()).await? {
             None => Ok(vec![]),
             Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
         }
     }
 
     async fn push_all(&self, accounts: &[CloudAccount]) -> SyncResult<()> {
-        self.store.ensure_dir(&self.remote_dir).await?;
+        driver_ensure_dir(&self.driver, &self.remote_dir).await?;
         let remote: Vec<RemoteAccount> = accounts.iter().map(RemoteAccount::from).collect();
         let bytes = serde_json::to_vec(&remote)?;
-        self.store.write(&self.file_path(), &bytes).await
+        driver_write(&self.driver, &self.file_path(), &bytes).await
     }
 }
 
@@ -346,7 +363,7 @@ impl RemotePlaylist {
 /// Tombstones / deletion packages (`WDMMPD01`) are out of scope this round.
 pub struct PlaylistSyncEngine {
     db: Arc<LibraryDatabase>,
-    store: Arc<dyn RemoteStore>,
+    driver: Arc<dyn CloudDriver>,
     remote_dir: String,
 }
 
@@ -358,7 +375,7 @@ impl PlaylistSyncEngine {
     ) -> Self {
         Self {
             db,
-            store: Arc::new(DriverStore { driver }),
+            driver,
             remote_dir: remote_dir.into(),
         }
     }
@@ -372,14 +389,14 @@ impl PlaylistSyncEngine {
     }
 
     async fn fetch_remote(&self, id: &str) -> SyncResult<Option<RemotePlaylist>> {
-        match self.store.read(&self.file_path(id)).await? {
+        match driver_read(&self.driver, &self.file_path(id)).await? {
             None => Ok(None),
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         }
     }
 
     async fn push_one(&self, pl: &Playlist, entries: &[PlaylistEntry]) -> SyncResult<()> {
-        self.store.ensure_dir(&self.playlists_dir()).await?;
+        driver_ensure_dir(&self.driver, &self.playlists_dir()).await?;
         let remote = RemotePlaylist {
             id: pl.id.clone(),
             name: pl.name.clone(),
@@ -398,7 +415,7 @@ impl PlaylistSyncEngine {
                 .collect(),
         };
         let bytes = serde_json::to_vec(&remote)?;
-        self.store.write(&self.file_path(&pl.id), &bytes).await
+        driver_write(&self.driver, &self.file_path(&pl.id), &bytes).await
     }
 }
 
@@ -411,7 +428,7 @@ impl SyncEngine for PlaylistSyncEngine {
         let mut outcomes = Vec::new();
 
         // Pull remote-only playlists (not present locally).
-        let remote_files = self.store.list_files(&self.playlists_dir()).await?;
+        let remote_files = driver_list_files(&self.driver, &self.playlists_dir()).await?;
         for fname in &remote_files {
             // file name is "<id>.json"
             let Some(pl_id) = fname.strip_suffix(".json") else {
