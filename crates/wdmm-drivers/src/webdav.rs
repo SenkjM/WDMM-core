@@ -54,7 +54,12 @@ impl WebDavDriver {
 
     /// Parse PROPFIND XML and extract items.
     /// `propfind_url` is the full URL that was requested (for filtering the collection itself).
-    fn parse_propfind_response(&self, xml: &str, propfind_url: &str) -> Result<Vec<CloudFileItem>> {
+    fn parse_propfind_response(
+        &self,
+        xml: &str,
+        propfind_url: &str,
+        include_self: bool,
+    ) -> Result<Vec<CloudFileItem>> {
         let mut reader = Reader::from_str(xml);
         reader.config_mut().trim_text(true);
 
@@ -125,7 +130,10 @@ impl WebDavDriver {
                             let name = decoded_href.trim_end_matches('/').split('/').last().unwrap_or("").to_string();
 
                             // skip the collection itself (href matches propfind_path)
-                            if !name.is_empty() && decoded_href.trim_end_matches('/') != propfind_path.trim_end_matches('/') {
+                            // unless the caller asked for a depth-0 stat of this path.
+                            if !name.is_empty() && (include_self
+                                || decoded_href.trim_end_matches('/') != propfind_path.trim_end_matches('/'))
+                            {
                                 // B1 step 4: carry the Basic auth header on each
                                 // item's raw_headers so downstream players/DLNA/B4.5
                                 // direct-mode can fetch the URL without a second
@@ -160,6 +168,46 @@ impl WebDavDriver {
 
         Ok(items)
     }
+
+    /// Depth-0 PROPFIND stat of a single path — returns the resource itself.
+    /// More robust than listing the parent and finding by name: works at the
+    /// server root and avoids an extra round-trip. B1 step 4.
+    async fn stat(&self, path: &str) -> Result<CloudFileItem> {
+        let url = self.join_path(path);
+
+        let propfind_body = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:resourcetype/>
+    <d:getcontentlength/>
+    <d:getlastmodified/>
+  </d:prop>
+</d:propfind>"#;
+
+        let resp = self
+            .client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+            .header("Depth", "0")
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(propfind_body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(DriverError::NotFound(path.to_string()));
+            }
+            return Err(DriverError::Network(format!("PROPFIND depth-0 failed: {}", resp.status())));
+        }
+
+        let body = resp.text().await?;
+        let items = self.parse_propfind_response(&body, &url, true)?;
+        // depth-0 returns exactly one response (the resource itself).
+        items
+            .into_iter()
+            .next()
+            .ok_or_else(|| DriverError::NotFound(path.to_string()))
+    }
 }
 
 #[async_trait]
@@ -190,13 +238,18 @@ impl WdmmVfs for WebDavDriver {
         }
 
         let body = resp.text().await?;
-        self.parse_propfind_response(&body, &url)
+        self.parse_propfind_response(&body, &url, false)
     }
 
+    /// Depth-0 PROPFIND stat of a single path — returns the resource itself
+    /// (the collection href). More robust than listing the parent and finding
+    /// by name: works at the server root and avoids an extra round-trip to
+    /// resolve "..". B1 step 4.
     async fn get(&self, path: &str) -> Result<CloudFileItem> {
-        let items = self.list(&format!("{}/..", path)).await?;
-        let name = path.trim_end_matches('/').split('/').last().unwrap_or("");
-        items.into_iter().find(|i| i.name == name).ok_or_else(|| DriverError::NotFound(path.to_string()))
+        // depth-0 PROPFIND. Replaces the previous "list the parent and find by
+        // name" approach, which failed at the server root and cost an extra
+        // request. The actual PROPFIND lives in `impl WebDavDriver::stat`.
+        self.stat(path).await
     }
 
     async fn mkdir(&self, path: &str) -> Result<()> {
@@ -394,7 +447,7 @@ mod tests {
         let driver = WebDavDriver::new("https://example.com/dav/", "", "").unwrap();
         // req_path matches the collection href so the collection itself is filtered.
         let items = driver
-            .parse_propfind_response(PROPFIND_FIXTURE, "/dav/Music")
+            .parse_propfind_response(PROPFIND_FIXTURE, "/dav/Music", false)
             .unwrap();
 
         // Collection itself must be filtered out; 2 real children remain.
@@ -431,7 +484,7 @@ mod tests {
   </response>
 </multistatus>"#;
         let driver = WebDavDriver::new("https://example.com/dav/", "", "").unwrap();
-        let items = driver.parse_propfind_response(UNPREFIXED, "/dav").unwrap();
+        let items = driver.parse_propfind_response(UNPREFIXED, "/dav", false).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "file.txt");
         assert_eq!(items[0].size, 42);
@@ -443,7 +496,7 @@ mod tests {
         let driver = WebDavDriver::new("https://example.com/dav/", "", "").unwrap();
         const EMPTY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:"></D:multistatus>"#;
-        let items = driver.parse_propfind_response(EMPTY, "/dav").unwrap();
+        let items = driver.parse_propfind_response(EMPTY, "/dav", false).unwrap();
         assert!(items.is_empty());
     }
 
