@@ -225,7 +225,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
-        let reg = proxy.register_file(&path, None).await.unwrap();
+        let reg = proxy.register_file(&path, None, None, None).await.unwrap();
         let addr = proxy.addr().unwrap();
         let url = format!("http://{addr}{}", reg.path_template);
         let client = reqwest::Client::new();

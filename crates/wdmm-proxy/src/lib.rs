@@ -28,7 +28,7 @@
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, State, ConnectInfo},
     http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::get,
@@ -36,10 +36,10 @@ use axum::{
 };
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
@@ -107,6 +107,20 @@ struct Entry {
     source: BackSource,
 }
 
+// ── Token metadata ────────────────────────────────────────────────────────────
+
+/// Security metadata for a registered token.
+///
+/// Tracks expiration and peer IP restrictions. Stored alongside `Entry` in
+/// the `Shared` registry. Absence of a `TokenMeta` for an existing token
+/// implies no expiration and no peer restrictions (backwards compat).
+struct TokenMeta {
+    created_at: SystemTime,
+    expires_at: Option<SystemTime>,
+    /// If `Some`, only requests from these IPs are allowed. `None` = any peer.
+    allowed_peers: Option<Vec<IpAddr>>,
+}
+
 // ── HLS session ───────────────────────────────────────────────────────────────
 
 /// An active HLS transcode session keyed by a proxy-assigned token.
@@ -143,6 +157,8 @@ pub struct HlsRegistration {
 
 struct Shared {
     entries: HashMap<String, Entry>,
+    /// Security metadata for registered tokens (expiration, peer whitelist).
+    token_meta: HashMap<String, TokenMeta>,
     /// Active HLS transcode sessions keyed by their proxy token.
     hls_sessions: HashMap<String, HlsSession>,
     /// Track active device+media pairs to enforce one-transcode-per-combo.
@@ -200,6 +216,7 @@ impl ProxyHandle {
     pub fn with_idle_timeout(bind_mode: BindMode, port: u16, idle_timeout: Duration) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             entries: HashMap::new(),
+            token_meta: HashMap::new(),
             hls_sessions: HashMap::new(),
             device_media_map: HashMap::new(),
             addr: None,
@@ -220,18 +237,28 @@ impl ProxyHandle {
     /// Register a local file. Returns a `Registration`.
     ///
     /// `name` is used only for Content-Type guessing (e.g. `"song.mp3"`).
+    ///
+    /// `ttl_secs` — optional time-to-live in seconds; `None` = no expiration.
+    ///
+    /// `allowed_peers` — optional IP whitelist; `None` = any peer allowed.
     pub async fn register_file(
         &self,
         path: impl Into<PathBuf>,
         name: Option<String>,
+        ttl_secs: Option<u64>,
+        allowed_peers: Option<Vec<IpAddr>>,
     ) -> ProxyResult<Registration> {
         let path = path.into();
         let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-        self.insert_entry(Entry {
-            name,
-            size,
-            source: BackSource::LocalFile(path),
-        })
+        self.insert_entry(
+            Entry {
+                name,
+                size,
+                source: BackSource::LocalFile(path),
+            },
+            ttl_secs,
+            allowed_peers,
+        )
         .await
     }
 
@@ -240,27 +267,45 @@ impl ProxyHandle {
     /// `size` — known file size in bytes; pass `0` if unknown.
     /// `ranges_fn(start, end)` — `start` and `end` are both inclusive byte
     /// offsets. `end = -1` means read to EOF (size unknown).
+    ///
+    /// `ttl_secs` — optional time-to-live in seconds; `None` = no expiration.
+    ///
+    /// `allowed_peers` — optional IP whitelist; `None` = any peer allowed.
     pub async fn register_driver<F>(
         &self,
         size: u64,
         name: Option<String>,
+        ttl_secs: Option<u64>,
+        allowed_peers: Option<Vec<IpAddr>>,
         ranges_fn: F,
     ) -> ProxyResult<Registration>
     where
         F: Fn(i64, i64) -> BoxStream + Send + Sync + 'static,
     {
-        self.insert_entry(Entry {
-            name,
-            size,
-            source: BackSource::DriverCallback(Arc::new(ranges_fn)),
-        })
+        self.insert_entry(
+            Entry {
+                name,
+                size,
+                source: BackSource::DriverCallback(Arc::new(ranges_fn)),
+            },
+            ttl_secs,
+            allowed_peers,
+        )
         .await
     }
 
     /// Revoke a token. The entry is removed immediately; in-flight requests
     /// will receive a 404 on the next sub-request after removal.
     pub fn unregister(&self, token: &str) {
-        self.shared.lock().unwrap().entries.remove(token);
+        let mut g = self.shared.lock().unwrap();
+        g.entries.remove(token);
+        g.token_meta.remove(token);
+    }
+
+    /// Revoke a token immediately. Alias for `unregister` (semantic clarity for
+    /// security-focused use cases).
+    pub fn revoke_token(&self, token: &str) {
+        self.unregister(token);
     }
 
     /// Renew the driver callback for an existing token (e.g. after re-auth).
@@ -294,12 +339,18 @@ impl ProxyHandle {
     /// replaced by the new one. Pass a unique `device_id` per player to avoid
     /// killing other devices' transcodes.
     ///
+    /// `ttl_secs` — optional time-to-live in seconds; `None` = no expiration.
+    ///
+    /// `allowed_peers` — optional IP whitelist; `None` = any peer allowed.
+    ///
     /// Returns an [`HlsRegistration`] with a `playlist_template` ready to serve.
     pub async fn register_hls(
         &self,
         device_id: impl Into<String>,
         input: impl Into<std::path::PathBuf>,
         mode: wdmm_ffmpeg::HlsMode,
+        ttl_secs: Option<u64>,
+        allowed_peers: Option<Vec<IpAddr>>,
     ) -> ProxyResult<HlsRegistration> {
         self.ensure_server().await?;
         let device_id = device_id.into();
@@ -335,6 +386,13 @@ impl ProxyHandle {
                 HlsSession { segment_dir, job, input: input.clone(), mode },
             );
             g.device_media_map.insert((device_id, input), token.clone());
+            let now = SystemTime::now();
+            let expires_at = ttl_secs.map(|t| now + Duration::from_secs(t));
+            g.token_meta.insert(token.clone(), TokenMeta {
+                created_at: now,
+                expires_at,
+                allowed_peers,
+            });
             arm_idle_timer(&mut g, Arc::clone(&self.shared));
         }
         Ok(HlsRegistration { token, playlist_template })
@@ -379,6 +437,7 @@ impl ProxyHandle {
         // Remove from device_media_map by scanning for the token
         g.device_media_map.retain(|_, t| t != token);
         g.hls_sessions.remove(token);
+        g.token_meta.remove(token);
     }
 
     /// Gracefully stop the proxy. The handle is still usable; the server will
@@ -396,13 +455,25 @@ impl ProxyHandle {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    async fn insert_entry(&self, entry: Entry) -> ProxyResult<Registration> {
+    async fn insert_entry(
+        &self,
+        entry: Entry,
+        ttl_secs: Option<u64>,
+        allowed_peers: Option<Vec<IpAddr>>,
+    ) -> ProxyResult<Registration> {
         self.ensure_server().await?;
         let token = new_token();
         let path_template = format!("/s/{token}");
         {
             let mut g = self.shared.lock().unwrap();
             g.entries.insert(token.clone(), entry);
+            let now = SystemTime::now();
+            let expires_at = ttl_secs.map(|t| now + Duration::from_secs(t));
+            g.token_meta.insert(token.clone(), TokenMeta {
+                created_at: now,
+                expires_at,
+                allowed_peers,
+            });
             arm_idle_timer(&mut g, Arc::clone(&self.shared));
         }
         Ok(Registration { token, path_template })
@@ -426,7 +497,7 @@ impl ProxyHandle {
 
         let shared_for_cleanup = Arc::clone(&self.shared);
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app)
+            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
                 .await
             {
@@ -544,6 +615,7 @@ pub fn resolve_range(header: &str, size: u64) -> Option<(u64, u64)> {
 
 async fn serve(
     State(shared): State<Arc<Mutex<Shared>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
@@ -554,6 +626,24 @@ async fn serve(
     }
     let (src, size, content_type) = {
         let mut g = shared.lock().unwrap();
+
+        // Validate token expiration
+        if let Some(meta) = g.token_meta.get(&token) {
+            if let Some(expires_at) = meta.expires_at {
+                if SystemTime::now() > expires_at {
+                    // Token expired — cleanup and return 401
+                    g.entries.remove(&token);
+                    g.token_meta.remove(&token);
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            if let Some(ref whitelist) = meta.allowed_peers {
+                if !whitelist.contains(&peer.ip()) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+        }
+
         let entry = g.entries.get(&token).ok_or(StatusCode::NOT_FOUND)?;
         let src = match &entry.source {
             BackSource::LocalFile(p)      => Src::File(p.clone()),
@@ -664,6 +754,7 @@ fn serve_callback(
 
 async fn serve_hls(
     State(shared): State<Arc<Mutex<Shared>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((token, seg)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
     // Reject path traversal attempts — HLS segment names are always flat.
@@ -673,6 +764,24 @@ async fn serve_hls(
 
     let (segment_dir, content_type) = {
         let mut g = shared.lock().unwrap();
+
+        // Validate token expiration
+        if let Some(meta) = g.token_meta.get(&token) {
+            if let Some(expires_at) = meta.expires_at {
+                if SystemTime::now() > expires_at {
+                    // Token expired — cleanup and return 401
+                    g.hls_sessions.remove(&token);
+                    g.token_meta.remove(&token);
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            if let Some(ref whitelist) = meta.allowed_peers {
+                if !whitelist.contains(&peer.ip()) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+        }
+
         let session = g.hls_sessions.get(&token).ok_or(StatusCode::NOT_FOUND)?;
         let segment_dir = session.segment_dir.clone();
         let ct: &'static str = if seg.ends_with(".m3u8") {
@@ -772,8 +881,8 @@ mod tests {
         let data: Vec<u8> = (0..=255u8).collect();
         std::fs::write(&path, &data).unwrap();
 
-        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
-        let reg = proxy.register_file(&path, Some("test.bin".into())).await.unwrap();
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
+        let reg = proxy.register_file(&path, Some("test.bin".into()), None, None).await.unwrap();
         let addr = proxy.addr().unwrap();
         let url = format!("http://{addr}{}", reg.path_template);
         let client = reqwest::Client::new();
@@ -818,10 +927,10 @@ mod tests {
 
         let data: Arc<Vec<u8>> = Arc::new((0u8..=255).collect());
 
-        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let d = Arc::clone(&data);
         let reg = proxy
-            .register_driver(256, Some("audio.mp3".into()), move |start, end| {
+            .register_driver(256, Some("audio.mp3".into()), None, None, move |start, end| {
                 let chunk = if end < 0 {
                     d[start as usize..].to_vec()
                 } else {
@@ -857,11 +966,11 @@ mod tests {
 
     #[tokio::test]
     async fn registration_path_only_no_url() {
-        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let path =
             std::env::temp_dir().join(format!("wdmm-path-test-{}.bin", std::process::id()));
         std::fs::write(&path, b"hello").unwrap();
-        let reg = proxy.register_file(&path, None).await.unwrap();
+        let reg = proxy.register_file(&path, None, None, None).await.unwrap();
         // path_template must start with "/" and not contain "http"
         assert!(reg.path_template.starts_with('/'), "path_template must start with /");
         assert!(!reg.path_template.contains("http"), "path_template must not embed scheme");
@@ -879,9 +988,9 @@ mod tests {
         ));
         std::fs::write(&path, b"stub").unwrap();
 
-        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy)
+            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
             .await
             .unwrap();
 
@@ -908,9 +1017,9 @@ mod tests {
         ));
         std::fs::write(&path, b"stub").unwrap();
 
-        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy)
+            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
             .await
             .unwrap();
 
@@ -934,14 +1043,14 @@ mod tests {
 
         // First registration
         let reg1 = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy)
+            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 1);
 
         // Second registration for same device+media kills the first
         let reg2 = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy)
+            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 1);
@@ -949,7 +1058,7 @@ mod tests {
 
         // Different device can transcode the same file
         let _reg3 = proxy
-            .register_hls("device-2", &path, wdmm_ffmpeg::HlsMode::DirectCopy)
+            .register_hls("device-2", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 2);

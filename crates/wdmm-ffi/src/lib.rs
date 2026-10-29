@@ -2018,7 +2018,7 @@ pub extern "C" fn wdmm_proxy_start(bind_mode_cstr: *const c_char, port: u16) -> 
         let tmp = std::env::temp_dir()
             .join(format!("wdmm-proxy-init-{}.tmp", std::process::id()));
         std::fs::write(&tmp, b"").ok();
-        let reg = handle.register_file(&tmp, None).await;
+        let reg = handle.register_file(&tmp, None, None, None).await;
         if let Ok(r) = &reg {
             handle.unregister(&r.token);
         }
@@ -2088,7 +2088,7 @@ pub extern "C" fn wdmm_proxy_register_file(
         None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
     };
     let path = std::path::Path::new(path_str);
-    let reg = rt().block_on(handle.register_file(path, name_opt));
+    let reg = rt().block_on(handle.register_file(path, name_opt, None, None));
     match reg {
         Ok(r) => {
             let port = handle.addr().map(|a| a.port()).unwrap_or(0);
@@ -2172,7 +2172,7 @@ pub extern "C" fn wdmm_proxy_register_hls(
         None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
     };
     let path = std::path::Path::new(path_str);
-    let reg = rt().block_on(handle.register_hls(device_str, path, mode));
+    let reg = rt().block_on(handle.register_hls(device_str, path, mode, None, None));
     match reg {
         Ok(r) => {
             let port = handle.addr().map(|a| a.port()).unwrap_or(0);
@@ -2611,7 +2611,7 @@ pub unsafe extern "C" fn wdmm_proxy_register_stream(
 
     let ctx = Arc::new(StreamCallbackCtx { cb, user_data: UnsafeUserData(user_data) });
 
-    let reg = rt().block_on(handle.register_driver(size, name_opt, move |start, end| {
+    let reg = rt().block_on(handle.register_driver(size, name_opt, None, None, move |start, end| {
         invoke_c_callback(&ctx, start, end)
     }));
 
