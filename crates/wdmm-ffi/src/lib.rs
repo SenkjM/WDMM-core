@@ -1312,6 +1312,261 @@ pub extern "C" fn wdmm_account_get_entry(
     }
 }
 
+/// Write bytes to a remote file for an account. `data_base64` is the file
+/// content as standard base64 (no line breaks). Returns `"ok"` or `"error:…"`.
+///
+/// Mirrors the Dart `WdmmVfs.put_content` path. Used by sync engines to push
+/// small JSON/metadata files — not the user-upload path (see drivers guide §8).
+#[no_mangle]
+pub extern "C" fn wdmm_account_put_content(
+    account_id: *const c_char,
+    path: *const c_char,
+    data_base64: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+    let data_b64 = match ptr_to_str(data_base64) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid data_base64"),
+    };
+
+    let data = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:base64 decode: {e}")),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::WdmmVfs::put_content(&*driver, path, &data)) {
+        Ok(()) => FfiString::from("ok"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Fetch the full raw bytes of a remote file. Returns a JSON object
+/// `{"data":"<base64>"}` on success, or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_get_content(
+    account_id: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let data = match rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*driver, path)) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+    match serde_json::to_string(&serde_json::json!({ "data": b64 })) {
+        Ok(s) => FfiString::from(s),
+        Err(e) => FfiString::from(format!("error:serde: {e}")),
+    }
+}
+
+/// Fetch a byte range `[start, end_inclusive]` from a remote file. `end_str`
+/// may be the decimal string of `u64::MAX` to mean "to end of file". Returns a
+/// JSON object `{"data":"<base64>"}` on success, or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_get_content_range(
+    account_id: *const c_char,
+    path: *const c_char,
+    start_str: *const c_char,
+    end_str: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+    let start: u64 = match ptr_to_str(start_str).and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => return FfiString::from("error:invalid start"),
+    };
+    let end_inclusive: u64 = match ptr_to_str(end_str).and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => return FfiString::from("error:invalid end"),
+    };
+    let end_opt = if end_inclusive == u64::MAX { None } else { Some(end_inclusive) };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let data = match rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
+        &*driver, path, start, end_opt,
+    )) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+    match serde_json::to_string(&serde_json::json!({ "data": b64 })) {
+        Ok(s) => FfiString::from(s),
+        Err(e) => FfiString::from(format!("error:serde: {e}")),
+    }
+}
+
+/// Server-side copy of `src` to `dst` (both account-absolute paths).
+/// Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_copy(
+    account_id: *const c_char,
+    src: *const c_char,
+    dst: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let src = match ptr_to_str(src) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid src"),
+    };
+    let dst = match ptr_to_str(dst) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid dst"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::WdmmVfs::copy(&*driver, src, dst)) {
+        Ok(()) => FfiString::from("ok"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Idempotent directory creation. Returns `"ok"` or `"error:…"`.
+#[no_mangle]
+pub extern "C" fn wdmm_account_ensure_dir(
+    account_id: *const c_char,
+    path: *const c_char,
+) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+    let path = match ptr_to_str(path) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid path"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    match rt().block_on(wdmm_drivers::WdmmVfs::ensure_dir(&*driver, path)) {
+        Ok(()) => FfiString::from("ok"),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Short status labels for the accounts list (VIP tier, bandwidth, …).
+/// Returns a JSON array `[{"key":"…","label":"…"}, …]` on success (empty array
+/// when the driver has no status API), or `"error:…"`. Drivers must fail-soft.
+#[no_mangle]
+pub extern "C" fn wdmm_account_status_tags(account_id: *const c_char) -> FfiString {
+    let account_id_str = match ptr_to_str(account_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid account_id"),
+    };
+
+    let account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return FfiString::from("error:account not found"),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let config = match build_driver_config(&account) {
+        Ok(c) => c,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+    };
+
+    let tags = match rt().block_on(wdmm_drivers::WdmmVfs::status_tags(&*driver)) {
+        Ok(t) => t,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+    match serde_json::to_string(&tags) {
+        Ok(s) => FfiString::from(s),
+        Err(e) => FfiString::from(format!("error:serde: {e}")),
+    }
+}
+
 /// Read a byte range `[start, end_inclusive]` from a cloud account file.
 ///
 /// `end_inclusive == u64::MAX` means "read to end of file".

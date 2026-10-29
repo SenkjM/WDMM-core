@@ -251,6 +251,61 @@ pub trait WdmmVfs: Send + Sync {
         let e = end.map(|e| (e as usize + 1).min(full.len())).unwrap_or(full.len());
         Ok(full[s..e].to_vec())
     }
+
+    /// Server-side copy of [src] to [dst] (both account-absolute paths).
+    ///
+    /// Default returns `Err(Unsupported)`. Drivers that expose a server-side
+    /// copy primitive (e.g. WebDAV `COPY`) should override it. When unsupported,
+    /// callers may fall back to `get_content` + `put_content`.
+    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+        let _ = (src, dst);
+        Err(DriverError::Other(
+            "copy not supported by this driver".into(),
+        ))
+    }
+
+    /// Idempotent directory creation: a path that already exists is **not** an
+    /// error. Drivers that can distinguish "exists" from a real failure should
+    /// override; the default delegates to [`WdmmVfs::mkdir`] and swallows the
+    /// "already exists" signal where the driver surfaces it via
+    /// [`DriverError::Other`] text or a tolerated HTTP status.
+    async fn ensure_dir(&self, path: &str) -> Result<()> {
+        match self.mkdir(path).await {
+            Ok(()) => Ok(()),
+            // WebDAV MKCOL on an existing collection returns 405; some servers
+            // return 409. Other drivers may phrase it as "already exists".
+            Err(DriverError::Other(msg))
+                if msg.contains("already")
+                    || msg.contains("exists")
+                    || msg.contains("405")
+                    || msg.contains("409") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Short status labels for the accounts list (VIP tier, bandwidth quota, …).
+    ///
+    /// Default returns empty — drivers without an account-status API don't need
+    /// to override. Implementations **must fail-soft**: catch network/auth
+    /// errors and return `Ok(vec![])` rather than propagating, so the accounts
+    /// list never blocks on a flaky status endpoint.
+    async fn status_tags(&self) -> Result<Vec<StatusTag>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A short status label emitted by [`WdmmVfs::status_tags`].
+///
+/// Mirrors the Dart `AccountStatusTag` (`lib/services/wdmm_vfs.dart`):
+/// `key` is stable for tests, `label` is display-ready. The FFI layer
+/// (`wdmm_account_status_tags`) serialises a `Vec<StatusTag>` to JSON.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StatusTag {
+    pub key: String,
+    pub label: String,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

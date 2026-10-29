@@ -13,28 +13,37 @@ use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 pub struct WebDavDriver {
     base_url: Url,
     client: Client,
+    /// Basic auth header value (`"Basic <base64>"`) for items' `raw_headers`.
+    /// Empty string when no credentials were provided.
+    auth_header: String,
 }
 
 impl WebDavDriver {
     pub fn new(url: &str, username: &str, password: &str) -> Result<Self> {
         let base = Url::parse(url).map_err(|e| DriverError::Config(e.to_string()))?;
 
+        let auth_header;
         let mut client_builder = Client::builder();
         if !username.is_empty() || !password.is_empty() {
             // Basic auth injected into default headers (reqwest pattern)
             let auth = format!("{}:{}", username, password);
             let encoded = base64::prelude::BASE64_STANDARD.encode(auth.as_bytes());
+            let header_value = format!("Basic {}", encoded);
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(
                 reqwest::header::AUTHORIZATION,
-                format!("Basic {}", encoded).parse().unwrap(),
+                header_value.parse().unwrap(),
             );
             client_builder = client_builder.default_headers(headers);
+            auth_header = header_value;
+        } else {
+            auth_header = String::new();
         }
 
         Ok(Self {
             base_url: base,
             client: client_builder.build().map_err(|e| DriverError::Config(e.to_string()))?,
+            auth_header,
         })
     }
 
@@ -117,13 +126,22 @@ impl WebDavDriver {
 
                             // skip the collection itself (href matches propfind_path)
                             if !name.is_empty() && decoded_href.trim_end_matches('/') != propfind_path.trim_end_matches('/') {
+                                // B1 step 4: carry the Basic auth header on each
+                                // item's raw_headers so downstream players/DLNA/B4.5
+                                // direct-mode can fetch the URL without a second
+                                // auth store. Empty when the server is anonymous.
+                                let raw_headers = if self.auth_header.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![("Authorization".to_string(), self.auth_header.clone())]
+                                };
                                 items.push(CloudFileItem {
                                     name,
                                     is_dir: current_is_dir,
                                     size: current_size,
                                     modified: current_modified,
                                     raw_url: Some(self.join_path(&decoded_href)),
-                                    raw_headers: vec![],
+                                    raw_headers,
                                     delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
                                     local_path: None,
                                 });
@@ -272,6 +290,49 @@ impl WdmmVfs for WebDavDriver {
             )));
         }
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+        let src_url = self.join_path(src);
+        let dst_url = self.join_path(dst);
+        let resp = self
+            .client
+            .request(reqwest::Method::from_bytes(b"COPY").unwrap(), &src_url)
+            .header("Destination", &dst_url)
+            .header("Overwrite", "T")
+            .send()
+            .await?;
+        // 201 Created (new resource) or 204 No Content (overwrote existing) are success.
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(DriverError::Network(format!("COPY failed: {}", resp.status())))
+        }
+    }
+
+    async fn ensure_dir(&self, path: &str) -> Result<()> {
+        let url = self.join_path(path);
+        let resp = self
+            .client
+            .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &url)
+            .send()
+            .await?;
+        // 201 Created, 405 Method Not Allowed (collection already exists),
+        // and 409 Conflict (intermediate created on some servers) all mean the
+        // directory is effectively present.
+        if resp.status().is_success()
+            || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            || resp.status() == reqwest::StatusCode::CONFLICT
+        {
+            Ok(())
+        } else {
+            Err(DriverError::Network(format!("MKCOL failed: {}", resp.status())))
+        }
+    }
+
+    async fn status_tags(&self) -> Result<Vec<crate::driver::StatusTag>> {
+        // WebDAV exposes no account-status API.
+        Ok(Vec::new())
     }
 }
 
