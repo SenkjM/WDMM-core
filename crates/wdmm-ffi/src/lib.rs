@@ -2091,11 +2091,16 @@ pub extern "C" fn wdmm_proxy_register_file(
     let reg = rt().block_on(handle.register_file(path, name_opt, None, None));
     match reg {
         Ok(r) => {
-            let port = handle.addr().map(|a| a.port()).unwrap_or(0);
+            let addr = handle.addr();
+            let port = addr.map(|a| a.port()).unwrap_or(0);
+            let host = addr
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
             FfiString::from(
                 serde_json::json!({
                     "token":         r.token,
                     "path_template": r.path_template,
+                    "host":          host,
                     "port":          port,
                 })
                 .to_string(),
@@ -2175,11 +2180,16 @@ pub extern "C" fn wdmm_proxy_register_hls(
     let reg = rt().block_on(handle.register_hls(device_str, path, mode, None, None));
     match reg {
         Ok(r) => {
-            let port = handle.addr().map(|a| a.port()).unwrap_or(0);
+            let addr = handle.addr();
+            let port = addr.map(|a| a.port()).unwrap_or(0);
+            let host = addr
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
             FfiString::from(
                 serde_json::json!({
                     "token":             r.token,
                     "playlist_template": r.playlist_template,
+                    "host":              host,
                     "port":              port,
                 })
                 .to_string(),
@@ -2570,12 +2580,13 @@ pub extern "C" fn wdmm_proxy_stream_set_result(
 /// ## Returns
 /// JSON on success:
 /// ```json
-/// {"token":"3f7a…","path_template":"/s/3f7a…","port":N}
+/// {"token":"3f7a…","path_template":"/s/3f7a…","host":"192.168.1.10","port":N}
 /// ```
 /// or `"error:<message>"` on failure. Caller must free the result via
 /// [`wdmm_ffi_free_string`].
 ///
-/// Caller builds the URL as `http://127.0.0.1:{port}{path_template}`.
+/// Caller builds the URL as `http://{host}:{port}{path_template}` using the
+/// `host` and `port` values from the response.
 ///
 /// ## Dart/Flutter note
 /// The callback is invoked **synchronously** from a Tokio worker thread.
@@ -2617,11 +2628,16 @@ pub unsafe extern "C" fn wdmm_proxy_register_stream(
 
     match reg {
         Ok(r) => {
-            let port = handle.addr().map(|a| a.port()).unwrap_or(0);
+            let addr = handle.addr();
+            let port = addr.map(|a| a.port()).unwrap_or(0);
+            let host = addr
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
             FfiString::from(
                 serde_json::json!({
                     "token":         r.token,
                     "path_template": r.path_template,
+                    "host":          host,
                     "port":          port,
                 })
                 .to_string(),
