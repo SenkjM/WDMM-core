@@ -29,6 +29,7 @@ const OAUTH_API: &str = "https://openapi.baidu.com/oauth/2.0/token";
 const DRIVER_TXT: &str = "baiduyun_go";
 
 /// Configuration for the Baidu NetDisk driver.
+#[derive(serde::Deserialize)]
 pub struct BaiduConfig {
     /// User-supplied OAuth2 access token (from account settings — never embedded).
     pub access_token: String,
@@ -96,6 +97,18 @@ impl BaiduDriver {
         if config.access_token.is_empty() {
             return Err(DriverError::Config("baidu: missing access_token".into()));
         }
+        let client = Client::builder()
+            .build()
+            .map_err(|e| DriverError::Config(e.to_string()))?;
+        Ok(Self { config, client })
+    }
+
+    /// Build a driver for the initial-verify / token-exchange flow.
+    ///
+    /// Unlike [new], this does NOT require `access_token` — the caller is
+    /// expected to immediately run [verify_initial_auth] which performs the
+    /// token exchange.
+    pub fn new_for_verify(config: BaiduConfig) -> Result<Self> {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
@@ -602,6 +615,20 @@ impl BaiduDriver {
             .filter(|s| !s.is_empty())
             .unwrap_or(self.config.access_token.as_str());
         Ok((access.to_string(), refresh.to_string()))
+    }
+
+    /// Initial-auth flow for account setup: exchanges `refresh_token` for
+    /// `access_token` + `refresh_token`.
+    ///
+    /// Returns credential patches to merge into config and persist to Core vault.
+    pub async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let (access_token, refresh_token) = self.refresh_access_token().await?;
+        let mut patches = std::collections::HashMap::new();
+        patches.insert("access_token".into(), access_token);
+        patches.insert("refresh_token".into(), refresh_token);
+        Ok(patches)
     }
 }
 

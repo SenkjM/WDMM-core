@@ -1856,6 +1856,93 @@ async fn refresh_and_rebuild(
     wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, new_config)
 }
 
+// ── Account verify FFI ────────────────────────────────────────────────────────
+
+/// Verify a (possibly new) cloud account by testing the connection and/or
+/// exchanging an OAuth `refresh_token` for runtime credentials.
+///
+/// # Arguments
+/// * `provider_type` — provider key string, e.g. `"aliyundrive"`, `"baidu_netdisk"`.
+/// * `config_json`   — form-submitted config as a JSON object.  Must include all
+///   fields the provider needs (e.g. `refresh_token` for aliyun/baidu).
+///
+/// # Return value
+/// JSON `{"ok":true,"token_patches":{"access_token":"…","drive_id":"…",…}}` on
+/// success, or `"error:<reason>"` on failure. Caller must free the result with
+/// `wdmm_ffi_free_string`.
+///
+/// `token_patches` must be merged into the config that is passed to
+/// `wdmm_account_upsert` so the driver can be reconstructed after an app
+/// restart (aliyun: access_token + drive_id; baidu: access_token + refresh_token).
+#[no_mangle]
+pub extern "C" fn wdmm_account_verify(
+    provider_type: *const c_char,
+    config_json: *const c_char,
+) -> FfiString {
+    let ptype = match ptr_to_str(provider_type) {
+        Some(s) => s,
+        None => return FfiString::from("error:missing provider_type"),
+    };
+    let cfg_str = match ptr_to_str(config_json) {
+        Some(s) => s,
+        None => return FfiString::from("error:missing config_json"),
+    };
+    let config: serde_json::Value = match serde_json::from_str(cfg_str) {
+        Ok(v) => v,
+        Err(e) => return FfiString::from(format!("error:invalid config JSON: {e}")),
+    };
+
+    let result: wdmm_drivers::Result<HashMap<String, String>> = (|| {
+        use wdmm_drivers::{AliyunConfig, AliyunDriver, BaiduConfig, BaiduDriver, DriverError};
+
+        match ptype {
+            // ── Aliyun: exchange refresh_token → access_token + drive_id ──────
+            "aliyundrive" | "aliyun" | "aliyundrive_open" => {
+                let cfg: AliyunConfig = serde_json::from_value(config.clone())
+                    .map_err(|e| DriverError::Config(e.to_string()))?;
+                let driver = AliyunDriver::new_for_verify(cfg)?;
+                rt().block_on(driver.verify_initial_auth())
+            }
+
+            // ── Baidu: exchange refresh_token → access_token ──────────────────
+            "baidu" | "baidu_netdisk" => {
+                let cfg: BaiduConfig = serde_json::from_value(config.clone())
+                    .map_err(|e| DriverError::Config(e.to_string()))?;
+                let driver = BaiduDriver::new_for_verify(cfg)?;
+                rt().block_on(driver.verify_initial_auth())
+            }
+
+            // ── All other providers: connection test via list("/") ─────────────
+            _ => {
+                // Build driver config inline (no DB account yet).
+                let driver_config = if ptype == "webdav" {
+                    let url = config["url"].as_str()
+                        .or_else(|| config["base_url"].as_str())
+                        .unwrap_or("");
+                    serde_json::json!({
+                        "url": url,
+                        "username": config["username"].as_str().unwrap_or(""),
+                        "password": config["password"].as_str().unwrap_or(""),
+                    })
+                } else {
+                    config.clone()
+                };
+                let driver = wdmm_drivers::DriverRegistry::create_driver(ptype, driver_config)?;
+                rt().block_on(wdmm_drivers::WdmmVfs::list(&*driver, "/"))
+                    .map(|_| HashMap::new())
+            }
+        }
+    })();
+
+    match result {
+        Ok(patches) => {
+            let json = serde_json::json!({"ok": true, "token_patches": patches});
+            FfiString::from(json.to_string())
+        }
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 // ── Proxy FFI ─────────────────────────────────────────────────────────────────
 //
 // The proxy is a process-global singleton, like the OpenAPI server. It starts

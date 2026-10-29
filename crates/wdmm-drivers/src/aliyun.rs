@@ -44,6 +44,7 @@ const OAUTH_API: &str = "https://openapi.aliyundrive.com/oauth/access_token";
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for the Aliyun Drive driver.
+#[derive(serde::Deserialize)]
 pub struct AliyunConfig {
     /// OAuth2 access token (user-supplied; never embedded in source).
     pub access_token: String,
@@ -118,6 +119,20 @@ impl AliyunDriver {
         if config.drive_id.is_empty() {
             return Err(DriverError::Config("aliyun: missing drive_id".into()));
         }
+        let client = Client::builder()
+            .build()
+            .map_err(|e| DriverError::Config(e.to_string()))?;
+        Ok(Self { config, client })
+    }
+
+    /// Build a driver for the initial-verify / token-exchange flow.
+    ///
+    /// Unlike [new], this does NOT require `access_token` or `drive_id` — the
+    /// caller is expected to immediately run [verify_initial_auth], which
+    /// exchanges the `refresh_token` for both. Runtime ops would naturally
+    /// fail with `AuthFailed` if these are absent, so the early guard is the
+    /// only thing relaxed here.
+    pub fn new_for_verify(config: AliyunConfig) -> Result<Self> {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
@@ -601,6 +616,63 @@ impl AliyunDriver {
             .filter(|s| !s.is_empty())
             .unwrap_or(token);
         Ok((access.to_string(), refresh.to_string()))
+    }
+
+    /// Fetches the user's resource drive id from the Aliyun user-info API.
+    ///
+    /// Uses a one-shot HTTP client with the provided `access_token` — does not
+    /// depend on `self.client` (which carries the old / empty token).
+    pub async fn get_drive_id_static(base_url: &str, access_token: &str) -> Result<String> {
+        let client = Client::builder()
+            .build()
+            .map_err(|e| DriverError::Config(e.to_string()))?;
+        let url = format!("{}/adrive/v1.0/oauth/users/info", base_url);
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(DriverError::AuthFailed);
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        // Prefer resource_drive_id; fall back to default_drive_id.
+        let drive_id = body["resource_drive_id"]
+            .as_str()
+            .or_else(|| body["default_drive_id"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if drive_id.is_empty() {
+            return Err(DriverError::Config(
+                "aliyun: no drive_id in users/info response".into(),
+            ));
+        }
+        Ok(drive_id)
+    }
+
+    /// Initial-auth flow for account setup: exchanges `refresh_token` for
+    /// `access_token`, then fetches `drive_id`.
+    ///
+    /// Returns a map of credential patches that must be merged into the stored
+    /// config **and** persisted to the Core vault so the driver can be
+    /// reconstructed after an app restart.
+    pub async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let (access_token, refresh_token) = self.refresh_access_token().await?;
+        let drive_id =
+            Self::get_drive_id_static(&self.config.base_url, &access_token).await?;
+        let mut patches = std::collections::HashMap::new();
+        patches.insert("access_token".into(), access_token);
+        patches.insert("refresh_token".into(), refresh_token);
+        patches.insert("drive_id".into(), drive_id);
+        Ok(patches)
     }
 }
 
