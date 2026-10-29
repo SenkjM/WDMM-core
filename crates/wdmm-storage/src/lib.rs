@@ -1094,6 +1094,23 @@ impl LibraryDatabase {
         Ok(())
     }
 
+    /// Patch the stored credentials for an account in-place (token refresh).
+    /// Only updates `credentials_encrypted` and `updated_at`; leaves all other
+    /// fields (provider_type, display_name, base_url, etc.) unchanged.
+    pub fn update_account_credentials(
+        &self,
+        id: &str,
+        credentials_encrypted: &[u8],
+    ) -> StorageResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE accounts SET credentials_encrypted = ?1, updated_at = ?2 WHERE id = ?3",
+            params![credentials_encrypted, now, id],
+        )?;
+        Ok(())
+    }
+
     // ── Tracks listing ─────────────────────────────────────────────────────────
 
     pub fn list_tracks(&self) -> StorageResult<Vec<LibraryTrack>> {

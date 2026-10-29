@@ -95,6 +95,26 @@ impl DriverRegistry {
                 if let Some(s) = config["base_url"].as_str() {
                     cfg.base_url = s.to_string();
                 }
+                // Token-refresh fields (persisted in Core vault; see Dart
+                // baidu_netdisk_driver form spec).
+                if let Some(s) = config["refresh_token"].as_str() {
+                    cfg.refresh_token = s.to_string();
+                }
+                if let Some(s) = config["client_id"].as_str() {
+                    cfg.client_id = s.to_string();
+                }
+                if let Some(s) = config["client_secret"].as_str() {
+                    cfg.client_secret = s.to_string();
+                }
+                if let Some(s) = config["api_url_address"].as_str() {
+                    cfg.api_url_address = s.to_string();
+                }
+                if let Some(b) = config["local_refresh"].as_bool() {
+                    cfg.local_refresh = b;
+                }
+                if let Some(s) = config["account_id"].as_str() {
+                    cfg.account_id = s.to_string();
+                }
                 Ok(Box::new(BaiduDriver::new(cfg)?))
             }
             "123" | "123_open" | "pan123" => {
@@ -120,6 +140,32 @@ impl DriverRegistry {
                 }
                 if let Some(s) = config["remove_way"].as_str() {
                     cfg.remove_way = s.to_string();
+                }
+                // Token-refresh fields (persisted in Core vault; see Dart
+                // aliyundrive_open_driver form spec).
+                if let Some(s) = config["refresh_token"].as_str() {
+                    cfg.refresh_token = s.to_string();
+                }
+                if let Some(s) = config["client_id"].as_str() {
+                    cfg.client_id = s.to_string();
+                }
+                if let Some(s) = config["client_secret"].as_str() {
+                    cfg.client_secret = s.to_string();
+                }
+                if let Some(s) = config["api_url_address"].as_str() {
+                    cfg.api_url_address = s.to_string();
+                }
+                if let Some(b) = config["local_refresh"].as_bool() {
+                    cfg.local_refresh = b;
+                }
+                if let Some(s) = config["drive_type"].as_str() {
+                    cfg.drive_type = s.to_string();
+                }
+                if let Some(s) = config["root_folder_id"].as_str() {
+                    cfg.root_folder_id = s.to_string();
+                }
+                if let Some(s) = config["account_id"].as_str() {
+                    cfg.account_id = s.to_string();
                 }
                 Ok(Box::new(AliyunDriver::new(cfg)?))
             }

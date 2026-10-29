@@ -19,12 +19,33 @@ const API_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 /// User-Agent required for download links (Dart downloadUA).
 const DOWNLOAD_UA: &str = "pan.baidu.com";
 
+/// Default online renew-API (OpenList public proxy).
+const DEFAULT_RENEW_API: &str = "https://api.oplist.org/baiduyun/renewapi";
+
+/// Direct OAuth token endpoint.
+const OAUTH_API: &str = "https://openapi.baidu.com/oauth/2.0/token";
+
+/// `driver_txt` query param expected by the OpenList renew endpoint.
+const DRIVER_TXT: &str = "baiduyun_go";
+
 /// Configuration for the Baidu NetDisk driver.
 pub struct BaiduConfig {
     /// User-supplied OAuth2 access token (from account settings — never embedded).
     pub access_token: String,
     /// API base URL. Defaults to `https://pan.baidu.com`.
     pub base_url: String,
+    /// OAuth2 refresh token (rotated on each refresh; persisted to Core vault).
+    pub refresh_token: String,
+    /// OAuth2 client id (required for `local_refresh` direct OAuth).
+    pub client_id: String,
+    /// OAuth2 client secret (required for `local_refresh` direct OAuth).
+    pub client_secret: String,
+    /// Custom online renew-API address (OpenList-style proxy). Empty → default.
+    pub api_url_address: String,
+    /// When true, skip online renew and use direct OAuth (needs client_id/secret).
+    pub local_refresh: bool,
+    /// Account id in the Core DB, used to persist refreshed tokens.
+    pub account_id: String,
 }
 
 impl Default for BaiduConfig {
@@ -32,6 +53,12 @@ impl Default for BaiduConfig {
         Self {
             access_token: String::new(),
             base_url: "https://pan.baidu.com".to_string(),
+            refresh_token: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            api_url_address: DEFAULT_RENEW_API.to_string(),
+            local_refresh: false,
+            account_id: String::new(),
         }
     }
 }
@@ -457,6 +484,10 @@ impl WdmmVfs for BaiduDriver {
             .map_err(|e| DriverError::Network(e.to_string()))?
             .to_vec())
     }
+
+    async fn refresh_credentials(&self) -> Result<(String, String)> {
+        self.refresh_access_token().await
+    }
 }
 
 fn http_status_error(status: reqwest::StatusCode, path: &str) -> DriverError {
@@ -466,6 +497,111 @@ fn http_status_error(status: reqwest::StatusCode, path: &str) -> DriverError {
         }
         reqwest::StatusCode::NOT_FOUND => DriverError::NotFound(path.to_string()),
         _ => DriverError::Network(format!("HTTP {status}")),
+    }
+}
+
+impl BaiduDriver {
+    /// Refresh the OAuth2 access token. Pure network call — does NOT mutate
+    /// `self`; returns the new `(access_token, refresh_token)` pair so the
+    /// caller (FFI layer) can persist them to the Core vault and rebuild the
+    /// driver.
+    ///
+    /// Strategy mirrors the Dart reference:
+    /// - `local_refresh == false` (default): GET the online renew-API (custom
+    ///   `api_url_address` or the default) — response must contain BOTH
+    ///   `refresh_token` and a non-empty `access_token`.
+    /// - `local_refresh == true`: direct OAuth using `client_id`/`client_secret`
+    ///   (both required); response `refresh_token` required, `access_token`
+    ///   may be empty in some Baidu responses.
+    pub async fn refresh_access_token(&self) -> Result<(String, String)> {
+        let token = self.config.refresh_token.trim();
+        if token.is_empty() {
+            return Err(DriverError::AuthFailed);
+        }
+
+        if !self.config.local_refresh {
+            let url = {
+                let custom = self.config.api_url_address.trim();
+                if !custom.is_empty() { custom } else { DEFAULT_RENEW_API }
+            };
+            return self.renew_via_online_api(url, token).await;
+        }
+
+        self.renew_via_oauth(token).await
+    }
+
+    /// Online renew-API branch. Requires BOTH refresh_token and a non-empty
+    /// access_token in the response.
+    async fn renew_via_online_api(&self, url: &str, token: &str) -> Result<(String, String)> {
+        let resp = self
+            .client
+            .get(url)
+            .query(&[
+                ("refresh_ui", token),
+                ("server_use", "true"),
+                ("driver_txt", DRIVER_TXT),
+            ])
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {status}")));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        let refresh = body["refresh_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Network("empty refresh_token".into()))?;
+        let access = body["access_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Network("empty access_token".into()))?;
+        Ok((access.to_string(), refresh.to_string()))
+    }
+
+    /// Direct OAuth refresh. Requires non-empty `client_id`/`client_secret`.
+    async fn renew_via_oauth(&self, token: &str) -> Result<(String, String)> {
+        let client_id = self.config.client_id.trim();
+        let client_secret = self.config.client_secret.trim();
+        if client_id.is_empty() || client_secret.is_empty() {
+            return Err(DriverError::Config(
+                "baidu: local_refresh needs client_id and client_secret".into(),
+            ));
+        }
+        let resp = self
+            .client
+            .get(OAUTH_API)
+            .query(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", token),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+            ])
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {status}")));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        let refresh = body["refresh_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Network("empty refresh_token".into()))?;
+        // Baidu direct OAuth may return an empty access_token string; keep old.
+        let access = body["access_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.config.access_token.as_str());
+        Ok((access.to_string(), refresh.to_string()))
     }
 }
 

@@ -16,6 +16,31 @@ use serde_json::Value;
 
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Default OAuth2 client id (public app from worker util.ts / Dart reference).
+/// Users may override with their own confidential app via `client_id` config.
+const DEFAULT_CLIENT_ID: &str = "25ab4837190e48718a28f80073574a4d";
+
+/// Default online renew-API (OpenList public proxy).
+const DEFAULT_RENEW_API: &str = "https://api.oplist.org/alicloud/renewapi";
+
+/// Built-in online renew-API candidate list (tried in order, first success wins).
+const BUILTIN_RENEW_APIS: &[&str] = &[
+    "https://api.oplist.org/alicloud/renewapi",
+    "https://api.oplist.org/ali_open/token",
+    "https://api.oplist.org/aliyundrive/token",
+    "https://api.alist.nn.ci/alist/ali_open/token",
+    "https://api.alist.nn.ci/aliyundrive/token",
+    "https://api-sam.oplist.org/aliyundrive/token",
+];
+
+/// `driver_txt` query param expected by the OpenList renew endpoint.
+const DRIVER_TXT: &str = "alicloud_qr";
+
+/// Direct OAuth token endpoint.
+const OAUTH_API: &str = "https://openapi.aliyundrive.com/oauth/access_token";
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for the Aliyun Drive driver.
@@ -29,6 +54,24 @@ pub struct AliyunConfig {
     pub base_url: String,
     /// Removal mode: `trash` (default) or `delete`.
     pub remove_way: String,
+    /// OAuth2 refresh token (rotated on each refresh; persisted to Core vault).
+    pub refresh_token: String,
+    /// OAuth2 client id. Defaults to the public app id used by the Dart
+    /// reference (worker util.ts); users may override with their own app.
+    pub client_id: String,
+    /// OAuth2 client secret (optional; only for confidential apps).
+    pub client_secret: String,
+    /// Custom online renew-API address (OpenList-style proxy). When empty the
+    /// built-in candidate list is used.
+    pub api_url_address: String,
+    /// When true, skip the online renew-API branch and use direct OAuth only.
+    pub local_refresh: bool,
+    /// Network drive type (`resource` / `default` / `backup`).
+    pub drive_type: String,
+    /// Root folder id (opaque; default `root`).
+    pub root_folder_id: String,
+    /// Account id in the Core DB, used to persist refreshed tokens.
+    pub account_id: String,
 }
 
 impl Default for AliyunConfig {
@@ -38,6 +81,14 @@ impl Default for AliyunConfig {
             drive_id: String::new(),
             base_url: "https://openapi.aliyundrive.com".to_string(),
             remove_way: "trash".to_string(),
+            refresh_token: String::new(),
+            client_id: DEFAULT_CLIENT_ID.to_string(),
+            client_secret: String::new(),
+            api_url_address: DEFAULT_RENEW_API.to_string(),
+            local_refresh: false,
+            drive_type: "resource".to_string(),
+            root_folder_id: "root".to_string(),
+            account_id: String::new(),
         }
     }
 }
@@ -395,6 +446,10 @@ impl WdmmVfs for AliyunDriver {
             .map_err(|e| DriverError::Network(e.to_string()))?
             .to_vec())
     }
+
+    async fn refresh_credentials(&self) -> Result<(String, String)> {
+        self.refresh_access_token().await
+    }
 }
 
 impl AliyunDriver {
@@ -411,6 +466,141 @@ impl AliyunDriver {
             .rsplit('/')
             .next()
             .unwrap_or(path)
+    }
+
+    /// Refresh the OAuth2 access token. Pure network call — does NOT mutate
+    /// `self`; returns the new `(access_token, refresh_token)` pair so the
+    /// caller (FFI layer) can persist them to the Core vault and rebuild the
+    /// driver.
+    ///
+    /// Strategy mirrors the Dart reference:
+    /// - `local_refresh == false` (default): try the online renew-API
+    ///   candidates in order (custom `api_url_address` first, then built-ins);
+    ///   fall back to direct OAuth if all fail.
+    /// - `local_refresh == true`: skip online renew, use direct OAuth only.
+    pub async fn refresh_access_token(&self) -> Result<(String, String)> {
+        let token = self.config.refresh_token.trim();
+        if token.is_empty() {
+            return Err(DriverError::AuthFailed);
+        }
+        let mut failures: Vec<String> = Vec::new();
+
+        if !self.config.local_refresh {
+            for url in self.renew_candidates() {
+                match self.renew_via_online_api(&url, token).await {
+                    Ok(tokens) => return Ok(tokens),
+                    Err(e) => failures.push(format!("{url} → {e}")),
+                }
+            }
+        }
+
+        match self.renew_via_oauth(token).await {
+            Ok(tokens) => Ok(tokens),
+            Err(e) => {
+                failures.push(format!("{OAUTH_API} → {e}"));
+                Err(DriverError::AuthFailed)
+            }
+        }
+    }
+
+    /// Online renew-API candidate list: custom `api_url_address` first (if
+    /// non-empty), then the built-in list. Duplicates collapse.
+    fn renew_candidates(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let custom = self.config.api_url_address.trim();
+        if !custom.is_empty() {
+            out.push(custom.to_string());
+        }
+        for &b in BUILTIN_RENEW_APIS {
+            let s = b.to_string();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// Try one online renew-API address. Returns `(access, refresh)` on success.
+    async fn renew_via_online_api(&self, url: &str, token: &str) -> Result<(String, String)> {
+        let resp = self
+            .client
+            .get(url)
+            .query(&[
+                ("refresh_ui", token),
+                ("refresh_token", token),
+                ("server_use", "true"),
+                ("driver_txt", DRIVER_TXT),
+            ])
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {status}")));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        // access_token / refresh_token may be at top level or inside `data`.
+        let empty = Value::Null;
+        let data = match body.get("data") {
+            Some(Value::Object(_)) => body.get("data").unwrap(),
+            _ => &empty,
+        };
+        let access = body["access_token"]
+            .as_str()
+            .or_else(|| data["access_token"].as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Network("empty access_token".into()))?;
+        let refresh = body["refresh_token"]
+            .as_str()
+            .or_else(|| data["refresh_token"].as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(token);
+        Ok((access.to_string(), refresh.to_string()))
+    }
+
+    /// Direct OAuth refresh (`/oauth/access_token`). Returns `(access, refresh)`.
+    async fn renew_via_oauth(&self, token: &str) -> Result<(String, String)> {
+        let client_id = {
+            let trimmed = self.config.client_id.trim();
+            if trimmed.is_empty() { DEFAULT_CLIENT_ID } else { trimmed }
+        };
+        let mut payload = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": token,
+            "client_id": client_id,
+        });
+        let secret = self.config.client_secret.trim();
+        if !secret.is_empty() {
+            payload["client_secret"] = Value::String(secret.to_string());
+        }
+        let resp = self
+            .client
+            .post(OAUTH_API)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {status}")));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        let access = body["access_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Network("empty access_token".into()))?;
+        let refresh = body["refresh_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(token);
+        Ok((access.to_string(), refresh.to_string()))
     }
 }
 

@@ -1086,7 +1086,7 @@ pub extern "C" fn wdmm_account_list_dir(
     };
     let path = ptr_to_str(path).unwrap_or("/");
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1104,6 +1104,17 @@ pub extern "C" fn wdmm_account_list_dir(
 
     let items = match rt().block_on(wdmm_drivers::WdmmVfs::list(&*driver, path)) {
         Ok(v) => v,
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            // Token expired: refresh, persist new tokens to Core vault, retry once.
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::list(&*new_driver, path)) {
+                Ok(v) => v,
+                Err(e) => return FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
@@ -1149,7 +1160,7 @@ pub extern "C" fn wdmm_account_mkdir(
         _ => return FfiString::from("error:invalid path"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1167,6 +1178,16 @@ pub extern "C" fn wdmm_account_mkdir(
 
     match rt().block_on(wdmm_drivers::WdmmVfs::mkdir(&*driver, path)) {
         Ok(()) => FfiString::ok(),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::mkdir(&*new_driver, path)) {
+                Ok(()) => FfiString::ok(),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -1191,7 +1212,7 @@ pub extern "C" fn wdmm_account_rename(
         _ => return FfiString::from("error:invalid new_path"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1209,6 +1230,16 @@ pub extern "C" fn wdmm_account_rename(
 
     match rt().block_on(wdmm_drivers::WdmmVfs::rename(&*driver, old_path, new_path)) {
         Ok(()) => FfiString::ok(),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::rename(&*new_driver, old_path, new_path)) {
+                Ok(()) => FfiString::ok(),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -1228,7 +1259,7 @@ pub extern "C" fn wdmm_account_remove(
         _ => return FfiString::from("error:invalid path"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1246,6 +1277,16 @@ pub extern "C" fn wdmm_account_remove(
 
     match rt().block_on(wdmm_drivers::WdmmVfs::remove(&*driver, path)) {
         Ok(()) => FfiString::ok(),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::remove(&*new_driver, path)) {
+                Ok(()) => FfiString::ok(),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -1267,7 +1308,7 @@ pub extern "C" fn wdmm_account_get_entry(
         _ => return FfiString::from("error:invalid path"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1285,6 +1326,16 @@ pub extern "C" fn wdmm_account_get_entry(
 
     let item = match rt().block_on(wdmm_drivers::WdmmVfs::get(&*driver, path)) {
         Ok(i) => i,
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::get(&*new_driver, path)) {
+                Ok(i) => i,
+                Err(e) => return FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
@@ -1341,7 +1392,7 @@ pub extern "C" fn wdmm_account_put_content(
         Err(e) => return FfiString::from(format!("error:base64 decode: {e}")),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1357,6 +1408,16 @@ pub extern "C" fn wdmm_account_put_content(
 
     match rt().block_on(wdmm_drivers::WdmmVfs::put_content(&*driver, path, &data)) {
         Ok(()) => FfiString::from("ok"),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::put_content(&*new_driver, path, &data)) {
+                Ok(()) => FfiString::from("ok"),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -1377,7 +1438,7 @@ pub extern "C" fn wdmm_account_get_content(
         _ => return FfiString::from("error:invalid path"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1393,6 +1454,16 @@ pub extern "C" fn wdmm_account_get_content(
 
     let data = match rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*driver, path)) {
         Ok(d) => d,
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*new_driver, path)) {
+                Ok(d) => d,
+                Err(e) => return FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
@@ -1430,7 +1501,7 @@ pub extern "C" fn wdmm_account_get_content_range(
     };
     let end_opt = if end_inclusive == u64::MAX { None } else { Some(end_inclusive) };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1448,6 +1519,18 @@ pub extern "C" fn wdmm_account_get_content_range(
         &*driver, path, start, end_opt,
     )) {
         Ok(d) => d,
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
+                &*new_driver, path, start, end_opt,
+            )) {
+                Ok(d) => d,
+                Err(e) => return FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
@@ -1478,7 +1561,7 @@ pub extern "C" fn wdmm_account_copy(
         _ => return FfiString::from("error:invalid dst"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1494,6 +1577,16 @@ pub extern "C" fn wdmm_account_copy(
 
     match rt().block_on(wdmm_drivers::WdmmVfs::copy(&*driver, src, dst)) {
         Ok(()) => FfiString::from("ok"),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::copy(&*new_driver, src, dst)) {
+                Ok(()) => FfiString::from("ok"),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -1513,7 +1606,7 @@ pub extern "C" fn wdmm_account_ensure_dir(
         _ => return FfiString::from("error:invalid path"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1529,6 +1622,16 @@ pub extern "C" fn wdmm_account_ensure_dir(
 
     match rt().block_on(wdmm_drivers::WdmmVfs::ensure_dir(&*driver, path)) {
         Ok(()) => FfiString::from("ok"),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::ensure_dir(&*new_driver, path)) {
+                Ok(()) => FfiString::from("ok"),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -1543,7 +1646,7 @@ pub extern "C" fn wdmm_account_status_tags(account_id: *const c_char) -> FfiStri
         None => return FfiString::from("error:invalid account_id"),
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
@@ -1559,6 +1662,16 @@ pub extern "C" fn wdmm_account_status_tags(account_id: *const c_char) -> FfiStri
 
     let tags = match rt().block_on(wdmm_drivers::WdmmVfs::status_tags(&*driver)) {
         Ok(t) => t,
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return FfiString::from("error:auth_failed"),
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::status_tags(&*new_driver)) {
+                Ok(t) => t,
+                Err(e) => return FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
     match serde_json::to_string(&tags) {
@@ -1602,7 +1715,7 @@ pub unsafe extern "C" fn wdmm_account_read_range(
         _ => return -1,
     };
 
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return -1,
         Err(_) => return -1,
@@ -1623,6 +1736,19 @@ pub unsafe extern "C" fn wdmm_account_read_range(
         &*driver, path_str, start, end_opt,
     )) {
         Ok(d) => d,
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            // Token expired: refresh, persist new tokens to Core vault, retry once.
+            let new_driver = match rt().block_on(refresh_and_rebuild(&mut account)) {
+                Ok(d) => d,
+                Err(_) => return -1,
+            };
+            match rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
+                &*new_driver, path_str, start, end_opt,
+            )) {
+                Ok(d) => d,
+                Err(_) => return -1,
+            }
+        }
         Err(_) => return -1,
     };
 
@@ -1645,9 +1771,18 @@ fn build_driver_config(account: &wdmm_core::models::CloudAccount) -> Result<serd
     // Parse credentials_encrypted as UTF-8 JSON object (plaintext store)
     let creds_str = std::str::from_utf8(&account.credentials_encrypted)
         .map_err(|e| format!("credentials not UTF-8: {e}"))?;
-    let mut creds: serde_json::Value = serde_json::from_str(creds_str)
+    let creds: serde_json::Value = serde_json::from_str(creds_str)
         .map_err(|e| format!("credentials not valid JSON: {e}"))?;
+    build_driver_config_from_creds(account, &creds)
+}
 
+/// Build driver config from an already-parsed credentials value. Extracted so
+/// the FFI refresh helper can call it after patching tokens without re-reading
+/// from the DB.
+fn build_driver_config_from_creds(
+    account: &wdmm_core::models::CloudAccount,
+    creds: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     // WebDAV: build config from base_url + credentials
     if account.provider_type == "webdav" {
         let url = account.base_url.as_deref().unwrap_or("");
@@ -1663,17 +1798,62 @@ fn build_driver_config(account: &wdmm_core::models::CloudAccount) -> Result<serd
         }));
     }
 
-    // Other providers: use credentials as config; inject base_url if missing and account.base_url set
+    // Other providers: use credentials as config; inject base_url + account_id
     if !creds.is_object() {
         return Err("credentials must be a JSON object".into());
     }
-    if creds.get("url").is_none() && creds.get("base_url").is_none() {
+    let mut config = creds.clone();
+    if config.get("url").is_none() && config.get("base_url").is_none() {
         if let Some(ref base_url) = account.base_url {
-            creds["base_url"] = serde_json::Value::String(base_url.clone());
+            config["base_url"] = serde_json::Value::String(base_url.clone());
         }
     }
+    // Inject account_id so drivers with refresh (aliyun, baidu) can persist
+    // new tokens to the Core vault via update_account_credentials.
+    config["account_id"] = serde_json::Value::String(account.id.clone());
 
-    Ok(creds)
+    Ok(config)
+}
+
+/// On `AuthFailed`, refresh credentials for `account`, persist to Core vault,
+/// and return a new driver built from the updated config. Mutates
+/// `account.credentials_encrypted` in-place so the caller can rebuild.
+///
+/// Returns `Err(AuthFailed)` if the driver doesn't support refresh or if the
+/// refresh network call itself fails.
+async fn refresh_and_rebuild(
+    account: &mut wdmm_core::models::CloudAccount,
+) -> wdmm_drivers::Result<Box<dyn wdmm_drivers::WdmmVfs>> {
+    use wdmm_drivers::DriverError;
+
+    // Build a probe driver from current config to call refresh_credentials.
+    let config = build_driver_config(account).map_err(|e| DriverError::Config(e))?;
+    let probe = wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config)
+        .map_err(|e| e)?;
+
+    let (new_access, new_refresh) = probe.refresh_credentials().await?;
+
+    // Patch access_token + refresh_token into the in-memory credentials blob.
+    let creds_str = std::str::from_utf8(&account.credentials_encrypted)
+        .map_err(|_| DriverError::Config("credentials not UTF-8".into()))?;
+    let mut creds: serde_json::Value = serde_json::from_str(creds_str)
+        .map_err(|_| DriverError::Config("credentials not JSON".into()))?;
+    creds["access_token"] = serde_json::Value::String(new_access);
+    creds["refresh_token"] = serde_json::Value::String(new_refresh);
+
+    let new_bytes = serde_json::to_vec(&creds)
+        .map_err(|_| DriverError::Config("failed to encode credentials".into()))?;
+
+    // Persist to Core vault — best effort (don't abort on DB failure; new tokens
+    // are still good for this call).
+    let _ = global_library_db().update_account_credentials(&account.id, &new_bytes);
+
+    // Update in-memory account so build_driver_config reads new tokens.
+    account.credentials_encrypted = new_bytes;
+
+    // Build fresh driver with refreshed tokens.
+    let new_config = build_driver_config(account).map_err(|e| DriverError::Config(e))?;
+    wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, new_config)
 }
 
 // ── Proxy FFI ─────────────────────────────────────────────────────────────────

@@ -295,6 +295,16 @@ pub trait WdmmVfs: Send + Sync {
     async fn status_tags(&self) -> Result<Vec<StatusTag>> {
         Ok(Vec::new())
     }
+
+    /// Refresh OAuth2 credentials and return the new `(access_token, refresh_token)`.
+    ///
+    /// Called by the FFI layer on `AuthFailed`; on success the FFI persists the
+    /// new tokens to the Core vault and retries the original operation once.
+    /// Drivers that do not support in-process refresh keep the default
+    /// `Err(AuthFailed)` — the FFI will surface the auth error to the caller.
+    async fn refresh_credentials(&self) -> Result<(String, String)> {
+        Err(DriverError::AuthFailed)
+    }
 }
 
 /// A short status label emitted by [`WdmmVfs::status_tags`].
