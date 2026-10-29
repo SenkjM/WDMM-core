@@ -24,6 +24,56 @@ const AVTRANSPORT_SERVICE_TYPE: &str = "urn:schemas-upnp-org:service:AVTransport
 const SOAP_ENVELOPE_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const SOAP_ENCODING_NS: &str = "http://schemas.xmlsoap.org/soap/encoding/";
 
+/// Information returned by `GetPositionInfo`.
+#[derive(Debug, Clone, Default)]
+pub struct PositionInfo {
+    /// Current track index (1-based; `0` typically means not implemented).
+    pub track: u32,
+    /// Duration of the current track in `HH:MM:SS` format, or `NOT_IMPLEMENTED`.
+    pub track_duration: String,
+    /// URI of the currently loaded track.
+    pub track_uri: String,
+    /// Playback position relative to track start (`HH:MM:SS`).
+    pub rel_time: String,
+    /// Absolute playback position (same as `rel_time` on most renderers).
+    pub abs_time: String,
+}
+
+/// Transport state reported by `GetTransportInfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportState {
+    Playing,
+    PausedPlayback,
+    Stopped,
+    Transitioning,
+    NoMediaPresent,
+    /// Any other string returned by the renderer.
+    Other(String),
+}
+
+impl TransportState {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "PLAYING" => Self::Playing,
+            "PAUSED_PLAYBACK" => Self::PausedPlayback,
+            "STOPPED" => Self::Stopped,
+            "TRANSITIONING" => Self::Transitioning,
+            "NO_MEDIA_PRESENT" => Self::NoMediaPresent,
+            _ => Self::Other(s.to_owned()),
+        }
+    }
+}
+
+/// Information returned by `GetTransportInfo`.
+#[derive(Debug, Clone)]
+pub struct TransportInfo {
+    pub state: TransportState,
+    /// `"OK"` or `"ERROR_OCCURRED"`.
+    pub status: String,
+    /// Playback speed, e.g. `"1"`.
+    pub speed: String,
+}
+
 /// AVTransport SOAP control client. One instance per renderer.
 pub struct AvTransportClient {
     control_url: String,
@@ -124,6 +174,65 @@ impl AvTransportClient {
         }
         Ok(())
     }
+
+    /// `GetPositionInfo` — current track and playback position.
+    pub async fn get_position_info(&self, instance_id: u32) -> DlnaResult<PositionInfo> {
+        let body = soap_action(
+            "GetPositionInfo",
+            &[("<InstanceID>", &instance_id.to_string())],
+        );
+        let resp = self.post_action_with_response("GetPositionInfo", &body).await?;
+        let vals = extract_soap_values(&resp, &[
+            "Track", "TrackDuration", "TrackURI", "RelTime", "AbsTime",
+        ]);
+        Ok(PositionInfo {
+            track: vals.get("Track").and_then(|s| s.parse().ok()).unwrap_or(0),
+            track_duration: vals.get("TrackDuration").cloned().unwrap_or_default(),
+            track_uri: vals.get("TrackURI").cloned().unwrap_or_default(),
+            rel_time: vals.get("RelTime").cloned().unwrap_or_default(),
+            abs_time: vals.get("AbsTime").cloned().unwrap_or_default(),
+        })
+    }
+
+    /// `GetTransportInfo` — current transport state (playing / paused / stopped).
+    pub async fn get_transport_info(&self, instance_id: u32) -> DlnaResult<TransportInfo> {
+        let body = soap_action(
+            "GetTransportInfo",
+            &[("<InstanceID>", &instance_id.to_string())],
+        );
+        let resp = self.post_action_with_response("GetTransportInfo", &body).await?;
+        let vals = extract_soap_values(&resp, &[
+            "CurrentTransportState", "CurrentTransportStatus", "CurrentSpeed",
+        ]);
+        Ok(TransportInfo {
+            state: TransportState::from_str(
+                vals.get("CurrentTransportState").map(|s| s.as_str()).unwrap_or("STOPPED"),
+            ),
+            status: vals.get("CurrentTransportStatus").cloned().unwrap_or_else(|| "OK".into()),
+            speed: vals.get("CurrentSpeed").cloned().unwrap_or_else(|| "1".into()),
+        })
+    }
+
+    /// Like `post_action` but returns the response body text for parsing.
+    async fn post_action_with_response(&self, action: &str, body: &str) -> DlnaResult<String> {
+        let soap_action_hdr = format!("\"{AVTRANSPORT_SERVICE_TYPE}#{action}\"");
+        let resp = self
+            .client
+            .post(&self.control_url)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .header("SOAPACTION", &soap_action_hdr)
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| DlnaError::Cast(format!("soap request failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(DlnaError::Cast(format!(
+                "soap action {action} returned {}",
+                resp.status()
+            )));
+        }
+        resp.text().await.map_err(|e| DlnaError::Cast(format!("body read failed: {e}")))
+    }
 }
 
 /// Build a SOAP envelope body for an AVTransport action.
@@ -149,6 +258,52 @@ fn soap_action(action: &str, args: &[(&str, &str)]) -> String {
     s.push_str("</s:Body>");
     s.push_str("</s:Envelope>");
     s
+}
+
+/// Extract named text values from a SOAP response envelope.
+///
+/// Returns a map of element local-name → unescaped text content.
+/// Only elements whose local names appear in `tags` are captured; first
+/// occurrence wins. Used by `get_position_info` and `get_transport_info`
+/// and re-exported for use in sibling modules.
+pub(crate) fn extract_soap_values<'t>(
+    xml: &str,
+    tags: &[&'t str],
+) -> std::collections::HashMap<&'t str, String> {
+    let mut result = std::collections::HashMap::new();
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut current_tag: Option<&str> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = e.name().local_name();
+                // Check whether this element's local name is one we want.
+                current_tag = tags
+                    .iter()
+                    .find(|&&t| t.as_bytes() == local.as_ref())
+                    .copied();
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(tag) = current_tag.take() {
+                    if !result.contains_key(tag) {
+                        if let Ok(s) = t.unescape() {
+                            result.insert(tag, s.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                current_tag = None;
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    result
 }
 
 /// Fetch the device description at `renderer.location` and return the
@@ -374,5 +529,88 @@ mod tests {
 
         assert_eq!(desc_count.load(Ordering::SeqCst), 1);
         assert_eq!(soap_count.load(Ordering::SeqCst), 2);
+    }
+
+    // ── GetPositionInfo / GetTransportInfo SOAP parsing ───────────────────────
+
+    const POS_XML: &str = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+      <Track>3</Track>
+      <TrackDuration>0:03:42</TrackDuration>
+      <TrackURI>http://media/song.mp3</TrackURI>
+      <RelTime>0:01:12</RelTime>
+      <AbsTime>0:01:12</AbsTime>
+    </u:GetPositionInfoResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+    #[test]
+    fn parses_position_info_xml() {
+        let vals = extract_soap_values(POS_XML, &[
+            "Track", "TrackDuration", "TrackURI", "RelTime", "AbsTime",
+        ]);
+        assert_eq!(vals.get("Track").unwrap(), "3");
+        assert_eq!(vals.get("TrackDuration").unwrap(), "0:03:42");
+        assert_eq!(vals.get("TrackURI").unwrap(), "http://media/song.mp3");
+        assert_eq!(vals.get("RelTime").unwrap(), "0:01:12");
+        assert_eq!(vals.get("AbsTime").unwrap(), "0:01:12");
+    }
+
+    #[test]
+    fn position_info_handles_missing_fields() {
+        let empty = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/></s:Body></s:Envelope>"#;
+        let vals = extract_soap_values(empty, &[
+            "Track", "TrackDuration", "TrackURI", "RelTime", "AbsTime",
+        ]);
+        assert!(vals.is_empty());
+        let info = PositionInfo {
+            track: vals.get("Track").and_then(|s| s.parse().ok()).unwrap_or(0),
+            track_duration: vals.get("TrackDuration").cloned().unwrap_or_default(),
+            track_uri: vals.get("TrackURI").cloned().unwrap_or_default(),
+            rel_time: vals.get("RelTime").cloned().unwrap_or_default(),
+            abs_time: vals.get("AbsTime").cloned().unwrap_or_default(),
+        };
+        assert_eq!(info.track, 0);
+        assert!(info.track_duration.is_empty());
+    }
+
+    const TRANSPORT_XML: &str = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+      <CurrentTransportState>PLAYING</CurrentTransportState>
+      <CurrentTransportStatus>OK</CurrentTransportStatus>
+      <CurrentSpeed>1</CurrentSpeed>
+    </u:GetTransportInfoResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+    #[test]
+    fn parses_transport_info_xml() {
+        let vals = extract_soap_values(TRANSPORT_XML, &[
+            "CurrentTransportState", "CurrentTransportStatus", "CurrentSpeed",
+        ]);
+        assert_eq!(vals.get("CurrentTransportState").unwrap(), "PLAYING");
+        assert_eq!(vals.get("CurrentTransportStatus").unwrap(), "OK");
+        assert_eq!(vals.get("CurrentSpeed").unwrap(), "1");
+    }
+
+    #[test]
+    fn transport_state_from_str_all_variants() {
+        assert_eq!(TransportState::from_str("PLAYING"), TransportState::Playing);
+        assert_eq!(TransportState::from_str("PAUSED_PLAYBACK"), TransportState::PausedPlayback);
+        assert_eq!(TransportState::from_str("STOPPED"), TransportState::Stopped);
+        assert_eq!(TransportState::from_str("TRANSITIONING"), TransportState::Transitioning);
+        assert_eq!(TransportState::from_str("NO_MEDIA_PRESENT"), TransportState::NoMediaPresent);
+        assert_eq!(
+            TransportState::from_str("CUSTOM"),
+            TransportState::Other("CUSTOM".into())
+        );
+        assert_eq!(
+            TransportState::from_str("STOPPED"),
+            TransportState::from_str("STOPPED")
+        );
     }
 }

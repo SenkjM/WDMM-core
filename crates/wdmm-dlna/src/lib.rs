@@ -13,6 +13,11 @@
 #![forbid(unsafe_code)]
 
 pub mod avtransport;
+pub mod gena;
+pub mod rendering_control;
+
+pub use gena::{GenaEvent, GenaSubscription};
+pub use rendering_control::RenderingControlClient;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -138,6 +143,64 @@ pub struct DlnaCastService {
     discovery: SsdpDiscovery,
 }
 
+/// Parse a UPnP device description XML and return the `controlURL` or
+/// `eventSubURL` of the named UPnP service type, if present.
+///
+/// `url_tag` is `"controlURL"` for SOAP control or `"eventSubURL"` for GENA
+/// event subscriptions. Used by `avtransport`, `rendering_control`, and `gena`.
+pub(crate) fn parse_service_url(xml: &str, service_type: &str, url_tag: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_service = false;
+    let mut in_target_tag = false;
+    let mut current_service_type = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = e.name().local_name();
+                let name = local.as_ref();
+                if name == b"service" {
+                    in_service = true;
+                    current_service_type.clear();
+                } else if in_service && name == url_tag.as_bytes() {
+                    in_target_tag = true;
+                } else if in_service && name == b"serviceType" {
+                    if let Ok(Event::Text(t)) = reader.read_event_into(&mut buf) {
+                        if let Ok(s) = t.unescape() {
+                            current_service_type = s.to_string();
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(t)) if in_target_tag => {
+                if let Ok(s) = t.unescape() {
+                    if current_service_type == service_type {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = e.name().local_name();
+                let name = local.as_ref();
+                if name == url_tag.as_bytes() {
+                    in_target_tag = false;
+                } else if name == b"service" {
+                    in_service = false;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
 impl DlnaCastService {
     pub fn new() -> Self {
         Self {
@@ -224,7 +287,7 @@ mod tests {
         let data: Vec<u8> = (0..=255u8).collect();
         std::fs::write(&path, &data).unwrap();
 
-        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let proxy = ProxyHandle::new(wdmm_proxy::BindMode::Loopback, 0);
         let reg = proxy.register_file(&path, None, None, None).await.unwrap();
         let addr = proxy.addr().unwrap();
         let url = format!("http://{addr}{}", reg.path_template);
