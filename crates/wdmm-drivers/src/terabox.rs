@@ -460,11 +460,16 @@ impl WdmmVfs for TeraboxDriver {
         Ok(())
     }
 
-    async fn rename(&self, _old_path: &str, new_path: &str) -> Result<()> {
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        // The /api/filemanager `rename` opera expects `path` = the SOURCE path
+        // (old) and `newname` = the basename of the destination. Using the
+        // destination as `path` would rename the (possibly nonexistent) new path
+        // to its own basename — a no-op or NotFound.
+        let normalized_old = Self::normalize_path(old_path);
         let normalized_new = Self::normalize_path(new_path);
         let new_name = Self::file_name(&normalized_new);
         let filelist = serde_json::json!([{
-            "path": normalized_new,
+            "path": normalized_old,
             "newname": new_name,
         }]);
         self.manage("rename", filelist).await
