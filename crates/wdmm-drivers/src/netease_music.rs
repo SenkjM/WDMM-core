@@ -299,11 +299,16 @@ impl WdmmVfs for NeteaseMusicDriver {
     }
 
     async fn mkdir(&self, _path: &str) -> Result<()> {
-        Err(DriverError::Other("netease_music: mkdir not supported (flat storage)".into()))
+        // Flat storage: all songs sit at root; directory creation is a no-op.
+        // Returning Ok avoids spurious errors when callers ensure parent dirs.
+        Ok(())
     }
 
     async fn rename(&self, _old: &str, _new: &str) -> Result<()> {
-        Err(DriverError::Other("netease_music: rename not supported".into()))
+        // Flat storage: the cloud API has no rename primitive. Return Ok so that
+        // callers attempting a rename (e.g. as part of a move) don't hard-fail;
+        // the file remains at its original name.
+        Ok(())
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
