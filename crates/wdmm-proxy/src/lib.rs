@@ -59,6 +59,34 @@ pub enum ProxyError {
 
 pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
 
+// ── BindMode ──────────────────────────────────────────────────────────────────
+
+/// Proxy server bind mode — controls which network interfaces the server listens on.
+///
+/// - `Loopback` — bind to `127.0.0.1` (localhost only; DLNA devices cannot reach)
+/// - `LanAny` — bind to `0.0.0.0` (all interfaces; OS routes to the appropriate one)
+/// - `LanIf(ip)` — bind to specific interface IP (e.g., `"192.168.1.100"`)
+/// - `Explicit(addr)` — bind to exact `SocketAddr` (for advanced control)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindMode {
+    Loopback,
+    LanAny,
+    LanIf(String),
+    Explicit(SocketAddr),
+}
+
+impl BindMode {
+    /// Resolve to a bind address string for use with `TcpListener::bind`.
+    pub fn to_bind_addr(&self, port: u16) -> String {
+        match self {
+            BindMode::Loopback => format!("127.0.0.1:{}", port),
+            BindMode::LanAny => format!("0.0.0.0:{}", port),
+            BindMode::LanIf(ip) => format!("{}:{}", ip, port),
+            BindMode::Explicit(addr) => addr.to_string(),
+        }
+    }
+}
+
 // ── BoxStream ─────────────────────────────────────────────────────────────────
 
 /// Pinned, boxed byte stream — same item type as `tokio_util::io::ReaderStream`.
