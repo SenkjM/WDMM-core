@@ -1,6 +1,6 @@
 # wdmm-drivers — Public API
 
-The `CloudDriver` trait and per-provider implementations, plus a JSON-config
+The `WdmmVfs` trait and per-provider implementations, plus a JSON-config
 registry. No driver embeds credentials in source; all secrets are user-supplied.
 
 ---
@@ -59,7 +59,7 @@ CloudFileItem::local_stream(name, is_dir, size, modified)
 CloudFileItem::local_file(name, is_dir, size, modified, local_path)
 ```
 
-### `trait CloudDriver: Send + Sync`
+### `trait WdmmVfs: Send + Sync`
 Cloud storage abstraction. Required methods:
 
 - `async fn init(&self) -> Result<()>` — default `Ok(())`.
@@ -83,7 +83,7 @@ Optional methods (default `Err(DriverError::Other("... not supported"))`):
 
 ### `struct DriverRegistry`
 
-### `fn DriverRegistry::create_driver(provider_type: &str, config: serde_json::Value) -> Result<Box<dyn CloudDriver>>`
+### `fn DriverRegistry::create_driver(provider_type: &str, config: serde_json::Value) -> Result<Box<dyn WdmmVfs>>`
 Instantiate a driver from a provider type + config JSON object.
 
 Recognised `provider_type` values and required config fields:
@@ -201,7 +201,7 @@ Optional: `salt`, `filename_encryption` (off|standard|obfuscate, default off),
 `filename_encoding` (base32|base64|base32768, default base64), `encrypted_suffix` (default `.bin`),
 `directory_name_encryption` (bool, default false), `source_account_id_name`, `source_dir` (default `/`).
 
-Also constructible via `CryptDriver::with_source(Arc<dyn CloudDriver>, CryptConfig)`.
+Also constructible via `CryptDriver::with_source(Arc<dyn WdmmVfs>, CryptConfig)`.
 
 - `list` — decrypts names from source; skips items that fail name decryption (allows mixed dirs).
 - `get` — returns `LocalStream` with plaintext size (`RcloneCipher::decrypted_size`); no `raw_url`.

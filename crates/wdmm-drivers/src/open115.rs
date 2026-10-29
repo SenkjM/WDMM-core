@@ -17,7 +17,7 @@ use serde_json::Value;
 
 const OPEN115_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/142.0.0.0 OpenList/425.6.30";
 
-use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -232,7 +232,7 @@ impl Open115Driver {
 }
 
 #[async_trait]
-impl CloudDriver for Open115Driver {
+impl WdmmVfs for Open115Driver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let cid = self.path_to_cid(path).await?;
         let items = self.list_cid(&cid.to_string()).await?;

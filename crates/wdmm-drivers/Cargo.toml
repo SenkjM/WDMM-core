@@ -1,6 +1,6 @@
 [package]
 name        = "wdmm-drivers"
-description  = "CloudDriver trait + drivers. WebDAV list is working; others stubbed with TODO"
+description  = "WdmmVfs trait + drivers. WebDAV list is working; others stubbed with TODO"
 version      = { workspace = true }
 edition      = { workspace = true }
 publish      = { workspace = true }

@@ -14,7 +14,7 @@ use chrono::DateTime;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -171,7 +171,7 @@ impl AliyunDriver {
 }
 
 #[async_trait]
-impl CloudDriver for AliyunDriver {
+impl WdmmVfs for AliyunDriver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let parent_id = if path == "/" || path.is_empty() {
             "root".to_string()

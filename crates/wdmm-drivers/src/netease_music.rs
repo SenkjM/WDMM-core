@@ -23,7 +23,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::driver::{CloudDriver, CloudFileItem, ContentDeliveryKind, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, ContentDeliveryKind, DriverError, Result};
 use wdmm_crypto::netease::{linuxapi_encrypt, weapi_encrypt};
 
 /// Configuration for the NeteaseMusic driver.
@@ -260,7 +260,7 @@ impl NeteaseMusicDriver {
 }
 
 #[async_trait]
-impl CloudDriver for NeteaseMusicDriver {
+impl WdmmVfs for NeteaseMusicDriver {
     async fn list(&self, _path: &str) -> Result<Vec<CloudFileItem>> {
         let songs = self.get_songs().await?;
         Ok(songs.into_iter().map(|s| s.into()).collect())

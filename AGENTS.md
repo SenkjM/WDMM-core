@@ -6,13 +6,13 @@ WDMM-core is the Rust business-logic layer shared by all WDMM platform clients.
 It owns: cloud drivers, sync/backup, task queue, crypto, DLNA, unified local proxy, OpenAPI.
 Platform repos (Android, Desktop) couple to it via FFI; OpenAPI is optional.
 
-## CloudDriver is the single authority for cloud file ops
+## WDMM-VFS is the single authority for cloud file ops
 
-All in-app cloud file operations go through **`CloudDriver`** (the unified driver trait in `wdmm-drivers`).
+All in-app cloud file operations go through **`WdmmVfs`** (the unified driver trait in `wdmm-drivers`; product name **WDMM-VFS** — formerly `CloudDriver`).
 
-- Sync, backup, and any file I/O goes through `CloudDriver` methods: `list` / `mkdir` / `remove` / `put_content` / `get_content`.
-- **Do not** introduce a `VirtualFs`, `ObjectFs`, or `RemoteStore`-as-public-VFS that duplicates `CloudDriver`. Private shims that only rename `CloudDriver` are deleted/inlined; engines take `Arc<dyn CloudDriver>` directly.
-- Account-scoped factory at FFI/outer edge only: `account_id` → `DriverRegistry::create_driver` → `CloudDriver`.
+- Sync, backup, and any file I/O goes through `WdmmVfs` methods: `list` / `mkdir` / `remove` / `put_content` / `get_content`.
+- **Do not** introduce a `VirtualFs`, `ObjectFs`, or `RemoteStore`-as-public-VFS that duplicates `WdmmVfs`. Private shims that only rename `WdmmVfs` are deleted/inlined; engines take `Arc<dyn WdmmVfs>` directly.
+- Account-scoped factory at FFI/outer edge only: `account_id` → `DriverRegistry::create_driver` → `WdmmVfs`.
 - Sync FFI takes `account_id + remote_dir (+ with_covers)` — never `url/user/pass`. Backup FFI retains `url/user/pass` until explicitly cut.
 - Missing put/get on a driver → driver error. No silent WebDAV-only fallback.
 - Wrapper drivers (Crypt) expose `LocalStream` (MustProxy), never a plaintext `raw_url`.

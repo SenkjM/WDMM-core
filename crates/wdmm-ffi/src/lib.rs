@@ -361,10 +361,10 @@ pub extern "C" fn wdmm_crypto_decrypt(
 
 // ── Sync FFI ─────────────────────────────────────────────────────────────────
 
-/// Helper: look up an account by ID and construct its CloudDriver.
+/// Helper: look up an account by ID and construct its WdmmVfs.
 fn driver_for_account(
     account_id_str: &str,
-) -> Result<std::sync::Arc<dyn wdmm_drivers::CloudDriver>, FfiString> {
+) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, FfiString> {
     let account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return Err(FfiString::from("error:account not found")),
@@ -707,7 +707,7 @@ pub extern "C" fn wdmm_webdav_list(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    let items = match rt().block_on(wdmm_drivers::CloudDriver::list(&driver, path)) {
+    let items = match rt().block_on(wdmm_drivers::WdmmVfs::list(&driver, path)) {
         Ok(v) => v,
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
@@ -762,7 +762,7 @@ pub extern "C" fn wdmm_webdav_mkdir(
         Ok(d) => d,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
-    match rt().block_on(wdmm_drivers::CloudDriver::mkdir(&driver, path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::mkdir(&driver, path)) {
         Ok(()) => FfiString::from("ok"),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -795,7 +795,7 @@ pub extern "C" fn wdmm_webdav_rename(
         Ok(d) => d,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
-    match rt().block_on(wdmm_drivers::CloudDriver::rename(&driver, old, newp)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::rename(&driver, old, newp)) {
         Ok(()) => FfiString::from("ok"),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -823,7 +823,7 @@ pub extern "C" fn wdmm_webdav_remove(
         Ok(d) => d,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
-    match rt().block_on(wdmm_drivers::CloudDriver::remove(&driver, path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::remove(&driver, path)) {
         Ok(()) => FfiString::from("ok"),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -863,7 +863,7 @@ pub extern "C" fn wdmm_driver_list(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    let items = match rt().block_on(wdmm_drivers::CloudDriver::list(&*driver, path)) {
+    let items = match rt().block_on(wdmm_drivers::WdmmVfs::list(&*driver, path)) {
         Ok(v) => v,
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
@@ -924,7 +924,7 @@ pub extern "C" fn wdmm_driver_mkdir(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    match rt().block_on(wdmm_drivers::CloudDriver::mkdir(&*driver, path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::mkdir(&*driver, path)) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -964,7 +964,7 @@ pub extern "C" fn wdmm_driver_rename(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    match rt().block_on(wdmm_drivers::CloudDriver::rename(&*driver, old_path, new_path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::rename(&*driver, old_path, new_path)) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -999,7 +999,7 @@ pub extern "C" fn wdmm_driver_remove(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    match rt().block_on(wdmm_drivers::CloudDriver::remove(&*driver, path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::remove(&*driver, path)) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -1041,7 +1041,7 @@ pub extern "C" fn wdmm_driver_get(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    let item = match rt().block_on(wdmm_drivers::CloudDriver::get(&*driver, path)) {
+    let item = match rt().block_on(wdmm_drivers::WdmmVfs::get(&*driver, path)) {
         Ok(i) => i,
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
@@ -1102,7 +1102,7 @@ pub extern "C" fn wdmm_account_list_dir(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    let items = match rt().block_on(wdmm_drivers::CloudDriver::list(&*driver, path)) {
+    let items = match rt().block_on(wdmm_drivers::WdmmVfs::list(&*driver, path)) {
         Ok(v) => v,
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
@@ -1165,7 +1165,7 @@ pub extern "C" fn wdmm_account_mkdir(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    match rt().block_on(wdmm_drivers::CloudDriver::mkdir(&*driver, path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::mkdir(&*driver, path)) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -1207,7 +1207,7 @@ pub extern "C" fn wdmm_account_rename(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    match rt().block_on(wdmm_drivers::CloudDriver::rename(&*driver, old_path, new_path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::rename(&*driver, old_path, new_path)) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -1244,7 +1244,7 @@ pub extern "C" fn wdmm_account_remove(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    match rt().block_on(wdmm_drivers::CloudDriver::remove(&*driver, path)) {
+    match rt().block_on(wdmm_drivers::WdmmVfs::remove(&*driver, path)) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -1283,7 +1283,7 @@ pub extern "C" fn wdmm_account_get_entry(
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
 
-    let item = match rt().block_on(wdmm_drivers::CloudDriver::get(&*driver, path)) {
+    let item = match rt().block_on(wdmm_drivers::WdmmVfs::get(&*driver, path)) {
         Ok(i) => i,
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
@@ -1364,7 +1364,7 @@ pub unsafe extern "C" fn wdmm_account_read_range(
     };
 
     let end_opt = if end_inclusive == u64::MAX { None } else { Some(end_inclusive) };
-    let data = match rt().block_on(wdmm_drivers::CloudDriver::get_content_range(
+    let data = match rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
         &*driver, path_str, start, end_opt,
     )) {
         Ok(d) => d,
@@ -4053,7 +4053,7 @@ pub extern "C" fn wdmm_backup_upload(
     let dir = ptr_to_str(remote_dir).unwrap_or("/WebdavMediaManager/backup/");
     let pass = ptr_to_str(passphrase).unwrap_or("");
     let driver = match wdmm_drivers::WebDavDriver::new(url, user, wpass) {
-        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::WdmmVfs>,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
     let lib = std::sync::Arc::clone(global_library_db());
@@ -4083,7 +4083,7 @@ pub extern "C" fn wdmm_backup_list(
     let wpass = ptr_to_str(webdav_pass).unwrap_or("");
     let dir = ptr_to_str(remote_dir).unwrap_or("/WebdavMediaManager/backup/");
     let driver = match wdmm_drivers::WebDavDriver::new(url, user, wpass) {
-        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::WdmmVfs>,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
     match rt().block_on(wdmm_sync::backup_list(driver, dir)) {
@@ -4115,7 +4115,7 @@ pub extern "C" fn wdmm_backup_download_restore(
     };
     let pass = ptr_to_str(passphrase).unwrap_or("");
     let driver = match wdmm_drivers::WebDavDriver::new(url, user, wpass) {
-        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::CloudDriver>,
+        Ok(d) => std::sync::Arc::new(d) as std::sync::Arc<dyn wdmm_drivers::WdmmVfs>,
         Err(e) => return FfiString::from(format!("error:driver: {e}")),
     };
     let lib = std::sync::Arc::clone(global_library_db());

@@ -2,7 +2,7 @@
 //!
 //! ## Round 4 status
 //! `CredentialSyncEngine` / `LibrarySyncEngine` / `PlaylistSyncEngine` now call
-//! a real [`CloudDriver`] (WebDAV happy path) for PROPFIND/GET/PUT via the
+//! a real [`WdmmVfs`] (WebDAV happy path) for PROPFIND/GET/PUT via the
 //! driver's `put_content` / `get_content` methods. Merge strategy is a simple
 //! last-write-wins at the entity level; conflicts surface as `SyncAction::Conflict`.
 //!
@@ -42,7 +42,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 use wdmm_core::models::{CloudAccount, LibraryTrack};
 use wdmm_core::rev_clock::RevClock;
-use wdmm_drivers::{CloudDriver, DriverError};
+use wdmm_drivers::{WdmmVfs, DriverError};
 use wdmm_storage::{LibraryDatabase, Playlist, PlaylistEntry, StorageError};
 
 #[derive(Debug, Error)]
@@ -136,15 +136,15 @@ fn join_path(base: &str, name: &str) -> String {
     format!("{base}/{name}")
 }
 
-// ── CloudDriver helpers (used by the credential + playlist engines) ──────────
+// ── WdmmVfs helpers (used by the credential + playlist engines) ──────────
 //
-// The engines talk to a [`CloudDriver`] directly — no parallel file-store trait.
+// The engines talk to a [`WdmmVfs`] directly — no parallel file-store trait.
 // These free functions adapt driver results into the sync-shaped results the
 // engines need: `NotFound` on read → `Ok(None)` (file not yet on remote); a network
 // error on `mkdir` is treated as success (many WebDAV servers return 405 when the
 // collection already exists); `NotFound` on `list` → empty (dir not yet created).
 
-async fn driver_read(driver: &Arc<dyn CloudDriver>, path: &str) -> SyncResult<Option<Vec<u8>>> {
+async fn driver_read(driver: &Arc<dyn WdmmVfs>, path: &str) -> SyncResult<Option<Vec<u8>>> {
     match driver.get_content(path).await {
         Ok(bytes) => Ok(Some(bytes)),
         Err(DriverError::NotFound(_)) => Ok(None),
@@ -152,12 +152,12 @@ async fn driver_read(driver: &Arc<dyn CloudDriver>, path: &str) -> SyncResult<Op
     }
 }
 
-async fn driver_write(driver: &Arc<dyn CloudDriver>, path: &str, data: &[u8]) -> SyncResult<()> {
+async fn driver_write(driver: &Arc<dyn WdmmVfs>, path: &str, data: &[u8]) -> SyncResult<()> {
     driver.put_content(path, data).await?;
     Ok(())
 }
 
-async fn driver_ensure_dir(driver: &Arc<dyn CloudDriver>, path: &str) -> SyncResult<()> {
+async fn driver_ensure_dir(driver: &Arc<dyn WdmmVfs>, path: &str) -> SyncResult<()> {
     match driver.mkdir(path).await {
         Ok(()) => Ok(()),
         Err(DriverError::Network(_)) => {
@@ -168,7 +168,7 @@ async fn driver_ensure_dir(driver: &Arc<dyn CloudDriver>, path: &str) -> SyncRes
     }
 }
 
-async fn driver_list_files(driver: &Arc<dyn CloudDriver>, dir: &str) -> SyncResult<Vec<String>> {
+async fn driver_list_files(driver: &Arc<dyn WdmmVfs>, dir: &str) -> SyncResult<Vec<String>> {
     match driver.list(dir).await {
         Ok(items) => Ok(items
             .into_iter()
@@ -228,10 +228,10 @@ impl From<&RemoteAccount> for CloudAccount {
 }
 
 /// Credential sync engine — syncs cloud account credentials to/from a remote
-/// `CloudDriver` store (WebDAV happy path).
+/// `WdmmVfs` store (WebDAV happy path).
 pub struct CredentialSyncEngine {
     db: Arc<LibraryDatabase>,
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
     remote_dir: String,
 }
 
@@ -241,7 +241,7 @@ impl CredentialSyncEngine {
     /// `{remote_dir}/credentials.json`.
     pub fn new(
         db: Arc<LibraryDatabase>,
-        driver: Arc<dyn CloudDriver>,
+        driver: Arc<dyn WdmmVfs>,
         remote_dir: impl Into<String>,
     ) -> Self {
         Self {
@@ -363,14 +363,14 @@ impl RemotePlaylist {
 /// Tombstones / deletion packages (`WDMMPD01`) are out of scope this round.
 pub struct PlaylistSyncEngine {
     db: Arc<LibraryDatabase>,
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
     remote_dir: String,
 }
 
 impl PlaylistSyncEngine {
     pub fn new(
         db: Arc<LibraryDatabase>,
-        driver: Arc<dyn CloudDriver>,
+        driver: Arc<dyn WdmmVfs>,
         remote_dir: impl Into<String>,
     ) -> Self {
         Self {
@@ -539,7 +539,7 @@ impl SyncEngine for PlaylistSyncEngine {
 /// This is the single entry point the FFI `wdmm_sync_trigger` calls.
 pub async fn run_sync_all(
     db: Arc<LibraryDatabase>,
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
     remote_dir: &str,
 ) -> SyncResult<serde_json::Value> {
     let cred = CredentialSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
@@ -585,7 +585,7 @@ pub async fn run_sync_all(
 /// to skip embedding — covers can be added on a later rebuild.
 pub async fn run_sync_full(
     db: Arc<LibraryDatabase>,
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
     remote_dir: &str,
     cover_roots: Option<CoverRoots>,
 ) -> SyncResult<serde_json::Value> {
@@ -629,7 +629,7 @@ mod tests {
     use wdmm_core::models::CloudAccount;
     use wdmm_drivers::{CloudFileItem, DriverError};
 
-    /// In-memory `CloudDriver` used by sync unit tests — no network.
+    /// In-memory `WdmmVfs` used by sync unit tests — no network.
     struct MockDriver {
         pub files: AsyncMutex<Map<String, Vec<u8>>>,
         dirs: AsyncMutex<std::collections::HashSet<String>>,
@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CloudDriver for MockDriver {
+    impl WdmmVfs for MockDriver {
         async fn init(&self) -> wdmm_drivers::Result<()> {
             Ok(())
         }
@@ -1184,7 +1184,7 @@ mod tests {
         .unwrap();
         db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1)).unwrap();
 
-        let driver_dyn: Arc<dyn CloudDriver> = driver;
+        let driver_dyn: Arc<dyn WdmmVfs> = driver;
         let summary = run_sync_all(Arc::clone(&db), driver_dyn, "/sync")
             .await
             .unwrap();

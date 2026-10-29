@@ -11,7 +11,7 @@ use chrono::DateTime;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
 /// Configuration for the 123 Pan driver.
 pub struct Pan123Config {
@@ -291,7 +291,7 @@ impl Pan123Driver {
 }
 
 #[async_trait]
-impl CloudDriver for Pan123Driver {
+impl WdmmVfs for Pan123Driver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let (parent_id, _) = self.resolve_path(path).await?;
         let entries = self.list_by_id(parent_id).await?;

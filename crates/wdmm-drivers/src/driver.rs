@@ -104,7 +104,7 @@ impl ContentDeliveryKind {
 
 // ── CloudFileItem ─────────────────────────────────────────────────────────────
 
-/// A cloud file or directory entry returned by a [`CloudDriver`].
+/// A cloud file or directory entry returned by a [`WdmmVfs`].
 #[derive(Debug, Clone)]
 pub struct CloudFileItem {
     pub name: String,
@@ -187,9 +187,9 @@ impl CloudFileItem {
     }
 }
 
-/// Cloud driver abstraction — aligns with Dart `CloudDriver`.
+/// Cloud driver abstraction — aligns with Dart `WdmmVfs`.
 #[async_trait]
-pub trait CloudDriver: Send + Sync {
+pub trait WdmmVfs: Send + Sync {
     /// Initialise the driver (fetch tokens, validate credentials, etc.).
     async fn init(&self) -> Result<()> {
         Ok(())
@@ -238,7 +238,7 @@ pub trait CloudDriver: Send + Sync {
     /// `Range: bytes=start-end`). Pass `end = None` to fetch from `start` to
     /// end-of-file.
     ///
-    /// Default impl falls back to [`CloudDriver::get_content`] and slices in
+    /// Default impl falls back to [`WdmmVfs::get_content`] and slices in
     /// memory, which is correct but wasteful for large files. Drivers that
     /// support HTTP Range (WebDAV, CtFile after redirect) should override this.
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {

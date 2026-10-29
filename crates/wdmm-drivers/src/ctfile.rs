@@ -1,4 +1,4 @@
-//! CtFile (城通网盘) CloudDriver — list + download_url.
+//! CtFile (城通网盘) WdmmVfs — list + download_url.
 //!
 //! API base: https://rest.ctfile.com/v1  (official OpenAPI v1)
 //! Auth: session token from 开放接口登录密钥管理 — **user-supplied only**.
@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -653,7 +653,7 @@ impl CtFileClient {
 
 // ─── CtFileDriver ─────────────────────────────────────────────────────────────
 
-/// `CloudDriver` implementation for CtFile (城通网盘).
+/// `WdmmVfs` implementation for CtFile (城通网盘).
 ///
 /// Implements `list()` (merged folder+file listing) and `get()` (direct
 /// download URL for streaming). Write operations are TODO for Round 3.
@@ -755,7 +755,7 @@ impl CtFileDriver {
 }
 
 #[async_trait]
-impl CloudDriver for CtFileDriver {
+impl WdmmVfs for CtFileDriver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let norm = Self::normalize_path(path);
         let id = self.path_to_id(&norm, false).await?;

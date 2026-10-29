@@ -1,15 +1,15 @@
 //! CryptDriver — rclone crypt wrapper.
 //!
-//! Wraps another CloudDriver, encrypting/decrypting filenames and content using
+//! Wraps another WdmmVfs, encrypting/decrypting filenames and content using
 //! the rclone crypt format. All `get()` calls return `LocalStream` with plaintext
 //! size; the `get_content` / `get_content_range` implementations decrypt blocks
 //! from the source driver on demand.
 //!
 //! Supports both:
 //! - Registry path with nested `source` config for testing
-//! - `CryptDriver::with_source(Arc<dyn CloudDriver>, CryptConfig)` for runtime
+//! - `CryptDriver::with_source(Arc<dyn WdmmVfs>, CryptConfig)` for runtime
 
-use crate::driver::{CloudDriver, CloudFileItem, ContentDeliveryKind, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, ContentDeliveryKind, DriverError, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 use wdmm_crypto::rclone::{NameEncoding, NameMode, RcloneCipher, RcloneError};
@@ -43,13 +43,13 @@ impl CryptConfig {
 /// CryptDriver wraps a source driver and performs rclone crypt encryption/decryption.
 pub struct CryptDriver {
     cipher: RcloneCipher,
-    source: Arc<dyn CloudDriver + Send + Sync>,
+    source: Arc<dyn WdmmVfs + Send + Sync>,
     config: CryptConfig,
 }
 
 impl CryptDriver {
     /// Create a CryptDriver wrapping the given source driver.
-    pub fn with_source(source: Arc<dyn CloudDriver + Send + Sync>, config: CryptConfig) -> Result<Self> {
+    pub fn with_source(source: Arc<dyn WdmmVfs + Send + Sync>, config: CryptConfig) -> Result<Self> {
         let cipher = RcloneCipher::new(
             &config.password,
             &config.salt,
@@ -130,7 +130,7 @@ const BLOCK_DATA_SIZE: u64 = 65536; // 64 KiB
 const BLOCK_SIZE: u64 = BLOCK_HEADER_SIZE + BLOCK_DATA_SIZE; // 65552 bytes
 
 #[async_trait]
-impl CloudDriver for CryptDriver {
+impl WdmmVfs for CryptDriver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let inner_path = self.map_to_inner(path, false)?;
         let inner_items = self.source.list(&inner_path).await?;
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CloudDriver for MockSource {
+    impl WdmmVfs for MockSource {
         async fn list(&self, _path: &str) -> Result<Vec<CloudFileItem>> {
             Err(DriverError::Other("MockSource::list not implemented".into()))
         }

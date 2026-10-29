@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tracing::info;
 use wdmm_core::models::LibraryTrack;
 use wdmm_core::rev_clock::RevClock;
-use wdmm_drivers::{CloudDriver, DriverError};
+use wdmm_drivers::{WdmmVfs, DriverError};
 use wdmm_storage::{LibraryDatabase, SyncState};
 
 const FORMAT: &str = "wmp_library_index";
@@ -139,7 +139,7 @@ fn merge_cloud_parts(
 }
 
 struct DriverStore {
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
 }
 
 impl DriverStore {
@@ -208,7 +208,7 @@ pub struct LibrarySyncEngine {
 impl LibrarySyncEngine {
     pub fn new(
         db: Arc<LibraryDatabase>,
-        driver: Arc<dyn CloudDriver>,
+        driver: Arc<dyn WdmmVfs>,
         remote_dir: impl Into<String>,
         cover_roots: Option<CoverRoots>,
     ) -> Self {

@@ -14,7 +14,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use wdmm_drivers::{CloudDriver, CloudFileItem};
+use wdmm_drivers::{WdmmVfs, CloudFileItem};
 use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase, Playlist, PlaylistEntry};
 
 const PBKDF2_ITERS_ENVELOPE: u32 = 120_000;
@@ -1141,7 +1141,7 @@ fn join_remote(dir: &str, name: &str) -> String {
 pub async fn backup_upload(
     lib: Arc<LibraryDatabase>,
     dmr: Option<Arc<DmrPrefsDatabase>>,
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
     remote_dir: &str,
     passphrase: &str,
     cover_roots: Option<&CoverRoots>,
@@ -1164,7 +1164,7 @@ pub async fn backup_upload(
 }
 
 pub async fn backup_list(
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
     remote_dir: &str,
 ) -> SyncResult<Vec<String>> {
     let items: Vec<CloudFileItem> = driver.list(remote_dir).await.map_err(SyncError::from)?;
@@ -1182,7 +1182,7 @@ pub async fn backup_list(
 pub async fn backup_download_restore(
     lib: Arc<LibraryDatabase>,
     dmr: Option<Arc<DmrPrefsDatabase>>,
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
     remote_file: &str,
     passphrase: &str,
     cover_roots: Option<&CoverRoots>,

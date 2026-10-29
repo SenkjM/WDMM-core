@@ -9,7 +9,7 @@ use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -247,7 +247,7 @@ impl BaiduDriver {
 }
 
 #[async_trait]
-impl CloudDriver for BaiduDriver {
+impl WdmmVfs for BaiduDriver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let items = self.list_dir(path).await?;
         Ok(items.iter().filter_map(Self::parse_item).collect())

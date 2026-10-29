@@ -25,7 +25,7 @@ use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::driver::{CloudDriver, CloudFileItem, ContentDeliveryKind, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, ContentDeliveryKind, DriverError, Result};
 
 /// Configuration for the Terabox driver.
 pub struct TeraboxConfig {
@@ -362,7 +362,7 @@ impl TeraboxDriver {
 }
 
 #[async_trait]
-impl CloudDriver for TeraboxDriver {
+impl WdmmVfs for TeraboxDriver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let normalized = Self::normalize_path(path);
         let files = self.list_dir(&normalized).await?;

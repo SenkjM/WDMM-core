@@ -1,4 +1,4 @@
-//! `wdmm-drivers` — CloudDriver trait + implementations.
+//! `wdmm-drivers` — WdmmVfs trait + implementations.
 //!
 //! Implemented drivers (production paths):
 //! - `WebDavDriver`       — WebDAV list/get/mkdir/rename/remove/put_content/get_content
@@ -29,14 +29,14 @@ pub use aliyun::{AliyunConfig, AliyunDriver};
 pub use baidu::{BaiduConfig, BaiduDriver};
 pub use crypt::{CryptConfig, CryptDriver};
 pub use ctfile::{CtFileConfig, CtFileDriver};
-pub use driver::{CloudDriver, CloudFileItem, ContentDeliveryKind, DriverError, Result};
+pub use driver::{WdmmVfs, CloudFileItem, ContentDeliveryKind, DriverError, Result};
 pub use netease_music::{NeteaseMusicConfig, NeteaseMusicDriver};
 pub use open115::{Open115Config, Open115Driver};
 pub use pan123::{Pan123Config, Pan123Driver};
 pub use terabox::{TeraboxConfig, TeraboxDriver};
 pub use webdav::WebDavDriver;
 
-/// Driver registry — instantiates a `CloudDriver` from a provider type + config JSON.
+/// Driver registry — instantiates a `WdmmVfs` from a provider type + config JSON.
 ///
 /// Config is user-supplied at runtime (e.g. from the accounts store). No driver
 /// embeds credentials in source. Missing required fields return `Config` errors.
@@ -46,7 +46,7 @@ impl DriverRegistry {
     pub fn create_driver(
         provider_type: &str,
         config: serde_json::Value,
-    ) -> Result<Box<dyn CloudDriver>> {
+    ) -> Result<Box<dyn WdmmVfs>> {
         use std::sync::Arc;
         use wdmm_crypto::rclone::{NameEncoding, NameMode};
 
@@ -213,8 +213,8 @@ impl DriverRegistry {
                     .unwrap_or(&empty_config);
 
                 let source_driver = Self::create_driver(source_provider, source_config.clone())?;
-                // Convert Box<dyn CloudDriver> to Arc<dyn CloudDriver>
-                let source_arc: Arc<dyn CloudDriver> = source_driver.into();
+                // Convert Box<dyn WdmmVfs> to Arc<dyn WdmmVfs>
+                let source_arc: Arc<dyn WdmmVfs> = source_driver.into();
 
                 Ok(Box::new(CryptDriver::with_source(source_arc, crypt_cfg)?))
             }

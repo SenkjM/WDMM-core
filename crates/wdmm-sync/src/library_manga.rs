@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::info;
 use wdmm_core::rev_clock::RevClock;
-use wdmm_drivers::{CloudDriver, DriverError};
+use wdmm_drivers::{WdmmVfs, DriverError};
 use wdmm_storage::{
     manga_id_for_remote, manga_sync_key, normalize_manga_remote_path, LibraryDatabase, MangaPage,
     MangaProgress, SyncState,
@@ -144,7 +144,7 @@ fn merge_manga_cloud_parts(
 // ── Remote store ──────────────────────────────────────────────────────────────
 
 struct DriverStore {
-    driver: Arc<dyn CloudDriver>,
+    driver: Arc<dyn WdmmVfs>,
 }
 
 impl DriverStore {
@@ -213,7 +213,7 @@ pub struct MangaLibrarySyncEngine {
 impl MangaLibrarySyncEngine {
     pub fn new(
         db: Arc<LibraryDatabase>,
-        driver: Arc<dyn CloudDriver>,
+        driver: Arc<dyn WdmmVfs>,
         remote_dir: impl Into<String>,
         cover_roots: Option<CoverRoots>,
     ) -> Self {

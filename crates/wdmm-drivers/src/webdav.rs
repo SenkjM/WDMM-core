@@ -8,7 +8,7 @@ use quick_xml::Reader;
 use reqwest::Client;
 use url::Url;
 
-use crate::driver::{CloudDriver, CloudFileItem, DriverError, Result};
+use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
 pub struct WebDavDriver {
     base_url: Url,
@@ -145,7 +145,7 @@ impl WebDavDriver {
 }
 
 #[async_trait]
-impl CloudDriver for WebDavDriver {
+impl WdmmVfs for WebDavDriver {
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let url = self.join_path(path);
 
@@ -451,7 +451,7 @@ mod tests {
     // ── put_content / get_content round-trip over mock HTTP ───────────────────
     //
     // Spins up a two-request mock: first PUT → 201, then GET → 200 + body.
-    // Verifies both new CloudDriver methods work end-to-end.
+    // Verifies both new WdmmVfs methods work end-to-end.
 
     async fn start_mock_put_get_server(payload: Vec<u8>) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
