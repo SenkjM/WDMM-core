@@ -649,6 +649,48 @@ impl CtFileClient {
             .await?;
         Ok(())
     }
+
+    // ─── fetch_bytes ──────────────────────────────────────────────────────────
+
+    /// Download bytes from a direct URL, optionally with an HTTP Range header.
+    ///
+    /// `range` is `Some((start, end_opt))` where both bounds are inclusive byte
+    /// offsets (same semantics as `Range: bytes=start-end`). Pass `None` to
+    /// fetch the whole resource.
+    ///
+    /// Reqwest follows redirects by default, so this works even when the CtFile
+    /// download URL redirects to a CDN.
+    pub async fn fetch_bytes(
+        &self,
+        url: &str,
+        ua: &str,
+        range: Option<(u64, Option<u64>)>,
+    ) -> Result<Vec<u8>> {
+        let mut req = self.client.get(url).header("User-Agent", ua);
+        if let Some((start, end_opt)) = range {
+            let range_val = match end_opt {
+                Some(end) => format!("bytes={}-{}", start, end),
+                None => format!("bytes={}-", start),
+            };
+            req = req.header("Range", range_val);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(DriverError::Other(format!(
+                "CtFile fetch_bytes: HTTP {}",
+                status.as_u16()
+            )));
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| DriverError::Network(e.to_string()))
+    }
 }
 
 // ─── CtFileDriver ─────────────────────────────────────────────────────────────
@@ -936,6 +978,20 @@ impl WdmmVfs for CtFileDriver {
         self.path_cache.lock().await.remove(&norm);
         self.client.clear_cache().await;
         Ok(())
+    }
+
+    async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
+        let norm = Self::normalize_path(path);
+        let id = self.path_to_id(&norm, true).await?;
+        let url = self.client.fetch_download_url(&id).await?;
+        self.client.fetch_bytes(&url, &self.user_agent, None).await
+    }
+
+    async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
+        let norm = Self::normalize_path(path);
+        let id = self.path_to_id(&norm, true).await?;
+        let url = self.client.fetch_download_url(&id).await?;
+        self.client.fetch_bytes(&url, &self.user_agent, Some((start, end))).await
     }
 }
 
