@@ -180,7 +180,8 @@ pub struct Registration {
 /// The server starts lazily on the first `register_*` and shuts down after
 /// `idle_timeout` of inactivity. Dropping the handle stops the server.
 pub struct ProxyHandle {
-    bind: SocketAddr,
+    bind_mode: BindMode,
+    port: u16,
     /// Stored so `ensure_server` can pass it to `arm_idle_timer` on first start.
     #[allow(dead_code)]
     idle_timeout: Duration,
@@ -188,13 +189,15 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
-    /// Create a handle bound to `bind` with the default 10-minute idle timeout.
-    pub fn new(bind: SocketAddr) -> Self {
-        Self::with_idle_timeout(bind, Duration::from_secs(600))
+    /// Create a handle with the given bind mode and port, using the default 10-minute idle timeout.
+    ///
+    /// Use `port = 0` to let the OS assign a free port.
+    pub fn new(bind_mode: BindMode, port: u16) -> Self {
+        Self::with_idle_timeout(bind_mode, port, Duration::from_secs(600))
     }
 
     /// Create a handle with a custom idle timeout.
-    pub fn with_idle_timeout(bind: SocketAddr, idle_timeout: Duration) -> Self {
+    pub fn with_idle_timeout(bind_mode: BindMode, port: u16, idle_timeout: Duration) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             entries: HashMap::new(),
             hls_sessions: HashMap::new(),
@@ -204,7 +207,7 @@ impl ProxyHandle {
             idle_cancel_tx: None,
             idle_timeout,
         }));
-        Self { bind, idle_timeout, shared }
+        Self { bind_mode, port, idle_timeout, shared }
     }
 
     /// Return the bound `SocketAddr`, or `None` when the server is not running.
@@ -410,7 +413,8 @@ impl ProxyHandle {
             return Ok(());
         }
 
-        let listener = TcpListener::bind(self.bind).await?;
+        let bind_addr = self.bind_mode.to_bind_addr(self.port);
+        let listener = TcpListener::bind(&bind_addr).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 

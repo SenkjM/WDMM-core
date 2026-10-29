@@ -1958,14 +1958,50 @@ fn proxy_cell() -> &'static std::sync::Mutex<Option<ProxyHandle>> {
     P.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-/// Start the local HTTP proxy bound to `127.0.0.1` on the given port.
-/// Use `port = 0` to let the OS assign a free port.
+/// Start the local HTTP proxy with the given bind mode and port.
+///
+/// # Parameters
+/// - `bind_mode_cstr`: C string specifying bind mode. Valid values:
+///   - `"loopback"` — bind to `127.0.0.1` (localhost only; DLNA devices cannot reach)
+///   - `"lan_any"` — bind to `0.0.0.0` (all interfaces; OS routes to appropriate one)
+///   - `"lan_if:<ip>"` — bind to specific interface IP (e.g., `"lan_if:192.168.1.100"`)
+///   - `"explicit:<addr>"` — bind to exact `SocketAddr` (e.g., `"explicit:192.168.1.100:8080"`)
+/// - `port`: port number. Use `0` to let the OS assign a free port (ignored when `bind_mode` is `"explicit:<addr>"`).
 ///
 /// Returns the assigned port as a decimal string, or `"error:<message>"`.
 /// Idempotent — if the proxy is already running this is a no-op and returns
 /// the existing port. Caller must free the result.
 #[no_mangle]
-pub extern "C" fn wdmm_proxy_start(port: u16) -> FfiString {
+pub extern "C" fn wdmm_proxy_start(bind_mode_cstr: *const c_char, port: u16) -> FfiString {
+    use wdmm_proxy::BindMode;
+
+    let bind_mode_str = unsafe {
+        if bind_mode_cstr.is_null() {
+            return FfiString::from("error:bind_mode is null");
+        }
+        match std::ffi::CStr::from_ptr(bind_mode_cstr).to_str() {
+            Ok(s) => s,
+            Err(_) => return FfiString::from("error:bind_mode is not valid UTF-8"),
+        }
+    };
+
+    let bind_mode = match bind_mode_str {
+        "loopback" => BindMode::Loopback,
+        "lan_any" => BindMode::LanAny,
+        s if s.starts_with("lan_if:") => {
+            let ip = &s[7..];
+            BindMode::LanIf(ip.to_string())
+        }
+        s if s.starts_with("explicit:") => {
+            let addr_str = &s[9..];
+            match addr_str.parse::<std::net::SocketAddr>() {
+                Ok(addr) => BindMode::Explicit(addr),
+                Err(_) => return FfiString::from(format!("error:invalid explicit address: {}", addr_str)),
+            }
+        }
+        _ => return FfiString::from(format!("error:unknown bind_mode: {}", bind_mode_str)),
+    };
+
     let mut guard = proxy_cell().lock().unwrap();
     // If already running, return the existing port.
     if let Some(ref h) = *guard {
@@ -1973,8 +2009,7 @@ pub extern "C" fn wdmm_proxy_start(port: u16) -> FfiString {
             return FfiString::from(addr.port().to_string());
         }
     }
-    let bind: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    let handle = ProxyHandle::new(bind);
+    let handle = ProxyHandle::new(bind_mode, port);
     // Trigger the lazy server start with an ephemeral temp file.
     // We call register_file on a temp path just to ensure the server starts
     // and we can read back the port. The file registration is immediately
