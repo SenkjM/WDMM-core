@@ -515,7 +515,7 @@ impl MangaLibrarySyncEngine {
     pub async fn estimate(&self, mangas_per_shard: usize) -> SyncResult<crate::SyncEstimateResult> {
         let per = if mangas_per_shard == 0 { DEFAULT_MANGAS_PER_SHARD } else { mangas_per_shard.clamp(50, 5000) };
         let count = self.db.list_mangas()?.len();
-        let shards = if count == 0 { 0 } else { (count + per - 1) / per };
+        let shards = if count == 0 { 0 } else { count.div_ceil(per) };
         let estimated_bytes = (count as i64) * 300; // ~300 B per manga row
 
         let manifest = self.read_manifest().await?;

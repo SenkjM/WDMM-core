@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info};
-use wdmm_core::models::{CloudAccount, LibraryTrack};
+use wdmm_core::models::CloudAccount;
 use wdmm_core::rev_clock::RevClock;
 use wdmm_drivers::{WdmmVfs, DriverError};
 use wdmm_storage::{LibraryDatabase, Playlist, PlaylistEntry, StorageError};

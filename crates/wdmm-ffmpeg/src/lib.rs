@@ -34,7 +34,7 @@ pub mod preset;
 mod sys;
 mod transcoder;
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -153,10 +153,10 @@ impl JobHandle {
     /// Block until the background thread finishes; return its result.
     pub fn join(mut self) -> FfmpegResult<()> {
         if let Some(t) = self.thread.take() {
-            let r = t.join().map_err(|_| {
-                FfmpegError::Io(std::io::Error::new(std::io::ErrorKind::Other, "thread panic"))
-            })?;
-            r
+            
+            t.join().map_err(|_| {
+                FfmpegError::Io(std::io::Error::other("thread panic"))
+            })?
         } else {
             Ok(())
         }

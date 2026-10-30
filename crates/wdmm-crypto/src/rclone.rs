@@ -105,7 +105,7 @@ impl RcloneCipher {
         }
         let mut p = n.as_bytes().to_vec();
         let pad = 16 - p.len() % 16;
-        p.extend(std::iter::repeat(pad as u8).take(pad));
+        p.extend(std::iter::repeat_n(pad as u8, pad));
         let b = eme(&p, &self.name_key, &self.tweak, false);
         Ok(match self.encoding {
             NameEncoding::Base32 => base32hex(&b),

@@ -115,6 +115,9 @@ struct Entry {
 /// the `Shared` registry. Absence of a `TokenMeta` for an existing token
 /// implies no expiration and no peer restrictions (backwards compat).
 struct TokenMeta {
+    /// Issuance time. Retained for diagnostics/future TTL-relative logic;
+    /// not currently read by the gate checks (which use `expires_at`).
+    #[allow(dead_code)]
     created_at: SystemTime,
     expires_at: Option<SystemTime>,
     /// If `Some`, only requests from these IPs are allowed. `None` = any peer.

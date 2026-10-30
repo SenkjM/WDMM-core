@@ -291,7 +291,7 @@ impl CtFileClient {
                     }
                     if api_code == 429
                         || http_status == 429
-                        || (api_code >= 500 && api_code < 600)
+                        || (500..600).contains(&api_code)
                         || http_status >= 500
                     {
                         last_err = Some(DriverError::Network(format!(
@@ -397,7 +397,7 @@ impl CtFileClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let modified = m.get("date").and_then(|v| parse_ctfile_date(v));
+                let modified = m.get("date").and_then(parse_ctfile_date);
                 if key.is_empty() || name.is_empty() {
                     return None;
                 }
@@ -480,7 +480,7 @@ impl CtFileClient {
                         .unwrap_or("")
                         .to_string();
                     let size = m.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let modified = m.get("date").and_then(|v| parse_ctfile_date(v));
+                    let modified = m.get("date").and_then(parse_ctfile_date);
                     if !key.is_empty() && !name.is_empty() {
                         all.push(CtFileFile {
                             key,

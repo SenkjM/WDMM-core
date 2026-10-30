@@ -266,7 +266,7 @@ impl WdmmVfs for Open115Driver {
             .as_str()
             .ok_or_else(|| DriverError::Network("115: missing pick_code".into()))?;
         let dl_url = format!("{}/open/ufile/downurl", self.config.base_url);
-        let dl_json = self.post_form(&dl_url, &[("pick_code", &pick_code)]).await?;
+        let dl_json = self.post_form(&dl_url, &[("pick_code", pick_code)]).await?;
         let raw_url = dl_json["data"].as_object().and_then(|m| m.values().next())
             .and_then(|v| v["url"]["url"].as_str())
             .ok_or_else(|| DriverError::Network("115: missing download url".into()))?

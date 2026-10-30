@@ -14,7 +14,7 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};

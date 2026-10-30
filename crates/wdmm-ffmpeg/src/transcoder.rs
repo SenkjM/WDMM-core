@@ -222,12 +222,11 @@ fn run_remux(
             let cp = (*st).codecpar;
             if cp.is_null() { continue; }
             let ct = (*cp).codec_type;
-            if ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO {
-                if !crate::preset::is_mpegts_copy_compatible((*cp).codec_id) {
+            if (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)
+                && !crate::preset::is_mpegts_copy_compatible((*cp).codec_id) {
                     has_incompatible = true;
                     break;
                 }
-            }
         }
         if has_incompatible {
             avformat_close_input(&mut in_ctx);
@@ -241,8 +240,8 @@ fn run_remux(
         );
         if ret < 0 || out_ctx.is_null() {
             avformat_close_input(&mut in_ctx);
-            return Err(FfmpegError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other, format!("alloc_output: {}", av_err2str(ret))
+            return Err(FfmpegError::Io(std::io::Error::other(
+                format!("alloc_output: {}", av_err2str(ret))
             )));
         }
 
@@ -254,7 +253,7 @@ fn run_remux(
             if out_st.is_null() {
                 avformat_close_input(&mut in_ctx);
                 avformat_free_context(out_ctx);
-                return Err(FfmpegError::Io(std::io::Error::new(std::io::ErrorKind::Other, "new_stream")));
+                return Err(FfmpegError::Io(std::io::Error::other("new_stream")));
             }
             avcodec_parameters_copy((*out_st).codecpar, (*in_st).codecpar);
             (*out_st).time_base = (*in_st).time_base;
@@ -276,8 +275,8 @@ fn run_remux(
             av_dict_free(&mut dict);
             avformat_close_input(&mut in_ctx);
             avformat_free_context(out_ctx);
-            return Err(FfmpegError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other, format!("avio_open: {}", av_err2str(ret))
+            return Err(FfmpegError::Io(std::io::Error::other(
+                format!("avio_open: {}", av_err2str(ret))
             )));
         }
 
@@ -286,18 +285,18 @@ fn run_remux(
         if ret < 0 {
             avformat_close_input(&mut in_ctx);
             avformat_free_context(out_ctx);
-            return Err(FfmpegError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other, format!("write_header: {}", av_err2str(ret))
+            return Err(FfmpegError::Io(std::io::Error::other(
+                format!("write_header: {}", av_err2str(ret))
             )));
         }
 
         // ── Read/write loop ───────────────────────────────────────────────
-        let pkt = av_packet_alloc();
+        let mut pkt = av_packet_alloc();
         if pkt.is_null() {
             avformat_close_input(&mut in_ctx);
             av_write_trailer(out_ctx);
             avformat_free_context(out_ctx);
-            return Err(FfmpegError::Io(std::io::Error::new(std::io::ErrorKind::Other, "pkt alloc")));
+            return Err(FfmpegError::Io(std::io::Error::other("pkt alloc")));
         }
 
         loop {
@@ -325,7 +324,7 @@ fn run_remux(
             av_packet_unref(pkt);
         }
 
-        av_packet_free(&mut (pkt as *mut AVPacket));
+        av_packet_free(&mut pkt);
         av_write_trailer(out_ctx);
         let mut pb = fmtctx_pb(out_ctx);
         avio_closep(&mut pb);
@@ -377,7 +376,7 @@ fn run_transcode(
         } else { -1 };
         let a_idx = av_find_best_stream(in_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &mut a_dec_codec, 0);
 
-        let nb = fmtctx_nb_streams(in_ctx) as usize;
+        let _nb = fmtctx_nb_streams(in_ctx) as usize;
         let streams_ptr = fmtctx_streams(in_ctx);
 
         // ── Open decoders ─────────────────────────────────────────────────
@@ -462,7 +461,7 @@ fn run_transcode(
         avformat_alloc_output_context2(&mut out_ctx, std::ptr::null(), hls_c.as_ptr(), playlist_c.as_ptr());
         if out_ctx.is_null() {
             cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
-            return Err(FfmpegError::Io(std::io::Error::new(std::io::ErrorKind::Other, "alloc output")));
+            return Err(FfmpegError::Io(std::io::Error::other("alloc output")));
         }
 
         // Add output streams
@@ -494,13 +493,13 @@ fn run_transcode(
         av_dict_free(&mut dict);
 
         // ── Decode/encode loop ────────────────────────────────────────────
-        let in_pkt   = av_packet_alloc();
-        let out_pkt  = av_packet_alloc();
-        let dec_frame = av_frame_alloc();
+        let mut in_pkt   = av_packet_alloc();
+        let mut out_pkt  = av_packet_alloc();
+        let mut dec_frame = av_frame_alloc();
         // Resize context for video scaling (allocated lazily).
         let mut sws: *mut SwsContext = std::ptr::null_mut();
         let mut swr: *mut SwrContext = std::ptr::null_mut();
-        let enc_vframe = if !v_enc_ctx.is_null() {
+        let mut enc_vframe = if !v_enc_ctx.is_null() {
             let f = av_frame_alloc();
             if !f.is_null() {
                 let w = codctx_frame_size(v_enc_ctx); // repurpose: use 0 for video
@@ -590,12 +589,12 @@ fn run_transcode(
                         }
                         if !swr.is_null() {
                             // Allocate resampled frame
-                            let resamp = av_frame_alloc();
+                            let mut resamp = av_frame_alloc();
                             if !resamp.is_null() {
                                 swr_convert_frame(swr, resamp, dec_frame);
                                 encode_and_write(a_enc_ctx, resamp, out_pkt, out_ctx, out_a_idx,
                                     codctx_time_base(a_enc_ctx));
-                                av_frame_free(&mut (resamp as *mut AVFrame));
+                                av_frame_free(&mut resamp);
                             }
                         } else {
                             encode_and_write(a_enc_ctx, dec_frame, out_pkt, out_ctx, out_a_idx,
@@ -621,10 +620,10 @@ fn run_transcode(
         // Cleanup
         if !sws.is_null() { sws_freeContext(sws); }
         if !swr.is_null() { swr_free(&mut swr); }
-        if !enc_vframe.is_null() { av_frame_free(&mut (enc_vframe as *mut AVFrame)); }
-        av_frame_free(&mut (dec_frame as *mut AVFrame));
-        av_packet_free(&mut (in_pkt as *mut AVPacket));
-        av_packet_free(&mut (out_pkt as *mut AVPacket));
+        if !enc_vframe.is_null() { av_frame_free(&mut enc_vframe); }
+        av_frame_free(&mut dec_frame);
+        av_packet_free(&mut in_pkt);
+        av_packet_free(&mut out_pkt);
 
         av_write_trailer(out_ctx);
         let mut pb = fmtctx_pb(out_ctx);

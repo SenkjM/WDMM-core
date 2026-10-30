@@ -980,14 +980,13 @@ pub fn restore_backup_bytes(
                         if let (Some(roots), Some(ci)) = (cover_roots, cover_index) {
                             let stem = cover::manga_cover_stem(&manga.id);
                             if let Some(&(kind, ref blob)) = manga_cover_entries.get(ci as usize) {
-                                if kind != cover::COVER_KIND_NONE && !blob.is_empty() {
-                                    if std::fs::create_dir_all(&roots.manga_covers_dir).is_ok() {
+                                if kind != cover::COVER_KIND_NONE && !blob.is_empty()
+                                    && std::fs::create_dir_all(&roots.manga_covers_dir).is_ok() {
                                         let path = roots.manga_covers_dir.join(&stem);
                                         if std::fs::write(&path, blob).is_ok() {
                                             wrote_manga_covers += 1;
                                         }
                                     }
-                                }
                             }
                         }
                     }
@@ -1090,7 +1089,7 @@ fn decode_playlist_wdmmpl01(bytes: &[u8]) -> SyncResult<(Playlist, Vec<PlaylistE
     let updated_dt = chrono::DateTime::parse_from_rfc3339(updated_str)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|| chrono::Utc::now());
+        .unwrap_or_else(chrono::Utc::now);
 
     let playlist = Playlist {
         id: id.clone(),

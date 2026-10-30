@@ -1699,6 +1699,14 @@ pub extern "C" fn wdmm_account_status_tags(account_id: *const c_char) -> FfiStri
 /// this on a worker thread and forwards the buffer to
 /// [`wdmm_proxy_stream_set_result`]. Mirrors Android
 /// `DlnaCastService.readRange` / `RustProxyStreamBridge`.
+///
+/// # Safety
+///
+/// `account_id` and `path` must be valid, NUL-terminated C strings for the
+/// duration of this call. `out_buf` and `out_len` must point to writable
+/// memory of the appropriate size (typically `*mut *mut u8` / `*mut usize`).
+/// Callers must free the returned buffer via
+/// [`wdmm_proxy_stream_free_buf`] to avoid a memory leak.
 #[no_mangle]
 pub unsafe extern "C" fn wdmm_account_read_range(
     account_id: *const c_char,
@@ -1832,9 +1840,8 @@ async fn refresh_and_rebuild(
     use wdmm_drivers::DriverError;
 
     // Build a probe driver from current config to call refresh_credentials.
-    let config = build_driver_config(account).map_err(|e| DriverError::Config(e))?;
-    let probe = wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config)
-        .map_err(|e| e)?;
+    let config = build_driver_config(account).map_err(DriverError::Config)?;
+    let probe = wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config)?;
 
     let (new_access, new_refresh) = probe.refresh_credentials().await?;
 
@@ -1857,7 +1864,7 @@ async fn refresh_and_rebuild(
     account.credentials_encrypted = new_bytes;
 
     // Build fresh driver with refreshed tokens.
-    let new_config = build_driver_config(account).map_err(|e| DriverError::Config(e))?;
+    let new_config = build_driver_config(account).map_err(DriverError::Config)?;
     wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, new_config)
 }
 
@@ -1965,6 +1972,11 @@ fn proxy_cell() -> &'static std::sync::Mutex<Option<ProxyHandle>> {
 
 /// Start the local HTTP proxy with the given bind mode and port.
 ///
+/// # Safety
+///
+/// `bind_mode_cstr` must be a valid, NUL-terminated C string for the duration
+/// of this call.
+///
 /// # Parameters
 /// - `bind_mode_cstr`: C string specifying bind mode. Valid values:
 ///   - `"loopback"` — bind to `127.0.0.1` (localhost only; DLNA devices cannot reach)
@@ -1977,7 +1989,7 @@ fn proxy_cell() -> &'static std::sync::Mutex<Option<ProxyHandle>> {
 /// Idempotent — if the proxy is already running this is a no-op and returns
 /// the existing port. Caller must free the result.
 #[no_mangle]
-pub extern "C" fn wdmm_proxy_start(bind_mode_cstr: *const c_char, port: u16) -> FfiString {
+pub unsafe extern "C" fn wdmm_proxy_start(bind_mode_cstr: *const c_char, port: u16) -> FfiString {
     use wdmm_proxy::BindMode;
 
     let bind_mode_str = unsafe {
@@ -2514,8 +2526,7 @@ fn invoke_c_callback(
     if result < 0 {
         waiter_map().lock().unwrap().remove(&req_id);
         return Box::pin(futures::stream::once(futures::future::ready(
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 format!("wdmm_proxy stream callback error {result}"),
             )),
         )));
@@ -2561,8 +2572,7 @@ fn invoke_c_callback(
             unsafe { drop(Vec::from_raw_parts(wr.buf, wr.len, wr.len)) };
         }
         return Box::pin(futures::stream::once(futures::future::ready(
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 format!("wdmm_proxy async callback error status {}", wr.status),
             )),
         )));
@@ -2593,9 +2603,9 @@ fn invoke_c_callback(
 /// # Safety
 /// On the success path (`status == 0`, `buf` non-null), `buf` must have been
 /// allocated via [`wdmm_proxy_stream_alloc_buf`]. Do not free it separately —
-/// Rust reclaims it.
+/// Rust reclaims it. `buf` must remain valid until this function returns.
 #[no_mangle]
-pub extern "C" fn wdmm_proxy_stream_set_result(
+pub unsafe extern "C" fn wdmm_proxy_stream_set_result(
     request_id: u64,
     buf: *mut u8,
     len: usize,

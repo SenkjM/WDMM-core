@@ -2088,11 +2088,9 @@ impl LibraryDatabase {
                 .map_err(|e| StorageError::Database(format!("tracks query: {e}")))?;
 
             let mut out = Vec::new();
-            for r in rows {
-                match r {
-                    Ok(t) => out.push(t),
-                    Err(_) => {} // skip malformed rows defensively
-                }
+            // skip malformed rows defensively (flatten drops Err)
+            for t in rows.flatten() {
+                out.push(t);
             }
             out
         } else {
@@ -2124,12 +2122,7 @@ impl LibraryDatabase {
                 .map_err(|e| StorageError::Database(format!("playlists query: {e}")))?;
 
             let mut out = Vec::new();
-            for r in rows {
-                match r {
-                    Ok(p) => out.push(p),
-                    Err(_) => {}
-                }
-            }
+            for p in rows.flatten() { out.push(p) }
             out
         };
 
@@ -2159,12 +2152,7 @@ impl LibraryDatabase {
                 .map_err(|e| StorageError::Database(format!("playlist_entries query: {e}")))?;
 
             let mut out = Vec::new();
-            for r in rows {
-                match r {
-                    Ok(e) => out.push(e),
-                    Err(_) => {}
-                }
-            }
+            for e in rows.flatten() { out.push(e) }
             out
         };
 
@@ -2203,11 +2191,9 @@ impl LibraryDatabase {
                     .map_err(|e| StorageError::Database(format!("deleted_tracks query: {e}")))?;
 
                 let mut out = Vec::new();
-                for r in rows {
-                    match r {
-                        Ok(t) => out.push(t),
-                        Err(_) => {} // skip malformed rows defensively
-                    }
+                // skip malformed rows defensively (flatten drops Err)
+                for t in rows.flatten() {
+                    out.push(t);
                 }
                 out
             }
@@ -2272,11 +2258,9 @@ impl LibraryDatabase {
                     .map_err(|e| StorageError::Database(format!("sync_state query: {e}")))?;
 
                 let mut out = Vec::new();
-                for r in rows {
-                    match r {
-                        Ok(s) => out.push(s),
-                        Err(_) => {} // skip malformed rows defensively
-                    }
+                // skip malformed rows defensively (flatten drops Err)
+                for s in rows.flatten() {
+                    out.push(s);
                 }
                 out
             }
@@ -3915,13 +3899,11 @@ fn compare_tracks(
                     let col_name: String = row.get(1)?;
                     Ok(col_name)
                 })?;
-                for r in rows {
-                    if let Ok(name) = r {
-                        if name == "source_name" {
-                            has_source_name = true;
-                        } else if name == "account_id" {
-                            has_account_id = true;
-                        }
+                for name in rows.flatten() {
+                    if name == "source_name" {
+                        has_source_name = true;
+                    } else if name == "account_id" {
+                        has_account_id = true;
                     }
                 }
             }
@@ -3957,10 +3939,8 @@ fn compare_tracks(
                 .map_err(|e| StorageError::Database(format!("tracks query: {e}")))?;
 
             let mut map = HashMap::new();
-            for r in rows {
-                if let Ok((k, v)) = r {
-                    map.insert(k, v);
-                }
+            for (k, v) in rows.flatten() {
+                map.insert(k, v);
             }
             map
         }
@@ -3981,10 +3961,8 @@ fn compare_tracks(
             Ok((key, (account_id, title, duration_ms)))
         })?;
         let mut map = HashMap::new();
-        for r in rows {
-            if let Ok((k, v)) = r {
-                map.insert(k, v);
-            }
+        for (k, v) in rows.flatten() {
+            map.insert(k, v);
         }
         map
     };
@@ -4053,10 +4031,8 @@ fn compare_deleted_tracks(
                 .map_err(|e| StorageError::Database(format!("deleted_tracks query: {e}")))?;
 
             let mut map = HashMap::new();
-            for r in rows {
-                if let Ok((k, v)) = r {
-                    map.insert(k, v);
-                }
+            for (k, v) in rows.flatten() {
+                map.insert(k, v);
             }
             map
         }
@@ -4136,10 +4112,8 @@ fn compare_sync_state(
                 .map_err(|e| StorageError::Database(format!("sync_state query: {e}")))?;
 
             let mut map = HashMap::new();
-            for r in rows {
-                if let Ok((k, v)) = r {
-                    map.insert(k, v);
-                }
+            for (k, v) in rows.flatten() {
+                map.insert(k, v);
             }
             map
         }
@@ -4159,10 +4133,8 @@ fn compare_sync_state(
             Ok((remote_key, (last_seq, base_up_to, parts)))
         })?;
         let mut map = HashMap::new();
-        for r in rows {
-            if let Ok((k, v)) = r {
-                map.insert(k, v);
-            }
+        for (k, v) in rows.flatten() {
+            map.insert(k, v);
         }
         map
     };

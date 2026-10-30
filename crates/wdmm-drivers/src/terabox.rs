@@ -497,8 +497,8 @@ fn terabox_sign(s1: &str, s2: &str) -> Result<String> {
     let v = s1.len();
 
     // KSA
-    for q in 0..256 {
-        a[q] = s1.as_bytes()[q % v];
+    for (q, slot) in a.iter_mut().enumerate() {
+        *slot = s1.as_bytes()[q % v];
     }
 
     let mut u = 0usize;
@@ -516,7 +516,7 @@ fn terabox_sign(s1: &str, s2: &str) -> Result<String> {
         u = (u + p[i] as usize) % 256;
         p.swap(i, u);
         let k = p[(p[i] as usize + p[u] as usize) % 256];
-        output.push((byte ^ k) & 0xFF);
+        output.push(byte ^ k);
     }
 
     Ok(BASE64.encode(&output))

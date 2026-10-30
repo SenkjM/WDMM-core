@@ -300,7 +300,7 @@ pub fn encode_manga_tomb_shard(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let meta_bytes = encode_meta(&meta);
-    let tomb_recs: Vec<_> = tombs.iter().map(|t| tomb_record_to_map(t)).collect();
+    let tomb_recs: Vec<_> = tombs.iter().map(tomb_record_to_map).collect();
     let tombs_bytes = wmp::encode_records(&tomb_recs, TOMB_INT_TAGS);
     let sections = [
         (SEC_META, meta_bytes, Codec::Raw),
@@ -398,9 +398,7 @@ pub fn apply_manga_cover_blobs(
         }
         let stem = manga_cover_stem(&row.manga.id);
         let path = dir.join(&stem);
-        if path.exists() {
-            written_ids.push(row.manga.id.clone());
-        } else if std::fs::write(&path, blob).is_ok() {
+        if path.exists() || std::fs::write(&path, blob).is_ok() {
             written_ids.push(row.manga.id.clone());
         }
     }

@@ -128,7 +128,7 @@ impl TaskQueue {
         let mut tasks = self.tasks.write().await;
         tasks.push(task);
         // Maintain FIFO order by creation time
-        tasks.sort_by(|a, b| a.created.cmp(&b.created));
+        tasks.sort_by_key(|a| a.created);
         Ok(())
     }
 
@@ -328,12 +328,12 @@ impl TaskQueue {
     pub fn should_auto_retry(task: &QueueTask, max_retries: u32) -> bool {
         task.attempts < max_retries
             && task.status == TaskStatus::Failed
-            && task.error.as_ref().map_or(true, |e| is_retryable_error(e))
+            && task.error.as_ref().is_none_or(|e| is_retryable_error(e))
     }
 
     /// Set the maximum number of simultaneous Active tasks. Clamped to `1..=8`.
     pub fn set_concurrency(&self, n: usize) {
-        self.concurrency.store(n.max(1).min(8), Ordering::Relaxed);
+        self.concurrency.store(n.clamp(1, 8), Ordering::Relaxed);
     }
 
     /// Return the current concurrency limit (default 1).

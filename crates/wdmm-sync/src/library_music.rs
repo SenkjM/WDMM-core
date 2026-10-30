@@ -564,7 +564,7 @@ impl LibrarySyncEngine {
     pub async fn estimate(&self, tracks_per_shard: usize) -> SyncResult<crate::SyncEstimateResult> {
         let per = if tracks_per_shard == 0 { DEFAULT_TRACKS_PER_SHARD } else { tracks_per_shard.clamp(50, 5000) };
         let count = self.db.list_tracks()?.len();
-        let shards = if count == 0 { 0 } else { (count + per - 1) / per };
+        let shards = if count == 0 { 0 } else { count.div_ceil(per) };
         let estimated_bytes = (count as i64) * 250; // ~250 B per track compressed
 
         let manifest = self.read_manifest().await?;

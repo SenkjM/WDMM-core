@@ -127,7 +127,7 @@ impl WebDavDriver {
                         in_response = false;
                         if let Some(href) = current_href.take() {
                             let decoded_href = urlencoding::decode(&href).unwrap_or_default().to_string();
-                            let name = decoded_href.trim_end_matches('/').split('/').last().unwrap_or("").to_string();
+                            let name = decoded_href.trim_end_matches('/').split('/').next_back().unwrap_or("").to_string();
 
                             // skip the collection itself (href matches propfind_path)
                             // unless the caller asked for a depth-0 stat of this path.

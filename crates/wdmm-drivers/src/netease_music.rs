@@ -211,7 +211,7 @@ impl NeteaseMusicDriver {
 
         let songs: Vec<NeteaseSong> = data
             .iter()
-            .filter_map(|item| NeteaseSong::from_value(item))
+            .filter_map(NeteaseSong::from_value)
             .collect();
 
         Ok(songs)

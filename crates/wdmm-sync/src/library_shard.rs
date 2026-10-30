@@ -84,6 +84,9 @@ pub struct TombRecord {
 
 #[derive(Debug, Clone)]
 pub struct DecodedLibraryShard {
+    /// Decoded shard header metadata. Retained for diagnostics/debugging;
+    /// not consumed by downstream sync logic yet.
+    #[allow(dead_code)]
     pub meta: ShardMeta,
     pub tracks: Vec<LibraryTrack>,
     pub tombstones: Vec<TombRecord>,
@@ -474,9 +477,7 @@ pub fn apply_music_cover_blobs(
         }
         let stem = music_cover_stem(&track.account_id, &track.remote_path);
         let path = dir.join(&stem);
-        if path.exists() {
-            written_ids.push(track.id.clone());
-        } else if std::fs::write(&path, blob).is_ok() {
+        if path.exists() || std::fs::write(&path, blob).is_ok() {
             written_ids.push(track.id.clone());
         }
     }
