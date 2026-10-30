@@ -9,9 +9,153 @@ name: Native Artifacts
 # Dispatch order: run this workflow on a given commit FIRST, then trigger the
 # Android / Desktop Testbuild workflows — they require a matching artifact.
 #
-# ABI note: ONLY arm64-v8a is built for Android. wdmm-ffmpeg hard-fails for
-# armeabi-v7a / x86 / x86_64 because no confirmed dual CLI (ffmpeg + ffprobe)
-# vendor source exists for those ABIs. See scripts/fetch-ffmpeg-vendor.sh.
+# FFmpeg note (B3.5): wdmm-ffmpeg dynamically links libavcodec/libavformat/…
+# The .so files are NOT bundled in this artifact — they live in the Flutter
+# repo's jniLibs, provisioned by build-ffmpeg-android.yml in that repo.
+# For the cargo-ndk link step, WDMM_FFMPEG_LIB_DIR must point to pre-built
+# arm64 FFmpeg libs; they are downloaded here from the rolling release tag.
+# armeabi-v7a: unsupported (LP64 struct offsets in wdmm-ffmpeg/src/sys.rs are
+# not valid on ILP32).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - refactor/rust-core
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # android-arm64: build libwdmm_ffi.so via cargo-ndk
+  # ---------------------------------------------------------------------------
+  android-arm64:
+    name: Build libwdmm_ffi.so (android-arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK r28
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28b
+          link-to-sdk: false
+
+      - name: Export NDK env for cargo-ndk
+        run: |
+          set -euo pipefail
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "NDK path: ${NDK_PATH}"
+
+      - name: Download FFmpeg arm64 shared libs
+        # Fetch pre-built libavcodec/libavformat/... for the wdmm-ffi link step.
+        # Produced by build-ffmpeg-android.yml in the Flutter repo.
+        # Warning (not error) if the release is absent on first bootstrap.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ffmpeg-android/arm64-v8a
+          gh release download ffmpeg-android-libs \
+            --repo "${{ github.repository_owner }}/Webdav_Media_Manager" \
+            --pattern "ffmpeg-android-arm64-v8a.tar.gz" \
+            --output /tmp/ffmpeg-android/arm64-v8a.tar.gz \
+            2>/dev/null && {
+            tar -xzf /tmp/ffmpeg-android/arm64-v8a.tar.gz -C /tmp/ffmpeg-android
+            ls -lh /tmp/ffmpeg-android/arm64-v8a/
+            echo "WDMM_FFMPEG_LIB_DIR=/tmp/ffmpeg-android/arm64-v8a" >> "$GITHUB_ENV"
+          } || {
+            echo "::warning::FFmpeg release 'ffmpeg-android-libs' not found — run build-ffmpeg-android.yml in the Flutter repo first. wdmm-ffi will fail to link."
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo-ndk binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-${{ runner.os }}-stable
+
+      - name: Install cargo-ndk
+        run: |
+          if ! command -v cargo-ndk &>/dev/null; then
+            cargo install cargo-ndk
+          fi
+
+      - name: Build wdmm-ffi for arm64-v8a
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a -o dist/android build --release -p wdmm-ffi
+          SO="dist/android/arm64-v8a/libwdmm_ffi.so"
+          if [ ! -f "$SO" ]; then
+            echo "::error::libwdmm_ffi.so not found at $SO"
+            exit 1
+          fi
+          echo "Built: $SO ($(du -sh "$SO" | cut -f1))"
+
+      - name: Write COMMIT.txt
+        run: git rev-parse HEAD > dist/android/arm64-v8a/COMMIT.txt
+
+      - name: Upload wdmm-ffi-android-arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdmm-ffi-android-arm64
+          path: dist/android/arm64-v8a/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # windows-x64: build wdmm_ffi.dll (x86_64-pc-windows-msvc)
+  # ---------------------------------------------------------------------------
+  windows-x64:
+    name: Build wdmm_ffi.dll (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wdmm-ffi for windows-x64
+        run: cargo build --release -p wdmm-ffi
+        env:
+          # Windows uses the system FFmpeg from pkg-config or WDMM_FFMPEG_LIB_DIR.
+          # For CI, wdmm-ffmpeg/build.rs falls back to dynamic link without a
+          # hard failure; the DLL loads libav from PATH at runtime on Windows.
+          WDMM_FFMPEG_LIB_DIR: ""
+
+      - name: Stage artifact and write COMMIT.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          DLL="target/release/wdmm_ffi.dll"
+          if [ ! -f "$DLL" ]; then
+            echo "::error::wdmm_ffi.dll not found at $DLL"
+            exit 1
+          fi
+          mkdir -p dist/windows-x64
+          cp "$DLL" dist/windows-x64/wdmm_ffi.dll
+          git rev-parse HEAD > dist/windows-x64/COMMIT.txt
+          echo "Staged: dist/windows-x64/wdmm_ffi.dll"
+
+      - name: Upload wdmm-ffi-windows-x64
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdmm-ffi-windows-x64
+          path: dist/windows-x64/
+          if-no-files-found: error
+          retention-days: 14
+
 
 on:
   workflow_dispatch:
