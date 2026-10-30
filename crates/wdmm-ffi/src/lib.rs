@@ -70,10 +70,17 @@ pub extern "C" fn wdmm_hello() -> FfiString {
 
 // ── Queue status ──────────────────────────────────────────────────────────────
 
-/// Global queue (created lazily on first call to a queue function).
+/// Module-level Arc queue — shared between FFI operations and the OpenAPI server.
+static QUEUE: OnceLock<std::sync::Arc<TaskQueue>> = OnceLock::new();
+
+/// Global queue reference (created lazily; shared with `global_queue_arc()`).
 fn global_queue() -> &'static TaskQueue {
-    static Q: OnceLock<TaskQueue> = OnceLock::new();
-    Q.get_or_init(TaskQueue::new)
+    QUEUE.get_or_init(|| std::sync::Arc::new(TaskQueue::new()))
+}
+
+/// Owned Arc clone of the global queue, for passing to `ApiServer::start`.
+fn global_queue_arc() -> std::sync::Arc<TaskQueue> {
+    std::sync::Arc::clone(QUEUE.get_or_init(|| std::sync::Arc::new(TaskQueue::new())))
 }
 
 /// Return queue tasks as a JSON array.
@@ -225,19 +232,18 @@ pub extern "C" fn wdmm_openapi_start(port: u16) -> FfiString {
         return FfiString::from(s.token().to_string());
     }
 
-    // Open in-memory DB for the server (real paths injected by platform later)
-    let db = match LibraryDatabase::open(std::path::Path::new(":memory:")) {
-        Ok(db) => std::sync::Arc::new(db),
-        Err(e) => return FfiString::from(format!("db error: {e}")),
-    };
-    let queue = std::sync::Arc::new(TaskQueue::new());
+    // Share the same Arc<LibraryDatabase> + Arc<TaskQueue> as the rest of the FFI.
+    let db = std::sync::Arc::clone(global_library_db());
+    let queue = global_queue_arc();
+
+    // Resolve the bearer token (file 0600 → KV → generate).
+    let token = resolve_api_token(&db);
 
     let config = ServerConfig {
         bind_mode: BindMode::Local,
         port,
-        token: uuid::Uuid::new_v4().to_string(),
+        token: token.clone(),
     };
-    let token = config.token.clone();
 
     match rt().block_on(ApiServer::start(config, db, queue)) {
         Ok(server) => {
@@ -2838,6 +2844,62 @@ pub extern "C" fn wdmm_token_rotate() -> FfiString {
     }
 }
 
+// ── Token file (0600) ────────────────────────────────────────────────────────
+//
+// When the library DB is a real on-disk file, the API bearer token is also
+// written to `<db_dir>/api-token` at mode 0600 so the token survives
+// hot-restarts without a round-trip to the KV store.
+
+/// Path to the 0600 token file, set once by `wdmm_library_init`.
+/// `None` when the DB is `:memory:` (tests / smoke-runs).
+static TOKEN_FILE_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+fn api_token_file() -> Option<&'static std::path::PathBuf> {
+    TOKEN_FILE_PATH.get().and_then(|o| o.as_ref())
+}
+
+/// Write `tok` to the 0600 token file (no-op when path unavailable).
+fn write_token_file(tok: &str) {
+    let Some(path) = api_token_file() else { return };
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(tok.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// Resolve the API bearer token: token file → KV store → generate fresh.
+///
+/// Priority ensures the token survives app restarts (file) and migrates
+/// gracefully from older KV-only builds (KV fallback with backfill).
+fn resolve_api_token(db: &LibraryDatabase) -> String {
+    // 1. Token file — most authoritative after first write.
+    if let Some(path) = api_token_file() {
+        if let Ok(tok) = std::fs::read_to_string(path) {
+            let tok = tok.trim().to_string();
+            if !tok.is_empty() {
+                return tok;
+            }
+        }
+    }
+    // 2. KV store fallback (migrating from KV-only builds).
+    if let Ok(Some(tok)) = db.load_kv(wdmm_openapi::TOKEN_KV_KEY) {
+        if !tok.is_empty() {
+            write_token_file(&tok); // backfill the file
+            return tok;
+        }
+    }
+    // 3. Generate a new token and persist to both destinations.
+    let tok = uuid::Uuid::new_v4().to_string();
+    let _ = db.save_kv(wdmm_openapi::TOKEN_KV_KEY, &tok);
+    write_token_file(&tok);
+    tok
+}
+
 // ── Library DB singleton ──────────────────────────────────────────────────────
 //
 // The FFI exposes a process-global library database. Real Android/Windows
@@ -2878,6 +2940,14 @@ pub extern "C" fn wdmm_library_init(path: *const c_char) -> FfiString {
         Some(s) => s,
         None => return FfiString::from("error:invalid path pointer"),
     };
+    // Derive the token-file path from the DB path (only for real on-disk DBs).
+    TOKEN_FILE_PATH.get_or_init(|| {
+        if p == ":memory:" {
+            None
+        } else {
+            std::path::Path::new(p).parent().map(|d| d.join("api-token"))
+        }
+    });
     // OnceLock: if already set this call is a no-op.
     LIBRARY_DB.get_or_init(|| {
         std::sync::Arc::new(
