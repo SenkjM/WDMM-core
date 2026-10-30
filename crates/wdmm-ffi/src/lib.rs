@@ -834,171 +834,11 @@ pub extern "C" fn wdmm_sync_tidy_orphans_manga(
 
 
 
-// ── WebDAV browse FFI ────────────────────────────────────────────────────────
-
-/// List a WebDAV directory via [`wdmm_drivers::WebDavDriver::list`].
-///
-/// Parameters (all null-terminated UTF-8 C strings):
-/// - `webdav_url`:  WebDAV base URL (e.g. `"https://nas.local/dav/"`)
-/// - `webdav_user`: HTTP Basic username (empty string for no auth)
-/// - `webdav_pass`: HTTP Basic password (empty string for no auth)
-/// - `path`:        Remote directory to list (e.g. `"/Music"`; default `"/"`)
-///
-/// Returns a JSON array on success:
-/// ```json
-/// [{"name":"Song.mp3","path":"/Music/Song.mp3","is_dir":false,"size":1234,"modified":"2024-01-02T03:04:05Z"}]
-/// ```
-/// or `"error:<message>"`. Caller must free the result.
-///
-/// # Safety
-/// All pointer parameters must be valid null-terminated UTF-8 C strings.
-#[no_mangle]
-pub extern "C" fn wdmm_webdav_list(
-    webdav_url: *const c_char,
-    webdav_user: *const c_char,
-    webdav_pass: *const c_char,
-    path: *const c_char,
-) -> FfiString {
-    let url = match ptr_to_str(webdav_url) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid webdav_url"),
-    };
-    let user = ptr_to_str(webdav_user).unwrap_or("");
-    let pass = ptr_to_str(webdav_pass).unwrap_or("");
-    let path = ptr_to_str(path).unwrap_or("/");
-
-    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
-        Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
-    };
-
-    let items = match rt().block_on(wdmm_drivers::WdmmVfs::list(&driver, path)) {
-        Ok(v) => v,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-
-    let parent = path.trim_end_matches('/');
-    let parent = if parent.is_empty() { "" } else { parent };
-
-    let arr: Vec<serde_json::Value> = items
-        .into_iter()
-        .map(|it| {
-            let joined = if parent.is_empty() {
-                format!("/{}", it.name.trim_start_matches('/'))
-            } else {
-                format!("{}/{}", parent, it.name.trim_start_matches('/'))
-            };
-            serde_json::json!({
-                "name": it.name,
-                "path": joined,
-                "is_dir": it.is_dir,
-                "size": it.size,
-                "modified": it.modified.map(|t| t.to_rfc3339()),
-            })
-        })
-        .collect();
-
-    match serde_json::to_string(&arr) {
-        Ok(s) => FfiString::from(s),
-        Err(e) => FfiString::from(format!("error:serde: {e}")),
-    }
-}
-
-
-/// Create a WebDAV collection (MKCOL). Returns `"ok"` or `"error:…"`.
-#[no_mangle]
-pub extern "C" fn wdmm_webdav_mkdir(
-    webdav_url: *const c_char,
-    webdav_user: *const c_char,
-    webdav_pass: *const c_char,
-    path: *const c_char,
-) -> FfiString {
-    let url = match ptr_to_str(webdav_url) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid webdav_url"),
-    };
-    let user = ptr_to_str(webdav_user).unwrap_or("");
-    let pass = ptr_to_str(webdav_pass).unwrap_or("");
-    let path = match ptr_to_str(path) {
-        Some(s) if !s.is_empty() => s,
-        _ => return FfiString::from("error:invalid path"),
-    };
-    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
-        Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
-    };
-    match rt().block_on(wdmm_drivers::WdmmVfs::mkdir(&driver, path)) {
-        Ok(()) => FfiString::from("ok"),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
-
-/// Rename/move a WebDAV path. Returns `"ok"` or `"error:…"`.
-#[no_mangle]
-pub extern "C" fn wdmm_webdav_rename(
-    webdav_url: *const c_char,
-    webdav_user: *const c_char,
-    webdav_pass: *const c_char,
-    old_path: *const c_char,
-    new_path: *const c_char,
-) -> FfiString {
-    let url = match ptr_to_str(webdav_url) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid webdav_url"),
-    };
-    let user = ptr_to_str(webdav_user).unwrap_or("");
-    let pass = ptr_to_str(webdav_pass).unwrap_or("");
-    let old = match ptr_to_str(old_path) {
-        Some(s) if !s.is_empty() => s,
-        _ => return FfiString::from("error:invalid old_path"),
-    };
-    let newp = match ptr_to_str(new_path) {
-        Some(s) if !s.is_empty() => s,
-        _ => return FfiString::from("error:invalid new_path"),
-    };
-    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
-        Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
-    };
-    match rt().block_on(wdmm_drivers::WdmmVfs::rename(&driver, old, newp)) {
-        Ok(()) => FfiString::from("ok"),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
-
-/// Delete a WebDAV file or directory. Returns `"ok"` or `"error:…"`.
-#[no_mangle]
-pub extern "C" fn wdmm_webdav_remove(
-    webdav_url: *const c_char,
-    webdav_user: *const c_char,
-    webdav_pass: *const c_char,
-    path: *const c_char,
-) -> FfiString {
-    let url = match ptr_to_str(webdav_url) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid webdav_url"),
-    };
-    let user = ptr_to_str(webdav_user).unwrap_or("");
-    let pass = ptr_to_str(webdav_pass).unwrap_or("");
-    let path = match ptr_to_str(path) {
-        Some(s) if !s.is_empty() => s,
-        _ => return FfiString::from("error:invalid path"),
-    };
-    let driver = match wdmm_drivers::WebDavDriver::new(url, user, pass) {
-        Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
-    };
-    match rt().block_on(wdmm_drivers::WdmmVfs::remove(&driver, path)) {
-        Ok(()) => FfiString::from("ok"),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
-
 // ── Generic Driver FFI ────────────────────────────────────────────────────────
 
 /// List directory entries via DriverRegistry.
 ///
-/// Returns JSON array matching `wdmm_webdav_list` shape:
+/// Returns JSON array:
 /// ```json
 /// [{"name":"file.mp3","path":"/path/file.mp3","is_dir":false,"size":1234,"modified":"2024-01-02T03:04:05Z"}]
 /// ```
@@ -1239,7 +1079,7 @@ pub extern "C" fn wdmm_driver_get(
 
 /// List directory entries for an account by ID.
 ///
-/// Returns JSON array matching `wdmm_webdav_list` shape or `"error:<message>"`.
+/// Returns JSON array or `"error:<message>"`.
 #[no_mangle]
 pub extern "C" fn wdmm_account_list_dir(
     account_id: *const c_char,
@@ -5167,34 +5007,6 @@ mod tests {
         let h = wdmm_hello();
         assert!(!h.ptr.is_null());
         wdmm_ffi_free_string(h);
-    }
-
-    #[test]
-    fn webdav_list_invalid_url_errors() {
-        let url = CString::new("not-a-url").unwrap();
-        let empty = CString::new("").unwrap();
-        let path = CString::new("/").unwrap();
-        let r = wdmm_webdav_list(url.as_ptr(), empty.as_ptr(), empty.as_ptr(), path.as_ptr());
-        assert!(!r.ptr.is_null());
-        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
-        assert!(s.starts_with("error:"), "expected error:…, got: {s}");
-        wdmm_ffi_free_string(r);
-    }
-
-    #[test]
-    fn webdav_mkdir_rename_remove_invalid_url_errors() {
-        let url = CString::new("not-a-url").unwrap();
-        let empty = CString::new("").unwrap();
-        let path = CString::new("/x").unwrap();
-        for r in [
-            wdmm_webdav_mkdir(url.as_ptr(), empty.as_ptr(), empty.as_ptr(), path.as_ptr()),
-            wdmm_webdav_rename(url.as_ptr(), empty.as_ptr(), empty.as_ptr(), path.as_ptr(), path.as_ptr()),
-            wdmm_webdav_remove(url.as_ptr(), empty.as_ptr(), empty.as_ptr(), path.as_ptr()),
-        ] {
-            let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
-            assert!(s.starts_with("error:"), "expected error:…, got: {s}");
-            wdmm_ffi_free_string(r);
-        }
     }
 
     #[test]
