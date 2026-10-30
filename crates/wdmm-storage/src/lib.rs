@@ -27,6 +27,7 @@ use thiserror::Error as ThisError;
 use uuid::Uuid;
 
 use wdmm_core::models::{CloudAccount, LibraryAlbum, LibraryArtist, LibraryTrack};
+pub use wdmm_core::models::TranscodePreset;
 
 #[derive(Debug, ThisError)]
 pub enum StorageError {
@@ -494,6 +495,33 @@ impl LibraryDatabase {
                 deleted_at  TEXT    NOT NULL,
                 pushed      INTEGER NOT NULL DEFAULT 0
             );
+
+            -- ── Transcode presets (schema v11, B3.5) ─────────────────────────
+            -- DLNA cast transcode profiles; seeded with 5 built-in presets.
+            CREATE TABLE IF NOT EXISTS transcode_presets (
+                id                TEXT PRIMARY KEY,
+                label             TEXT NOT NULL,
+                container         TEXT NOT NULL DEFAULT 'mpegts',
+                -- video: NULL codec ⇒ audio-only (no video stream)
+                video_codec       TEXT,
+                video_hw_preferred INTEGER NOT NULL DEFAULT 1,
+                video_max_w       INTEGER,
+                video_max_h       INTEGER,
+                video_max_bitrate INTEGER,        -- bits per second
+                video_fps_cap     INTEGER,
+                -- audio
+                audio_codec       TEXT NOT NULL DEFAULT 'aac',
+                audio_bitrate     INTEGER NOT NULL DEFAULT 128000,
+                audio_channels    INTEGER NOT NULL DEFAULT 2,
+                audio_sample_rate INTEGER,
+                -- hls
+                hls_segment_secs  INTEGER NOT NULL DEFAULT 4,
+                remux_first       INTEGER NOT NULL DEFAULT 1,
+                -- ui
+                sort_order        INTEGER NOT NULL DEFAULT 0,
+                is_builtin        INTEGER NOT NULL DEFAULT 0,
+                updated_at        INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -806,6 +834,33 @@ impl LibraryDatabase {
 
             conn.execute(
                 "INSERT OR IGNORE INTO _schema_version (version) VALUES (10)",
+                [],
+            )?;
+        }
+
+        // ── v11 migration: transcode_presets table + 5 built-in presets ──────
+        if current_ver < 11 {
+            // The table is already created by the base DDL above (IF NOT EXISTS).
+            // Just seed the 5 built-in presets if absent.
+            let now = chrono::Utc::now().timestamp();
+            conn.execute_batch(&format!(
+                r#"
+                INSERT OR IGNORE INTO transcode_presets
+                    (id, label, container, video_codec, video_hw_preferred,
+                     video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                     audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
+                     hls_segment_secs, remux_first, sort_order, is_builtin, updated_at)
+                VALUES
+                    ('passthrough',  'Direct / Pass-through',   'original', NULL,      0, NULL, NULL,    NULL,    NULL, 'copy', 0,      0, NULL, 4, 0, 0, 1, {now}),
+                    ('dlna-compat',  'DLNA Compatible (default)','mpegts', 'h264', 1, 1280,  720,  2000000, 30,   'aac',  128000, 2,    44100, 4, 1, 1, 1, {now}),
+                    ('balanced',     'Balanced',                 'mpegts', 'h264', 1, 1920, 1080, 4000000, 60,   'aac',  192000, 2,    48000, 4, 1, 2, 1, {now}),
+                    ('high',         'High Quality',             'mpegts', 'h264', 1, 1920, 1080, 8000000, NULL, 'aac',  256000, 2,    48000, 4, 1, 3, 1, {now}),
+                    ('audio-only',   'Audio Only',               'mpegts', NULL,   0, NULL, NULL,    NULL,    NULL, 'mp3',  320000, 2, 44100, 4, 0, 4, 1, {now});
+                "#,
+                now = now,
+            ))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (11)",
                 [],
             )?;
         }
@@ -1584,6 +1639,129 @@ impl LibraryDatabase {
     pub fn delete_kv(&self, key: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM kv_store WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    // ── Transcode presets (B3.5) ──────────────────────────────────────────────
+
+    /// List all transcode presets ordered by sort_order.
+    pub fn list_transcode_presets(&self) -> StorageResult<Vec<TranscodePreset>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, container,
+                    video_codec, video_hw_preferred,
+                    video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                    audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
+                    hls_segment_secs, remux_first, sort_order, is_builtin
+             FROM transcode_presets
+             ORDER BY sort_order ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TranscodePreset {
+                id:                  row.get(0)?,
+                label:               row.get(1)?,
+                container:           row.get(2)?,
+                video_codec:         row.get(3)?,
+                video_hw_preferred:  row.get::<_, i64>(4)? != 0,
+                video_max_w:         row.get(5)?,
+                video_max_h:         row.get(6)?,
+                video_max_bitrate:   row.get(7)?,
+                video_fps_cap:       row.get(8)?,
+                audio_codec:         row.get(9)?,
+                audio_bitrate:       row.get::<_, i64>(10)? as u32,
+                audio_channels:      row.get::<_, i64>(11)? as u8,
+                audio_sample_rate:   row.get(12)?,
+                hls_segment_secs:    row.get::<_, i64>(13)? as u32,
+                remux_first:         row.get::<_, i64>(14)? != 0,
+                sort_order:          row.get::<_, i64>(15)? as u32,
+                is_builtin:          row.get::<_, i64>(16)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Get one preset by id.
+    pub fn get_transcode_preset(&self, id: &str) -> StorageResult<Option<TranscodePreset>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, container,
+                    video_codec, video_hw_preferred,
+                    video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                    audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
+                    hls_segment_secs, remux_first, sort_order, is_builtin
+             FROM transcode_presets WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(TranscodePreset {
+                id:                 row.get(0)?,
+                label:              row.get(1)?,
+                container:          row.get(2)?,
+                video_codec:        row.get(3)?,
+                video_hw_preferred: row.get::<_, i64>(4)? != 0,
+                video_max_w:        row.get(5)?,
+                video_max_h:        row.get(6)?,
+                video_max_bitrate:  row.get(7)?,
+                video_fps_cap:      row.get(8)?,
+                audio_codec:        row.get(9)?,
+                audio_bitrate:      row.get::<_, i64>(10)? as u32,
+                audio_channels:     row.get::<_, i64>(11)? as u8,
+                audio_sample_rate:  row.get(12)?,
+                hls_segment_secs:   row.get::<_, i64>(13)? as u32,
+                remux_first:        row.get::<_, i64>(14)? != 0,
+                sort_order:         row.get::<_, i64>(15)? as u32,
+                is_builtin:         row.get::<_, i64>(16)? != 0,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Upsert a transcode preset. `updated_at` is set to now.
+    pub fn save_transcode_preset(&self, preset: &TranscodePreset) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR REPLACE INTO transcode_presets
+             (id, label, container,
+              video_codec, video_hw_preferred,
+              video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+              audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
+              hls_segment_secs, remux_first, sort_order, is_builtin, updated_at)
+             VALUES (?1,?2,?3, ?4,?5, ?6,?7,?8,?9, ?10,?11,?12,?13, ?14,?15,?16,?17,?18)",
+            params![
+                &preset.id,
+                &preset.label,
+                &preset.container,
+                &preset.video_codec,
+                preset.video_hw_preferred as i64,
+                preset.video_max_w,
+                preset.video_max_h,
+                preset.video_max_bitrate,
+                preset.video_fps_cap,
+                &preset.audio_codec,
+                preset.audio_bitrate as i64,
+                preset.audio_channels as i64,
+                preset.audio_sample_rate,
+                preset.hls_segment_secs as i64,
+                preset.remux_first as i64,
+                preset.sort_order as i64,
+                preset.is_builtin as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a preset by id. Built-in presets can be deleted if needed
+    /// (they are re-seeded on fresh install, not on upgrade).
+    pub fn delete_transcode_preset(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM transcode_presets WHERE id = ?1", params![id])?;
         Ok(())
     }
 }
@@ -3865,7 +4043,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
     }
 
     #[test]
@@ -5393,7 +5571,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -5926,7 +6104,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -6368,7 +6546,7 @@ mod tests {
 
         // Open through LibraryDatabase — triggers v10 migration.
         let db = LibraryDatabase::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10, "schema must reach v10");
+        assert_eq!(db.schema_version().unwrap(), 11, "schema must reach v11");
 
         let mangas = db.list_mangas().unwrap();
         let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");

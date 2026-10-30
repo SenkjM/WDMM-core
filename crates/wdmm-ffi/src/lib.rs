@@ -2133,51 +2133,116 @@ pub extern "C" fn wdmm_proxy_unregister(token: *const std::os::raw::c_char) -> F
 // `wdmm_proxy_start`. DLNA cast takes the URL from the caller — the proxy only
 // supplies the token path; the caller composes the full URL.
 
+// ── Transcode preset CRUD ─────────────────────────────────────────────────────
+
+/// Return all transcode presets as a JSON array.
+///
+/// Returns a JSON array on success, or `"error:<message>"` on failure.
+/// Caller must free the result via [`wdmm_ffi_free_string`].
+#[no_mangle]
+pub extern "C" fn wdmm_transcode_presets_json() -> FfiString {
+    let db = global_library_db();
+    match db.list_transcode_presets() {
+        Ok(presets) => match serde_json::to_string(&presets) {
+            Ok(j) => FfiString::from(j),
+            Err(e) => FfiString::from(format!("error:{e}")),
+        },
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Save (insert or update) a transcode preset.
+///
+/// `json` must be a null-terminated JSON object matching [`TranscodePreset`].
+/// Returns `"ok"` or `"error:<message>"`. Caller must free the result.
+///
+/// # Safety
+/// `json` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_transcode_preset_save(json: *const c_char) -> FfiString {
+    let s = match ptr_to_str(json) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid json pointer"),
+    };
+    let preset: wdmm_storage::TranscodePreset = match serde_json::from_str(s) {
+        Ok(p) => p,
+        Err(e) => return FfiString::from(format!("error:parse:{e}")),
+    };
+    let db = global_library_db();
+    match db.save_transcode_preset(&preset) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Delete a transcode preset by ID.
+///
+/// Built-in presets (`is_builtin = true`) are not deleted; the call returns
+/// `"error:builtin"` in that case.  Returns `"ok"` or `"error:<message>"`.
+/// Caller must free the result.
+///
+/// # Safety
+/// `id` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_transcode_preset_delete(id: *const c_char) -> FfiString {
+    let s = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid id pointer"),
+    };
+    let db = global_library_db();
+    match db.delete_transcode_preset(s) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 /// Register an HLS session with the proxy.
 ///
 /// `device_id` — unique identifier for the player device (null-terminated UTF-8).
-/// `file_path` — absolute path to the input media file (null-terminated UTF-8).
-/// `mode_json` — transcode mode as a JSON object (may be `NULL` for the default):
-///
-/// ```json
-/// {"mode":"direct_copy"}
-/// {"mode":"compat","video_codec":"libx264","audio_codec":"aac"}
-/// ```
+/// `input_url` — absolute file path or `http://127.0.0.1:{port}/…` loopback URL.
+/// `preset_id` — ID of a [`TranscodePreset`] row (see `wdmm_transcode_presets_json`).
 ///
 /// Returns JSON on success:
 /// ```json
-/// {"token":"3f7a…","playlist_template":"/h/3f7a…/index.m3u8","port":43221}
+/// {"token":"3f7a…","playlist_template":"/h/3f7a…/index.m3u8","host":"127.0.0.1","port":43221}
 /// ```
 /// or `"error:<message>"` on failure. Caller must free the result via
 /// [`wdmm_ffi_free_string`].
 ///
 /// # Safety
-/// `device_id` and `file_path` must be valid null-terminated UTF-8 C strings.
-/// `mode_json` may be `NULL` (treated as `{"mode":"direct_copy"}`).
+/// All pointer arguments must be valid null-terminated UTF-8 C strings.
 #[no_mangle]
 pub extern "C" fn wdmm_proxy_register_hls(
     device_id: *const c_char,
-    file_path: *const c_char,
-    mode_json: *const c_char,
+    input_url: *const c_char,
+    preset_id: *const c_char,
 ) -> FfiString {
     let device_str = match ptr_to_str(device_id) {
         Some(s) => s,
         None => return FfiString::from("error:invalid device_id"),
     };
-    let path_str = match ptr_to_str(file_path) {
+    let url_str = match ptr_to_str(input_url) {
         Some(s) => s,
-        None => return FfiString::from("error:invalid file_path"),
+        None => return FfiString::from("error:invalid input_url"),
     };
-    let mode_str = ptr_to_str(mode_json).unwrap_or(r#"{"mode":"direct_copy"}"#);
-    let mode = parse_hls_mode(mode_str);
+    let pid = match ptr_to_str(preset_id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid preset_id"),
+    };
+
+    let db = global_library_db();
+    let preset = match db.get_transcode_preset(pid) {
+        Ok(Some(p)) => p,
+        Ok(None) => return FfiString::from(format!("error:preset not found: {pid}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
 
     let guard = proxy_cell().lock().unwrap();
     let handle = match guard.as_ref() {
         Some(h) => h,
         None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
     };
-    let path = std::path::Path::new(path_str);
-    let reg = rt().block_on(handle.register_hls(device_str, path, mode, None, None));
+    let reg = rt().block_on(handle.register_hls(device_str, url_str, preset, None, None));
     match reg {
         Ok(r) => {
             let addr = handle.addr();
@@ -2242,25 +2307,6 @@ pub extern "C" fn wdmm_proxy_unregister_hls(token: *const c_char) -> FfiString {
         h.unregister_hls(tok);
     }
     FfiString::ok()
-}
-
-/// Parse an HLS mode JSON object.
-///
-/// ```json
-/// {"mode":"direct_copy"}
-/// {"mode":"compat","video_codec":"libx264","audio_codec":"aac"}
-/// ```
-///
-/// Unknown or missing `mode` field → [`HlsMode::DirectCopy`].
-fn parse_hls_mode(json: &str) -> wdmm_ffmpeg::HlsMode {
-    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
-    match v["mode"].as_str().unwrap_or("direct_copy") {
-        "compat" => wdmm_ffmpeg::HlsMode::Compat {
-            video_codec: v["video_codec"].as_str().map(Into::into),
-            audio_codec: v["audio_codec"].as_str().map(Into::into),
-        },
-        _ => wdmm_ffmpeg::HlsMode::DirectCopy,
-    }
 }
 
 // ── Proxy stream FFI ──────────────────────────────────────────────────────────

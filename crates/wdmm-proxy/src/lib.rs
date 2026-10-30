@@ -132,10 +132,10 @@ struct HlsSession {
     segment_dir: std::path::PathBuf,
     /// Active transcode job. Replaced atomically on seek.
     job: wdmm_ffmpeg::JobHandle,
-    /// Original input path — preserved so seek can restart the job.
-    input: std::path::PathBuf,
-    /// Transcode mode — preserved for seek restarts.
-    mode: wdmm_ffmpeg::HlsMode,
+    /// Original input URL (file path or http loopback URL) — for seek restarts.
+    input_url: String,
+    /// Transcode preset — preserved for seek restarts.
+    preset: wdmm_ffmpeg::TranscodePreset,
 }
 
 /// Result of a successful `register_hls` call.
@@ -164,7 +164,7 @@ struct Shared {
     /// Track active device+media pairs to enforce one-transcode-per-combo.
     /// Maps (device_id, media_path) -> token. When a new request arrives for the
     /// same combo, the old session is killed and replaced.
-    device_media_map: HashMap<(String, PathBuf), String>,
+    device_media_map: HashMap<(String, String), String>,
     addr: Option<SocketAddr>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// Drop the old sender to cancel the previous idle task; assign new one.
@@ -322,22 +322,21 @@ impl ProxyHandle {
 
     // ── HLS register / seek / unregister ─────────────────────────────────────
 
-    /// Register an HLS session for `input`.
-    ///
-    /// Calls [`wdmm_ffmpeg::open_job`] which creates the segment directory and
-    /// (once vendored binaries are wired) spawns the transcode process. Use
-    /// [`HlsMode::DirectCopy`] (the default) for codec-compatible media and
-    /// [`HlsMode::Compat`] for transcoding. For the 「单文件直通」 compat option
-    /// use [`register_file`](Self::register_file) with byte Range instead.
-    ///
-    /// Returns [`HlsRegistration`]; callers compose the playlist URL as
-    /// `http://{bind_host}:{port}{playlist_template}`.
     /// Register an HLS transcode session.
     ///
-    /// **Enforcement:** One transcode per `(device_id, input_path)` pair. If a
+    /// Calls [`wdmm_ffmpeg::open_job`] which starts an in-process libav
+    /// transcode/remux job writing `index.m3u8` + `.ts` segments into a
+    /// temp directory. The [`wdmm_ffmpeg::TranscodePreset`] drives codec
+    /// selection (`remux_first`, `video_codec`, `audio_codec`, …). For
+    /// 「单文件直通」 byte-Range playback use [`register_file`](Self::register_file).
+    ///
+    /// **Enforcement:** One transcode per `(device_id, input_url)` pair. If a
     /// session already exists for this combo, the old session is killed and
     /// replaced by the new one. Pass a unique `device_id` per player to avoid
     /// killing other devices' transcodes.
+    ///
+    /// `input_url` accepts a local file path or an `http://127.0.0.1:{port}/…`
+    /// loopback proxy stream URL (for encrypted source media).
     ///
     /// `ttl_secs` — optional time-to-live in seconds; `None` = no expiration.
     ///
@@ -347,33 +346,32 @@ impl ProxyHandle {
     pub async fn register_hls(
         &self,
         device_id: impl Into<String>,
-        input: impl Into<std::path::PathBuf>,
-        mode: wdmm_ffmpeg::HlsMode,
+        input_url: impl Into<String>,
+        preset: wdmm_ffmpeg::TranscodePreset,
         ttl_secs: Option<u64>,
         allowed_peers: Option<Vec<IpAddr>>,
     ) -> ProxyResult<HlsRegistration> {
         self.ensure_server().await?;
         let device_id = device_id.into();
-        let input = input.into();
+        let input_url = input_url.into();
 
         // Check if there's already a transcode for this device+media pair
         let old_token = {
             let g = self.shared.lock().unwrap();
-            g.device_media_map.get(&(device_id.clone(), input.clone())).cloned()
+            g.device_media_map.get(&(device_id.clone(), input_url.clone())).cloned()
         };
 
         // Kill the old session if it exists
         if let Some(token) = old_token {
-            info!("replacing existing HLS session for device={device_id}, input={input:?}");
+            info!("replacing existing HLS session for device={device_id}, input={input_url}");
             self.unregister_hls(&token);
         }
 
         let job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
-            input: input.clone(),
-            mode: mode.clone(),
-            subtitles: wdmm_ffmpeg::SubtitleMode::Off,
+            input_url: input_url.clone(),
+            preset: preset.clone(),
             start_offset_secs: 0.0,
-            segment_duration_secs: 6,
+            segment_dir: PathBuf::new(),
         })
         .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
         let segment_dir = job.segment_dir.clone();
@@ -383,9 +381,9 @@ impl ProxyHandle {
             let mut g = self.shared.lock().unwrap();
             g.hls_sessions.insert(
                 token.clone(),
-                HlsSession { segment_dir, job, input: input.clone(), mode },
+                HlsSession { segment_dir, job, input_url: input_url.clone(), preset },
             );
-            g.device_media_map.insert((device_id, input), token.clone());
+            g.device_media_map.insert((device_id, input_url), token.clone());
             let now = SystemTime::now();
             let expires_at = ttl_secs.map(|t| now + Duration::from_secs(t));
             g.token_meta.insert(token.clone(), TokenMeta {
@@ -404,20 +402,19 @@ impl ProxyHandle {
     /// The old segment directory is removed when the old [`JobHandle`] drops.
     /// No-op if the token is unknown.
     pub async fn seek_hls(&self, token: &str, offset_secs: f64) -> ProxyResult<()> {
-        // Extract input + mode without holding the lock across an await point.
-        let (input, mode) = {
+        // Extract input_url + preset without holding the lock across an await point.
+        let (input_url, preset) = {
             let g = self.shared.lock().unwrap();
             match g.hls_sessions.get(token) {
                 None => return Ok(()),
-                Some(s) => (s.input.clone(), s.mode.clone()),
+                Some(s) => (s.input_url.clone(), s.preset.clone()),
             }
         };
         let new_job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
-            input: input.clone(),
-            mode: mode.clone(),
-            subtitles: wdmm_ffmpeg::SubtitleMode::Off,
+            input_url: input_url.clone(),
+            preset: preset.clone(),
             start_offset_secs: offset_secs,
-            segment_duration_secs: 6,
+            segment_dir: PathBuf::new(),
         })
         .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
         let new_segment_dir = new_job.segment_dir.clone();
@@ -990,7 +987,7 @@ mod tests {
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
+            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
             .await
             .unwrap();
 
@@ -1019,7 +1016,7 @@ mod tests {
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
+            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
             .await
             .unwrap();
 
@@ -1043,14 +1040,14 @@ mod tests {
 
         // First registration
         let reg1 = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
+            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 1);
 
         // Second registration for same device+media kills the first
         let reg2 = proxy
-            .register_hls("device-1", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
+            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 1);
@@ -1058,7 +1055,7 @@ mod tests {
 
         // Different device can transcode the same file
         let _reg3 = proxy
-            .register_hls("device-2", &path, wdmm_ffmpeg::HlsMode::DirectCopy, None, None)
+            .register_hls("device-2", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 2);

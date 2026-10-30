@@ -155,3 +155,50 @@ pub struct QueueTask {
     pub local_path: Option<String>,  // destination path
 }
 
+
+// ── Transcode presets (B3.5) ──────────────────────────────────────────────────
+
+/// A DLNA cast transcode preset. Canonical type shared by wdmm-storage and
+/// wdmm-ffmpeg. See `wdmm-storage` schema v11 for the DB layout.
+///
+/// `video_codec = None`      → audio-only (no video stream).
+/// `container  = "original"` → pass-through without re-muxing.
+/// `audio_codec = "copy"`    → copy audio unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscodePreset {
+    /// Stable identifier (e.g. `"dlna-compat"`, `"passthrough"`).
+    pub id: String,
+    /// Human-readable label shown in the UI.
+    pub label: String,
+    /// Output container: `"mpegts"`, `"mp4"`, or `"original"`.
+    pub container: String,
+    /// Video codec: `"h264"` → tries `h264_mediacodec`, then `libx264`.
+    /// `None` = audio-only.
+    pub video_codec: Option<String>,
+    /// Prefer hardware encoder (`h264_mediacodec`) before `libx264`.
+    pub video_hw_preferred: bool,
+    /// Max output width px (scale-down only). `None` = no limit.
+    pub video_max_w: Option<u32>,
+    /// Max output height px. `None` = no limit.
+    pub video_max_h: Option<u32>,
+    /// Max video bitrate bits/s. `None` = no limit.
+    pub video_max_bitrate: Option<u32>,
+    /// Frame-rate cap (e.g. 30). `None` = no cap.
+    pub video_fps_cap: Option<u32>,
+    /// Audio codec: `"aac"`, `"mp3"`, or `"copy"`.
+    pub audio_codec: String,
+    /// Audio bitrate bits/s (e.g. `128_000`).
+    pub audio_bitrate: u32,
+    /// Output channel count (1 = mono, 2 = stereo).
+    pub audio_channels: u8,
+    /// Output sample rate Hz. `None` = keep source.
+    pub audio_sample_rate: Option<u32>,
+    /// HLS segment duration in seconds.
+    pub hls_segment_secs: u32,
+    /// Try remux (copy streams) before falling back to transcode.
+    pub remux_first: bool,
+    /// UI sort order (lower = earlier).
+    pub sort_order: u32,
+    /// `true` for the 5 factory presets.
+    pub is_builtin: bool,
+}
