@@ -83,6 +83,38 @@ impl TableDiff {
 mod dmr_prefs;
 pub use dmr_prefs::{DmrPrefRow, DmrPrefsDatabase};
 
+/// A signed media link issued by `POST /v1/media/link` (B4.5).
+#[derive(Debug, Clone)]
+pub struct MediaLinkRow {
+    /// Opaque 128-bit link ID (hex, 32 chars).
+    pub id: String,
+    pub account_id: String,
+    pub remote_path: String,
+    /// `"direct"` or `"proxy"`.
+    pub kind: String,
+    /// Proxy token (only set when `kind == "proxy"`).
+    pub proxy_token: Option<String>,
+    pub ttl_secs: u64,
+    /// Unix timestamp (seconds) when the link expires.
+    pub expires_at: i64,
+    pub revoked: bool,
+    pub created_at: i64,
+}
+
+fn media_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaLinkRow> {
+    Ok(MediaLinkRow {
+        id:           row.get(0)?,
+        account_id:   row.get(1)?,
+        remote_path:  row.get(2)?,
+        kind:         row.get(3)?,
+        proxy_token:  row.get(4)?,
+        ttl_secs:     row.get::<_, i64>(5)? as u64,
+        expires_at:   row.get(6)?,
+        revoked:      row.get::<_, i64>(7)? != 0,
+        created_at:   row.get(8)?,
+    })
+}
+
 /// Summary returned by [`LibraryDatabase::import_from_sqflite`].
 ///
 /// The JSON shape is additive: `deleted_tracks` and `sync_state` (v6) were
@@ -522,6 +554,24 @@ impl LibraryDatabase {
                 is_builtin        INTEGER NOT NULL DEFAULT 0,
                 updated_at        INTEGER NOT NULL
             );
+
+            -- ── Media links (schema v12, B4.5) ───────────────────────────────
+            -- Signed links issued by POST /v1/media/link (direct or proxy).
+            CREATE TABLE IF NOT EXISTS media_links (
+                id          TEXT PRIMARY KEY,
+                account_id  TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                kind        TEXT NOT NULL CHECK(kind IN ('direct','proxy')),
+                proxy_token TEXT,
+                ttl_secs    INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL,
+                revoked     INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS media_links_proxy_token
+                ON media_links (proxy_token) WHERE proxy_token IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS media_links_expires
+                ON media_links (expires_at);
             "#,
         )?;
 
@@ -861,6 +911,35 @@ impl LibraryDatabase {
             ))?;
             conn.execute(
                 "INSERT OR IGNORE INTO _schema_version (version) VALUES (11)",
+                [],
+            )?;
+        }
+
+        // ── v12 migration: media_links table ─────────────────────────────────
+        if current_ver < 12 {
+            // Table + indexes already created by fresh-schema DDL; only needed
+            // for existing DBs that started on v11.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS media_links (
+                    id          TEXT PRIMARY KEY,
+                    account_id  TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    kind        TEXT NOT NULL CHECK(kind IN ('direct','proxy')),
+                    proxy_token TEXT,
+                    ttl_secs    INTEGER NOT NULL,
+                    expires_at  INTEGER NOT NULL,
+                    revoked     INTEGER NOT NULL DEFAULT 0,
+                    created_at  INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS media_links_proxy_token
+                    ON media_links (proxy_token) WHERE proxy_token IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS media_links_expires
+                    ON media_links (expires_at);
+                "#,
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (12)",
                 [],
             )?;
         }
@@ -1763,6 +1842,88 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM transcode_presets WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // ── Media links (B4.5) ───────────────────────────────────────────────────
+
+    /// Insert a new media link record.
+    pub fn create_media_link(&self, link: &MediaLinkRow) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO media_links
+             (id, account_id, remote_path, kind, proxy_token, ttl_secs,
+              expires_at, revoked, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                link.id, link.account_id, link.remote_path, link.kind,
+                link.proxy_token, link.ttl_secs as i64, link.expires_at,
+                link.revoked as i64, link.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up a media link by its opaque `id`.
+    pub fn get_media_link(&self, id: &str) -> StorageResult<Option<MediaLinkRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,account_id,remote_path,kind,proxy_token,ttl_secs,
+                    expires_at,revoked,created_at
+             FROM media_links WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(media_link_from_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Look up a media link by its `proxy_token` (for proxy mode 410 checks).
+    pub fn get_media_link_by_token(&self, token: &str) -> StorageResult<Option<MediaLinkRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,account_id,remote_path,kind,proxy_token,ttl_secs,
+                    expires_at,revoked,created_at
+             FROM media_links WHERE proxy_token = ?1",
+        )?;
+        let mut rows = stmt.query(params![token])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(media_link_from_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Mark a link as revoked by its opaque `id`.
+    pub fn revoke_media_link(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE media_links SET revoked = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a link as revoked by its `proxy_token`.
+    pub fn revoke_media_link_by_token(&self, token: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE media_links SET revoked = 1 WHERE proxy_token = ?1",
+            params![token],
+        )?;
+        Ok(())
+    }
+
+    /// Delete expired links older than `before_ts` (Unix seconds).
+    /// Call this periodically to keep the table small.
+    pub fn cleanup_expired_media_links(&self, before_ts: i64) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM media_links WHERE expires_at < ?1",
+            params![before_ts],
+        )?;
+        Ok(n)
     }
 }
 

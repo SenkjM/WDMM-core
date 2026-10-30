@@ -54,7 +54,7 @@ async fn main() {
     println!("  curl -H 'Authorization: Bearer {}' http://127.0.0.1:{port}/v1/accounts", config.token);
     println!("  curl -H 'Authorization: Bearer {}' http://127.0.0.1:{port}/v1/tasks", config.token);
 
-    let server = ApiServer::start(config, db, queue)
+    let server = ApiServer::start(config, db, queue, None)
         .await
         .expect("failed to start API server");
 

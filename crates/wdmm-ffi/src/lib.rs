@@ -211,13 +211,172 @@ pub extern "C" fn wdmm_queue_pending_count() -> i32 {
 
 // ── OpenAPI server ────────────────────────────────────────────────────────────
 
-use wdmm_openapi::{ApiServer, BindMode, ServerConfig};
+use wdmm_openapi::{
+    ApiServer, BindMode, MediaLinkFn, MediaLinkHeader, MediaLinkRequest, MediaLinkResponse,
+    ServerConfig,
+};
 
 /// Shared server handle.
 fn server_cell() -> &'static std::sync::Mutex<Option<ApiServer>> {
     static S: OnceLock<std::sync::Mutex<Option<ApiServer>>> = OnceLock::new();
     S.get_or_init(|| std::sync::Mutex::new(None))
 }
+/// Build the [`MediaLinkFn`] callback injected into the OpenAPI server at startup.
+///
+/// - **direct** mode: resolves driver → `driver.get(path)` → raw URL + auth headers.
+/// - **proxy** mode: resolves driver → registers byte-range callback with in-process
+///   proxy → returns loopback proxy URL.
+///
+/// Both modes persist a [`wdmm_storage::MediaLinkRow`] for TTL tracking.
+fn build_media_link_fn() -> MediaLinkFn {
+    std::sync::Arc::new(|req: MediaLinkRequest| -> wdmm_openapi::BoxFuture<_> {
+        Box::pin(async move {
+            let MediaLinkRequest { account_id, remote_path, mode, ttl_secs } = req;
+
+            // Helper: driver_for_account returns FfiString errors; convert cleanly.
+            macro_rules! get_driver {
+                ($id:expr) => {
+                    match driver_for_account($id) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let msg = unsafe {
+                                std::ffi::CStr::from_ptr(e.ptr).to_string_lossy().to_string()
+                            };
+                            unsafe { drop(std::ffi::CString::from_raw(e.ptr)); }
+                            return Err(msg);
+                        }
+                    }
+                };
+            }
+
+            let now = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            };
+
+            // ── Proxy mode ────────────────────────────────────────────────────
+            if mode == "proxy" {
+                let driver = get_driver!(&account_id);
+
+                // File metadata (size for Content-Length hint).
+                let item = driver.get(&remote_path).await
+                    .map_err(|e| format!("driver.get: {e}"))?;
+                let file_size = item.size;
+
+                // Clone proxy handle before any await (holds no lock).
+                let proxy_handle = {
+                    let guard = proxy_cell().lock().unwrap();
+                    match guard.as_ref() {
+                        Some(h) => h.clone(),
+                        None => return Err(
+                            "proxy not started — call wdmm_proxy_start first".into()
+                        ),
+                    }
+                };
+
+                // ranges_fn: re-creates driver per call so per-request auth tokens
+                // (e.g. Aliyun time-limited URLs) stay fresh.
+                let account_id2 = account_id.clone();
+                let path2 = remote_path.clone();
+                let ranges_fn = move |start: i64, end: i64| -> wdmm_proxy::BoxStream {
+                    let aid = account_id2.clone();
+                    let path = path2.clone();
+                    let driver = match driver_for_account(&aid) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            unsafe { drop(std::ffi::CString::from_raw(e.ptr)); }
+                            return Box::pin(futures::stream::once(futures::future::ready(
+                                Err(std::io::Error::other("driver unavailable")),
+                            )));
+                        }
+                    };
+                    let start_u  = start.max(0) as u64;
+                    let end_opt  = if end < 0 { None } else { Some(end as u64) };
+                    Box::pin(futures::stream::once(async move {
+                        driver.get_content_range(&path, start_u, end_opt)
+                            .await
+                            .map(bytes::Bytes::from)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    }))
+                };
+
+                let reg = proxy_handle
+                    .register_driver(
+                        file_size, Some(remote_path.clone()), Some(ttl_secs), None, ranges_fn,
+                    )
+                    .await
+                    .map_err(|e| format!("proxy register: {e}"))?;
+
+                let addr    = proxy_handle.addr();
+                let host    = addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "127.0.0.1".into());
+                let port    = addr.map(|a| a.port()).unwrap_or(0);
+                let url     = format!("http://{}:{}{}", host, port, reg.path_template);
+                let ts      = now();
+                let item_id = uuid::Uuid::new_v4().to_string();
+                let expires = ts + ttl_secs as i64;
+
+                let _ = global_library_db().create_media_link(&wdmm_storage::MediaLinkRow {
+                    id: item_id.clone(),
+                    account_id,
+                    remote_path,
+                    kind: "proxy".into(),
+                    proxy_token: Some(reg.token),
+                    ttl_secs,
+                    expires_at: expires,
+                    revoked: false,
+                    created_at: ts,
+                });
+
+                return Ok(MediaLinkResponse {
+                    kind: "proxy".into(),
+                    url,
+                    headers: vec![],
+                    expires_at: expires,
+                    item_id,
+                });
+            }
+
+            // ── Direct mode ───────────────────────────────────────────────────
+            let driver = get_driver!(&account_id);
+            let item   = driver.get(&remote_path).await
+                .map_err(|e| format!("driver.get: {e}"))?;
+            let url    = item.raw_url
+                .ok_or_else(|| "no direct URL available for this file".to_string())?;
+            let headers: Vec<MediaLinkHeader> = item
+                .raw_headers
+                .into_iter()
+                .map(|(name, value)| MediaLinkHeader { name, value })
+                .collect();
+
+            let ts      = now();
+            let item_id = uuid::Uuid::new_v4().to_string();
+            let expires = ts + ttl_secs as i64;
+
+            let _ = global_library_db().create_media_link(&wdmm_storage::MediaLinkRow {
+                id: item_id.clone(),
+                account_id,
+                remote_path,
+                kind: "direct".into(),
+                proxy_token: None,
+                ttl_secs,
+                expires_at: expires,
+                revoked: false,
+                created_at: ts,
+            });
+
+            Ok(MediaLinkResponse {
+                kind: "direct".into(),
+                url,
+                headers,
+                expires_at: expires,
+                item_id,
+            })
+        })
+    })
+}
+
 
 /// Start the OpenAPI server on 127.0.0.1 at the given port.
 ///
@@ -245,7 +404,7 @@ pub extern "C" fn wdmm_openapi_start(port: u16) -> FfiString {
         token: token.clone(),
     };
 
-    match rt().block_on(ApiServer::start(config, db, queue)) {
+    match rt().block_on(ApiServer::start(config, db, queue, Some(build_media_link_fn()))) {
         Ok(server) => {
             *guard = Some(server);
             FfiString::from(token)

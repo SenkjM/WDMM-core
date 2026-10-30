@@ -14,11 +14,11 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::sync::{oneshot, RwLock};
 use wdmm_core::models::{CloudAccount, LibraryTrack};
@@ -38,6 +38,58 @@ pub enum ApiError {
 }
 
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
+
+// ── Media-link callback types (B4.5) ─────────────────────────────────────────
+
+/// Boxed async future returned by [`MediaLinkFn`].
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// Async callback that resolves one `POST /v1/media/link` request.
+/// Implemented in `wdmm-ffi` and injected at server startup.
+pub type MediaLinkFn = Arc<
+    dyn Fn(MediaLinkRequest) -> BoxFuture<Result<MediaLinkResponse, String>>
+        + Send
+        + Sync,
+>;
+
+/// Incoming body for `POST /v1/media/link`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaLinkRequest {
+    pub account_id: String,
+    pub remote_path: String,
+    /// `"direct"` (default) or `"proxy"`.
+    #[serde(default = "default_link_mode")]
+    pub mode: String,
+    /// Link validity in seconds (default 7200 = 2 h; 86400 for downloads).
+    #[serde(default = "default_link_ttl")]
+    pub ttl_secs: u64,
+}
+
+fn default_link_mode() -> String { "direct".into() }
+fn default_link_ttl()  -> u64    { 7200 }
+
+/// Outgoing body for `POST /v1/media/link`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaLinkResponse {
+    /// `"direct"` or `"proxy"`.
+    pub kind: String,
+    /// Resolved URL (raw upstream URL or `http://…/s/<token>`).
+    pub url: String,
+    /// Auth headers to include when fetching (direct mode only; never logged).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<MediaLinkHeader>,
+    /// Unix timestamp when this link expires.
+    pub expires_at: i64,
+    /// Opaque link ID (for future revocation).
+    pub item_id: String,
+}
+
+/// One HTTP header forwarded with a direct link.
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaLinkHeader {
+    pub name: String,
+    pub value: String,
+}
 
 /// OpenAPI server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +157,8 @@ struct AppState {
     queue: Arc<TaskQueue>,
     /// Current bearer token — updated in-place on rotate.
     token: Arc<tokio::sync::RwLock<String>>,
+    /// Optional callback for `POST /v1/media/link` (None → 501).
+    media_link: Option<MediaLinkFn>,
 }
 
 impl AppState {
@@ -113,12 +167,14 @@ impl AppState {
         db: Arc<LibraryDatabase>,
         queue: Arc<TaskQueue>,
         token: String,
+        media_link: Option<MediaLinkFn>,
     ) -> Self {
         Self {
             config,
             db,
             queue,
             token: Arc::new(tokio::sync::RwLock::new(token)),
+            media_link,
         }
     }
 
@@ -557,6 +613,34 @@ async fn set_playlist_entries(
     }
 }
 
+// ── Handler: POST /v1/media/link ─────────────────────────────────────────────
+
+async fn post_media_link(
+    State(state): State<AppState>,
+    Json(req): Json<MediaLinkRequest>,
+) -> impl IntoResponse {
+    let Some(ref handler) = state.media_link else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "media link service not available"})),
+        )
+            .into_response();
+    };
+    match handler(req).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) if e.starts_with("expired:") || e.starts_with("revoked:") => (
+            StatusCode::GONE,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 fn build_router(state: AppState) -> Router {
@@ -575,6 +659,8 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/playlists", get(list_playlists).post(create_playlist))
         .route("/v1/playlists/:id", get(get_playlist).put(update_playlist).delete(delete_playlist))
         .route("/v1/playlists/:id/entries", get(list_playlist_entries).put(set_playlist_entries))
+        // ── Media links (B4.5) ────────────────────────────────────────────────
+        .route("/v1/media/link", post(post_media_link))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -606,6 +692,7 @@ impl ApiServer {
         config: ServerConfig,
         db: Arc<LibraryDatabase>,
         queue: Arc<TaskQueue>,
+        media_link: Option<MediaLinkFn>,
     ) -> ApiResult<Self> {
         let addr = format!(
             "{}:{}",
@@ -640,6 +727,7 @@ impl ApiServer {
             db,
             queue,
             token.clone(),
+            media_link,
         );
         let live_token = Arc::clone(&state.token);
         let app = build_router(state);
@@ -703,7 +791,7 @@ mod tests {
             port: 0,
             token: "test-token".into(),
         };
-        let server = ApiServer::start(config, db, queue).await.unwrap();
+        let server = ApiServer::start(config, db, queue, None).await.unwrap();
         let base = format!("http://127.0.0.1:{}", server.port());
         let client = reqwest::Client::new();
         (server, client, base)
@@ -815,7 +903,7 @@ mod tests {
             port: 0,
             token: "tok2".into(),
         };
-        let server = ApiServer::start(config, db, Arc::clone(&queue)).await.unwrap();
+        let server = ApiServer::start(config, db, Arc::clone(&queue), None).await.unwrap();
         let base = format!("http://127.0.0.1:{}", server.port());
         let client = reqwest::Client::new();
 
@@ -853,7 +941,7 @@ mod tests {
             port: 0,
             token: "persist-me-123".into(),
         };
-        let server = ApiServer::start(config, Arc::clone(&db), Arc::clone(&queue))
+        let server = ApiServer::start(config, Arc::clone(&db), Arc::clone(&queue), None)
             .await
             .unwrap();
         server.stop().await;
@@ -870,7 +958,7 @@ mod tests {
             port: 0,
             token: String::new(),
         };
-        let server2 = ApiServer::start(config2, db, queue).await.unwrap();
+        let server2 = ApiServer::start(config2, db, queue, None).await.unwrap();
         let base = format!("http://127.0.0.1:{}", server2.port());
         let client = reqwest::Client::new();
 
@@ -893,7 +981,7 @@ mod tests {
             port: 0,
             token: "old-tok".into(),
         };
-        let server = ApiServer::start(config, db, queue).await.unwrap();
+        let server = ApiServer::start(config, db, queue, None).await.unwrap();
         let base = format!("http://127.0.0.1:{}", server.port());
         let client = reqwest::Client::new();
 

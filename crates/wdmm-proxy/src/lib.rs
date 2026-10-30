@@ -195,6 +195,7 @@ pub struct Registration {
 ///
 /// The server starts lazily on the first `register_*` and shuts down after
 /// `idle_timeout` of inactivity. Dropping the handle stops the server.
+#[derive(Clone)]
 pub struct ProxyHandle {
     bind_mode: BindMode,
     port: u16,
