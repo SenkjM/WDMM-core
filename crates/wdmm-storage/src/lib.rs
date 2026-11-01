@@ -2435,26 +2435,31 @@ impl LibraryDatabase {
     /// Deletion order is children-first; no FK cascade is assumed.
     pub fn delete_user_folder(&self, id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
-        let descendants = collect_descendants(&conn, id)?;
         let tx = conn.unchecked_transaction()?;
-        // Order is deepest-first (children before parents) for clarity;
-        // no FK enforces ordering but it mirrors logical dependency.
-        for desc_id in descendants.iter().rev() {
-            tx.execute(
-                "DELETE FROM user_folder_items WHERE folder_id = ?1",
-                params![desc_id],
-            )?;
-            tx.execute(
-                "DELETE FROM user_folders WHERE id = ?1",
-                params![desc_id],
-            )?;
-        }
-        // Self items + self.
+        // Delete all descendant items + folders plus the root in two parameterized
+        // CTE-prefixed DELETE statements (M2 fix): no per-node execute() loop, no
+        // string interpolation.  The recursive CTE collects all descendant IDs in
+        // one round-trip; the DELETE consumes it via `IN (SELECT ...)`.
         tx.execute(
-            "DELETE FROM user_folder_items WHERE folder_id = ?1",
+            "WITH RECURSIVE cte(id) AS (
+                 SELECT id FROM user_folders WHERE parent_id = ?1
+                 UNION ALL
+                 SELECT uf.id FROM user_folders uf INNER JOIN cte ON uf.parent_id = cte.id
+             )
+             DELETE FROM user_folder_items
+             WHERE folder_id IN (SELECT id FROM cte) OR folder_id = ?1",
             params![id],
         )?;
-        tx.execute("DELETE FROM user_folders WHERE id = ?1", params![id])?;
+        tx.execute(
+            "WITH RECURSIVE cte(id) AS (
+                 SELECT id FROM user_folders WHERE parent_id = ?1
+                 UNION ALL
+                 SELECT uf.id FROM user_folders uf INNER JOIN cte ON uf.parent_id = cte.id
+             )
+             DELETE FROM user_folders
+             WHERE id IN (SELECT id FROM cte) OR id = ?1",
+            params![id],
+        )?;
         tx.commit()?;
         Ok(())
     }
