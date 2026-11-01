@@ -99,18 +99,17 @@ cd "$X264_SRC"
 # sysroot.  -fPIC is required because FFmpeg will link x264 into a .so.
 #
 # The x264 stable branch switched to an autoconf-based configure (NDK r28
-# era) that ignores --cc= but respects the CC env var for AC_PROG_CC.
-# We export CC here so autoconf picks it up; we also pass --cc= for
-# compatibility with older hand-rolled x264 configure scripts.
+# era). It respects CC/CXX/AR env vars for AC_PROG_CC but rejects --cc=
+# and --disable-shared as unknown options. We also disable asm to avoid
+# requiring NASM (Android cross-compile doesn't need it for our use case).
 export CC="${CC}"
 export CXX="${CXX}"
 export AR="${AR}"
 ./configure \
   --host="$X264_HOST" \
   --cross-prefix="${TOOLCHAIN}/${TRIPLE}${MIN_API}-" \
-  --cc="${CC}" \
   --enable-static \
-  --disable-shared \
+  --disable-asm \
   --disable-opencl \
   --disable-cli \
   --extra-cflags="-fPIC -O2" \
