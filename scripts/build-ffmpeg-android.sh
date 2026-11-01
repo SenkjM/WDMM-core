@@ -201,9 +201,11 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
   --prefix="$FFMPEG_INSTALL" \
   --disable-x86asm
 
-# Inject --max-page-size into LDFLAGS for shared library linking
-log "--- inject --max-page-size into config.mak ---"
-sed -i "s|^LDFLAGS=|LDFLAGS=${PAGE_SIZE_LDFLAGS} |" ffbuild/config.mak
+# Inject --max-page-size into SHFLAGS for shared library linking.
+# FFmpeg's build system uses SHFLAGS (not LDFLAGS) when linking .so files;
+# LDFLAGS only applies to program targets (ffmpeg/ffprobe, which we disable).
+log "--- inject --max-page-size into config.mak SHFLAGS ---"
+sed -i "s|^SHFLAGS=|SHFLAGS=${PAGE_SIZE_LDFLAGS} |" ffbuild/config.mak
 
 # ── License guard ───────────────────────────────────────────────────────────
 # The PLAN (m01480) forbids --enable-nonfree in an AGPL project.  FFmpeg's
