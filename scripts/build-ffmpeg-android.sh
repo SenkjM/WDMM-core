@@ -206,6 +206,9 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
 # LDFLAGS only applies to program targets (ffmpeg/ffprobe, which we disable).
 log "--- inject --max-page-size into config.mak SHFLAGS ---"
 sed -i "s|^SHFLAGS=|SHFLAGS=${PAGE_SIZE_LDFLAGS} |" ffbuild/config.mak
+# Diagnostic: confirm the sed matched and what SHFLAGS now contains.
+log "  SHFLAGS after inject:"
+grep '^SHFLAGS=' ffbuild/config.mak | sed 's/^/    /'
 
 # ── License guard ───────────────────────────────────────────────────────────
 # The PLAN (m01480) forbids --enable-nonfree in an AGPL project.  FFmpeg's
@@ -243,11 +246,18 @@ log "--- 16 KB page alignment audit ---"
 bad=0
 for so in "${OUTPUT_DIR}"/lib*.so; do
   # LOAD segment alignment must be >= 0x4000 (16384) for Android 15 16 KB pages.
+  # readelf -lW prints program headers indented ("  LOAD  ..."), so match on
+  # the first field == LOAD. The alignment is the final field (hex with 0x).
   align=$(readelf -lW "$so" 2>/dev/null \
-    | awk '/^LOAD/ {print $NF; exit}' \
-    | sed 's/^0*//' || true)
-  if [ -z "$align" ] || [ "$((align))" -lt 16384 ]; then
-    err "  ${so##*/}: LOAD alignment < 16384 (got ${align:-?})"
+    | awk '$1=="LOAD" {print $NF; exit}' || true)
+  # Strip 0x prefix so bash $(( )) parses it as hex via 16#.
+  align="${align#0x}"
+  align="${align#0X}"
+  if [ -z "$align" ]; then
+    err "  ${so##*/}: could not read LOAD alignment (got ?)"
+    bad=1
+  elif [ "$((16#$align))" -lt 16384 ]; then
+    err "  ${so##*/}: LOAD alignment < 16384 (got 0x${align})"
     bad=1
   fi
 done
