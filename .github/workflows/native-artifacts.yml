@@ -129,10 +129,9 @@ jobs:
       - name: Build wdmm-ffi for windows-x64
         # Windows CI has no FFmpeg libs available, so we build without the
         # `ffmpeg` feature — wdmm-ffmpeg stubs all APIs (no libav* link).
+        # WDMM_FFMPEG_LIB_DIR is intentionally absent; build.rs skips link
+        # directives when CARGO_FEATURE_FFMPEG is not set (no --features ffmpeg).
         run: cargo build --release -p wdmm-ffi
-        env:
-          # WDMM_FFMPEG_LIB_DIR is intentionally absent; build.rs skips link
-          # directives when CARGO_FEATURE_FFMPEG is not set (no --features ffmpeg).
 
       - name: Stage artifact and write COMMIT.txt
         shell: bash
