@@ -97,6 +97,14 @@ cd "$X264_SRC"
 # x264's configure does not understand --sysroot; it relies on the
 # cross-prefix to point at the NDK clang driver, which honours its own
 # sysroot.  -fPIC is required because FFmpeg will link x264 into a .so.
+#
+# The x264 stable branch switched to an autoconf-based configure (NDK r28
+# era) that ignores --cc= but respects the CC env var for AC_PROG_CC.
+# We export CC here so autoconf picks it up; we also pass --cc= for
+# compatibility with older hand-rolled x264 configure scripts.
+export CC="${CC}"
+export CXX="${CXX}"
+export AR="${AR}"
 ./configure \
   --host="$X264_HOST" \
   --cross-prefix="${TOOLCHAIN}/${TRIPLE}${MIN_API}-" \
