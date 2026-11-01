@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
-use wdmm_ffmpeg::{open_job, JobOpts, HlsMode, SubtitleMode};
+use wdmm_ffmpeg::{open_job, JobOpts};
+use wdmm_ffmpeg::preset;
 
 /// Generate a short test video using ffmpeg. Returns path to the video file.
 async fn create_test_video() -> PathBuf {
@@ -39,11 +40,10 @@ async fn hls_job_produces_segments() {
     let video = create_test_video().await;
 
     let handle = open_job(JobOpts {
-        input: video,
-        mode: HlsMode::DirectCopy,
-        subtitles: SubtitleMode::Off,
+        input_url: video.to_string_lossy().into_owned(),
+        preset: preset::preset_passthrough(),
         start_offset_secs: 0.0,
-        segment_duration_secs: 2,
+        segment_dir: PathBuf::new(), // empty → open_job auto-creates a temp dir
     })
     .expect("failed to open job");
 
@@ -65,7 +65,7 @@ async fn hls_job_produces_segments() {
         let segments: Vec<_> = std::fs::read_dir(&segment_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ts"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ts"))
             .collect();
         if !segments.is_empty() {
             // Success

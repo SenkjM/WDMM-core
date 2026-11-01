@@ -1040,7 +1040,7 @@ mod tests {
         ));
         std::fs::write(&path, b"stub").unwrap();
 
-        let proxy = ProxyHandle::new(([127, 0, 0, 1], 0).into());
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
 
         // First registration
         let reg1 = proxy

@@ -684,8 +684,7 @@ mod tests {
 
     #[test]
     fn config_requires_token() {
-        let mut cfg = AliyunConfig::default();
-        cfg.drive_id = "drv1".into();
+        let cfg = AliyunConfig { drive_id: "drv1".into(), ..Default::default() };
         assert!(matches!(
             AliyunDriver::new(cfg),
             Err(DriverError::Config(_))
@@ -694,8 +693,7 @@ mod tests {
 
     #[test]
     fn config_requires_drive_id() {
-        let mut cfg = AliyunConfig::default();
-        cfg.access_token = "tok".into();
+        let cfg = AliyunConfig { access_token: "tok".into(), ..Default::default() };
         assert!(matches!(
             AliyunDriver::new(cfg),
             Err(DriverError::Config(_))

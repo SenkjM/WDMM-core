@@ -5264,7 +5264,7 @@ mod tests {
     fn proxy_register_stream_smoke() {
         let _guard = proxy_lock().lock().unwrap();
         // Start proxy on an OS-assigned port.
-        let port_str = wdmm_proxy_start(0);
+        let port_str = unsafe { wdmm_proxy_start(c"loopback".as_ptr(), 0) };
         let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
         wdmm_ffi_free_string(port_str);
         let port: u16 = port_s.parse().expect("proxy_start returns a port");
@@ -5416,7 +5416,7 @@ mod tests {
         }
 
         // Start the proxy on an OS-assigned port.
-        let port_str = wdmm_proxy_start(0);
+        let port_str = unsafe { wdmm_proxy_start(c"loopback".as_ptr(), 0) };
         let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
         wdmm_ffi_free_string(port_str);
         let port: u16 = port_s.parse().expect("proxy_start returns a port");
@@ -5461,7 +5461,7 @@ mod tests {
             let buf = wdmm_proxy_stream_alloc_buf(ADATA.len());
             assert!(!buf.is_null(), "alloc_buf returned null");
             unsafe { std::ptr::copy_nonoverlapping(ADATA.as_ptr(), buf, ADATA.len()) };
-            wdmm_proxy_stream_set_result(req_id, buf, ADATA.len(), 0);
+            unsafe { wdmm_proxy_stream_set_result(req_id, buf, ADATA.len(), 0) };
         });
 
         // GET — blocks invoke_c_callback until the reply thread calls set_result.
@@ -5527,7 +5527,7 @@ mod tests {
             0 // async intent
         }
 
-        let port_str = wdmm_proxy_start(0);
+        let port_str = unsafe { wdmm_proxy_start(c"loopback".as_ptr(), 0) };
         let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
         wdmm_ffi_free_string(port_str);
         let port: u16 = port_s.parse().expect("proxy_start returns a port");
@@ -5558,7 +5558,7 @@ mod tests {
                 .unwrap();
             assert!(!tout.timed_out());
             let req_id = guard.unwrap();
-            wdmm_proxy_stream_set_result(req_id, std::ptr::null_mut(), 0, -1);
+            unsafe { wdmm_proxy_stream_set_result(req_id, std::ptr::null_mut(), 0, -1) };
         });
 
         // GET — the proxy should surface an IO error (connection reset / partial
@@ -5604,7 +5604,7 @@ mod tests {
     fn proxy_start_stop_and_register_file() {
         let _guard = proxy_lock().lock().unwrap();
         // Start on an OS-assigned port.
-        let port_str = wdmm_proxy_start(0);
+        let port_str = unsafe { wdmm_proxy_start(c"loopback".as_ptr(), 0) };
         let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
         wdmm_ffi_free_string(port_str);
         let port: u16 = port_s.parse().expect("proxy_start returns a port");
@@ -6229,7 +6229,7 @@ mod tests {
         let r = wdmm_manga_list();
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         let arr: serde_json::Value = serde_json::from_str(s).unwrap();
-        assert!(arr.as_array().unwrap().len() >= 1);
+        assert!(!arr.as_array().unwrap().is_empty());
         wdmm_ffi_free_string(r);
 
         // ── set_pages ─────────────────────────────────────────────────────────
@@ -6276,7 +6276,7 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
         assert!(!s.starts_with("error:"), "wdmm_manga_list_progress failed: {s}");
         let prog_arr: serde_json::Value = serde_json::from_str(s).unwrap();
-        assert!(prog_arr.as_array().unwrap().len() >= 1);
+        assert!(!prog_arr.as_array().unwrap().is_empty());
         wdmm_ffi_free_string(r);
 
         // ── list_series ───────────────────────────────────────────────────────
@@ -6331,7 +6331,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let id = v["id"].as_str().unwrap().to_string();
         assert_eq!(v["display_name"], "NAS");
-        assert!(v["credentials_b64"].as_str().unwrap().len() > 0);
+        assert!(!v["credentials_b64"].as_str().unwrap().is_empty());
 
         let r = wdmm_account_list();
         let list_s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();

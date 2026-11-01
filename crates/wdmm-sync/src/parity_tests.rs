@@ -7,6 +7,8 @@
 //        11 (container tomb source\0path), 12B (local wins), 12C (exact tie),
 //        13 (legacy loose-image skip), 14 (full rebuild clears tombs + cursor).
 
+use wdmm_core::models::LibraryTrack;
+
 // ── Music ─────────────────────────────────────────────────────────────────────
 
 /// Scenario 2: cloud rev=80 wins; B's stale rev=30 is not uploaded.

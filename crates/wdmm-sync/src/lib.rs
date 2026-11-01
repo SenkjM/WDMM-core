@@ -963,6 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_sync_all_aggregates() {
+        use wdmm_core::models::LibraryTrack;
         let db = tmp_db();
         let driver = Arc::new(MockDriver::new());
         db.insert_account(&CloudAccount {
@@ -1206,6 +1207,7 @@ mod tests {
     /// records them as consumed and they are skipped.
     #[tokio::test]
     async fn incremental_stable_base_skips_lib_reads() {
+        use wdmm_core::models::LibraryTrack;
         let driver = Arc::new(MockDriver::new());
         let db = tmp_db();
 

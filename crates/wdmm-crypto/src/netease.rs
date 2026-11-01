@@ -233,7 +233,7 @@ mod tests {
     fn test_linuxapi_uppercase_hex() {
         let payload = json!({"url": "u", "method": "POST"});
         let eparams = linuxapi_encrypt(&payload);
-        assert!(eparams.chars().all(|c| c.is_ascii_hexdigit() && (c.is_uppercase() || c.is_digit(10))));
+        assert!(eparams.chars().all(|c| c.is_ascii_hexdigit() && (c.is_uppercase() || c.is_ascii_digit())));
         assert_eq!(eparams.len() % 32, 0);
     }
 }

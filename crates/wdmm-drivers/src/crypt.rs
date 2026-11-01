@@ -369,7 +369,7 @@ mod tests {
                 .ok_or_else(|| DriverError::NotFound(path.to_string()))?;
 
             Ok(CloudFileItem {
-                name: path.split('/').last().unwrap_or("").to_string(),
+                name: path.split('/').next_back().unwrap_or("").to_string(),
                 is_dir: false,
                 size: data.len() as u64,
                 modified: Some(chrono::Utc::now()),

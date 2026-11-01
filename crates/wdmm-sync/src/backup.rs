@@ -1615,7 +1615,7 @@ mod tests {
         let sections_empty = parse_bk_container(&bk_empty_container).unwrap();
 
         // Verify PASS_CHECK section does NOT exist
-        assert!(sections_empty.get(&SEC_PASS_CHECK).is_none(), "PASS_CHECK should not exist with empty passphrase");
+        assert!(!sections_empty.contains_key(&SEC_PASS_CHECK), "PASS_CHECK should not exist with empty passphrase");
     }
 
     #[test]
@@ -1926,14 +1926,14 @@ mod tests {
         let bk = build_backup_bytes(&lib, None, "", None).unwrap();
         let container = envelope_decrypt(&bk, "").unwrap();
         let secs = parse_bk_container(&container).unwrap();
-        assert!(secs.get(&SEC_COVERS).is_none(), "COVERS must be absent when roots not set");
-        assert!(secs.get(&SEC_MANGA_COVERS).is_none(), "MANGA_COVERS must be absent when roots not set");
+        assert!(!secs.contains_key(&SEC_COVERS), "COVERS must be absent when roots not set");
+        assert!(!secs.contains_key(&SEC_MANGA_COVERS), "MANGA_COVERS must be absent when roots not set");
 
         // Track record must not carry coverIndex
         let tracks_raw = secs.get(&SEC_TRACKS).unwrap();
         let recs = decode_records(tracks_raw, TRACK_INT_TAGS).unwrap();
         assert_eq!(recs.len(), 1);
-        assert!(recs[0].get(&TAG_TRACK_COVER_INDEX).is_none(), "no coverIndex without roots");
+        assert!(!recs[0].contains_key(&TAG_TRACK_COVER_INDEX), "no coverIndex without roots");
     }
 
     #[test]
@@ -1961,10 +1961,10 @@ mod tests {
         let bk = build_backup_bytes(&lib, None, "", Some(&roots)).unwrap();
         let container = envelope_decrypt(&bk, "").unwrap();
         let secs = parse_bk_container(&container).unwrap();
-        assert!(secs.get(&SEC_COVERS).is_none(), "COVERS absent when files missing");
+        assert!(!secs.contains_key(&SEC_COVERS), "COVERS absent when files missing");
         let tracks_raw = secs.get(&SEC_TRACKS).unwrap();
         let recs = decode_records(tracks_raw, TRACK_INT_TAGS).unwrap();
-        assert!(recs[0].get(&TAG_TRACK_COVER_INDEX).is_none(), "no coverIndex when file missing");
+        assert!(!recs[0].contains_key(&TAG_TRACK_COVER_INDEX), "no coverIndex when file missing");
     }
 
     /// Verify that a COVERS section emitted by Android (kind=2 = WmpImageKind::jpeg) is written
