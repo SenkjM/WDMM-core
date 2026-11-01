@@ -102,9 +102,12 @@ cd "$X264_SRC"
 # era). It respects CC/CXX/AR env vars for AC_PROG_CC but rejects --cc=
 # and --disable-shared as unknown options. We also disable asm to avoid
 # requiring NASM (Android cross-compile doesn't need it for our use case).
+# NDK r28 provides llvm-strings (not ${TRIPLE}${MIN_API}-strings), so we
+# export STRINGS to point to it.
 export CC="${CC}"
 export CXX="${CXX}"
 export AR="${AR}"
+export STRINGS="${TOOLCHAIN}/llvm-strings"
 ./configure \
   --host="$X264_HOST" \
   --cross-prefix="${TOOLCHAIN}/${TRIPLE}${MIN_API}-" \
