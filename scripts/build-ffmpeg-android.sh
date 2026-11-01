@@ -142,8 +142,12 @@ cd "$FFMPEG_SRC"
 #   so Android's dlopen finds them by SONAME without version gymnastics.
 # --enable-pic:     position-independent code (we link into a .so).
 # --max-page-size=16384: 16 KB page alignment for Android 15+ (Pixel 8a/9).
+#
+# NDK r28 cross-compile: FFmpeg's configure C compiler test needs explicit -lm
+# to link a test executable. We also add -ldl for dlopen support.
 EXTRA_CFLAGS="-fPIC -O2 -ffunction-sections -fdata-sections -I${X264_INSTALL}/include"
 EXTRA_LDFLAGS="-L${X264_INSTALL}/lib -Wl,--max-page-size=16384 -Wl,-z,max-page-size=16384"
+EXTRA_LIBS="-lm -ldl"
 
 ./configure \
   --enable-shared \
@@ -187,6 +191,7 @@ EXTRA_LDFLAGS="-L${X264_INSTALL}/lib -Wl,--max-page-size=16384 -Wl,-z,max-page-s
   --sysroot="$SYSROOT" \
   --extra-cflags="$EXTRA_CFLAGS" \
   --extra-ldflags="$EXTRA_LDFLAGS" \
+  --extra-libs="$EXTRA_LIBS" \
   --pkg-config-flags="--static" \
   --prefix="$FFMPEG_INSTALL"
 
