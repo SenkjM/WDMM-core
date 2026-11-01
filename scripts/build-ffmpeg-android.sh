@@ -107,6 +107,7 @@ cd "$X264_SRC"
 export CC="${CC}"
 export CXX="${CXX}"
 export AR="${AR}"
+export RANLIB="${RANLIB}"
 export STRINGS="${TOOLCHAIN}/llvm-strings"
 ./configure \
   --host="$X264_HOST" \
