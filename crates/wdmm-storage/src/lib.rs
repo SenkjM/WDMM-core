@@ -2437,7 +2437,8 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         let descendants = collect_descendants(&conn, id)?;
         let tx = conn.unchecked_transaction()?;
-        // Deepest descendants first (collect_descendants is BFS so we reverse).
+        // Order is deepest-first (children before parents) for clarity;
+        // no FK enforces ordering but it mirrors logical dependency.
         for desc_id in descendants.iter().rev() {
             tx.execute(
                 "DELETE FROM user_folder_items WHERE folder_id = ?1",
@@ -2524,19 +2525,21 @@ impl LibraryDatabase {
             "DELETE FROM user_folder_items WHERE folder_id = ?1",
             params![folder_id],
         )?;
-        for item in items {
-            tx.execute(
+        {
+            let mut insert = tx.prepare(
                 "INSERT INTO user_folder_items
                  (folder_id, ref_kind, ref_key, sort_order, added_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+            )?;
+            for item in items {
+                insert.execute(params![
                     folder_id,
                     &item.ref_kind,
                     &item.ref_key,
                     item.sort_order,
                     item.added_at,
-                ],
-            )?;
+                ])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -2565,33 +2568,37 @@ impl LibraryDatabase {
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM user_folder_items", [])?;
         tx.execute("DELETE FROM user_folders", [])?;
-        for folder in folders {
-            let normalized = normalize_parent(folder.parent_id.as_deref());
-            tx.execute(
+        {
+            let mut ins_folder = tx.prepare(
                 "INSERT INTO user_folders (id, name, parent_id, sort_order, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+            )?;
+            for folder in folders {
+                let normalized = normalize_parent(folder.parent_id.as_deref());
+                ins_folder.execute(params![
                     &folder.id,
                     &folder.name,
                     normalized,
                     folder.sort_order,
                     folder.created_at,
-                ],
-            )?;
+                ])?;
+            }
         }
-        for item in items {
-            tx.execute(
+        {
+            let mut ins_item = tx.prepare(
                 "INSERT INTO user_folder_items \
                  (folder_id, ref_kind, ref_key, sort_order, added_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+            )?;
+            for item in items {
+                ins_item.execute(params![
                     &item.folder_id,
                     &item.ref_kind,
                     &item.ref_key,
                     item.sort_order,
                     item.added_at,
-                ],
-            )?;
+                ])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -3785,25 +3792,22 @@ fn normalize_parent(parent_id: Option<&str>) -> Option<&str> {
     }
 }
 
-/// BFS-collect all descendant folder IDs of `root_id` (not including root).
+/// Collect all descendant folder IDs of `root_id` (not including root) using
+/// a single recursive CTE — O(1) round-trips regardless of tree depth.
 fn collect_descendants(conn: &Connection, root_id: &str) -> StorageResult<Vec<String>> {
-    let mut result = Vec::new();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(root_id.to_string());
-    while let Some(parent) = queue.pop_front() {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id FROM user_folders WHERE parent_id = ?1",
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map(params![parent], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        for child_id in ids {
-            queue.push_back(child_id.clone());
-            result.push(child_id);
-        }
-    }
-    Ok(result)
+    let mut stmt = conn.prepare_cached(
+        "WITH RECURSIVE cte(id) AS (
+             SELECT id FROM user_folders WHERE parent_id = ?1
+             UNION ALL
+             SELECT uf.id FROM user_folders uf INNER JOIN cte ON uf.parent_id = cte.id
+         )
+         SELECT id FROM cte",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![root_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(ids)
 }
 
 // ── Comparison helpers ───────────────────────────────────────────────────────
