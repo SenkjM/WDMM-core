@@ -128,6 +128,9 @@ if [ -f "${X264_INSTALL}/lib/pkgconfig/x264.pc" ]; then
   sed -i "s|^prefix=.*|prefix=${X264_INSTALL}|" "${X264_INSTALL}/lib/pkgconfig/x264.pc"
 fi
 
+# Export PKG_CONFIG_PATH so FFmpeg's configure can find x264.pc
+export PKG_CONFIG_PATH="${X264_INSTALL}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
 # ── Build FFmpeg (shared, no CLI) ──────────────────────────────────────────
 log "--- FFmpeg: fetch ${FFMPEG_VERSION} ---"
 if [ ! -d "$FFMPEG_SRC" ]; then
