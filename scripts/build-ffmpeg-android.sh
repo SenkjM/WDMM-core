@@ -152,7 +152,7 @@ cd "$FFMPEG_SRC"
 EXTRA_CFLAGS="-fPIC -O2 -ffunction-sections -fdata-sections -I${X264_INSTALL}/include"
 EXTRA_LDFLAGS="-L${X264_INSTALL}/lib -L${SYSROOT}/usr/lib/${TRIPLE}/${MIN_API} -L${SYSROOT}/usr/lib/${TRIPLE}"
 EXTRA_LIBS="-lm -ldl -lc"
-PAGE_SIZE_LDFLAGS="-Wl,--max-page-size=16384 -Wl,-z,max-page-size=16384"
+PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
 
 ./configure \
   --enable-shared \
