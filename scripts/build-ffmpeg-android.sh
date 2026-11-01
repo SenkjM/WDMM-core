@@ -72,6 +72,12 @@ NM="${TOOLCHAIN}/llvm-nm"
 RANLIB="${TOOLCHAIN}/llvm-ranlib"
 STRIP="${TOOLCHAIN}/llvm-strip"
 
+# Export toolchain variables so both x264 and FFmpeg can use them.
+# NDK r28 provides llvm-* tools (llvm-ar, llvm-ranlib, llvm-strings, etc.)
+# but not ${TRIPLE}${MIN_API}-* variants.
+export CC CXX AR NM RANLIB STRIP
+export STRINGS="${TOOLCHAIN}/llvm-strings"
+
 SRC_DIR="${BUILD_DIR}/src"
 X264_SRC="${SRC_DIR}/x264"
 X264_INSTALL="${BUILD_DIR}/x264-install"
@@ -102,13 +108,6 @@ cd "$X264_SRC"
 # era). It respects CC/CXX/AR env vars for AC_PROG_CC but rejects --cc=
 # and --disable-shared as unknown options. We also disable asm to avoid
 # requiring NASM (Android cross-compile doesn't need it for our use case).
-# NDK r28 provides llvm-strings (not ${TRIPLE}${MIN_API}-strings), so we
-# export STRINGS to point to it.
-export CC="${CC}"
-export CXX="${CXX}"
-export AR="${AR}"
-export RANLIB="${RANLIB}"
-export STRINGS="${TOOLCHAIN}/llvm-strings"
 ./configure \
   --host="$X264_HOST" \
   --cross-prefix="${TOOLCHAIN}/${TRIPLE}${MIN_API}-" \
