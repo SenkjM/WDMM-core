@@ -4998,13 +4998,14 @@ mod tests {
     // Proxy tests share the process-global proxy_cell() singleton.  Run them
     // sequentially behind this lock to avoid one test's stop() tearing down the
     // proxy mid-request of another test.
-    fn proxy_lock() -> &'static Mutex<()> {
+    fn global_test_lock() -> &'static Mutex<()> {
         static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
     fn version_smoke() {
+        let _guard = global_test_lock().lock().unwrap();
         let v = wdmm_version();
         assert!(!v.ptr.is_null());
         let s = unsafe { CStr::from_ptr(v.ptr) }.to_str().unwrap();
@@ -5014,6 +5015,7 @@ mod tests {
 
     #[test]
     fn hello_smoke() {
+        let _guard = global_test_lock().lock().unwrap();
         let h = wdmm_hello();
         assert!(!h.ptr.is_null());
         wdmm_ffi_free_string(h);
@@ -5021,6 +5023,7 @@ mod tests {
 
     #[test]
     fn queue_status_empty() {
+        let _guard = global_test_lock().lock().unwrap();
         // Queue is a global singleton — may contain tasks from other tests.
         // Only verify it parses as a JSON array.
         let s = wdmm_queue_status_json();
@@ -5032,6 +5035,7 @@ mod tests {
 
     #[test]
     fn openapi_start_stop() {
+        let _guard = global_test_lock().lock().unwrap();
         // port 0 → OS assigns a free port
         let tok = wdmm_openapi_start(0);
         assert!(!tok.ptr.is_null());
@@ -5051,6 +5055,7 @@ mod tests {
 
     #[test]
     fn queue_cancel_not_found() {
+        let _guard = global_test_lock().lock().unwrap();
         let id = CString::new("nonexistent").unwrap();
         let result = wdmm_queue_cancel(id.as_ptr());
         let s = unsafe { CStr::from_ptr(result.ptr) }.to_str().unwrap();
@@ -5060,6 +5065,7 @@ mod tests {
 
     #[test]
     fn track_ffi_crud() {
+        let _guard = global_test_lock().lock().unwrap();
         let json = CString::new(r#"{"id":"aabbcc","title":"Test Song","artist":"Artist","remote_path":"/m/test.mp3","account_id":"acc1","size":5000,"duration_ms":180000,"mime_type":"audio/mpeg"}"#).unwrap();
 
         // Upsert
@@ -5107,6 +5113,7 @@ mod tests {
 
     #[test]
     fn fts_search_comprehensive() {
+        let _guard = global_test_lock().lock().unwrap();
         use std::ffi::CString;
 
         // Upsert tracks with varied metadata
@@ -5177,6 +5184,7 @@ mod tests {
 
     #[test]
     fn import_sqflite_nonexistent_path() {
+        let _guard = global_test_lock().lock().unwrap();
         let path = CString::new("/tmp/wdmm_does_not_exist_r6.db").unwrap();
         let r = wdmm_library_import_from_sqflite(path.as_ptr());
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
@@ -5187,6 +5195,7 @@ mod tests {
 
     #[test]
     fn compare_sqflite_empty_old_db() {
+        let _guard = global_test_lock().lock().unwrap();
         // Create a real temp old DB with the Android-schema tables, empty.
         let tmp = std::env::temp_dir().join(format!(
             "wdmm_ffi_compare_{}.db",
@@ -5232,6 +5241,7 @@ mod tests {
 
     #[test]
     fn queue_enqueue_and_status() {
+        let _guard = global_test_lock().lock().unwrap();
         // Enqueue a download_track task
         let json = CString::new(
             r#"{"id":"qtest-001","kind":"download_track","remote_path":"/m/test.mp3","total_bytes":500000}"#
@@ -5262,7 +5272,7 @@ mod tests {
 
     #[test]
     fn proxy_register_stream_smoke() {
-        let _guard = proxy_lock().lock().unwrap();
+        let _guard = global_test_lock().lock().unwrap();
         // Start proxy on an OS-assigned port.
         let port_str = unsafe { wdmm_proxy_start(c"loopback".as_ptr(), 0) };
         let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
@@ -5380,7 +5390,7 @@ mod tests {
     /// return those bytes.
     #[test]
     fn proxy_register_stream_async_set_result() {
-        let _guard = proxy_lock().lock().unwrap();
+        let _guard = global_test_lock().lock().unwrap();
 
         // Bytes the "Dart" reply thread will deliver.
         static ADATA: &[u8] = b"async-set-result-bytes";
@@ -5499,7 +5509,7 @@ mod tests {
     /// an IO error to the HTTP client (no hang, no spurious bytes).
     #[test]
     fn proxy_register_stream_async_error_status() {
-        let _guard = proxy_lock().lock().unwrap();
+        let _guard = global_test_lock().lock().unwrap();
 
         struct AsyncSlot {
             req_id: Mutex<Option<u64>>,
@@ -5602,7 +5612,7 @@ mod tests {
 
     #[test]
     fn proxy_start_stop_and_register_file() {
-        let _guard = proxy_lock().lock().unwrap();
+        let _guard = global_test_lock().lock().unwrap();
         // Start on an OS-assigned port.
         let port_str = unsafe { wdmm_proxy_start(c"loopback".as_ptr(), 0) };
         let port_s = unsafe { CStr::from_ptr(port_str.ptr) }.to_str().unwrap().to_string();
@@ -5650,6 +5660,7 @@ mod tests {
 
     #[test]
     fn user_folder_ffi_crud() {
+        let _guard = global_test_lock().lock().unwrap();
         // Create two root folders (UUID ids auto-generated).
         let j1 = CString::new(r#"{"name":"FFI Music","sort_order":0}"#).unwrap();
         let r = wdmm_user_folder_create(j1.as_ptr());
@@ -5782,6 +5793,7 @@ mod tests {
 
     #[test]
     fn playlist_ffi_crud() {
+        let _guard = global_test_lock().lock().unwrap();
         // Create a playlist (id auto-generated).
         let j = CString::new(r#"{"name":"FFI Playlist CRUD"}"#).unwrap();
         let r = wdmm_playlist_create(j.as_ptr());
@@ -5867,6 +5879,7 @@ mod tests {
 
     #[test]
     fn kv_ffi_roundtrip() {
+        let _guard = global_test_lock().lock().unwrap();
         use std::ffi::CString;
         let key = CString::new("__test_kv_ffi_key").unwrap();
         let val = CString::new("hello-kv").unwrap();
@@ -5898,6 +5911,7 @@ mod tests {
 
     #[test]
     fn settings_remember_last_path() {
+        let _guard = global_test_lock().lock().unwrap();
         use std::ffi::CString;
         // enable
         let r = wdmm_settings_set_network_remember_last_path(1);
@@ -5938,6 +5952,7 @@ mod tests {
 
     #[test]
     fn settings_session_last_path_not_persisted() {
+        let _guard = global_test_lock().lock().unwrap();
         use std::ffi::CString;
         let new_path = CString::new("/smb/server/share").unwrap();
         let r = wdmm_settings_set_network_last_path(new_path.as_ptr());
@@ -5960,6 +5975,7 @@ mod tests {
 
     #[test]
     fn user_folder_set_items_ffi() {
+        let _guard = global_test_lock().lock().unwrap();
         use std::ffi::CString;
 
         // Create a dedicated folder to avoid contaminating the shared "root".
@@ -6035,6 +6051,7 @@ mod tests {
 
     #[test]
     fn user_folder_replace_snapshot_ffi() {
+        let _guard = global_test_lock().lock().unwrap();
         use std::ffi::CString;
 
         // ── First snapshot: two folders (unix + ISO8601 timestamps), two items ─
@@ -6176,6 +6193,7 @@ mod tests {
 
     #[test]
     fn manga_ffi_smoke() {
+        let _guard = global_test_lock().lock().unwrap();
         use std::ffi::CString;
 
         // ── list (empty) ──────────────────────────────────────────────────────
@@ -6308,6 +6326,7 @@ mod tests {
 
     #[test]
     fn manga_delete_not_found() {
+        let _guard = global_test_lock().lock().unwrap();
         let cid = std::ffi::CString::new("does-not-exist").unwrap();
         let r = wdmm_manga_delete(cid.as_ptr());
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
@@ -6320,6 +6339,7 @@ mod tests {
 
     #[test]
     fn account_ffi_crud_roundtrip() {
+        let _guard = global_test_lock().lock().unwrap();
         let upsert = CString::new(
             r#"{"provider_type":"webdav","display_name":"NAS","base_url":"https://nas.local/dav","credentials":{"username":"u","password":"p","remote_dir":"/wdmm"}}"#,
         )
@@ -6369,6 +6389,7 @@ mod tests {
 
     #[test]
     fn queue_concurrency_ffi() {
+        let _guard = global_test_lock().lock().unwrap();
         // get default
         let initial = wdmm_queue_get_concurrency();
         assert!(initial >= 1, "default concurrency must be >= 1");
@@ -6399,6 +6420,7 @@ mod tests {
 
     #[test]
     fn deleted_track_ffi_roundtrip() {
+        let _guard = global_test_lock().lock().unwrap();
         let json = CString::new(
             r#"{"source_name":"src1","remote_path":"/music/track.flac","rev":100,"deleted_at":"2024-01-01T00:00:00Z","pushed":0}"#,
         )
@@ -6448,6 +6470,7 @@ mod tests {
 
     #[test]
     fn tombstoned_remote_paths_ffi() {
+        let _guard = global_test_lock().lock().unwrap();
         let json1 = CString::new(
             r#"{"source_name":"src_x","remote_path":"/a.mp3","rev":1,"deleted_at":"2024-01-01T00:00:00Z","pushed":0}"#,
         )
@@ -6472,6 +6495,7 @@ mod tests {
 
     #[test]
     fn sync_state_ffi_roundtrip() {
+        let _guard = global_test_lock().lock().unwrap();
         let json = CString::new(
             r#"{"remote_key":"library:test","last_seq":50,"base_up_to":25,"parts":"{\"x\":1}","updated_at":"2024-01-01T00:00:00Z"}"#,
         )
@@ -6511,6 +6535,7 @@ mod tests {
 
     #[test]
     fn artist_album_aggregation_ffi() {
+        let _guard = global_test_lock().lock().unwrap();
         // Clear library first
         let r = wdmm_library_clear_all();
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
@@ -6598,6 +6623,7 @@ mod tests {
 
     #[test]
     fn track_get_by_source_path_ffi() {
+        let _guard = global_test_lock().lock().unwrap();
         // Arrange: insert a track (unique IDs — no clear needed)
         let track_json = CString::new(
             r#"{"id":"ffi-src-1","title":"FFI Source Track","remote_path":"/src/track.mp3","account_id":"acc-ffi","size":2000,"duration_ms":90000}"#,
@@ -6629,6 +6655,7 @@ mod tests {
 
     #[test]
     fn cue_album_for_slice_and_slices_for_cue_ffi() {
+        let _guard = global_test_lock().lock().unwrap();
         // Arrange: insert album + 2 slices (unique IDs — no clear needed)
         let album_json = CString::new(
             r#"{"cue_id":"cue-ffi-1","source_name":"nas-ffi","cue_remote_path":"/ffi/disc.cue","title":"FFI Disc","performer":"FFI Artist","cache_group_id":null,"created_at":"2024-01-01T00:00:00Z"}"#,
@@ -6706,6 +6733,7 @@ mod tests {
 
     #[test]
     fn deleted_manga_ffi_upsert_and_list() {
+        let _guard = global_test_lock().lock().unwrap();
         // Upsert a tombstone without a rev (rev = null).
         let json = CString::new(
             r#"{"manga_id":"dm-ffi-1","source_name":"nas-dm","remote_path":"/m/x.cbz","sync_key":"nas-dm/m/x.cbz","rev":null,"deleted_at":"2024-03-01T00:00:00Z","pushed":0}"#,
@@ -6753,6 +6781,7 @@ mod tests {
 
     #[test]
     fn list_cue_albums_ffi_non_empty_after_upsert() {
+        let _guard = global_test_lock().lock().unwrap();
         // Insert an album with a unique id so the test is independent of ordering.
         let album_json = CString::new(
             r#"{"cue_id":"cue-list-ffi-99","source_name":"nas-list","cue_remote_path":"/list/disc.cue","title":"List Disc","performer":null,"cache_group_id":null,"created_at":"2024-06-01T00:00:00Z"}"#,
