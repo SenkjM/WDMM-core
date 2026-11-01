@@ -147,9 +147,8 @@ cd "$FFMPEG_SRC"
 # --max-page-size=16384: 16 KB page alignment for Android 15+ (Pixel 8a/9).
 #
 # NDK r28 cross-compile: FFmpeg's configure C compiler test needs explicit
-# library paths but breaks with --max-page-size flags. Split LDFLAGS:
-# EXTRA_LDFLAGS (for configure) has sysroot paths only; PAGE_SIZE_LDFLAGS
-# (for make) adds --max-page-size on top.
+# library paths but breaks with --max-page-size flags. Pass sysroot paths
+# to configure; inject page-size flags into config.mak after configure.
 EXTRA_CFLAGS="-fPIC -O2 -ffunction-sections -fdata-sections -I${X264_INSTALL}/include"
 EXTRA_LDFLAGS="-L${X264_INSTALL}/lib -L${SYSROOT}/usr/lib/${TRIPLE}/${MIN_API} -L${SYSROOT}/usr/lib/${TRIPLE}"
 EXTRA_LIBS="-lm -ldl -lc"
@@ -199,7 +198,12 @@ PAGE_SIZE_LDFLAGS="-Wl,--max-page-size=16384 -Wl,-z,max-page-size=16384"
   --extra-ldflags="$EXTRA_LDFLAGS" \
   --extra-libs="$EXTRA_LIBS" \
   --pkg-config-flags="--static" \
-  --prefix="$FFMPEG_INSTALL"
+  --prefix="$FFMPEG_INSTALL" \
+  --disable-x86asm
+
+# Inject --max-page-size into LDFLAGS for shared library linking
+log "--- inject --max-page-size into config.mak ---"
+sed -i "s|^LDFLAGS=|LDFLAGS=${PAGE_SIZE_LDFLAGS} |" ffbuild/config.mak
 
 # ── License guard ───────────────────────────────────────────────────────────
 # The PLAN (m01480) forbids --enable-nonfree in an AGPL project.  FFmpeg's
@@ -211,8 +215,7 @@ if grep -q -- "--enable-nonfree" "${FFMPEG_SRC}/ffbuild/config.log" 2>/dev/null;
 fi
 
 log "--- FFmpeg: build (-j${JOBS}) ---"
-# Apply --max-page-size during link by prepending to LDFLAGS
-LDFLAGS="${PAGE_SIZE_LDFLAGS} ${LDFLAGS:-}" make -j"$JOBS"
+make -j"$JOBS"
 make install
 
 # ── Install shared libs to OUTPUT_DIR ──────────────────────────────────────
