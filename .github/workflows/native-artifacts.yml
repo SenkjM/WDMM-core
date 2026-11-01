@@ -94,7 +94,7 @@ jobs:
       - name: Build wdmm-ffi for arm64-v8a
         run: |
           set -euo pipefail
-          cargo ndk -t arm64-v8a -o dist/android build --release -p wdmm-ffi
+          cargo ndk -t arm64-v8a -o dist/android build --release --features ffmpeg -p wdmm-ffi
           SO="dist/android/arm64-v8a/libwdmm_ffi.so"
           if [ ! -f "$SO" ]; then
             echo "::error::libwdmm_ffi.so not found at $SO"
@@ -127,12 +127,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build wdmm-ffi for windows-x64
+        # Windows CI has no FFmpeg libs available, so we build without the
+        # `ffmpeg` feature — wdmm-ffmpeg stubs all APIs (no libav* link).
         run: cargo build --release -p wdmm-ffi
         env:
-          # Windows uses the system FFmpeg from pkg-config or WDMM_FFMPEG_LIB_DIR.
-          # For CI, wdmm-ffmpeg/build.rs falls back to dynamic link without a
-          # hard failure; the DLL loads libav from PATH at runtime on Windows.
-          WDMM_FFMPEG_LIB_DIR: ""
+          # WDMM_FFMPEG_LIB_DIR is intentionally absent; build.rs skips link
+          # directives when CARGO_FEATURE_FFMPEG is not set (no --features ffmpeg).
 
       - name: Stage artifact and write COMMIT.txt
         shell: bash

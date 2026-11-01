@@ -100,6 +100,7 @@ cd "$X264_SRC"
 ./configure \
   --host="$X264_HOST" \
   --cross-prefix="${TOOLCHAIN}/${TRIPLE}${MIN_API}-" \
+  --cc="${CC}" \
   --enable-static \
   --disable-shared \
   --disable-opencl \

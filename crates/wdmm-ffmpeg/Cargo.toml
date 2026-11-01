@@ -16,3 +16,9 @@ wdmm-core    = { workspace = true }
 
 [build-dependencies]
 # link logic is in build.rs (dynamic link against libav* shared libs).
+
+[features]
+# Enable real FFmpeg linking. Without this flag, all public APIs return
+# `FfmpegError::Unavailable` and no link-time FFmpeg symbols are required
+# (used for CI builds on platforms without FFmpeg, e.g. Windows CI runner).
+ffmpeg = []

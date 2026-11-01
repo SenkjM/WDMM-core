@@ -31,12 +31,16 @@
 #![allow(dead_code)]
 
 pub mod preset;
-mod sys;
+mod sys; // always compiled — preset.rs uses its pub const values (AV_CODEC_ID_*)
+#[cfg(feature = "ffmpeg")]
 mod transcoder;
 
+#[cfg(feature = "ffmpeg")]
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ffmpeg")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "ffmpeg")]
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -95,8 +99,17 @@ pub struct ProbeResult {
 }
 
 /// Probe a media URL (local path or http URL) via in-process libav.
+#[cfg(feature = "ffmpeg")]
 pub fn probe(url: &str) -> FfmpegResult<ProbeResult> {
     transcoder::probe_url(url)
+}
+
+/// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
+#[cfg(not(feature = "ffmpeg"))]
+pub fn probe(_url: &str) -> FfmpegResult<ProbeResult> {
+    Err(FfmpegError::Unavailable(
+        "FFmpeg not linked (build with --features ffmpeg)".into(),
+    ))
 }
 
 // ── HLS job ───────────────────────────────────────────────────────────────────
@@ -131,6 +144,7 @@ impl Default for JobOpts {
 /// The job writes `index.m3u8` + numbered `.ts` segments into
 /// [`segment_dir`](JobHandle::segment_dir). The proxy reads from that
 /// directory. On drop the job is cancelled and the segment directory removed.
+#[cfg(feature = "ffmpeg")]
 #[derive(Debug)]
 pub struct JobHandle {
     pub segment_dir: PathBuf,
@@ -138,6 +152,17 @@ pub struct JobHandle {
     thread: Option<std::thread::JoinHandle<FfmpegResult<()>>>,
 }
 
+/// Stub handle used when the `ffmpeg` feature is off. `open_job` always
+/// returns `Err(FfmpegError::Unavailable)`, so this struct is never
+/// constructed; it exists only so callers compile.
+#[cfg(not(feature = "ffmpeg"))]
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct JobHandle {
+    pub segment_dir: PathBuf,
+}
+
+#[cfg(feature = "ffmpeg")]
 impl JobHandle {
     /// Directory where the job writes `index.m3u8` + segments.
     pub fn segment_dir(&self) -> &Path {
@@ -153,7 +178,7 @@ impl JobHandle {
     /// Block until the background thread finishes; return its result.
     pub fn join(mut self) -> FfmpegResult<()> {
         if let Some(t) = self.thread.take() {
-            
+
             t.join().map_err(|_| {
                 FfmpegError::Io(std::io::Error::other("thread panic"))
             })?
@@ -163,6 +188,7 @@ impl JobHandle {
     }
 }
 
+#[cfg(feature = "ffmpeg")]
 impl Drop for JobHandle {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -176,11 +202,24 @@ impl Drop for JobHandle {
     }
 }
 
+#[cfg(not(feature = "ffmpeg"))]
+impl JobHandle {
+    pub fn segment_dir(&self) -> &Path { &self.segment_dir }
+    pub fn cancel(&self) {}
+    pub fn join(self) -> FfmpegResult<()> { Ok(()) }
+}
+
+#[cfg(not(feature = "ffmpeg"))]
+impl Drop for JobHandle {
+    fn drop(&mut self) {}
+}
+
 /// Open a new HLS transcode/remux job.
 ///
 /// Spawns a background OS thread that runs the in-process libav pipeline.
 /// Returns a [`JobHandle`] whose [`Drop`] cancels the job and removes the
 /// segment directory.
+#[cfg(feature = "ffmpeg")]
 pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
     // Generate a session id for tracing; the directory is caller-provided.
     let id = format!("{:016x}", rand::random::<u64>());
@@ -217,10 +256,19 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
     })
 }
 
+/// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
+#[cfg(not(feature = "ffmpeg"))]
+pub fn open_job(_opts: JobOpts) -> FfmpegResult<JobHandle> {
+    Err(FfmpegError::Unavailable(
+        "FFmpeg not linked (build with --features ffmpeg)".into(),
+    ))
+}
+
 // ── Small helper for FFI: resolve a codec name from a codec pointer ───────────
 
 /// Return the `name` field of an `AVCodec` (offset +8 on LP64, after the
 /// `AVClass*` at +0). Returns the numeric codec id if the pointer is null.
+#[cfg(feature = "ffmpeg")]
 #[allow(dead_code)]
 pub(crate) fn codec_name(codec: *const sys::AVCodec, codec_id: u32) -> String {
     unsafe {
@@ -256,6 +304,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg")]
     fn fit_dimensions_scales_down() {
         let (w, h) = transcoder::fit_dimensions(1920, 1080, Some(1280), Some(720));
         assert_eq!(w, 1280);
@@ -263,6 +312,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg")]
     fn fit_dimensions_preserves_aspect() {
         // 1920x1080 → max 1280 wide
         let (w, h) = transcoder::fit_dimensions(1920, 1080, Some(1280), None);
@@ -271,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg")]
     fn fit_dimensions_rounds_even() {
         // 641x361 → must round to even
         let (w, h) = transcoder::fit_dimensions(641, 361, None, None);

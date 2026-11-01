@@ -8,6 +8,11 @@ publish      = { workspace = true }
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# Forward to wdmm-ffmpeg: enable real FFmpeg linking (Android/desktop builds).
+# Without this flag, wdmm-ffmpeg provides stubs and links no libav* symbols.
+ffmpeg = ["wdmm-ffmpeg/ffmpeg"]
+
 [dependencies]
 wdmm-core    = { workspace = true }
 wdmm-crypto  = { workspace = true }

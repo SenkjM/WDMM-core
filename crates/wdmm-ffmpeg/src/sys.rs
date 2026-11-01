@@ -10,7 +10,9 @@
 
 #![allow(non_camel_case_types, dead_code, non_snake_case, clippy::too_many_arguments)]
 
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_int, c_uint, c_void};
+#[cfg(feature = "ffmpeg")]
+use std::ffi::c_char;
 
 // ── Primitive type aliases ────────────────────────────────────────────────────
 
@@ -252,7 +254,10 @@ pub struct AVPacket {
 #[inline] pub unsafe fn frame_set_ch_layout(f: *mut AVFrame, v: AVChannelLayout) { *(f as *mut u8).add(408).cast() = v; }
 
 // ── extern "C" declarations ───────────────────────────────────────────────────
+// Gated on the `ffmpeg` Cargo feature — only present when FFmpeg shared libs
+// are available for linking.
 
+#[cfg(feature = "ffmpeg")]
 extern "C" {
     // format / demux
     pub fn avformat_open_input(ps: *mut *mut AVFormatContext, url: *const c_char,
@@ -336,6 +341,7 @@ extern "C" {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Convert an FFmpeg error code to a human-readable string.
+#[cfg(feature = "ffmpeg")]
 pub fn av_err2str(errnum: c_int) -> String {
     let mut buf = [0u8; 256];
     unsafe { av_strerror(errnum, buf.as_mut_ptr().cast(), buf.len()); }
