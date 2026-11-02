@@ -58,8 +58,34 @@ impl WebDavDriver {
     }
 
     fn join_path(&self, path: &str) -> String {
-        let trimmed = path.trim_start_matches('/');
-        self.base_url.join(trimmed).unwrap().to_string()
+        // If `path` already starts with the base URL's path prefix (i.e. the
+        // caller passed an absolute server path that includes the base path),
+        // strip that prefix first so we never double-append it.
+        //
+        // Example: base = "http://host/dav/", path = "/dav/Local"
+        //   → strip "/dav" prefix → relative = "Local"
+        //   → base.join("Local") = "http://host/dav/Local"  ✓
+        //
+        // Example: base = "http://host/dav/", path = "/Local"
+        //   → no prefix match → relative = "Local"
+        //   → base.join("Local") = "http://host/dav/Local"  ✓
+        //
+        // Example: base = "http://host/", path = "/Local"
+        //   → no prefix (base path is "/") → relative = "Local"
+        //   → base.join("Local") = "http://host/Local"  ✓
+        let base_path = self.base_url.path(); // e.g. "/dav/"
+        // Canonical prefix to strip: base path without trailing slash.
+        let prefix = base_path.trim_end_matches('/'); // e.g. "/dav"
+
+        let relative = if !prefix.is_empty() && path.starts_with(prefix) {
+            // Strip prefix, then remove any leading slash so Url::join treats
+            // it as a relative path (not an absolute one that replaces the path).
+            path[prefix.len()..].trim_start_matches('/')
+        } else {
+            path.trim_start_matches('/')
+        };
+
+        self.base_url.join(relative).unwrap().to_string()
     }
 
     /// Convert a server-supplied absolute href (e.g. `/dav/Local/file.mp3`)
@@ -461,6 +487,64 @@ mod tests {
         assert_eq!(
             driver.join_path("/Photos/holiday"),
             "https://cloud.example.com/remote.php/webdav/Photos/holiday"
+        );
+    }
+
+    /// join_path must be idempotent: if the caller passes an absolute path
+    /// that already includes the base URL's path prefix, the prefix must be
+    /// stripped to avoid double-appending.
+    ///
+    /// Regression test for: Dart's `joinRemotePath` produces "/dav/Local"
+    /// (account.remotePath="/dav" + path="/Local"), but Rust's WebDavDriver
+    /// already has base_url="http://host/dav/".  Without prefix stripping,
+    /// `join_path("/dav/Local")` produced "http://host/dav/dav/Local".
+    #[test]
+    fn url_joining_strips_base_path_prefix() {
+        // With trailing slash on base
+        let driver = WebDavDriver::new("https://example.com/dav/", "", "").unwrap();
+        assert_eq!(
+            driver.join_path("/dav/Local"),
+            "https://example.com/dav/Local",
+            "absolute path with base prefix must be idempotent"
+        );
+        assert_eq!(
+            driver.join_path("/dav/Local/Music"),
+            "https://example.com/dav/Local/Music",
+            "deep absolute path with base prefix must be idempotent"
+        );
+        // Without trailing slash on base
+        let driver2 = WebDavDriver::new("https://example.com/dav", "", "").unwrap();
+        assert_eq!(
+            driver2.join_path("/dav/Local"),
+            "https://example.com/dav/Local",
+            "idempotent even when base has no trailing slash"
+        );
+    }
+
+    /// Idempotent join must also work for Nextcloud-style deep base paths.
+    #[test]
+    fn url_joining_nextcloud_idempotent() {
+        let driver = WebDavDriver::new("https://cloud.example.com/remote.php/webdav", "", "").unwrap();
+        assert_eq!(
+            driver.join_path("/remote.php/webdav/Photos"),
+            "https://cloud.example.com/remote.php/webdav/Photos",
+            "nextcloud deep path must be idempotent"
+        );
+    }
+
+    /// Root base URL (path = "/") must not over-strip.
+    #[test]
+    fn url_joining_root_base_no_strip() {
+        let driver = WebDavDriver::new("https://example.com/", "", "").unwrap();
+        assert_eq!(
+            driver.join_path("/Local"),
+            "https://example.com/Local",
+            "root base must not strip anything"
+        );
+        assert_eq!(
+            driver.join_path("/dav/Local"),
+            "https://example.com/dav/Local",
+            "root base preserves full path"
         );
     }
 
