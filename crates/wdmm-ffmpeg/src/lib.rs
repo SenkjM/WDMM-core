@@ -97,7 +97,8 @@ pub struct ProgressSnapshot {
 /// Encoder selection actually used by a job (§7.3).
 #[derive(Clone, Debug, Default)]
 pub struct EncoderInfo {
-    /// `"remux"`, `"hybrid"` (video copied, audio re-encoded) or `"transcode"`.
+    /// `"remux"`/`"hybrid"` for the copy paths, `"hw"` when a MediaCodec
+    /// hardware encoder was actually opened, `"sw"` when libx264 encodes.
     pub mode: String,
     /// Actual video encoder name; `None` for a remux, `"copy"` for hybrid
     /// remux (video packets are copied, not re-encoded).
@@ -106,7 +107,8 @@ pub struct EncoderInfo {
     pub audio: Option<String>,
     /// The preset asked for a hardware encoder.
     pub hw_requested: bool,
-    /// `h264_mediacodec` was present in the linked libavcodec.
+    /// A hardware encoder actually opened successfully (presence in libavcodec
+    /// alone is not enough — `avcodec_open2` must have succeeded).
     pub hw_available: bool,
 }
 

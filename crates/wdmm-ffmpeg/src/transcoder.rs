@@ -43,7 +43,10 @@ const PROGRESS_LOG_EVERY_MS: u64 = 2_000;
 
 // ── Remux decision (pure logic lives in `crate::plan`, host-testable) ──────
 
-use crate::plan::{hybrid_audio_codec_id, remux_dropped_streams, remux_plan, RemuxPlan};
+use crate::plan::{
+    choose_video_encoder, encoder_frame_rate, fallback_warning, hw_gop_size, hw_video_encoder_name,
+    hybrid_audio_codec_id, remux_dropped_streams, remux_plan, RemuxPlan,
+};
 
 /// Options for opening the loopback HTTP input: bound every blocking read so a
 /// stalled upstream fails with a real error instead of hanging the job forever.
@@ -472,12 +475,74 @@ fn codec_display_name(codec_id: AVCodecID) -> String {
     }
 }
 
-/// Whether the linked libavcodec contains `h264_mediacodec`.
+/// Human-readable name for the pixel formats the hardware path can feed.
+fn pix_fmt_name(fmt: c_int) -> &'static str {
+    if fmt == AV_PIX_FMT_NV12 {
+        "nv12"
+    } else if fmt == AV_PIX_FMT_YUV420P {
+        "yuv420p"
+    } else {
+        "unknown"
+    }
+}
+
+/// Configure and open a MediaCodec hardware video encoder.
 ///
-/// The packaged Android `libavcodec.so` only ships `libx264`, so this is
-/// routinely `false` — the job falls back to software encoding and reports it.
-fn h264_mediacodec_available() -> bool {
-    unsafe { !avcodec_find_encoder_by_name(c"h264_mediacodec".as_ptr()).is_null() }
+/// `mediacodecenc.c` accepts software frames via an input ByteBuffer in
+/// `AV_PIX_FMT_NV12` or `AV_PIX_FMT_YUV420P` (no EGL/Surface); NV12 is tried
+/// first because that is the semi-planar format the Android encoders prefer.
+/// Opening is the real probe: `avcodec_find_encoder_by_name` only proves the
+/// wrapper is compiled into libavcodec, while the device codec may be missing
+/// or reject the configuration. `max_b_frames = 0` is mandatory for this
+/// encoder, and `AV_CODEC_FLAG_GLOBAL_HEADER` makes it emit AVCC extradata in
+/// `codecpar` so the MPEG-TS muxer can insert `h264_mp4toannexb`.
+///
+/// Returns the opened context plus the pixel format, or a diagnostic string
+/// describing the last failure (caller falls back to libx264 and reports it).
+unsafe fn open_hw_video_encoder(
+    tag: &str,
+    hw_name: &str,
+    codec: *const AVCodec,
+    preset: &wdmm_core::models::TranscodePreset,
+    width: c_int,
+    height: c_int,
+    framerate: AVRational,
+) -> Result<(*mut AVCodecContext, c_int), String> {
+    let gop = hw_gop_size(framerate.num, framerate.den);
+    let mut last_err = String::from("unknown error");
+    for pix_fmt in [AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P] {
+        let mut ctx = avcodec_alloc_context3(codec);
+        if ctx.is_null() {
+            last_err = "avcodec_alloc_context3 returned null".to_string();
+            continue;
+        }
+        codctx_set_width(ctx, width);
+        codctx_set_height(ctx, height);
+        codctx_set_pix_fmt(ctx, pix_fmt);
+        codctx_set_time_base(ctx, AVRational::new(1, 90_000));
+        codctx_set_framerate(ctx, framerate);
+        codctx_set_gop_size(ctx, gop);
+        codctx_set_max_b_frames(ctx, 0);
+        if let Some(br) = preset.video_max_bitrate {
+            codctx_set_bit_rate(ctx, br as i64);
+        }
+        codctx_set_flags(ctx, codctx_flags(ctx) | AV_CODEC_FLAG_GLOBAL_HEADER);
+        let ret = avcodec_open2(ctx, codec, std::ptr::null_mut());
+        diag::log(format!(
+            "{tag} transcode avcodec_open2(hw video encoder {hw_name} pix_fmt={} gop={gop} max_b_frames=0) rc={ret}",
+            pix_fmt_name(pix_fmt)
+        ));
+        if ret >= 0 {
+            return Ok((ctx, pix_fmt));
+        }
+        last_err = format!(
+            "pix_fmt={} rc={ret} ({})",
+            pix_fmt_name(pix_fmt),
+            av_err2str(ret)
+        );
+        avcodec_free_context(&mut ctx);
+    }
+    Err(last_err)
 }
 
 /// Build a contextual error for a failed libav call.
@@ -1114,7 +1179,6 @@ fn run_remux(
     let playlist_c = CString::new(playlist.to_string_lossy().as_ref()).unwrap();
     let seg_pat_c = CString::new(seg_pat.to_string_lossy().as_ref()).unwrap();
     let hls_c = c"hls";
-    let hw_available = h264_mediacodec_available();
 
     unsafe {
         // ── Open input ───────────────────────────────────────────────────────
@@ -1227,6 +1291,8 @@ fn run_remux(
         }
 
         // ── Telemetry ───────────────────────────────────────────────────────
+        // Both copy paths leave the video stream untouched, so no encoder was
+        // probed or opened — the hardware fields are false by definition.
         let audio_mode = if plan == RemuxPlan::Hybrid {
             audio_enc_name.clone()
         } else if a_idx >= 0 {
@@ -1242,8 +1308,8 @@ fn run_remux(
             },
             video: Some("copy".into()),
             audio: audio_mode,
-            hw_requested: preset.video_hw_preferred,
-            hw_available,
+            hw_requested: false,
+            hw_available: false,
         });
         if plan == RemuxPlan::Hybrid {
             let src_name = audio_codec_id
@@ -1538,7 +1604,6 @@ fn run_transcode(
     let playlist_c = CString::new(playlist.to_string_lossy().as_ref()).unwrap();
     let seg_pat_c = CString::new(seg_pat.to_string_lossy().as_ref()).unwrap();
     let hls_c = c"hls";
-    let hw_available = h264_mediacodec_available();
 
     unsafe {
         // ── Open + seek input ─────────────────────────────────────────────
@@ -1659,56 +1724,17 @@ fn run_transcode(
             }
         }
 
-        // ── Select encoders ───────────────────────────────────────────────
+        // ── Video encoder selection + open ────────────────────────────────
+        // Selection and opening happen in one pass: hardware usability must be
+        // proven with a real `avcodec_open2` because a compiled-in
+        // `h264_mediacodec` can still fail on a device without that codec. The
+        // fallback to libx264 is never silent — it goes to `EncoderInfo.warnings`
+        // and the diag log with the failure reason.
+        let mut v_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
         let mut v_enc_codec: *const AVCodec = std::ptr::null();
         let mut v_enc_name: Option<String> = None;
-        if want_video {
-            if preset.video_hw_preferred {
-                let hw = avcodec_find_encoder_by_name(c"h264_mediacodec".as_ptr());
-                if hw.is_null() {
-                    diag::log(format!(
-                        "{tag} transcode encoder: requested h264_mediacodec not found (hw_available=false) → fallback libx264"
-                    ));
-                    telemetry.warn("h264_mediacodec 不可用，已回退 libx264");
-                } else {
-                    v_enc_codec = hw;
-                    v_enc_name = Some("h264_mediacodec".into());
-                }
-            }
-            if v_enc_codec.is_null() {
-                v_enc_codec = avcodec_find_encoder_by_name(c"libx264".as_ptr());
-                if !v_enc_codec.is_null() {
-                    v_enc_name = Some("libx264".into());
-                }
-            }
-            if v_enc_codec.is_null() {
-                v_enc_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-                if !v_enc_codec.is_null() {
-                    v_enc_name = Some("h264".into());
-                }
-            }
-            if v_enc_codec.is_null() {
-                diag::log(format!(
-                    "{tag} transcode failed: no H.264 encoder available in libavcodec"
-                ));
-                cleanup_transcode(
-                    in_ctx,
-                    std::ptr::null_mut(),
-                    v_dec_ctx,
-                    a_dec_ctx,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                return Err(FfmpegError::Probe(
-                    "no H.264 encoder available (libx264 missing)".into(),
-                ));
-            }
-            diag::log(format!(
-                "{tag} transcode encoder selected video={} hw_requested={} hw_available={hw_available}",
-                v_enc_name.as_deref().unwrap_or("?"),
-                preset.video_hw_preferred
-            ));
-        }
+        let mut v_enc_pix_fmt: c_int = AV_PIX_FMT_YUV420P;
+        let mut hw_available = false;
 
         let a_codec_id = match preset.audio_codec.as_str() {
             "mp3" => AV_CODEC_ID_MP3,
@@ -1747,39 +1773,8 @@ fn run_transcode(
             telemetry.warn("转码路径暂不支持音频直拷，音频已丢弃");
         }
 
-        telemetry.set_encoder(EncoderInfo {
-            mode: "transcode".into(),
-            video: v_enc_name.clone(),
-            audio: if audio_stream_present {
-                Some(if a_codec_id == 0 {
-                    "copy".to_string()
-                } else {
-                    preset.audio_codec.clone()
-                })
-            } else {
-                None
-            },
-            hw_requested: preset.video_hw_preferred,
-            hw_available,
-        });
-
-        // ── Open encoders ─────────────────────────────────────────────────
-        let mut v_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
+        // ── Open video encoder (hardware probe, then software fallback) ────
         if want_video {
-            v_enc_ctx = avcodec_alloc_context3(v_enc_codec);
-            if v_enc_ctx.is_null() {
-                cleanup_transcode(
-                    in_ctx,
-                    std::ptr::null_mut(),
-                    v_dec_ctx,
-                    a_dec_ctx,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                return Err(FfmpegError::Probe(
-                    "avcodec_alloc_context3(video encoder) returned null".into(),
-                ));
-            }
             let in_st = *streams_ptr.add(v_idx as usize);
             let src_w = (*(*in_st).codecpar).width;
             let src_h = (*(*in_st).codecpar).height;
@@ -1789,42 +1784,143 @@ fn run_transcode(
                 preset.video_max_w.map(|v| v as i32),
                 preset.video_max_h.map(|v| v as i32),
             );
-            codctx_set_width(v_enc_ctx, out_w);
-            codctx_set_height(v_enc_ctx, out_h);
-            codctx_set_pix_fmt(v_enc_ctx, AV_PIX_FMT_YUV420P);
-            codctx_set_time_base(v_enc_ctx, AVRational::new(1, 90000));
-            codctx_set_gop_size(v_enc_ctx, 12);
-            codctx_set_max_b_frames(v_enc_ctx, 2);
-            if let Some(br) = preset.video_max_bitrate {
-                codctx_set_bit_rate(v_enc_ctx, br as i64);
+            let src_rate = stream_r_frame_rate(in_st);
+            let (fps_num, fps_den) =
+                encoder_frame_rate(src_rate.num, src_rate.den, preset.video_fps_cap);
+            let framerate = AVRational::new(fps_num, fps_den);
+            let hw_name = hw_video_encoder_name(preset.video_codec.as_deref());
+            let hw_name_c = CString::new(hw_name).unwrap();
+            let hw_codec = if preset.video_hw_preferred {
+                avcodec_find_encoder_by_name(hw_name_c.as_ptr())
+            } else {
+                std::ptr::null()
+            };
+            let hw_present = !hw_codec.is_null();
+            let mut hw_open_error: Option<String> = None;
+            if hw_present {
+                match open_hw_video_encoder(
+                    tag, hw_name, hw_codec, preset, out_w, out_h, framerate,
+                ) {
+                    Ok((ctx, pix_fmt)) => {
+                        v_enc_ctx = ctx;
+                        v_enc_codec = hw_codec;
+                        v_enc_pix_fmt = pix_fmt;
+                        v_enc_name = Some(hw_name.to_string());
+                        hw_available = true;
+                    }
+                    Err(err) => hw_open_error = Some(err),
+                }
             }
-            let ret = avcodec_open2(v_enc_ctx, v_enc_codec, std::ptr::null_mut());
+            // Pure decision after the probe. Hardware is selected only when it
+            // actually opened, so the warning names the real fallback reason.
+            let choice = choose_video_encoder(
+                preset.video_codec.as_deref(),
+                preset.video_hw_preferred,
+                hw_present,
+                hw_available,
+            );
             diag::log(format!(
-                "{tag} transcode avcodec_open2(video encoder {}) rc={ret}",
-                v_enc_name.as_deref().unwrap_or("?")
+                "{tag} transcode encoder choice: requested_hw={hw_name} present={hw_present} opened={hw_available} fps={}/{} gop={}",
+                framerate.num,
+                framerate.den,
+                hw_gop_size(framerate.num, framerate.den)
             ));
-            if ret < 0 {
-                let name = v_enc_name.unwrap_or_else(|| "h264".into());
-                cleanup_transcode(
-                    in_ctx,
-                    std::ptr::null_mut(),
-                    v_dec_ctx,
-                    a_dec_ctx,
-                    v_enc_ctx,
-                    std::ptr::null_mut(),
-                );
-                return Err(ffmpeg_err(
-                    format!("avcodec_open2(video encoder {name})"),
-                    ret,
-                ));
+            if let Some(warning) = fallback_warning(choice, hw_name, hw_open_error.as_deref()) {
+                diag::log(format!("{tag} transcode hardware fallback: {warning}"));
+                telemetry.warn(warning);
             }
+            if !hw_available {
+                // Software path: libx264 first, then any H.264 encoder. Pixel
+                // format, GOP and B-frame config stay byte-for-byte identical
+                // to the pre-hardware software behaviour.
+                v_enc_codec = avcodec_find_encoder_by_name(c"libx264".as_ptr());
+                if !v_enc_codec.is_null() {
+                    v_enc_name = Some("libx264".into());
+                }
+                if v_enc_codec.is_null() {
+                    v_enc_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+                    if !v_enc_codec.is_null() {
+                        v_enc_name = Some("h264".into());
+                    }
+                }
+                if v_enc_codec.is_null() {
+                    diag::log(format!(
+                        "{tag} transcode failed: no H.264 encoder available in libavcodec"
+                    ));
+                    cleanup_transcode(
+                        in_ctx,
+                        std::ptr::null_mut(),
+                        v_dec_ctx,
+                        a_dec_ctx,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                    return Err(FfmpegError::Probe(
+                        "no H.264 encoder available (libx264 missing)".into(),
+                    ));
+                }
+                v_enc_pix_fmt = AV_PIX_FMT_YUV420P;
+                v_enc_ctx = avcodec_alloc_context3(v_enc_codec);
+                if v_enc_ctx.is_null() {
+                    cleanup_transcode(
+                        in_ctx,
+                        std::ptr::null_mut(),
+                        v_dec_ctx,
+                        a_dec_ctx,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                    return Err(FfmpegError::Probe(
+                        "avcodec_alloc_context3(video encoder) returned null".into(),
+                    ));
+                }
+                codctx_set_width(v_enc_ctx, out_w);
+                codctx_set_height(v_enc_ctx, out_h);
+                codctx_set_pix_fmt(v_enc_ctx, v_enc_pix_fmt);
+                codctx_set_time_base(v_enc_ctx, AVRational::new(1, 90000));
+                codctx_set_gop_size(v_enc_ctx, 12);
+                codctx_set_max_b_frames(v_enc_ctx, 2);
+                if let Some(br) = preset.video_max_bitrate {
+                    codctx_set_bit_rate(v_enc_ctx, br as i64);
+                }
+                let ret = avcodec_open2(v_enc_ctx, v_enc_codec, std::ptr::null_mut());
+                diag::log(format!(
+                    "{tag} transcode avcodec_open2(video encoder {}) rc={ret}",
+                    v_enc_name.as_deref().unwrap_or("?")
+                ));
+                if ret < 0 {
+                    let name = v_enc_name.clone().unwrap_or_else(|| "h264".into());
+                    cleanup_transcode(
+                        in_ctx,
+                        std::ptr::null_mut(),
+                        v_dec_ctx,
+                        a_dec_ctx,
+                        v_enc_ctx,
+                        std::ptr::null_mut(),
+                    );
+                    return Err(ffmpeg_err(
+                        format!("avcodec_open2(video encoder {name})"),
+                        ret,
+                    ));
+                }
+            }
+            diag::log(format!(
+                "{tag} transcode encoder selected video={} mode={} pix_fmt={}",
+                v_enc_name.as_deref().unwrap_or("?"),
+                if hw_available { "hw" } else { "sw" },
+                pix_fmt_name(v_enc_pix_fmt)
+            ));
         }
 
         let mut a_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
+        let mut a_enc_name: Option<String> = None;
         let audio_sample_rate = preset.audio_sample_rate.unwrap_or(48_000) as i32;
         if !a_enc_codec.is_null() && !a_dec_ctx.is_null() {
             match open_audio_encoder(preset, a_codec_id, tag) {
-                Ok((ctx, _name)) => a_enc_ctx = ctx,
+                Ok((ctx, name)) => {
+                    a_enc_ctx = ctx;
+                    a_enc_name = Some(name);
+                }
                 Err(e) => {
                     cleanup_transcode(
                         in_ctx,
@@ -1838,6 +1934,22 @@ fn run_transcode(
                 }
             }
         }
+
+        telemetry.set_encoder(EncoderInfo {
+            mode: if hw_available { "hw".into() } else { "sw".into() },
+            video: v_enc_name.clone(),
+            audio: if audio_stream_present {
+                Some(if a_codec_id == 0 {
+                    "copy".to_string()
+                } else {
+                    a_enc_name.unwrap_or_else(|| preset.audio_codec.clone())
+                })
+            } else {
+                None
+            },
+            hw_requested: preset.video_hw_preferred,
+            hw_available,
+        });
 
         // ── Open HLS output ───────────────────────────────────────────────
         let mut out_ctx: *mut AVFormatContext = std::ptr::null_mut();
@@ -1980,7 +2092,7 @@ fn run_transcode(
             }
             frame_set_width(enc_vframe, video_out_dims.0);
             frame_set_height(enc_vframe, video_out_dims.1);
-            frame_set_format(enc_vframe, AV_PIX_FMT_YUV420P);
+            frame_set_format(enc_vframe, v_enc_pix_fmt);
             let ret = av_frame_get_buffer(enc_vframe, 32);
             if ret < 0 {
                 free_loop_state(
@@ -2055,7 +2167,7 @@ fn run_transcode(
                                 frame_format(dec_frame),
                                 dw,
                                 dh,
-                                AV_PIX_FMT_YUV420P,
+                                v_enc_pix_fmt,
                                 2,
                                 std::ptr::null(),
                                 std::ptr::null(),

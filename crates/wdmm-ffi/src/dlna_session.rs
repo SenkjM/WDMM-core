@@ -1800,8 +1800,8 @@ pub extern "C" fn wdmm_dlna_session_start(config_json: *const c_char) -> FfiStri
 /// (0.0 when direct/unknown), `encode_content_ms`, `encode_wall_ms`,
 /// `playlist_ready`, `segments`, `estimated_realtime` (bool|null),
 /// `error` (string|null, set when `phase == "failed"`), and the §7.3
-/// diagnostics keys `encode_mode`, `video_encoder`, `audio_encoder`,
-/// `encode_warnings`, `diagnostics`.
+/// diagnostics keys `encode_mode` (`remux`/`hybrid`/`hw`/`sw`),
+/// `video_encoder`, `audio_encoder`, `encode_warnings`, `diagnostics`.
 ///
 /// Every subtitle candidate also carries `embedded` (bool), `track`
 /// (AV stream index or null), `codec` (libav codec name or null) and

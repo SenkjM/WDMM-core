@@ -61,6 +61,152 @@ pub fn hybrid_audio_codec_id(audio_codec: &str) -> u32 {
     }
 }
 
+// ── Video encoder selection (hardware MediaCodec vs. libx264) ────────────────
+
+/// MediaCodec H.264 encoder name.
+pub const HW_H264_ENCODER: &str = "h264_mediacodec";
+/// MediaCodec H.265/HEVC encoder name.
+pub const HW_HEVC_ENCODER: &str = "hevc_mediacodec";
+/// Software H.264 encoder name (the universal fallback).
+pub const SW_H264_ENCODER: &str = "libx264";
+
+/// Hardware encoder to request for the preset's video codec.
+///
+/// Only an explicit HEVC request selects `hevc_mediacodec`; everything else
+/// (including `None`) keeps the H.264 path — the codec is never switched
+/// silently.
+pub fn hw_video_encoder_name(video_codec: Option<&str>) -> &'static str {
+    match video_codec {
+        Some(codec) if codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265") => {
+            HW_HEVC_ENCODER
+        }
+        _ => HW_H264_ENCODER,
+    }
+}
+
+/// Why the transcode path ended up on the software encoder (if it did).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftwareReason {
+    /// The preset did not ask for hardware encoding.
+    NotPreferred,
+    /// The requested MediaCodec encoder is not compiled into libavcodec.
+    HardwareUnavailable,
+    /// The encoder exists but `avcodec_open2` failed (device codec missing or
+    /// configuration rejected).
+    HardwareOpenFailed,
+}
+
+/// Video encoder chosen for the transcode path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncoderChoice {
+    /// A MediaCodec encoder that already opened successfully.
+    Hardware { name: &'static str },
+    /// libx264, with the reason hardware was not used.
+    Software {
+        name: &'static str,
+        reason: SoftwareReason,
+    },
+}
+
+/// Decide which video encoder to use after probing.
+///
+/// `hw_codec_present` is `avcodec_find_encoder_by_name(...) != NULL`;
+/// `hw_open_ok` is a real `avcodec_open2` success. Hardware is only chosen when
+/// both are true — presence alone is not proof that the device codec works.
+pub fn choose_video_encoder(
+    video_codec: Option<&str>,
+    hw_preferred: bool,
+    hw_codec_present: bool,
+    hw_open_ok: bool,
+) -> VideoEncoderChoice {
+    if !hw_preferred {
+        return VideoEncoderChoice::Software {
+            name: SW_H264_ENCODER,
+            reason: SoftwareReason::NotPreferred,
+        };
+    }
+    if !hw_codec_present {
+        return VideoEncoderChoice::Software {
+            name: SW_H264_ENCODER,
+            reason: SoftwareReason::HardwareUnavailable,
+        };
+    }
+    if !hw_open_ok {
+        return VideoEncoderChoice::Software {
+            name: SW_H264_ENCODER,
+            reason: SoftwareReason::HardwareOpenFailed,
+        };
+    }
+    VideoEncoderChoice::Hardware {
+        name: hw_video_encoder_name(video_codec),
+    }
+}
+
+/// Never-silent fallback message for `EncoderInfo.warnings` / the diag log.
+///
+/// Returns `None` when no fallback happened (hardware was used, or the preset
+/// never asked for hardware). The fallback reason is always spelled out.
+pub fn fallback_warning(
+    choice: VideoEncoderChoice,
+    requested_hw: &str,
+    open_error: Option<&str>,
+) -> Option<String> {
+    match choice {
+        VideoEncoderChoice::Hardware { .. } => None,
+        VideoEncoderChoice::Software {
+            reason: SoftwareReason::NotPreferred,
+            ..
+        } => None,
+        VideoEncoderChoice::Software {
+            reason: SoftwareReason::HardwareUnavailable,
+            ..
+        } => Some(format!("{requested_hw} 不可用，已回退 {SW_H264_ENCODER}")),
+        VideoEncoderChoice::Software {
+            reason: SoftwareReason::HardwareOpenFailed,
+            ..
+        } => {
+            let err = open_error.unwrap_or("unknown error");
+            Some(format!(
+                "{requested_hw} 打开失败（{err}），已回退 {SW_H264_ENCODER}"
+            ))
+        }
+    }
+}
+
+/// Frame rate to configure on the video encoder.
+///
+/// Uses the source stream rate when it is sane and not above the preset cap;
+/// otherwise falls back to the cap (or 30 fps). Returns `(num, den)`.
+pub fn encoder_frame_rate(input_num: i32, input_den: i32, fps_cap: Option<u32>) -> (i32, i32) {
+    let sane_source = (input_num > 0 && input_den > 0).then(|| input_num as f64 / input_den as f64);
+    let cap = fps_cap.filter(|c| *c > 0);
+    if let Some(fps) = sane_source {
+        if (1.0..=240.0).contains(&fps) && cap.is_none_or(|c| fps <= c as f64) {
+            return (input_num, input_den);
+        }
+    }
+    let base = match sane_source {
+        Some(fps) if (1.0..=240.0).contains(&fps) => fps,
+        _ => 30.0,
+    };
+    let capped = cap.map_or(base, |c| base.min(c as f64)).max(1.0);
+    (capped.round() as i32, 1)
+}
+
+/// GOP size (frames) for a hardware encoder.
+///
+/// `mediacodecenc.c` derives the I-frame interval from
+/// `round(gop_size / fps)` and warns when it rounds to 0, so keep at least two
+/// seconds between keyframes (MediaCodec default behaviour would be one).
+pub fn hw_gop_size(fps_num: i32, fps_den: i32) -> i32 {
+    if fps_num <= 0 || fps_den <= 0 {
+        return 60;
+    }
+    let fps = fps_num as f64 / fps_den as f64;
+    ((2.0 * fps).round() as i32).max(1)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,4 +269,101 @@ mod tests {
         assert_eq!(hybrid_audio_codec_id("opus"), AAC);
         assert_eq!(hybrid_audio_codec_id("copy"), AAC);
     }
+
+    #[test]
+    fn hardware_encoder_name_follows_the_preset_codec() {
+        assert_eq!(hw_video_encoder_name(Some("h264")), HW_H264_ENCODER);
+        assert_eq!(hw_video_encoder_name(Some("H264")), HW_H264_ENCODER);
+        assert_eq!(hw_video_encoder_name(Some("hevc")), HW_HEVC_ENCODER);
+        assert_eq!(hw_video_encoder_name(Some("h265")), HW_HEVC_ENCODER);
+        // No explicit codec request keeps H.264 — never silently switch codecs.
+        assert_eq!(hw_video_encoder_name(None), HW_H264_ENCODER);
+    }
+
+    #[test]
+    fn video_encoder_choice_prefers_opened_hardware() {
+        // H.264 preset + hardware preferred + present + opened → hardware.
+        assert_eq!(
+            choose_video_encoder(Some("h264"), true, true, true),
+            VideoEncoderChoice::Hardware {
+                name: HW_H264_ENCODER
+            }
+        );
+        // Explicit HEVC request selects the HEVC encoder.
+        assert_eq!(
+            choose_video_encoder(Some("hevc"), true, true, true),
+            VideoEncoderChoice::Hardware {
+                name: HW_HEVC_ENCODER
+            }
+        );
+        // Not preferred → software, and the reason says so.
+        assert_eq!(
+            choose_video_encoder(Some("h264"), false, true, true),
+            VideoEncoderChoice::Software {
+                name: SW_H264_ENCODER,
+                reason: SoftwareReason::NotPreferred
+            }
+        );
+        // Missing from libavcodec → software.
+        assert_eq!(
+            choose_video_encoder(Some("h264"), true, false, false),
+            VideoEncoderChoice::Software {
+                name: SW_H264_ENCODER,
+                reason: SoftwareReason::HardwareUnavailable
+            }
+        );
+        // Present but the device codec could not be opened → software; presence
+        // alone must never be treated as usable.
+        assert_eq!(
+            choose_video_encoder(Some("hevc"), true, true, false),
+            VideoEncoderChoice::Software {
+                name: SW_H264_ENCODER,
+                reason: SoftwareReason::HardwareOpenFailed
+            }
+        );
+    }
+
+    #[test]
+    fn fallback_warnings_are_never_silent() {
+        let hw = choose_video_encoder(Some("h264"), true, true, true);
+        assert_eq!(fallback_warning(hw, HW_H264_ENCODER, None), None);
+        let not_preferred = choose_video_encoder(Some("h264"), false, true, true);
+        assert_eq!(
+            fallback_warning(not_preferred, HW_H264_ENCODER, None),
+            None
+        );
+        let unavailable = choose_video_encoder(Some("h264"), true, false, false);
+        let msg = fallback_warning(unavailable, HW_H264_ENCODER, None).unwrap();
+        assert!(msg.contains(HW_H264_ENCODER), "{msg}");
+        assert!(msg.contains(SW_H264_ENCODER), "{msg}");
+        assert!(msg.contains("不可用"), "{msg}");
+        let open_failed = choose_video_encoder(Some("hevc"), true, true, false);
+        let msg = fallback_warning(open_failed, HW_HEVC_ENCODER, Some("rc=-38")).unwrap();
+        assert!(msg.contains(HW_HEVC_ENCODER), "{msg}");
+        assert!(msg.contains("rc=-38"), "{msg}");
+        assert!(msg.contains("回退"), "{msg}");
+    }
+
+    #[test]
+    fn encoder_frame_rate_keeps_sane_source_and_respects_cap() {
+        // 29.97 fps source, no cap → exact source rational.
+        assert_eq!(encoder_frame_rate(30000, 1001, None), (30000, 1001));
+        // 60 fps source with a 30 fps cap → 30/1.
+        assert_eq!(encoder_frame_rate(60, 1, Some(30)), (30, 1));
+        // Unknown/missing source rate → 30 fps default, cap still honoured.
+        assert_eq!(encoder_frame_rate(0, 1, None), (30, 1));
+        assert_eq!(encoder_frame_rate(0, 0, Some(24)), (24, 1));
+        // Nonsense source (e.g. 1000 fps) falls back to the default.
+        assert_eq!(encoder_frame_rate(1000, 1, None), (30, 1));
+    }
+
+    #[test]
+    fn hardware_gop_is_two_seconds() {
+        assert_eq!(hw_gop_size(30, 1), 60);
+        assert_eq!(hw_gop_size(30000, 1001), 60);
+        assert_eq!(hw_gop_size(60, 1), 120);
+        // Degenerate input rate keeps a usable 2 s GOP at 30 fps.
+        assert_eq!(hw_gop_size(0, 0), 60);
+    }
 }
+

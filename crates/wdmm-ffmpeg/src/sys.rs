@@ -66,8 +66,15 @@ pub const AV_CODEC_ID_MP3: AVCodecID = 86017;
 
 // Pixel/sample format values (FFmpeg 7.1).
 pub const AV_PIX_FMT_YUV420P: AVPixelFormat = 0;
+/// `AV_PIX_FMT_NV12` — the MediaCodec ByteBuffer semi-planar format.
+pub const AV_PIX_FMT_NV12: AVPixelFormat = 23;
 pub const AV_SAMPLE_FMT_FLTP: AVSampleFormat = 8;
 pub const AV_SAMPLE_FMT_S16P: AVSampleFormat = 6;
+
+/// `AV_CODEC_FLAG_GLOBAL_HEADER` — put extradata in `codecpar` instead of the
+/// first packet. Required for MediaCodec encoders so the MPEG-TS muxer can
+/// detect AVCC extradata and insert `h264_mp4toannexb` / `hevc_mp4toannexb`.
+pub const AV_CODEC_FLAG_GLOBAL_HEADER: c_int = 1 << 22;
 
 // AV_ROUND_NEAR_INF (5) | AV_ROUND_PASS_MINMAX (8192 = 1 << 13)
 pub const AV_ROUND_NEAR_INF_PASS: u32 = 5 | (1 << 13);
@@ -313,6 +320,25 @@ pub unsafe fn codctx_set_ch_layout(c: *mut AVCodecContext, v: AVChannelLayout) {
 #[inline]
 pub unsafe fn codctx_frame_size(c: *const AVCodecContext) -> c_int {
     *(c as *const u8).add(376).cast()
+}
+/// flags (i32 @ +64) — e.g. `AV_CODEC_FLAG_GLOBAL_HEADER`.
+#[inline]
+pub unsafe fn codctx_flags(c: *const AVCodecContext) -> c_int {
+    *(c as *const u8).add(64).cast()
+}
+#[inline]
+pub unsafe fn codctx_set_flags(c: *mut AVCodecContext, v: c_int) {
+    *(c as *mut u8).add(64).cast() = v;
+}
+/// framerate (AVRational @ +100) — used by the MediaCodec encoder for its
+/// `frame-rate` format key and to derive the I-frame interval.
+#[inline]
+pub unsafe fn codctx_framerate(c: *const AVCodecContext) -> AVRational {
+    *(c as *const u8).add(100).cast()
+}
+#[inline]
+pub unsafe fn codctx_set_framerate(c: *mut AVCodecContext, v: AVRational) {
+    *(c as *mut u8).add(100).cast() = v;
 }
 
 // AVFrame: sizeof=440
