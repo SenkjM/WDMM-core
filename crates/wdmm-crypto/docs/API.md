@@ -83,7 +83,7 @@ Constants:
 - `FILE_HEADER_SIZE`: 8 bytes (magic).
 - `BLOCK_SIZE`: 65536 bytes plaintext per block.
 
-See `/workspace/agent-tools/wdmm-crypt-proxy-path.md` for integration with `CryptDriver`.
+See `wdmm-drivers/docs/API.md` (CryptDriver section) for integration with `CryptDriver`.
 
 ---
 
@@ -98,12 +98,12 @@ See `/workspace/agent-tools/wdmm-crypt-proxy-path.md` for integration with `Cryp
 Encrypt a JSON payload for Netease weapi endpoints.
 Returns `params=<encrypted>` form body string (UTF-8).
 Uses AES-128-CBC with PKCS7 padding (two rounds: random key, then fixed key) + base64.
-Golden test vector in `/workspace/WMM-dlna-ui/test/netease_music_crypto_test.dart`.
+Test vectors are in the crate's unit tests (`src/netease.rs`).
 
 ### `fn linuxapi_encrypt(data: &serde_json::Value) -> Result<String>`
 Encrypt a JSON payload for Netease linuxapi endpoints.
 Returns `eparams=<hex>` form body string (UTF-8).
 Uses AES-128-ECB with PKCS7 padding + RSA (modulus from official client) + hex encoding.
-Golden test vector in same Dart test file.
+Test vectors are in the crate's unit tests (`src/netease.rs`).
 
 IV for both: ASCII literal `b"0102030405060708"` (16 bytes).

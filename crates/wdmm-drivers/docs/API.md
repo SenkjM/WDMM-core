@@ -213,4 +213,4 @@ Uses `wdmm_crypto::rclone::RcloneCipher`. Callers must route `LocalStream` throu
 
 ---
 
-Callers (media_kit, DLNA, future mounts) decide proxy need from this kind. Enum is `#[non_exhaustive]`. See `/workspace/agent-tools/wdmm-crypt-proxy-path.md` §6.
+Callers (media_kit, DLNA, future mounts) decide proxy need from this kind. Enum is `#[non_exhaustive]`.

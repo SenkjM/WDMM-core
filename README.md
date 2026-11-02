@@ -2,7 +2,7 @@
 
 **WebDAV Media Manager** front/back split: all business logic, optional OpenAPI server, DLNA/UPnP cast, unified local proxy.
 
-This is a **Cargo workspace** with 11 crates. Source-level coupling to platform repos (Android Flutter via `flutter_rust_bridge`, Windows C# via `csbindgen`). **Not published to crates.io** — see `docs/CONSTRAINTS.md §5` for rationale.
+This is a **Cargo workspace** with 11 crates. Source-level coupling to platform repos (Android Flutter via `flutter_rust_bridge`, Windows C# via `csbindgen`). **Not published to crates.io** — driver crates embed no client secrets; see `AGENTS.md` for publishing stance.
 
 ---
 
@@ -12,7 +12,7 @@ This is a **Cargo workspace** with 11 crates. Source-level coupling to platform 
 |-------|------|
 | `wdmm-core` | Pure data models, track identity (SHA-1), `RevClock`, zero platform deps |
 | `wdmm-crypto` | AES-256-GCM credential vault + backup envelope (PBKDF2 600k iterations) |
-| `wdmm-drivers` | `CloudDriver` trait; **WebDAV list working**, others stubbed |
+| `wdmm-drivers` | `WdmmVfs` trait; **WebDAV list working**, others stubbed |
 | `wdmm-storage` | rusqlite library DB (schema v1 skeleton, aligns WDMM library direction) |
 | `wdmm-queue` | Task-queue FIFO state machine + resumable download stub |
 | `wdmm-sync` | Incremental sync engine (credentials / playlists / library / manga) stub |
@@ -116,7 +116,7 @@ Access:
 - **Drivers — official API only**: WebDAV works. baidu / aliyundrive / 115 / ctfile / terabox / netease are stubbed (TODO per architecture report §4.3 phasing). OAuth keys are **user-supplied** (not embedded).
 - **DB migration**: `wdmm-storage` uses rusqlite; migration from Dart `sqflite` is **one-shot** (no long-term dual-write window).
 - **DLNA + local proxy**: DLNA owned by Rust; unified proxy extracted to `wdmm-proxy` (re-exported from `wdmm-dlna` for backward compat). Android/Windows delegates cast/stream operations via FFI.
-- **Publish = false**: Workspace default. See `docs/CONSTRAINTS.md §5` (service ToS, key leakage risk, attack surface).
+- **Publish = false**: Workspace default. Driver crates embed no client secrets; not on crates.io (service ToS, key leakage risk, attack surface).
 
 ---
 
@@ -128,15 +128,14 @@ Access:
 - Sync engines are interface-only stubs
 - DLNA discovery/cast not implemented
 
-Full implementation continues in subsequent rounds per `saf_work/wdmm-split-impl-brief.md` phasing.
+Full implementation tracked in subsequent work items.
 
 ---
 
 ## References
 
-- **Constraints**: `docs/CONSTRAINTS.md`
-- **Architecture Report**: `/workspace/saf_work/wdmm-fe-be-split-architecture-report.md`
-- **Brief**: `/workspace/saf_work/wdmm-split-impl-brief.md`
+- **Agent instructions / architecture**: `AGENTS.md`
+- **Per-crate API docs**: `crates/*/docs/API.md`
 - **Platform Repos**:
   - Android: `Webdav_Media_Manager` (branch `refactor/rust-core`)
   - Windows: `WDMM-desktop` (separate repo)

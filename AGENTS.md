@@ -20,7 +20,8 @@ All in-app cloud file operations go through **`WdmmVfs`** (the unified driver tr
 
 ## One-shot coding rule (mandatory)
 
-Finish the new authority completely, then delete the old path and wire callers. No feature flags, no dual-write/dual-read, no soft fallbacks, no dead code kept for "mid-step usability". See `/workspace/saf_work/wdmm-fe-be-split-constraints.md` for the full constraints.
+Finish the new authority completely, then delete the old path and wire callers. No feature flags,
+no dual-write/dual-read, no soft fallbacks, no dead code kept for "mid-step usability".
 
 ## FFI coupling
 
@@ -30,13 +31,45 @@ Finish the new authority completely, then delete the old path and wire callers. 
 
 ## Logic ownership
 
-**Into Rust**: Library DB (rusqlite), cloud drivers, task queue, sync/backup encoding, crypto, DLNA, unified local proxy.
+**Into Rust**: Library DB (rusqlite), cloud drivers, task queue, sync/backup encoding, crypto,
+DLNA, unified local proxy.
 
-**Stay platform (Kotlin/C#)**: Playback stack, system media session, SAF/MediaStore/.nomedia, foreground service lifecycle, pure UI.
+**Stay platform (Kotlin/C#)**: Playback stack, system media session, SAF/MediaStore/.nomedia,
+foreground service lifecycle, pure UI.
+
+## Build, test, lint
+
+```bash
+cargo check --workspace
+cargo build --release
+cargo test --workspace
+cargo test -p wdmm-sync && cargo test -p wdmm-drivers
+cargo clippy --workspace -- -D warnings
+```
+
+## Branch and commit conventions
+
+- Active branch: `refactor/rust-core`
+- Commit prefixes: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`
+- Do not commit to `main` directly. No force-push. No triggering CI via API.
+- When a platform repo bumps the submodule pointer, pin to the target Core SHA in the same
+  commit that updates callers.
+
+## CI workflows
+
+`.github/workflows/native-artifacts.yml` — builds native release artifacts (Linux x86_64,
+Windows x86_64, Android arm64) and uploads them for platform repo consumption.
+
+## Where docs live
+
+- Per-crate API docs: `crates/*/docs/API.md` (12 files + `FFMPEG-ATTRIBUTION`)
+- Architecture and constraints: this file (`AGENTS.md`)
+- No top-level `docs/` directory; crate docs are the source of truth for public API
 
 ## Publishing stance
 
-Core source may be open on GitHub; **not published to crates.io** (yet). Driver crates default `publish = false`. No client secrets in repo.
+Core source may be open on GitHub; **not published to crates.io**. Driver crates default
+`publish = false`. No client secrets in repo.
 
 ## Verification
 

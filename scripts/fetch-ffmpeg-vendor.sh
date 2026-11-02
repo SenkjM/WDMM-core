@@ -8,7 +8,7 @@
 #
 # Environment:
 #   WDMM_FFMPEG_CACHE  — directory containing already-downloaded archives.
-#                        Defaults to /workspace/agent-tools/ffmpeg-vendor-cache.
+#                        Defaults to ${XDG_CACHE_HOME:-$HOME/.cache}/wdmm-ffmpeg-vendor.
 #   WDMM_FFMPEG_ONLY   — optional: linux-x86_64 | windows-x86_64 | android-arm64
 #                        When set, only that target is fetched/required (CI jobs).
 #
@@ -28,7 +28,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENDOR="$REPO_ROOT/crates/wdmm-ffmpeg/vendor"
-CACHE="${WDMM_FFMPEG_CACHE:-/workspace/agent-tools/ffmpeg-vendor-cache}"
+CACHE="${WDMM_FFMPEG_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/wdmm-ffmpeg-vendor}"
 TMPWORK="$(mktemp -d)"
 trap 'rm -rf "$TMPWORK"' EXIT
 
