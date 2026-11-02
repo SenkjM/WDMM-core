@@ -124,10 +124,15 @@ impl WebDavDriver {
         reader.config_mut().trim_text(true);
 
         // Extract the path from the PROPFIND URL for filtering.
+        // Decode percent-encoding so it can be compared with decoded_href below
+        // (e.g. "/dav/My%20Music" == "/dav/My Music" after decoding both sides).
         let propfind_path = Url::parse(propfind_url)
             .ok()
             .and_then(|u| u.path().strip_prefix('/').map(|s| format!("/{}", s)))
             .unwrap_or_else(|| propfind_url.to_string());
+        let propfind_path = urlencoding::decode(&propfind_path)
+            .unwrap_or_else(|_| std::borrow::Cow::Borrowed(&propfind_path))
+            .into_owned();
 
         let mut items = Vec::new();
         let mut current_href: Option<String> = None;
@@ -647,6 +652,48 @@ mod tests {
 <D:multistatus xmlns:D="DAV:"></D:multistatus>"#;
         let items = driver.parse_propfind_response(EMPTY, "/dav", false).unwrap();
         assert!(items.is_empty());
+    }
+
+    /// Regression: folder names with spaces caused the parent-directory filter to
+    /// miss the collection entry because `propfind_path` was percent-encoded
+    /// ("/dav/My%20Music") while `decoded_href` was plain text ("/dav/My Music").
+    /// After the fix both sides are decoded before comparison.
+    #[test]
+    fn parse_propfind_space_in_folder_name_filters_collection() {
+        const SPACE_FIXTURE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/dav/My%20Music</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/></D:resourcetype>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/My%20Music/song.mp3</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype/>
+        <D:getcontentlength>9999</D:getcontentlength>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+        let driver = WebDavDriver::new("https://example.com/dav/", "", "").unwrap();
+        // The PROPFIND was issued against the percent-encoded URL.
+        let items = driver
+            .parse_propfind_response(
+                SPACE_FIXTURE,
+                "https://example.com/dav/My%20Music",
+                false,
+            )
+            .unwrap();
+        // The collection itself (/dav/My%20Music) must be filtered out.
+        assert_eq!(items.len(), 1, "collection with space in name must be filtered out");
+        assert_eq!(items[0].name, "song.mp3");
     }
 
     // ── Async HTTP integration test (mock server, no external deps) ────────────
