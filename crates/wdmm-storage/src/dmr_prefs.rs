@@ -68,7 +68,7 @@ impl DmrPrefsDatabase {
             // Treat that as a no-op so the migration is idempotent.
             let msg = e.to_string();
             if msg.contains("duplicate column name") {
-                Ok(())
+                Ok::<(), StorageError>(())
             } else {
                 Err(e.into())
             }
