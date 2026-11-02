@@ -15,3 +15,6 @@ crates/wdmm-ffmpeg/vendor/
 
 # Claude local worktrees (never commit)
 .claude/
+
+# Local FFmpeg vendor cache downloaded by tool/build-rust.ps1
+.ffmpeg-vendor-cache/
