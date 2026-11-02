@@ -154,12 +154,9 @@ pub fn probe_url(url: &str) -> FfmpegResult<ProbeResult> {
 
             match codec_type {
                 AVMEDIA_TYPE_VIDEO => {
-                    let fps_raw = av_q2d(AVRational::new(
-                        // framerate is not in codecpar; estimate from stream->r_frame_rate
-                        // r_frame_rate is at +56 in AVStream (after duration@48, which is 8 bytes)
-                        *(st as *const u8).add(56).cast::<i32>(),
-                        *(st as *const u8).add(60).cast::<i32>(),
-                    ));
+                    // framerate is not in codecpar; read AVStream.r_frame_rate
+                    // (@216/@220 on LP64 — see `stream_r_frame_rate`, `+56` is nb_frames).
+                    let fps_raw = av_q2d(stream_r_frame_rate(st));
                     video.push(VideoStream {
                         index: (*st).index as u32,
                         codec: codec_name,
@@ -202,6 +199,248 @@ pub fn probe_url(url: &str) -> FfmpegResult<ProbeResult> {
             subtitles: subs,
             format_name: fmt_name,
         })
+    }
+}
+
+// ── Embedded text subtitle extraction ─────────────────────────────────────────
+
+/// How many packets/cues an extraction walk may consume before it gives up.
+/// A subtitle track is tiny; this only guards against pathological inputs.
+const SUBTITLE_MAX_PACKETS: u64 = 2_000_000;
+
+/// Read a libav-returned C string, tolerating NULL.
+unsafe fn cstr_opt(p: *const c_char) -> Option<String> {
+    if p.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+    }
+}
+
+/// Turn one decoded `AVSubtitle` into a cue (text + absolute ms window).
+unsafe fn cue_from_avsubtitle(
+    sub: *const AVSubtitle,
+    fallback_pts_ms: i64,
+    codec: &str,
+) -> Option<crate::subtitle::Cue> {
+    let sub_pts = subtitle_pts(sub);
+    // AVSubtitle.pts is in AV_TIME_BASE (µs); fall back to the packet pts.
+    let base_ms = if sub_pts == AV_NOPTS_VALUE || sub_pts < 0 {
+        fallback_pts_ms
+    } else {
+        sub_pts / 1_000
+    };
+    let start_ms = base_ms + subtitle_start_display_time(sub) as i64;
+    let end_ms = base_ms + subtitle_end_display_time(sub) as i64;
+
+    let num = subtitle_num_rects(sub);
+    let rects = subtitle_rects(sub);
+    if rects.is_null() || num == 0 {
+        return None;
+    }
+    let mut texts: Vec<String> = Vec::new();
+    for i in 0..num {
+        let rect = *rects.add(i as usize);
+        if rect.is_null() {
+            continue;
+        }
+        if rect_type(rect) == SUBTITLE_RECT_BITMAP {
+            // Should have been rejected before decoding, but never render.
+            continue;
+        }
+        let text = cstr_opt(rect_text(rect));
+        let ass = cstr_opt(rect_ass(rect));
+        if let Some(body) = crate::subtitle::cue_text_from_decoded(text.as_deref(), ass.as_deref())
+        {
+            texts.push(body);
+        }
+    }
+    if texts.is_empty() {
+        return None;
+    }
+    let text = texts.join("\n");
+    let start_ms = start_ms.max(0) as u64;
+    let end_ms = if end_ms <= start_ms as i64 {
+        start_ms.saturating_add(1_000)
+    } else {
+        end_ms as u64
+    };
+    diag::log(format!(
+        "[subtitle] cue {start_ms}..{end_ms}ms from {codec} ({} rect(s))",
+        texts.len()
+    ));
+    Some(crate::subtitle::Cue {
+        start_ms,
+        end_ms,
+        text,
+    })
+}
+
+/// Decode the subtitle stream at `stream_index` of an already-opened input.
+unsafe fn extract_subtitle_inner(
+    fmt_ctx: *mut AVFormatContext,
+    stream_index: u32,
+) -> FfmpegResult<String> {
+    use crate::subtitle::{self, normalize_cues, to_webvtt, Cue, TrackKind};
+
+    let nb = fmtctx_nb_streams(fmt_ctx) as usize;
+    if stream_index as usize >= nb {
+        return Err(FfmpegError::Probe(format!(
+            "subtitle stream {stream_index} not found ({nb} streams in input)"
+        )));
+    }
+    let st = *fmtctx_streams(fmt_ctx).add(stream_index as usize);
+    if st.is_null() || (*st).codecpar.is_null() {
+        return Err(FfmpegError::Probe(format!(
+            "subtitle stream {stream_index} has no codec parameters"
+        )));
+    }
+    let cp = (*st).codecpar;
+    if (*cp).codec_type != AVMEDIA_TYPE_SUBTITLE {
+        return Err(FfmpegError::Probe(format!(
+            "stream {stream_index} is not a subtitle stream (av media type {})",
+            (*cp).codec_type
+        )));
+    }
+    let codec = codec_display_name((*cp).codec_id);
+    match subtitle::classify_codec(&codec) {
+        TrackKind::Text => {}
+        TrackKind::Bitmap => {
+            return Err(FfmpegError::Probe(format!(
+                "stream {stream_index} codec '{codec}': {}",
+                subtitle::unsupported_reason(&codec).unwrap_or("bitmap subtitle")
+            )));
+        }
+        TrackKind::Other => {
+            return Err(FfmpegError::Probe(format!(
+                "stream {stream_index} codec '{codec}': {}",
+                subtitle::unsupported_reason(&codec).unwrap_or("unsupported subtitle")
+            )));
+        }
+    }
+
+    let decoder = avcodec_find_decoder((*cp).codec_id);
+    if decoder.is_null() {
+        return Err(FfmpegError::Probe(format!(
+            "libavcodec has no decoder for subtitle codec '{codec}'"
+        )));
+    }
+    let mut dec_ctx = avcodec_alloc_context3(decoder);
+    if dec_ctx.is_null() {
+        return Err(FfmpegError::Probe(
+            "avcodec_alloc_context3(subtitle) returned NULL".into(),
+        ));
+    }
+    let ret = avcodec_parameters_to_context(dec_ctx, cp);
+    if ret < 0 {
+        avcodec_free_context(&mut dec_ctx);
+        return Err(ffmpeg_err(
+            format!("avcodec_parameters_to_context({codec})"),
+            ret,
+        ));
+    }
+    let ret = avcodec_open2(dec_ctx, decoder, std::ptr::null_mut());
+    if ret < 0 {
+        avcodec_free_context(&mut dec_ctx);
+        return Err(ffmpeg_err(format!("avcodec_open2({codec})"), ret));
+    }
+
+    let mut pkt = av_packet_alloc();
+    if pkt.is_null() {
+        avcodec_free_context(&mut dec_ctx);
+        return Err(FfmpegError::Probe("av_packet_alloc returned NULL".into()));
+    }
+
+    let tb = (*st).time_base;
+    let mut cues: Vec<Cue> = Vec::new();
+    let mut packets = 0u64;
+    let mut decode_errors = 0u32;
+    let mut read_error: Option<i32> = None;
+
+    loop {
+        let ret = av_read_frame(fmt_ctx, pkt);
+        if ret < 0 {
+            // AVERROR_EOF is the normal end; anything else is reported when no
+            // cue was produced at all.
+            read_error = Some(ret);
+            break;
+        }
+        if (*pkt).stream_index as u32 == stream_index {
+            packets += 1;
+            let fallback_pts_ms = if (*pkt).pts == AV_NOPTS_VALUE {
+                0
+            } else {
+                av_rescale_q((*pkt).pts, tb, MS_TB).max(0)
+            };
+            let mut sub: AVSubtitle = std::mem::zeroed();
+            let mut got: c_int = 0;
+            let ret = avcodec_decode_subtitle2(dec_ctx, &mut sub, &mut got, pkt);
+            if ret < 0 {
+                decode_errors += 1;
+                if decode_errors <= 3 {
+                    diag::log(format!(
+                        "[subtitle] decode error #{decode_errors} in '{codec}' stream {stream_index}: {}",
+                        av_err2str(ret)
+                    ));
+                }
+            }
+            if got != 0 {
+                let cue = cue_from_avsubtitle(&sub, fallback_pts_ms, &codec);
+                avsubtitle_free(&mut sub);
+                if let Some(cue) = cue {
+                    cues.push(cue);
+                }
+            }
+        }
+        av_packet_unref(pkt);
+        if packets >= SUBTITLE_MAX_PACKETS || cues.len() >= subtitle::MAX_CUES {
+            diag::log(format!(
+                "[subtitle] stopping extraction early after {packets} packets / {} cues",
+                cues.len()
+            ));
+            break;
+        }
+    }
+
+    av_packet_free(&mut pkt);
+    avcodec_free_context(&mut dec_ctx);
+
+    let cues = normalize_cues(cues);
+    if cues.is_empty() {
+        return Err(FfmpegError::Probe(format!(
+            "no subtitle cues decoded from '{codec}' stream {stream_index} \
+             ({packets} packets, {decode_errors} decode error(s){}",
+            read_error
+                .map(|code| format!(", read ended with {}", av_err2str(code)))
+                .unwrap_or_default()
+        )));
+    }
+    diag::log(format!(
+        "[subtitle] extracted {} cues from '{codec}' stream {stream_index} ({packets} packets, {decode_errors} decode error(s))",
+        cues.len()
+    ));
+    Ok(to_webvtt(&cues))
+}
+
+/// Extract one embedded text subtitle stream as WebVTT (public entry point).
+pub fn extract_subtitle_track(url: &str, stream_index: u32) -> FfmpegResult<String> {
+    let url_c = CString::new(url).map_err(|e| FfmpegError::Probe(e.to_string()))?;
+    unsafe {
+        let mut fmt_ctx: *mut AVFormatContext = std::ptr::null_mut();
+        let mut opts = input_open_options();
+        let ret = avformat_open_input(&mut fmt_ctx, url_c.as_ptr(), std::ptr::null(), &mut opts);
+        av_dict_free(&mut opts);
+        if ret < 0 || fmt_ctx.is_null() {
+            return Err(ffmpeg_err(format!("open subtitle source {url}"), ret));
+        }
+        let ret = avformat_find_stream_info(fmt_ctx, std::ptr::null_mut());
+        let result = if ret < 0 {
+            Err(ffmpeg_err("avformat_find_stream_info(subtitle)", ret))
+        } else {
+            extract_subtitle_inner(fmt_ctx, stream_index)
+        };
+        avformat_close_input(&mut fmt_ctx);
+        result
     }
 }
 

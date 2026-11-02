@@ -33,13 +33,12 @@
 pub mod diag; // always compiled — diagnostics must work without libav
 pub mod plan; // always compiled — pure remux/hybrid decision rules, host-testable
 pub mod preset;
+pub mod subtitle; // always compiled — pure text/timing → WebVTT conversion, host-testable
 mod sys; // always compiled — preset.rs uses its pub const values (AV_CODEC_ID_*)
 
 #[cfg(feature = "ffmpeg")]
 mod transcoder;
 
-#[cfg(feature = "ffmpeg")]
-use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "ffmpeg")]
 use std::sync::atomic::AtomicBool;
@@ -53,6 +52,7 @@ use thiserror::Error;
 pub use plan::{
     hybrid_audio_codec_id, remux_dropped_streams, remux_plan, remux_stream_selection, RemuxPlan,
 };
+pub use subtitle::{classify_codec, Cue, TrackKind};
 pub use wdmm_core::models::TranscodePreset;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -227,6 +227,26 @@ pub fn probe(url: &str) -> FfmpegResult<ProbeResult> {
 /// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
 #[cfg(not(feature = "ffmpeg"))]
 pub fn probe(_url: &str) -> FfmpegResult<ProbeResult> {
+    Err(FfmpegError::Unavailable(
+        "FFmpeg not linked (build with --features ffmpeg)".into(),
+    ))
+}
+
+/// Extract one embedded **text** subtitle stream and convert it to WebVTT.
+///
+/// Demuxes `url`, decodes the subtitle stream at `stream_index` through
+/// libavcodec (`avcodec_decode_subtitle2`, no rendering), then converts the
+/// decoded cues to WebVTT with [`subtitle::to_webvtt`]. Bitmap subtitle codecs
+/// (PGS/DVD/DVB) are rejected up front with a [`subtitle::unsupported_reason`]
+/// message — they need rendering, not text conversion.
+#[cfg(feature = "ffmpeg")]
+pub fn extract_subtitle_track(url: &str, stream_index: u32) -> FfmpegResult<String> {
+    transcoder::extract_subtitle_track(url, stream_index)
+}
+
+/// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
+#[cfg(not(feature = "ffmpeg"))]
+pub fn extract_subtitle_track(_url: &str, _stream_index: u32) -> FfmpegResult<String> {
     Err(FfmpegError::Unavailable(
         "FFmpeg not linked (build with --features ffmpeg)".into(),
     ))
@@ -450,27 +470,6 @@ pub fn open_job(_opts: JobOpts) -> FfmpegResult<JobHandle> {
     Err(FfmpegError::Unavailable(
         "FFmpeg not linked (build with --features ffmpeg)".into(),
     ))
-}
-
-// ── Small helper for FFI: resolve a codec name from a codec pointer ───────────
-
-/// Return the `name` field of an `AVCodec` (offset +8 on LP64, after the
-/// `AVClass*` at +0). Returns the numeric codec id if the pointer is null.
-#[cfg(feature = "ffmpeg")]
-#[allow(dead_code)]
-pub(crate) fn codec_name(codec: *const sys::AVCodec, codec_id: u32) -> String {
-    unsafe {
-        if codec.is_null() {
-            return format!("{}", codec_id);
-        }
-        let name_ptr = *(codec as *const u8)
-            .add(8)
-            .cast::<*const std::ffi::c_char>();
-        if name_ptr.is_null() {
-            return format!("{}", codec_id);
-        }
-        CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
-    }
 }
 
 #[cfg(test)]

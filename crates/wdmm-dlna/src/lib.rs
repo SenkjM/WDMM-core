@@ -24,7 +24,7 @@ pub mod rendering_control;
 pub mod session;
 
 pub use connection_manager::ConnectionManagerClient;
-pub use didl::{build_didl_lite, DidlRes, SUBTITLE_PROTOCOL_INFO};
+pub use didl::{build_didl_lite, subtitle_content_type, subtitle_protocol_info, DidlRes};
 pub use gena::{GenaEvent, GenaSubscription};
 pub use rendering_control::RenderingControlClient;
 pub use session::{DlnaSession, TickResult};

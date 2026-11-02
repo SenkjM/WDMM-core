@@ -15,9 +15,7 @@
     clippy::too_many_arguments
 )]
 
-#[cfg(feature = "ffmpeg")]
-use std::ffi::c_char;
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 
 // ── Primitive type aliases ────────────────────────────────────────────────────
 
@@ -31,6 +29,19 @@ pub type AVSampleFormat = c_int;
 pub const AVMEDIA_TYPE_VIDEO: AVMediaType = 0;
 pub const AVMEDIA_TYPE_AUDIO: AVMediaType = 1;
 pub const AVMEDIA_TYPE_DATA: AVMediaType = 2;
+pub const AVMEDIA_TYPE_SUBTITLE: AVMediaType = 3;
+
+// AVSubtitle.format values (libavcodec/avcodec.h enum AVSubtitleType).
+pub const SUBTITLE_NONE: u16 = 0;
+pub const SUBTITLE_BITMAP: u16 = 1;
+pub const SUBTITLE_TEXT: u16 = 2;
+pub const SUBTITLE_ASS: u16 = 3;
+
+// AVSubtitleType of one AVSubtitleRect.type (same values, int-typed).
+pub const SUBTITLE_RECT_NONE: c_int = 0;
+pub const SUBTITLE_RECT_BITMAP: c_int = 1;
+pub const SUBTITLE_RECT_TEXT: c_int = 2;
+pub const SUBTITLE_RECT_ASS: c_int = 3;
 
 pub const AV_NOPTS_VALUE: i64 = i64::MIN;
 
@@ -145,7 +156,11 @@ pub struct AVStream {
     pub time_base: AVRational,            // +32 (8)
     pub start_time: i64,                  // +40 (8)
     pub duration: i64,                    // +48 (8)
-    _tail: [u8; 176],                     // +56 (176)
+    /// nb_frames (i64 @ +56) … discard/sample_aspect_ratio/metadata/avg_frame_rate/
+    /// attached_pic/side_data/nb_side_data/event_flags
+    _gap0: [u8; 160], // +56  .. +216
+    pub r_frame_rate: AVRational,         // +216 (8)
+    _tail: [u8; 8],                       // +224 (8)
 } // sizeof=232 ✓
 
 // ── AVPacket (104 bytes, LP64) ────────────────────────────────────────────────
@@ -210,6 +225,16 @@ pub struct SwrContext {
 }
 #[repr(C)]
 pub struct AVAudioFifo {
+    _p: [u8; 0],
+}
+/// Opaque marker for libavcodec's `AVSubtitle` (32 bytes, LP64; see accessors).
+#[repr(C)]
+pub struct AVSubtitle {
+    _p: [u8; 0],
+}
+/// Opaque marker for libavcodec's `AVSubtitleRect` (96 bytes, LP64; see accessors).
+#[repr(C)]
+pub struct AVSubtitleRect {
     _p: [u8; 0],
 }
 
@@ -366,6 +391,70 @@ pub unsafe fn frame_set_ch_layout(f: *mut AVFrame, v: AVChannelLayout) {
     *(f as *mut u8).add(408).cast() = v;
 }
 
+// AVStream helpers (offsets verified against FFmpeg 7.1 libavformat/avformat.h).
+/// `r_frame_rate` (AVRational @ +216 / +220). `+56` is `nb_frames`, not a rate.
+#[inline]
+pub unsafe fn stream_r_frame_rate(s: *const AVStream) -> AVRational {
+    (*s).r_frame_rate
+}
+
+// AVSubtitle (sizeof=32): format u16 @0, start_display_time u32 @4,
+// end_display_time u32 @8, num_rects u32 @12, rects ** @16, pts i64 @24.
+#[inline]
+pub unsafe fn subtitle_format(s: *const AVSubtitle) -> u16 {
+    *(s as *const u8).cast()
+}
+/// Cue start, in milliseconds relative to the packet pts.
+#[inline]
+pub unsafe fn subtitle_start_display_time(s: *const AVSubtitle) -> u32 {
+    *((s as *const u8).add(4).cast())
+}
+/// Cue end, in milliseconds relative to the packet pts.
+#[inline]
+pub unsafe fn subtitle_end_display_time(s: *const AVSubtitle) -> u32 {
+    *((s as *const u8).add(8).cast())
+}
+#[inline]
+pub unsafe fn subtitle_num_rects(s: *const AVSubtitle) -> u32 {
+    *((s as *const u8).add(12).cast())
+}
+/// `AVSubtitleRect **rects` (@ +16).
+#[inline]
+pub unsafe fn subtitle_rects(s: *const AVSubtitle) -> *const *mut AVSubtitleRect {
+    *(s as *const u8).add(16).cast()
+}
+/// Packet pts in AV_TIME_BASE (µs) units (@ +24).
+#[inline]
+pub unsafe fn subtitle_pts(s: *const AVSubtitle) -> i64 {
+    *((s as *const u8).add(24).cast())
+}
+
+// AVSubtitleRect (sizeof=96): x@0,y@4,w@8,h@12,nb_colors@16, data[4]@24,
+// linesize[4]@56, flags@72, type@76, text *@80, ass *@88.
+#[inline]
+pub unsafe fn rect_type(r: *const AVSubtitleRect) -> c_int {
+    *((r as *const u8).add(76).cast())
+}
+#[inline]
+pub unsafe fn rect_flags(r: *const AVSubtitleRect) -> c_int {
+    *((r as *const u8).add(72).cast())
+}
+/// `char *text` (@ +80) — NUL-terminated plain UTF-8 text, may be null.
+#[inline]
+pub unsafe fn rect_text(r: *const AVSubtitleRect) -> *const c_char {
+    *(r as *const u8).add(80).cast()
+}
+/// `char *ass` (@ +88) — NUL-terminated ASS/SSA event line, may be null.
+#[inline]
+pub unsafe fn rect_ass(r: *const AVSubtitleRect) -> *const c_char {
+    *(r as *const u8).add(88).cast()
+}
+/// `uint8_t *data[i]` (@ +24 + i*8).
+#[inline]
+pub unsafe fn rect_data(r: *const AVSubtitleRect, plane: usize) -> *mut u8 {
+    *((r as *const u8).add(24 + plane * 8).cast())
+}
+
 // ── extern "C" declarations ───────────────────────────────────────────────────
 // Gated on the `ffmpeg` Cargo feature — only present when FFmpeg shared libs
 // are available for linking.
@@ -442,6 +531,16 @@ extern "C" {
     pub fn avcodec_send_frame(avctx: *mut AVCodecContext, frame: *const AVFrame) -> c_int;
     pub fn avcodec_receive_packet(avctx: *mut AVCodecContext, avpkt: *mut AVPacket) -> c_int;
     pub fn avcodec_flush_buffers(avctx: *mut AVCodecContext);
+    /// Decode one subtitle packet into `sub`. `got_sub_ptr` is 1 when a subtitle
+    /// was produced; must be paired with [`avsubtitle_free`].
+    pub fn avcodec_decode_subtitle2(
+        avctx: *mut AVCodecContext,
+        sub: *mut AVSubtitle,
+        got_sub_ptr: *mut c_int,
+        avpkt: *mut AVPacket,
+    ) -> c_int;
+    /// Free the rects and allocated strings of a decoded subtitle.
+    pub fn avsubtitle_free(sub: *mut AVSubtitle);
 
     // frames
     pub fn av_frame_alloc() -> *mut AVFrame;

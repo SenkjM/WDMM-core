@@ -5,12 +5,32 @@
 //! `CurrentURIMetaData` to `SetAVTransportURI` (SOAP-escaped once more by the
 //! AVTransport envelope builder).
 //!
-//! The subtitle resource convention matches the legacy Dart path: a second
-//! `<res>` element whose `protocolInfo` is [`SUBTITLE_PROTOCOL_INFO`] lets
-//! DLNA renderers with caption support pick up sidecar subtitles.
+//! Subtitles are advertised as an extra `<res>` element whose `protocolInfo`
+//! content type is the real subtitle MIME type. Kodi's UPnP renderer
+//! (`UPnPInternal.cpp` `GetResource` + `SupportedSubFormats`) only accepts a
+//! subtitle resource when the MIME **subtype** is the actual format (`srt`,
+//! `ass`, `ssa`, `vtt`, `sub`) — it logs `adding subtitle: #N, type '<t>'` and
+//! hands the URL to the player. A `text/plain` resource is silently ignored.
 
-/// `protocolInfo` used for the subtitle (sidecar) `<res>` element.
-pub const SUBTITLE_PROTOCOL_INFO: &str = "http-get:*:text/plain:DLNA.ORG_PN=*";
+/// Content type (`text/<ext>`) Kodi accepts for a sidecar subtitle extension.
+///
+/// `None` means "not a subtitle Kodi accepts here" — callers must not emit a
+/// subtitle `<res>` in that case.
+pub fn subtitle_content_type(ext: &str) -> Option<&'static str> {
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "srt" => "text/srt",
+        "ass" => "text/ass",
+        "ssa" => "text/ssa",
+        "vtt" => "text/vtt",
+        "sub" => "text/sub",
+        _ => return None,
+    })
+}
+
+/// `protocolInfo` for a subtitle `<res>`: `http-get:*:<content-type>:*`.
+pub fn subtitle_protocol_info(ext: &str) -> Option<String> {
+    subtitle_content_type(ext).map(|content_type| format!("http-get:*:{content_type}:*"))
+}
 
 /// One media resource of a DIDL-Lite item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,10 +54,10 @@ impl DidlRes {
 
 /// Build a DIDL-Lite document with a title and one `<res>` per resource.
 ///
-/// The first resource is the media stream; a second resource should use
-/// [`SUBTITLE_PROTOCOL_INFO`] (see [`DidlRes`]). Output is byte-identical to
-/// the Dart `_didlLite` for the same inputs (no XML declaration, no
-/// whitespace).
+/// The first resource is the media stream; a second resource may be a subtitle
+/// sidecar whose `protocol_info` comes from [`subtitle_protocol_info`]. Output
+/// is byte-identical to the Dart `_didlLite` for the same inputs (no XML
+/// declaration, no whitespace).
 pub fn build_didl_lite(title: &str, resources: &[DidlRes]) -> String {
     let mut s = String::new();
     s.push_str(
@@ -78,10 +98,7 @@ mod tests {
 
     #[test]
     fn builds_single_resource_didl() {
-        let didl = build_didl_lite(
-            "Movie",
-            &[DidlRes::new("http://media/movie.mkv", PROTO)],
-        );
+        let didl = build_didl_lite("Movie", &[DidlRes::new("http://media/movie.mkv", PROTO)]);
         assert_eq!(
             didl,
             "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
@@ -115,24 +132,48 @@ mod tests {
 
     #[test]
     fn builds_dual_res_with_subtitle_protocol() {
+        let proto = subtitle_protocol_info("srt").expect("srt is a subtitle format");
         let didl = build_didl_lite(
             "Episode 1",
             &[
                 DidlRes::new("http://media/ep1.mkv", PROTO),
-                DidlRes::new("http://media/ep1.srt", SUBTITLE_PROTOCOL_INFO),
+                DidlRes::new("http://media/ep1.srt", proto.clone()),
             ],
         );
         assert_eq!(didl.matches("<res ").count(), 2);
         assert!(didl.contains(&format!(
-            "<res protocolInfo=\"{SUBTITLE_PROTOCOL_INFO}\">http://media/ep1.srt</res>"
+            "<res protocolInfo=\"{proto}\">http://media/ep1.srt</res>"
         )));
+        assert!(didl.contains("http-get:*:text/srt:*"));
+    }
+
+    #[test]
+    fn subtitle_protocol_info_uses_real_mime_subtype() {
+        for (ext, content_type) in [
+            ("srt", "text/srt"),
+            ("ASS", "text/ass"),
+            ("ssa", "text/ssa"),
+            ("vtt", "text/vtt"),
+            ("sub", "text/sub"),
+        ] {
+            assert_eq!(
+                subtitle_protocol_info(ext).as_deref(),
+                Some(&format!("http-get:*:{content_type}:*")[..])
+            );
+        }
+        assert_eq!(subtitle_protocol_info("txt"), None);
+        assert_eq!(subtitle_protocol_info("idx"), None);
+        assert_eq!(subtitle_protocol_info(""), None);
     }
 
     #[test]
     fn escapes_protocol_info_special_chars() {
         let didl = build_didl_lite(
             "X",
-            &[DidlRes::new("http://m/a", "http-get:*:video/mp4:DLNA.ORG_PN=A&B")],
+            &[DidlRes::new(
+                "http://m/a",
+                "http-get:*:video/mp4:DLNA.ORG_PN=A&B",
+            )],
         );
         assert!(didl.contains("DLNA.ORG_PN=A&amp;B"));
     }

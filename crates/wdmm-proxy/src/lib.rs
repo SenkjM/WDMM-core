@@ -807,6 +807,13 @@ pub fn content_type_for(name: Option<&str>) -> &'static str {
         "aac"          => "audio/aac",
         "wav"          => "audio/wav",
         "ogg" | "opus" => "audio/ogg",
+        // Subtitle sidecars and generated WebVTT, served to the DLNA renderer.
+        // Kodi matches the MIME *subtype* against its subtitle formats.
+        "srt"          => "text/srt",
+        "ass"          => "text/ass",
+        "ssa"          => "text/ssa",
+        "vtt"          => "text/vtt",
+        "sub"          => "text/sub",
         _              => "application/octet-stream",
     }
 }
@@ -1114,6 +1121,16 @@ mod tests {
     fn content_type_audio() {
         assert_eq!(content_type_for(Some("track.mp3")), "audio/mpeg");
         assert_eq!(content_type_for(Some("lossless.flac")), "audio/flac");
+    }
+    #[test]
+    fn content_type_subtitles() {
+        // The subtitle endpoint must serve the real text MIME: Kodi's UPnP
+        // renderer matches the subtype against its supported subtitle formats.
+        assert_eq!(content_type_for(Some("movie.zh.srt")), "text/srt");
+        assert_eq!(content_type_for(Some("movie.ass")), "text/ass");
+        assert_eq!(content_type_for(Some("movie.SSA")), "text/ssa");
+        assert_eq!(content_type_for(Some("movie.vtt")), "text/vtt");
+        assert_eq!(content_type_for(Some("movie.sub")), "text/sub");
     }
     #[test]
     fn content_type_fallback() {
