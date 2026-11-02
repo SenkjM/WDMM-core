@@ -63,13 +63,16 @@ impl ConnectionManagerClient {
         &self.control_url
     }
 
-    /// `GetProtocolInfo` — renderer sink `protocolInfo` entries.
+    /// `GetProtocolInfo` — raw `<Source>` list plus parsed sink `protocolInfo`
+    /// entries.
     ///
-    /// The `<Sink>` text is split on `,`, trimmed and empty entries dropped
-    /// (same as Dart `_getSinkProtocolInfo`). Transport/parse errors surface as
-    /// [`DlnaError::Cast`]; callers that want Dart's "empty list on failure"
-    /// behaviour can use `unwrap_or_default()`.
-    pub async fn get_sink_protocol_info(&self) -> DlnaResult<Vec<String>> {
+    /// `Source` is what the renderer can push as a MediaServer; it is empty on
+    /// MediaRenderer-only devices (Kodi replies with an empty `<Source>`). It is
+    /// returned verbatim (trimmed) because the UI shows it as-is. The `<Sink>`
+    /// text is split on `,`, trimmed and empty entries dropped (same as Dart
+    /// `_getSinkProtocolInfo`). Transport/parse errors surface as
+    /// [`DlnaError::Cast`].
+    pub async fn get_protocol_info(&self) -> DlnaResult<(String, Vec<String>)> {
         let body = soap_envelope(CONNECTION_MANAGER_SERVICE_TYPE, "GetProtocolInfo", &[]);
         let resp = post_soap(
             &self.client,
@@ -79,10 +82,18 @@ impl ConnectionManagerClient {
             &body,
         )
         .await?;
-        let mut vals = extract_soap_values(&resp, &["Sink"]);
-        Ok(split_sink_protocol_info(
-            vals.remove("Sink").unwrap_or_default().as_str(),
-        ))
+        let mut vals = extract_soap_values(&resp, &["Source", "Sink"]);
+        let source = vals.remove("Source").unwrap_or_default();
+        let sink = split_sink_protocol_info(vals.remove("Sink").unwrap_or_default().as_str());
+        Ok((source.trim().to_string(), sink))
+    }
+
+    /// `GetProtocolInfo` — renderer sink `protocolInfo` entries.
+    ///
+    /// Callers that want Dart's "empty list on failure" behaviour can use
+    /// `unwrap_or_default()`.
+    pub async fn get_sink_protocol_info(&self) -> DlnaResult<Vec<String>> {
+        self.get_protocol_info().await.map(|(_, sink)| sink)
     }
 
     /// Pick the `protocolInfo` string to embed in DIDL-Lite for `mime`.
@@ -242,6 +253,53 @@ mod tests {
         assert!(post
             .to_ascii_lowercase()
             .contains("content-type: text/xml; charset=utf-8"));
+    }
+
+    #[tokio::test]
+    async fn fetches_raw_source_alongside_sink() {
+        const RESP_WITH_SOURCE: &str = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
+      <Source>http-get:*:video/mp4:*, http-get:*:audio/mpeg:*</Source>
+      <Sink>http-get:*:video/mp4:*</Sink>
+    </u:GetProtocolInfoResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let server = spawn_fake_http(|req| {
+            if req.starts_with("GET ") {
+                FakeResponse::ok(DESC_WITH_CM)
+            } else {
+                FakeResponse::ok(RESP_WITH_SOURCE)
+            }
+        })
+        .await;
+        let renderer = renderer_for(&server).await;
+        let client = ConnectionManagerClient::from_renderer(&renderer)
+            .await
+            .expect("ConnectionManager client");
+        let (source, sink) = client.get_protocol_info().await.expect("protocol info");
+        assert_eq!(source, "http-get:*:video/mp4:*, http-get:*:audio/mpeg:*");
+        assert_eq!(sink, vec!["http-get:*:video/mp4:*".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn empty_source_reports_empty_string() {
+        let server = spawn_fake_http(|req| {
+            if req.starts_with("GET ") {
+                FakeResponse::ok(DESC_WITH_CM)
+            } else {
+                FakeResponse::ok(SINK_RESP)
+            }
+        })
+        .await;
+        let renderer = renderer_for(&server).await;
+        let client = ConnectionManagerClient::from_renderer(&renderer)
+            .await
+            .expect("ConnectionManager client");
+        let (source, sink) = client.get_protocol_info().await.expect("protocol info");
+        assert_eq!(source, "");
+        assert_eq!(sink.len(), 3);
     }
 
     #[tokio::test]

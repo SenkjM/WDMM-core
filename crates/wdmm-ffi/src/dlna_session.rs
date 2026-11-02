@@ -1104,6 +1104,63 @@ pub extern "C" fn wdmm_dlna_session_close(handle: u32) -> FfiString {
     FfiString::from("ok")
 }
 
+// ── FFI: renderer protocol info ──────────────────────────────────────────────
+
+/// Query a renderer's ConnectionManager `GetProtocolInfo` without casting.
+///
+/// `renderer_location` — the renderer's device-description URL (the SSDP
+/// `<LOCATION>` a discovery result carries). No session, proxy or account is
+/// touched, so the UI can ask "would this renderer accept the file?" before
+/// starting a cast.
+///
+/// Returns `{"ok":true,"source":"…","sink":"…","sink_count":N}`:
+/// * `source` — the renderer's raw `<Source>` protocol list (empty on
+///   MediaRenderer-only devices such as Kodi),
+/// * `sink` — the renderer's `<Sink>` list as a comma-separated string
+///   (trimmed, empty entries dropped),
+/// * `sink_count` — number of sink entries,
+///
+/// or `{"ok":false,"error":"…"}` when the description cannot be fetched, the
+/// device exposes no ConnectionManager:1 service, or the SOAP call fails.
+/// Caller must free the result via [`crate::wdmm_ffi_free_string`].
+///
+/// # Safety
+/// `renderer_location` must be a valid null-terminated UTF-8 C string (or null).
+#[no_mangle]
+pub extern "C" fn wdmm_dlna_sink_protocol_info_json(
+    renderer_location: *const c_char,
+) -> FfiString {
+    let Some(location) = ptr_to_str(renderer_location).filter(|value| !value.is_empty()) else {
+        return err_json("invalid renderer_location");
+    };
+    let renderer = DlnaRenderer {
+        usn: location.to_string(),
+        location: location.to_string(),
+        server: None,
+    };
+    match rt().block_on(read_sink_protocol_info(&renderer)) {
+        Ok(value) => FfiString::from(value.to_string()),
+        Err(e) => err_json(e),
+    }
+}
+
+/// Fetch and shape a renderer's `GetProtocolInfo` document.
+async fn read_sink_protocol_info(renderer: &DlnaRenderer) -> Result<Value, String> {
+    let client = ConnectionManagerClient::from_renderer(renderer)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (source, sink) = client
+        .get_protocol_info()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "ok": true,
+        "source": source,
+        "sink": sink.join(","),
+        "sink_count": sink.len(),
+    }))
+}
+
 // ── FFI: extended discovery ──────────────────────────────────────────────────
 
 /// Discover DLNA renderers and enrich each entry with its device description.
