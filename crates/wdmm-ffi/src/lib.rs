@@ -20,6 +20,8 @@ use tokio::runtime::Runtime;
 use wdmm_queue::TaskQueue;
 use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase};
 
+mod dlna_session;
+
 // ── Runtime singleton ─────────────────────────────────────────────────────────
 
 fn rt() -> &'static Runtime {
