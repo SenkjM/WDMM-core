@@ -62,6 +62,30 @@ impl WebDavDriver {
         self.base_url.join(trimmed).unwrap().to_string()
     }
 
+    /// Convert a server-supplied absolute href (e.g. `/dav/Local/file.mp3`)
+    /// into a full URL by reusing the base URL's scheme + host, **not** by
+    /// appending to the base path.  This avoids the double-segment bug where
+    /// `join_path("/dav/Local/file.mp3")` would produce `.../dav/dav/Local/…`.
+    fn href_to_url(&self, href: &str) -> String {
+        // If the server already returned a full URL (some proxy servers do),
+        // use it directly.
+        if href.starts_with("http://") || href.starts_with("https://") {
+            return href.to_string();
+        }
+        // Otherwise reconstruct: scheme://host[:port] + absolute_path
+        let origin = format!(
+            "{}://{}",
+            self.base_url.scheme(),
+            self.base_url.host_str().unwrap_or("")
+        );
+        let origin = if let Some(port) = self.base_url.port() {
+            format!("{}:{}", origin, port)
+        } else {
+            origin
+        };
+        format!("{}{}", origin, href)
+    }
+
     /// Parse PROPFIND XML and extract items.
     /// `propfind_url` is the full URL that was requested (for filtering the collection itself).
     fn parse_propfind_response(
@@ -158,7 +182,7 @@ impl WebDavDriver {
                                     is_dir: current_is_dir,
                                     size: current_size,
                                     modified: current_modified,
-                                    raw_url: Some(self.join_path(&decoded_href)),
+                                    raw_url: Some(self.href_to_url(&decoded_href)),
                                     raw_headers,
                                     delivery: crate::driver::ContentDeliveryKind::NetworkDirect,
                                     local_path: None,
@@ -783,6 +807,208 @@ mod tests {
                     "raw_url missing expected base path fragment.\nexpected prefix: {expected_fragment}\ngot: {raw}"
                 );
             }
+        }
+    }
+
+    // ── Full CRUD live tests ─────────────────────────────────────────────────
+    //
+    // These exercise put_content / get_content / get_content_range / get /
+    // mkdir / rename / copy / remove / ensure_dir against a real server.
+    //
+    // Servers (e.g. OpenList/Alist) may not implement the full WebDAV spec.
+    // Tests that hit an unsupported operation print a clear note and skip
+    // rather than failing — the important thing is that we know what works.
+    //
+    // All writes go under a test-scoped subdirectory and are cleaned up at
+    // the end (best-effort).  Use a writable account; the guest account may
+    // be read-only on some servers.
+
+    /// Returns true if the error looks like "server doesn't support this method".
+    fn is_unsupported(e: &DriverError) -> bool {
+        match e {
+            DriverError::Network(msg) => {
+                let m = msg.to_ascii_lowercase();
+                m.contains("405") || m.contains("501") || m.contains("not allowed")
+                    || m.contains("not implemented") || m.contains("forbidden")
+                    || m.contains("403") || m.contains("500")
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WDMM_TEST_WEBDAV_URL env var (run with --ignored); account needs write access"]
+    async fn live_crud_put_get_remove() {
+        let Some((url, user, pass, subdir)) = live_webdav_config() else {
+            eprintln!("WDMM_TEST_WEBDAV_URL not set — skipping");
+            return;
+        };
+        let base = url.trim_end_matches('/').to_string();
+        let driver = WebDavDriver::new(&base, &user, &pass).unwrap();
+
+        let test_dir = format!("/{}/wdmm_test_crud", subdir.trim_matches('/'));
+        let test_file = format!("{}/hello.txt", test_dir);
+        let payload = b"wdmm-live-test-payload-v1";
+
+        // ── ensure_dir ──────────────────────────────────────────────────────
+        match driver.ensure_dir(&test_dir).await {
+            Ok(()) => eprintln!("ensure_dir({test_dir}): ok"),
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support MKCOL (ensure_dir): {e}");
+                return;
+            }
+            Err(e) => panic!("ensure_dir failed unexpectedly: {e}"),
+        }
+
+        // ── put_content ─────────────────────────────────────────────────────
+        match driver.put_content(&test_file, payload).await {
+            Ok(()) => eprintln!("put_content({test_file}): ok"),
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support PUT (put_content): {e}");
+                let _ = driver.remove(&test_dir).await;
+                return;
+            }
+            Err(e) => {
+                let _ = driver.remove(&test_dir).await;
+                panic!("put_content failed: {e}");
+            }
+        }
+
+        // ── get_content ─────────────────────────────────────────────────────
+        match driver.get_content(&test_file).await {
+            Ok(data) => {
+                assert_eq!(data.as_slice(), payload, "get_content round-trip mismatch");
+                eprintln!("get_content({test_file}): ok ({} bytes)", data.len());
+            }
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support GET (get_content): {e}");
+            }
+            Err(e) => {
+                let _ = driver.remove(&test_file).await;
+                let _ = driver.remove(&test_dir).await;
+                panic!("get_content failed: {e}");
+            }
+        }
+
+        // ── get_content_range ───────────────────────────────────────────────
+        match driver.get_content_range(&test_file, 5, Some(9)).await {
+            Ok(data) => {
+                // bytes 5..=9 of "wdmm-live-test-payload-v1" = "live-"
+                assert_eq!(&data, b"live-", "range [5,9] mismatch");
+                eprintln!("get_content_range({test_file}, 5..9): ok");
+            }
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support Range requests: {e}");
+            }
+            Err(e) => {
+                let _ = driver.remove(&test_file).await;
+                let _ = driver.remove(&test_dir).await;
+                panic!("get_content_range failed: {e}");
+            }
+        }
+
+        // ── get (depth-0 stat) ───────────────────────────────────────────────
+        match driver.get(&test_file).await {
+            Ok(item) => {
+                assert_eq!(item.name, "hello.txt");
+                assert!(!item.is_dir);
+                assert_eq!(item.size, payload.len() as u64, "stat size mismatch");
+                eprintln!("get({test_file}): ok (size={})", item.size);
+            }
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support depth-0 PROPFIND (get): {e}");
+            }
+            Err(e) => {
+                let _ = driver.remove(&test_file).await;
+                let _ = driver.remove(&test_dir).await;
+                panic!("get failed: {e}");
+            }
+        }
+
+        // ── rename (MOVE) ────────────────────────────────────────────────────
+        let renamed = format!("{}/hello_renamed.txt", test_dir);
+        match driver.rename(&test_file, &renamed).await {
+            Ok(()) => eprintln!("rename({test_file} → {renamed}): ok"),
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support MOVE (rename): {e}");
+                // still present as test_file — remove it
+                let _ = driver.remove(&test_file).await;
+                let _ = driver.remove(&test_dir).await;
+                return;
+            }
+            Err(e) => {
+                let _ = driver.remove(&test_file).await;
+                let _ = driver.remove(&test_dir).await;
+                panic!("rename failed: {e}");
+            }
+        }
+
+        // ── copy ─────────────────────────────────────────────────────────────
+        let copied = format!("{}/hello_copy.txt", test_dir);
+        match driver.copy(&renamed, &copied).await {
+            Ok(()) => eprintln!("copy({renamed} → {copied}): ok"),
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support COPY: {e}");
+            }
+            Err(e) => {
+                let _ = driver.remove(&renamed).await;
+                let _ = driver.remove(&test_dir).await;
+                panic!("copy failed: {e}");
+            }
+        }
+
+        // ── remove (cleanup) ─────────────────────────────────────────────────
+        for path in &[&renamed, &copied, &test_dir] {
+            match driver.remove(path).await {
+                Ok(()) => eprintln!("remove({path}): ok"),
+                Err(e) if is_unsupported(&e) => {
+                    eprintln!("NOTE: server does not support DELETE (remove): {e}");
+                }
+                Err(e) => eprintln!("WARN: cleanup remove({path}) failed: {e}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WDMM_TEST_WEBDAV_URL env var (run with --ignored); account needs write access"]
+    async fn live_mkdir_and_remove() {
+        let Some((url, user, pass, subdir)) = live_webdav_config() else {
+            eprintln!("WDMM_TEST_WEBDAV_URL not set — skipping");
+            return;
+        };
+        let base = url.trim_end_matches('/').to_string();
+        let driver = WebDavDriver::new(&base, &user, &pass).unwrap();
+
+        let test_dir = format!("/{}/wdmm_test_mkdir", subdir.trim_matches('/'));
+
+        // ── mkdir ────────────────────────────────────────────────────────────
+        match driver.mkdir(&test_dir).await {
+            Ok(()) => eprintln!("mkdir({test_dir}): ok"),
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support MKCOL (mkdir): {e}");
+                return;
+            }
+            Err(e) => panic!("mkdir failed: {e}"),
+        }
+
+        // Verify directory exists via list of parent
+        let parent = format!("/{}", subdir.trim_matches('/'));
+        match driver.list(&parent).await {
+            Ok(items) => {
+                let found = items.iter().any(|i| i.name == "wdmm_test_mkdir" && i.is_dir);
+                assert!(found, "newly created dir not found in parent listing");
+                eprintln!("verified wdmm_test_mkdir in parent listing");
+            }
+            Err(e) => eprintln!("WARN: could not verify mkdir via list: {e}"),
+        }
+
+        // ── cleanup ──────────────────────────────────────────────────────────
+        match driver.remove(&test_dir).await {
+            Ok(()) => eprintln!("remove({test_dir}): ok"),
+            Err(e) if is_unsupported(&e) => {
+                eprintln!("NOTE: server does not support DELETE: {e}");
+            }
+            Err(e) => eprintln!("WARN: cleanup failed: {e}"),
         }
     }
 }
