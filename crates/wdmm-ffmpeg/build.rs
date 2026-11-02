@@ -26,7 +26,14 @@ fn main() {
         }
     }
 
-    for lib in ["avformat", "avcodec", "avfilter", "swresample", "swscale", "avutil"] {
+    for lib in [
+        "avformat",
+        "avcodec",
+        "avfilter",
+        "swresample",
+        "swscale",
+        "avutil",
+    ] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
 }

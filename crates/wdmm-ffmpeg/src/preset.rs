@@ -14,23 +14,23 @@ use wdmm_core::models::TranscodePreset;
 /// so the proxy hands the raw stream straight to the renderer.
 pub fn preset_passthrough() -> TranscodePreset {
     TranscodePreset {
-        id:                 "passthrough".into(),
-        label:              "Direct / Pass-through".into(),
-        container:          "original".into(),
-        video_codec:        None,
+        id: "passthrough".into(),
+        label: "Direct / Pass-through".into(),
+        container: "original".into(),
+        video_codec: None,
         video_hw_preferred: false,
-        video_max_w:        None,
-        video_max_h:        None,
-        video_max_bitrate:  None,
-        video_fps_cap:      None,
-        audio_codec:        "copy".into(),
-        audio_bitrate:      0,
-        audio_channels:     0,
-        audio_sample_rate:  None,
-        hls_segment_secs:   4,
-        remux_first:        false,
-        sort_order:         0,
-        is_builtin:         true,
+        video_max_w: None,
+        video_max_h: None,
+        video_max_bitrate: None,
+        video_fps_cap: None,
+        audio_codec: "copy".into(),
+        audio_bitrate: 0,
+        audio_channels: 0,
+        audio_sample_rate: None,
+        hls_segment_secs: 4,
+        remux_first: false,
+        sort_order: 0,
+        is_builtin: true,
     }
 }
 
@@ -39,23 +39,23 @@ pub fn preset_passthrough() -> TranscodePreset {
 /// H.264 + AAC, 720p cap, 2 Mbps video — the widest-compatible DLNA profile.
 pub fn preset_dlna_compat() -> TranscodePreset {
     TranscodePreset {
-        id:                 "dlna-compat".into(),
-        label:              "DLNA Compatible (default)".into(),
-        container:          "mpegts".into(),
-        video_codec:        Some("h264".into()),
+        id: "dlna-compat".into(),
+        label: "DLNA Compatible (default)".into(),
+        container: "mpegts".into(),
+        video_codec: Some("h264".into()),
         video_hw_preferred: true,
-        video_max_w:        Some(1280),
-        video_max_h:        Some(720),
-        video_max_bitrate:  Some(2_000_000),
-        video_fps_cap:      Some(30),
-        audio_codec:        "aac".into(),
-        audio_bitrate:      128_000,
-        audio_channels:     2,
-        audio_sample_rate:  Some(44100),
-        hls_segment_secs:   4,
-        remux_first:        true,
-        sort_order:         1,
-        is_builtin:         true,
+        video_max_w: Some(1280),
+        video_max_h: Some(720),
+        video_max_bitrate: Some(2_000_000),
+        video_fps_cap: Some(30),
+        audio_codec: "aac".into(),
+        audio_bitrate: 128_000,
+        audio_channels: 2,
+        audio_sample_rate: Some(44100),
+        hls_segment_secs: 4,
+        remux_first: true,
+        sort_order: 1,
+        is_builtin: true,
     }
 }
 
@@ -65,23 +65,23 @@ pub fn preset_dlna_compat() -> TranscodePreset {
 /// compatibility for modern DLNA renderers.
 pub fn preset_balanced() -> TranscodePreset {
     TranscodePreset {
-        id:                 "balanced".into(),
-        label:              "Balanced".into(),
-        container:          "mpegts".into(),
-        video_codec:        Some("h264".into()),
+        id: "balanced".into(),
+        label: "Balanced".into(),
+        container: "mpegts".into(),
+        video_codec: Some("h264".into()),
         video_hw_preferred: true,
-        video_max_w:        Some(1920),
-        video_max_h:        Some(1080),
-        video_max_bitrate:  Some(4_000_000),
-        video_fps_cap:      Some(60),
-        audio_codec:        "aac".into(),
-        audio_bitrate:      192_000,
-        audio_channels:     2,
-        audio_sample_rate:  Some(48000),
-        hls_segment_secs:   4,
-        remux_first:        true,
-        sort_order:         2,
-        is_builtin:         true,
+        video_max_w: Some(1920),
+        video_max_h: Some(1080),
+        video_max_bitrate: Some(4_000_000),
+        video_fps_cap: Some(60),
+        audio_codec: "aac".into(),
+        audio_bitrate: 192_000,
+        audio_channels: 2,
+        audio_sample_rate: Some(48000),
+        hls_segment_secs: 4,
+        remux_first: true,
+        sort_order: 2,
+        is_builtin: true,
     }
 }
 
@@ -90,23 +90,23 @@ pub fn preset_balanced() -> TranscodePreset {
 /// H.264 + AAC, 1080p, 8 Mbps — maximum quality within the H.264 envelope.
 pub fn preset_high() -> TranscodePreset {
     TranscodePreset {
-        id:                 "high".into(),
-        label:              "High Quality".into(),
-        container:          "mpegts".into(),
-        video_codec:        Some("h264".into()),
+        id: "high".into(),
+        label: "High Quality".into(),
+        container: "mpegts".into(),
+        video_codec: Some("h264".into()),
         video_hw_preferred: true,
-        video_max_w:        Some(1920),
-        video_max_h:        Some(1080),
-        video_max_bitrate:  Some(8_000_000),
-        video_fps_cap:      None,
-        audio_codec:        "aac".into(),
-        audio_bitrate:      256_000,
-        audio_channels:     2,
-        audio_sample_rate:  Some(48000),
-        hls_segment_secs:   4,
-        remux_first:        true,
-        sort_order:         3,
-        is_builtin:         true,
+        video_max_w: Some(1920),
+        video_max_h: Some(1080),
+        video_max_bitrate: Some(8_000_000),
+        video_fps_cap: None,
+        audio_codec: "aac".into(),
+        audio_bitrate: 256_000,
+        audio_channels: 2,
+        audio_sample_rate: Some(48000),
+        hls_segment_secs: 4,
+        remux_first: true,
+        sort_order: 3,
+        is_builtin: true,
     }
 }
 
@@ -116,23 +116,23 @@ pub fn preset_high() -> TranscodePreset {
 /// cast to a renderer that does not support video (or for audio-only sources).
 pub fn preset_audio_only() -> TranscodePreset {
     TranscodePreset {
-        id:                 "audio-only".into(),
-        label:              "Audio Only".into(),
-        container:          "mpegts".into(),
-        video_codec:        None,
+        id: "audio-only".into(),
+        label: "Audio Only".into(),
+        container: "mpegts".into(),
+        video_codec: None,
         video_hw_preferred: false,
-        video_max_w:        None,
-        video_max_h:        None,
-        video_max_bitrate:  None,
-        video_fps_cap:      None,
-        audio_codec:        "mp3".into(),
-        audio_bitrate:      320_000,
-        audio_channels:     2,
-        audio_sample_rate:  Some(44100),
-        hls_segment_secs:   4,
-        remux_first:        false,
-        sort_order:         4,
-        is_builtin:         true,
+        video_max_w: None,
+        video_max_h: None,
+        video_max_bitrate: None,
+        video_fps_cap: None,
+        audio_codec: "mp3".into(),
+        audio_bitrate: 320_000,
+        audio_channels: 2,
+        audio_sample_rate: Some(44100),
+        hls_segment_secs: 4,
+        remux_first: false,
+        sort_order: 4,
+        is_builtin: true,
     }
 }
 
@@ -147,24 +147,69 @@ pub fn all_builtin_presets() -> [TranscodePreset; 5] {
     ]
 }
 
-/// Return `true` when the source video codec is HLS/MPEG-TS compatible
+/// Return `true` when the source **video** codec is HLS/MPEG-TS compatible
 /// for copy (no re-encode needed). Only H.264, H.265, and MPEG-2 are safe
 /// to remux into MPEG-TS without transcoding.
 ///
-/// `codec_name` should come from `AVCodecParameters.codec_id` resolved via
-/// `avcodec_get_name()`, or use the constants below.
-pub fn is_mpegts_copy_compatible(codec_id: u32) -> bool {
-    use crate::sys::{AV_CODEC_ID_H264, AV_CODEC_ID_AAC, AV_CODEC_ID_MP3};
-    const AV_CODEC_ID_HEVC:  u32 = 173;
+/// The video and audio verdicts are intentionally separate: MKV files whose
+/// video is copyable but whose audio is not (e.g. HEVC + Opus) can still run
+/// in the cheap hybrid mode instead of a full re-encode.
+pub fn is_mpegts_video_copy_compatible(codec_id: u32) -> bool {
+    use crate::sys::AV_CODEC_ID_H264;
+    const AV_CODEC_ID_HEVC: u32 = 173;
     const AV_CODEC_ID_MPEG2: u32 = 2;
-    const AV_CODEC_ID_AC3:   u32 = 86019;
-    const AV_CODEC_ID_EAC3:  u32 = 86056;
 
     matches!(codec_id, v if v == AV_CODEC_ID_H264
         || v == AV_CODEC_ID_HEVC
-        || v == AV_CODEC_ID_MPEG2
-        || v == AV_CODEC_ID_AAC
+        || v == AV_CODEC_ID_MPEG2)
+}
+
+/// Return `true` when the source **audio** codec can be copied into
+/// MPEG-TS without re-encoding (AAC, MP3, AC-3, E-AC-3).
+pub fn is_mpegts_audio_copy_compatible(codec_id: u32) -> bool {
+    use crate::sys::{AV_CODEC_ID_AAC, AV_CODEC_ID_MP3};
+    const AV_CODEC_ID_AC3: u32 = 86019;
+    const AV_CODEC_ID_EAC3: u32 = 86056;
+
+    matches!(codec_id, v if v == AV_CODEC_ID_AAC
         || v == AV_CODEC_ID_MP3
         || v == AV_CODEC_ID_AC3
         || v == AV_CODEC_ID_EAC3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sys::{AV_CODEC_ID_AAC, AV_CODEC_ID_H264, AV_CODEC_ID_MP3};
+
+    // FFmpeg 7.1 AVCodecID values not modelled in `sys`.
+    const AV_CODEC_ID_HEVC: u32 = 173;
+    const AV_CODEC_ID_MPEG2: u32 = 2;
+    const AV_CODEC_ID_OPUS: u32 = 86076;
+    const AV_CODEC_ID_FLAC: u32 = 86028;
+    const AV_CODEC_ID_VP9: u32 = 167;
+    const AV_CODEC_ID_AV1: u32 = 226;
+    const AV_CODEC_ID_AC3: u32 = 86019;
+    const AV_CODEC_ID_EAC3: u32 = 86056;
+
+    #[test]
+    fn video_copy_compatibility_matrix() {
+        assert!(is_mpegts_video_copy_compatible(AV_CODEC_ID_H264));
+        assert!(is_mpegts_video_copy_compatible(AV_CODEC_ID_HEVC));
+        assert!(is_mpegts_video_copy_compatible(AV_CODEC_ID_MPEG2));
+        assert!(!is_mpegts_video_copy_compatible(AV_CODEC_ID_VP9));
+        assert!(!is_mpegts_video_copy_compatible(AV_CODEC_ID_AV1));
+        assert!(!is_mpegts_video_copy_compatible(AV_CODEC_ID_AAC));
+    }
+
+    #[test]
+    fn audio_copy_compatibility_matrix() {
+        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_AAC));
+        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_MP3));
+        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_AC3));
+        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_EAC3));
+        assert!(!is_mpegts_audio_copy_compatible(AV_CODEC_ID_OPUS));
+        assert!(!is_mpegts_audio_copy_compatible(AV_CODEC_ID_FLAC));
+        assert!(!is_mpegts_audio_copy_compatible(AV_CODEC_ID_H264));
+    }
 }

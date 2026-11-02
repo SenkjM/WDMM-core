@@ -90,7 +90,9 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_guard() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -117,7 +119,10 @@ mod tests {
         let t = tail(MAX_LINES + 100);
         assert_eq!(t.len(), MAX_LINES);
         assert!(t[0].ends_with(&format!("line-{}", 10)));
-        assert!(t.last().unwrap().ends_with(&format!("line-{}", MAX_LINES + 9)));
+        assert!(t
+            .last()
+            .unwrap()
+            .ends_with(&format!("line-{}", MAX_LINES + 9)));
         clear();
     }
 

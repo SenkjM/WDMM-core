@@ -24,7 +24,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -40,6 +40,44 @@ const MS_TB: AVRational = AVRational::new(1, 1000);
 
 /// How often (~ms of wall time) to emit a progress diagnostic line.
 const PROGRESS_LOG_EVERY_MS: u64 = 2_000;
+
+// ── Remux decision (pure logic lives in `crate::plan`, host-testable) ──────
+
+use crate::plan::{hybrid_audio_codec_id, remux_dropped_streams, remux_plan, RemuxPlan};
+
+/// Options for opening the loopback HTTP input: bound every blocking read so a
+/// stalled upstream fails with a real error instead of hanging the job forever.
+const INPUT_TIMEOUT_US: i64 = 15_000_000;
+
+unsafe fn input_open_options() -> *mut AVDictionary {
+    let timeout = CString::new(INPUT_TIMEOUT_US.to_string()).unwrap();
+    let mut dict: *mut AVDictionary = std::ptr::null_mut();
+    av_dict_set(&mut dict, c"timeout".as_ptr(), timeout.as_ptr(), 0);
+    av_dict_set(&mut dict, c"probesize".as_ptr(), c"5000000".as_ptr(), 0);
+    av_dict_set(
+        &mut dict,
+        c"analyzeduration".as_ptr(),
+        c"3000000".as_ptr(),
+        0,
+    );
+    dict
+}
+
+/// Codec id of a stream, when the index and stream are valid.
+unsafe fn stream_codec_id(streams_ptr: *const *mut AVStream, idx: i32) -> Option<u32> {
+    if idx < 0 {
+        return None;
+    }
+    let st = *streams_ptr.add(idx as usize);
+    if st.is_null() {
+        return None;
+    }
+    let cp = (*st).codecpar;
+    if cp.is_null() {
+        return None;
+    }
+    Some((*cp).codec_id)
+}
 
 // ── Probe ─────────────────────────────────────────────────────────────────────
 
@@ -225,20 +263,25 @@ unsafe fn log_streams(tag: &str, mode: &str, streams: *const *mut AVStream, nb: 
             AVMEDIA_TYPE_VIDEO => {
                 video = format!(
                     "{name} (id={}) {}x{}",
-                    (*cp).codec_id, (*cp).width, (*cp).height
+                    (*cp).codec_id,
+                    (*cp).width,
+                    (*cp).height
                 )
             }
             AVMEDIA_TYPE_AUDIO => {
                 audio = format!(
                     "{name} (id={}) {}Hz {}ch",
-                    (*cp).codec_id, (*cp).sample_rate, (*cp).ch_layout.nb_channels
+                    (*cp).codec_id,
+                    (*cp).sample_rate,
+                    (*cp).ch_layout.nb_channels
                 )
             }
             _ => {}
         }
         diag::log(format!(
             "{tag} {mode} input stream {i}: type={} codec={name} (id={})",
-            (*cp).codec_type, (*cp).codec_id
+            (*cp).codec_type,
+            (*cp).codec_id
         ));
     }
     diag::log(format!(
@@ -318,9 +361,9 @@ impl<'a> JobCtx<'a> {
         }
         let found = std::fs::read_dir(self.segment_dir)
             .map(|entries| {
-                entries.flatten().any(|e| {
-                    e.file_name().to_string_lossy().ends_with(".ts")
-                })
+                entries
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".ts"))
             })
             .unwrap_or(false);
         if found {
@@ -386,7 +429,9 @@ pub fn run_hls_job(
         ) {
             Ok(()) => Ok(()),
             Err(e) => {
-                diag::log(format!("{tag} remux failed: {e}; falling back to transcode"));
+                diag::log(format!(
+                    "{tag} remux failed: {e}; falling back to transcode"
+                ));
                 if cancel.load(Ordering::Relaxed) {
                     Ok(())
                 } else {
@@ -432,6 +477,387 @@ pub fn run_hls_job(
     result
 }
 
+// ── Shared audio decode → resample → encode pipeline ────────────────────────
+// Used by both the full transcode path and the hybrid remux path (copy video,
+// re-encode only the audio track). Keeping one implementation means the hybrid
+// mode cannot silently drift away from the transcode path.
+
+unsafe fn open_audio_decoder(
+    streams_ptr: *const *mut AVStream,
+    a_idx: i32,
+    a_dec_codec: *const AVCodec,
+    tag: &str,
+) -> FfmpegResult<*mut AVCodecContext> {
+    let in_st = *streams_ptr.add(a_idx as usize);
+    let dec_name = codec_display_name((*(*in_st).codecpar).codec_id);
+    let mut dec_ctx = avcodec_alloc_context3(a_dec_codec);
+    if dec_ctx.is_null() {
+        return Err(FfmpegError::Probe(
+            "avcodec_alloc_context3(audio decoder) returned null".into(),
+        ));
+    }
+    let ret = avcodec_parameters_to_context(dec_ctx, (*in_st).codecpar);
+    if ret < 0 {
+        avcodec_free_context(&mut dec_ctx);
+        return Err(ffmpeg_err(
+            "avcodec_parameters_to_context(audio decoder)",
+            ret,
+        ));
+    }
+    let ret = avcodec_open2(dec_ctx, a_dec_codec, std::ptr::null_mut());
+    diag::log(format!(
+        "{tag} avcodec_open2(audio decoder {dec_name}) rc={ret}"
+    ));
+    if ret < 0 {
+        avcodec_free_context(&mut dec_ctx);
+        return Err(ffmpeg_err(
+            format!("avcodec_open2(audio decoder {dec_name})"),
+            ret,
+        ));
+    }
+    Ok(dec_ctx)
+}
+
+unsafe fn open_audio_encoder(
+    preset: &wdmm_core::models::TranscodePreset,
+    codec_id: AVCodecID,
+    tag: &str,
+) -> FfmpegResult<(*mut AVCodecContext, String)> {
+    let enc_name = codec_display_name(codec_id);
+    let enc_codec = avcodec_find_encoder(codec_id);
+    if enc_codec.is_null() {
+        diag::log(format!(
+            "{tag} failed: no encoder for audio codec {enc_name} (id={codec_id})"
+        ));
+        return Err(FfmpegError::Probe(format!(
+            "no encoder for audio codec {enc_name} (id={codec_id})"
+        )));
+    }
+    let mut enc_ctx = avcodec_alloc_context3(enc_codec);
+    if enc_ctx.is_null() {
+        return Err(FfmpegError::Probe(
+            "avcodec_alloc_context3(audio encoder) returned null".into(),
+        ));
+    }
+    let audio_sample_rate = preset.audio_sample_rate.unwrap_or(48_000) as i32;
+    codctx_set_sample_rate(enc_ctx, audio_sample_rate);
+    // Set the time base *before* opening: encoders derive packet timestamps
+    // from it, and the value must match the output stream's.
+    codctx_set_time_base(enc_ctx, AVRational::new(1, audio_sample_rate));
+    codctx_set_sample_fmt(enc_ctx, AV_SAMPLE_FMT_FLTP);
+    let layout = if preset.audio_channels == 1 {
+        AVChannelLayout::mono()
+    } else {
+        AVChannelLayout::stereo()
+    };
+    codctx_set_ch_layout(enc_ctx, layout);
+    codctx_set_bit_rate(enc_ctx, preset.audio_bitrate as i64);
+    let ret = avcodec_open2(enc_ctx, enc_codec, std::ptr::null_mut());
+    diag::log(format!(
+        "{tag} avcodec_open2(audio encoder {}) rc={ret}",
+        codec_display_name(codec_id)
+    ));
+    if ret < 0 {
+        avcodec_free_context(&mut enc_ctx);
+        return Err(ffmpeg_err(
+            format!(
+                "avcodec_open2(audio encoder {})",
+                codec_display_name(codec_id)
+            ),
+            ret,
+        ));
+    }
+    Ok((enc_ctx, codec_display_name(codec_id)))
+}
+
+/// Audio transcode pipeline: swresample context plus a sample FIFO.
+///
+/// swresample hands back whatever sample count the decoder produced (FLAC emits
+/// 4096-sample frames), while the AAC/MP3 encoders require exactly
+/// `AVCodecContext.frame_size` samples per frame — `libavcodec/encode.c` rejects
+/// `nb_samples > frame_size` with EINVAL. The FIFO re-chunks the resampled audio
+/// into encoder-sized frames and keeps an independent sample counter for
+/// timestamps.
+struct AudioPipeline {
+    swr: *mut SwrContext,
+    fifo: *mut AVAudioFifo,
+    sample_rate: c_int,
+    layout: AVChannelLayout,
+    frame_size: c_int,
+    next_pts: i64,
+    /// First decoded frame described the source format; later frames must match.
+    source_configured: bool,
+}
+
+impl Default for AudioPipeline {
+    fn default() -> Self {
+        Self {
+            swr: std::ptr::null_mut(),
+            fifo: std::ptr::null_mut(),
+            sample_rate: 0,
+            layout: AVChannelLayout::stereo(),
+            frame_size: 0,
+            next_pts: 0,
+            source_configured: false,
+        }
+    }
+}
+
+impl AudioPipeline {
+    unsafe fn new(audio_sample_rate: i32, audio_channels: u32) -> Self {
+        Self {
+            sample_rate: audio_sample_rate,
+            layout: if audio_channels == 1 {
+                AVChannelLayout::mono()
+            } else {
+                AVChannelLayout::stereo()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Lazily configure swresample/FIFO from the first decoded frame.
+    unsafe fn ensure(
+        &mut self,
+        a_enc_ctx: *mut AVCodecContext,
+        dec_frame: *mut AVFrame,
+    ) -> FfmpegResult<()> {
+        if self.source_configured {
+            return Ok(());
+        }
+        let ret = swr_alloc_set_opts2(
+            &mut self.swr,
+            &self.layout,
+            AV_SAMPLE_FMT_FLTP,
+            self.sample_rate,
+            frame_ch_layout(dec_frame),
+            frame_format(dec_frame) as AVSampleFormat,
+            frame_sample_rate(dec_frame),
+            0,
+            std::ptr::null_mut(),
+        );
+        if ret < 0 || self.swr.is_null() {
+            return Err(ffmpeg_err("swr_alloc_set_opts2", ret));
+        }
+        let ret = swr_init(self.swr);
+        if ret < 0 {
+            return Err(ffmpeg_err("swr_init", ret));
+        }
+        self.frame_size = codctx_frame_size(a_enc_ctx);
+        if self.frame_size <= 0 {
+            // Encoders without a fixed frame size never need re-chunking; any
+            // positive value makes `drain` a pass-through of what the FIFO has.
+            self.frame_size = 1;
+        }
+        self.fifo = av_audio_fifo_alloc(
+            AV_SAMPLE_FMT_FLTP,
+            self.layout.nb_channels,
+            self.frame_size * 4,
+        );
+        if self.fifo.is_null() {
+            return Err(FfmpegError::Probe(
+                "av_audio_fifo_alloc returned null".into(),
+            ));
+        }
+        self.source_configured = true;
+        Ok(())
+    }
+
+    /// Resample one decoded frame, queue it, and mux every complete output frame.
+    unsafe fn push(
+        &mut self,
+        a_enc_ctx: *mut AVCodecContext,
+        dec_frame: *mut AVFrame,
+        out_pkt: *mut AVPacket,
+        out_ctx: *mut AVFormatContext,
+        out_a_idx: i32,
+        job: &mut JobCtx<'_>,
+    ) -> FfmpegResult<()> {
+        self.ensure(a_enc_ctx, dec_frame)?;
+        let mut conv = av_frame_alloc();
+        if conv.is_null() {
+            return Err(FfmpegError::Probe(
+                "av_frame_alloc(resampled) returned null".into(),
+            ));
+        }
+        // `swr_convert_frame()` re-validates the output frame against the context
+        // it was initialised with (`config_changed()` compares format,
+        // sample_rate and layout, returning AVERROR_OUTPUT_CHANGED otherwise). A
+        // bare frame leaves format=NONE/sample_rate=0/empty layout, so describe
+        // the target here; with linesize[0] == 0 swresample allocates the buffer
+        // and fills in nb_samples itself.
+        frame_set_format(conv, AV_SAMPLE_FMT_FLTP);
+        frame_set_sample_rate(conv, self.sample_rate);
+        frame_set_ch_layout(conv, self.layout);
+        let ret = swr_convert_frame(self.swr, conv, dec_frame);
+        if ret < 0 {
+            av_frame_free(&mut conv);
+            return Err(ffmpeg_err("swr_convert_frame", ret));
+        }
+        let samples = frame_nb_samples(conv);
+        if samples > 0 {
+            let written = av_audio_fifo_write(self.fifo, frame_extended_data(conv).cast(), samples);
+            if written < samples {
+                av_frame_free(&mut conv);
+                return Err(FfmpegError::Probe(format!(
+                    "av_audio_fifo_write accepted {written} of {samples} samples"
+                )));
+            }
+        }
+        av_frame_free(&mut conv);
+        self.drain(a_enc_ctx, out_pkt, out_ctx, out_a_idx, job, false)
+    }
+
+    /// Mux the next `frame_size` samples. With `flush` the remaining tail (which
+    /// may be shorter than a full frame) is emitted too.
+    unsafe fn drain(
+        &mut self,
+        a_enc_ctx: *mut AVCodecContext,
+        out_pkt: *mut AVPacket,
+        out_ctx: *mut AVFormatContext,
+        out_a_idx: i32,
+        job: &mut JobCtx<'_>,
+        flush: bool,
+    ) -> FfmpegResult<()> {
+        if self.fifo.is_null() {
+            return Ok(());
+        }
+        loop {
+            let available = av_audio_fifo_size(self.fifo);
+            let want = if flush {
+                available.min(self.frame_size)
+            } else {
+                self.frame_size
+            };
+            if want <= 0 || available < want {
+                return Ok(());
+            }
+            let mut frame = av_frame_alloc();
+            if frame.is_null() {
+                return Err(FfmpegError::Probe(
+                    "av_frame_alloc(audio encoder input) returned null".into(),
+                ));
+            }
+            frame_set_nb_samples(frame, want);
+            frame_set_format(frame, AV_SAMPLE_FMT_FLTP);
+            frame_set_sample_rate(frame, self.sample_rate);
+            frame_set_ch_layout(frame, self.layout);
+            let ret = av_frame_get_buffer(frame, 0);
+            if ret < 0 {
+                av_frame_free(&mut frame);
+                return Err(ffmpeg_err("av_frame_get_buffer(audio)", ret));
+            }
+            let got = av_audio_fifo_read(self.fifo, frame_extended_data(frame).cast(), want);
+            if got != want {
+                av_frame_free(&mut frame);
+                return Err(FfmpegError::Probe(format!(
+                    "av_audio_fifo_read returned {got} samples, expected {want}"
+                )));
+            }
+            frame_set_pts(frame, self.next_pts);
+            self.next_pts += i64::from(want);
+            let result = encode_and_write(
+                a_enc_ctx,
+                frame,
+                out_pkt,
+                out_ctx,
+                out_a_idx,
+                codctx_time_base(a_enc_ctx),
+                job,
+            );
+            av_frame_free(&mut frame);
+            result?;
+        }
+    }
+
+    unsafe fn free(&mut self) {
+        if !self.fifo.is_null() {
+            av_audio_fifo_free(self.fifo);
+            self.fifo = std::ptr::null_mut();
+        }
+        if !self.swr.is_null() {
+            swr_free(&mut self.swr);
+        }
+        self.source_configured = false;
+    }
+}
+
+/// Drain all decoded audio frames after one packet was sent to the decoder.
+/// Non-fatal decode errors are logged (max 3) and skipped.
+unsafe fn drain_audio_frames(
+    a_dec_ctx: *mut AVCodecContext,
+    a_enc_ctx: *mut AVCodecContext,
+    pkt: *mut AVPacket,
+    dec_frame: *mut AVFrame,
+    audio: &mut AudioPipeline,
+    out_pkt: *mut AVPacket,
+    out_ctx: *mut AVFormatContext,
+    out_a_idx: i32,
+    job: &mut JobCtx<'_>,
+    tag: &str,
+    decode_errors_logged: &mut u32,
+) -> FfmpegResult<()> {
+    let sret = avcodec_send_packet(a_dec_ctx, pkt);
+    if sret < 0 {
+        if *decode_errors_logged < 3 {
+            *decode_errors_logged += 1;
+            diag::log(format!(
+                "{tag} avcodec_send_packet(audio) rc={sret}: {}",
+                av_err2str(sret)
+            ));
+        }
+        return Ok(());
+    }
+    loop {
+        let r = avcodec_receive_frame(a_dec_ctx, dec_frame);
+        if r == AVERROR_EAGAIN || r == AVERROR_EOF {
+            return Ok(());
+        }
+        if r < 0 {
+            if *decode_errors_logged < 3 {
+                *decode_errors_logged += 1;
+                diag::log(format!(
+                    "{tag} avcodec_receive_frame(audio) rc={r}: {}",
+                    av_err2str(r)
+                ));
+            }
+            return Ok(());
+        }
+        let result = audio.push(a_enc_ctx, dec_frame, out_pkt, out_ctx, out_a_idx, job);
+        av_frame_unref(dec_frame);
+        result?;
+    }
+}
+
+/// Copy one input packet verbatim into the muxer (remux video/audio streams).
+unsafe fn copy_packet_to_muxer(
+    pkt: *mut AVPacket,
+    in_st: *mut AVStream,
+    out_ctx: *mut AVFormatContext,
+    out_idx: i32,
+    job: &mut JobCtx<'_>,
+) -> FfmpegResult<()> {
+    let sps = fmtctx_streams(out_ctx);
+    let out_st = *sps.add(out_idx as usize);
+    if out_st.is_null() {
+        return Err(FfmpegError::Probe(
+            "output stream pointer is null (remux)".into(),
+        ));
+    }
+    av_packet_rescale_ts(pkt, (*in_st).time_base, (*out_st).time_base);
+    (*pkt).pos = -1;
+
+    // Capture before the write consumes the packet.
+    let pts = (*pkt).pts;
+    let tb = (*out_st).time_base;
+    let ret = av_interleaved_write_frame(out_ctx, pkt);
+    if ret < 0 {
+        return Err(ffmpeg_err("av_interleaved_write_frame (remux)", ret));
+    }
+    job.record(pts, tb);
+    Ok(())
+}
+
 // ── Remux path ────────────────────────────────────────────────────────────────
 
 fn run_remux(
@@ -453,13 +879,10 @@ fn run_remux(
 
     unsafe {
         // ── Open input ───────────────────────────────────────────────────────
+        let mut in_opts = input_open_options();
         let mut in_ctx: *mut AVFormatContext = std::ptr::null_mut();
-        let ret = avformat_open_input(
-            &mut in_ctx,
-            url_c.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        );
+        let ret = avformat_open_input(&mut in_ctx, url_c.as_ptr(), std::ptr::null(), &mut in_opts);
+        av_dict_free(&mut in_opts);
         diag::log(format!("{tag} remux avformat_open_input rc={ret}"));
         if ret < 0 {
             return Err(ffmpeg_err("avformat_open_input (remux)", ret));
@@ -480,46 +903,116 @@ fn run_remux(
             ));
         }
 
-        // ── Validate remux compatibility ──────────────────────────────────
+        // ── Pick best streams, then decide remux / hybrid / transcode ─────
         let nb = fmtctx_nb_streams(in_ctx) as usize;
         let streams_ptr = fmtctx_streams(in_ctx);
         log_streams(tag, "remux", streams_ptr, nb);
-        let mut has_incompatible = false;
-        for i in 0..nb {
-            let st = *streams_ptr.add(i);
-            if st.is_null() {
+
+        let mut v_dec_codec: *const AVCodec = std::ptr::null();
+        let mut a_dec_codec: *const AVCodec = std::ptr::null();
+        let v_idx = av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &mut v_dec_codec, 0);
+        let a_idx = av_find_best_stream(in_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &mut a_dec_codec, 0);
+        let video_codec_id = stream_codec_id(streams_ptr, v_idx);
+        let audio_codec_id = stream_codec_id(streams_ptr, a_idx);
+        let plan = remux_plan(video_codec_id, audio_codec_id);
+        diag::log(format!(
+            "{tag} remux plan: video_idx={v_idx} video_codec={} audio_idx={a_idx} audio_codec={} → {plan:?}",
+            video_codec_id
+                .map(codec_display_name)
+                .unwrap_or_else(|| "none".into()),
+            audio_codec_id
+                .map(codec_display_name)
+                .unwrap_or_else(|| "none".into()),
+        ));
+        for dropped in remux_dropped_streams(v_idx, a_idx, nb) {
+            let st = *streams_ptr.add(dropped);
+            if st.is_null() || (*st).codecpar.is_null() {
+                diag::log(format!("{tag} remux dropping stream {dropped} (unknown)"));
                 continue;
             }
             let cp = (*st).codecpar;
-            if cp.is_null() {
-                continue;
-            }
-            let ct = (*cp).codec_type;
-            if (ct == AVMEDIA_TYPE_VIDEO || ct == AVMEDIA_TYPE_AUDIO)
-                && !crate::preset::is_mpegts_copy_compatible((*cp).codec_id)
-            {
-                diag::log(format!(
-                    "{tag} remux verdict: stream {i} codec={} (id={}) is not MPEG-TS copy compatible",
-                    codec_display_name((*cp).codec_id),
-                    (*cp).codec_id
-                ));
-                has_incompatible = true;
-                break;
-            }
+            diag::log(format!(
+                "{tag} remux dropping stream {dropped} codec={} (id={})",
+                codec_display_name((*cp).codec_id),
+                (*cp).codec_id
+            ));
         }
-        if has_incompatible {
+        if plan == RemuxPlan::Transcode {
+            diag::log(format!(
+                "{tag} remux decision: video not MPEG-TS copy compatible → full transcode fallback"
+            ));
             avformat_close_input(&mut in_ctx);
-            return Err(FfmpegError::Probe("codec not mpegts-copy-compatible".into()));
+            return Err(FfmpegError::Probe(
+                "video codec not mpegts-copy-compatible".into(),
+            ));
         }
-        diag::log(format!("{tag} remux verdict: all streams MPEG-TS copy compatible"));
 
+        // ── Hybrid mode: decode the incompatible audio, encode AAC/MP3 ──────
+        let audio_sample_rate = preset.audio_sample_rate.unwrap_or(48_000) as i32;
+        let mut a_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
+        let mut a_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
+        let mut audio_enc_name: Option<String> = None;
+        if plan == RemuxPlan::Hybrid {
+            let audio_codec = hybrid_audio_codec_id(&preset.audio_codec);
+            diag::log(format!(
+                "{tag} remux hybrid: copying video, re-encoding audio {} → {}",
+                audio_codec_id
+                    .map(codec_display_name)
+                    .unwrap_or_else(|| "?".into()),
+                codec_display_name(audio_codec),
+            ));
+            a_dec_ctx = match open_audio_decoder(streams_ptr, a_idx, a_dec_codec, tag) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    avformat_close_input(&mut in_ctx);
+                    return Err(e);
+                }
+            };
+            match open_audio_encoder(preset, audio_codec, tag) {
+                Ok((ctx, name)) => {
+                    a_enc_ctx = ctx;
+                    audio_enc_name = Some(name);
+                }
+                Err(e) => {
+                    cleanup_transcode(
+                        in_ctx,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        a_dec_ctx,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
+        // ── Telemetry ───────────────────────────────────────────────────────
+        let audio_mode = if plan == RemuxPlan::Hybrid {
+            audio_enc_name.clone()
+        } else if a_idx >= 0 {
+            Some("copy".to_string())
+        } else {
+            None
+        };
         telemetry.set_encoder(EncoderInfo {
-            mode: "remux".into(),
-            video: None,
-            audio: Some("copy".into()),
+            mode: if plan == RemuxPlan::Hybrid {
+                "hybrid".into()
+            } else {
+                "remux".into()
+            },
+            video: Some("copy".into()),
+            audio: audio_mode,
             hw_requested: preset.video_hw_preferred,
             hw_available,
         });
+        if plan == RemuxPlan::Hybrid {
+            let src_name = audio_codec_id
+                .map(codec_display_name)
+                .unwrap_or_else(|| "?".into());
+            let enc_name = audio_enc_name.clone().unwrap_or_else(|| "aac".into());
+            telemetry.warn(format!("音频 {src_name} 不可直拷，已转码为 {enc_name}"));
+        }
 
         // ── Open HLS output ───────────────────────────────────────────────
         let mut out_ctx: *mut AVFormatContext = std::ptr::null_mut();
@@ -530,31 +1023,81 @@ fn run_remux(
             playlist_c.as_ptr(),
         );
         if ret < 0 || out_ctx.is_null() {
-            avformat_close_input(&mut in_ctx);
+            cleanup_transcode(
+                in_ctx,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                a_dec_ctx,
+                std::ptr::null_mut(),
+                a_enc_ctx,
+            );
             return Err(ffmpeg_err("avformat_alloc_output_context2 (remux)", ret));
         }
 
-        // Copy streams
-        for i in 0..nb {
-            let in_st = *streams_ptr.add(i);
-            if in_st.is_null() {
-                continue;
-            }
+        macro_rules! fail_remux {
+            ($err:expr) => {{
+                cleanup_transcode(
+                    in_ctx,
+                    out_ctx,
+                    std::ptr::null_mut(),
+                    a_dec_ctx,
+                    std::ptr::null_mut(),
+                    a_enc_ctx,
+                );
+                return Err($err);
+            }};
+        }
+
+        // Only the best video and best audio streams reach the muxer; every
+        // other stream (subtitles, attachments, extra audio tracks) is dropped
+        // because MPEG-TS cannot carry them and they would fail the remux.
+        let mut out_v_idx: i32 = -1;
+        let mut out_a_idx: i32 = -1;
+        if v_idx >= 0 {
+            let in_st = *streams_ptr.add(v_idx as usize);
             let out_st = avformat_new_stream(out_ctx, std::ptr::null());
             if out_st.is_null() {
-                avformat_close_input(&mut in_ctx);
-                avformat_free_context(out_ctx);
-                return Err(FfmpegError::Probe(
-                    "avformat_new_stream returned null (remux)".into(),
+                fail_remux!(FfmpegError::Probe(
+                    "avformat_new_stream(video) returned null (remux)".into()
                 ));
             }
             let ret = avcodec_parameters_copy((*out_st).codecpar, (*in_st).codecpar);
             if ret < 0 {
-                avformat_close_input(&mut in_ctx);
-                avformat_free_context(out_ctx);
-                return Err(ffmpeg_err("avcodec_parameters_copy (remux)", ret));
+                fail_remux!(ffmpeg_err("avcodec_parameters_copy(video, remux)", ret));
             }
             (*out_st).time_base = (*in_st).time_base;
+            out_v_idx = (*out_st).index;
+        }
+        if a_idx >= 0 {
+            let out_st = avformat_new_stream(out_ctx, std::ptr::null());
+            if out_st.is_null() {
+                fail_remux!(FfmpegError::Probe(
+                    "avformat_new_stream(audio) returned null (remux)".into()
+                ));
+            }
+            if plan == RemuxPlan::Hybrid {
+                if a_enc_ctx.is_null() {
+                    fail_remux!(FfmpegError::Probe(
+                        "hybrid audio encoder is null (remux)".into()
+                    ));
+                }
+                let ret = avcodec_parameters_from_context((*out_st).codecpar, a_enc_ctx);
+                if ret < 0 {
+                    fail_remux!(ffmpeg_err(
+                        "avcodec_parameters_from_context(audio, hybrid)",
+                        ret
+                    ));
+                }
+                (*out_st).time_base = codctx_time_base(a_enc_ctx);
+            } else {
+                let in_st = *streams_ptr.add(a_idx as usize);
+                let ret = avcodec_parameters_copy((*out_st).codecpar, (*in_st).codecpar);
+                if ret < 0 {
+                    fail_remux!(ffmpeg_err("avcodec_parameters_copy(audio, remux)", ret));
+                }
+                (*out_st).time_base = (*in_st).time_base;
+            }
+            out_a_idx = (*out_st).index;
         }
 
         // HLS muxer options. The HLS muxer is AVFMT_NOFILE: libav opens the
@@ -563,9 +1106,27 @@ fn run_remux(
         let mut dict: *mut AVDictionary = std::ptr::null_mut();
         let seg_secs = preset.hls_segment_secs.to_string();
         let seg_secs_c = CString::new(seg_secs.as_str()).unwrap();
+        // Cut the first segment early (>=1 s, <=2 s) so the playlist exists
+        // sooner; this is what lets the renderer start before a long segment
+        // has been fully written.
+        let init_secs = preset.hls_segment_secs.min(2).to_string();
+        let init_secs_c = CString::new(init_secs.as_str()).unwrap();
         av_dict_set(&mut dict, c"hls_time".as_ptr(), seg_secs_c.as_ptr(), 0);
+        av_dict_set(
+            &mut dict,
+            c"hls_init_time".as_ptr(),
+            init_secs_c.as_ptr(),
+            0,
+        );
         av_dict_set(&mut dict, c"hls_list_size".as_ptr(), c"0".as_ptr(), 0);
-        av_dict_set(&mut dict, c"hls_flags".as_ptr(), c"split_by_time".as_ptr(), 0);
+        if plan == RemuxPlan::Remux {
+            av_dict_set(
+                &mut dict,
+                c"hls_flags".as_ptr(),
+                c"split_by_time".as_ptr(),
+                0,
+            );
+        }
         av_dict_set(
             &mut dict,
             c"hls_segment_filename".as_ptr(),
@@ -577,23 +1138,35 @@ fn run_remux(
         diag::log(format!("{tag} remux avformat_write_header rc={ret}"));
         av_dict_free(&mut dict);
         if ret < 0 {
-            avformat_close_input(&mut in_ctx);
-            avformat_free_context(out_ctx);
-            return Err(ffmpeg_err("avformat_write_header (remux)", ret));
+            fail_remux!(ffmpeg_err("avformat_write_header (remux)", ret));
         }
 
         // ── Read/write loop ───────────────────────────────────────────────
         let mut pkt = av_packet_alloc();
         if pkt.is_null() {
-            avformat_close_input(&mut in_ctx);
-            avformat_free_context(out_ctx);
-            return Err(FfmpegError::Probe(
-                "av_packet_alloc returned null (remux)".into(),
+            fail_remux!(FfmpegError::Probe(
+                "av_packet_alloc returned null (remux)".into()
             ));
+        }
+        let mut dec_frame: *mut AVFrame = std::ptr::null_mut();
+        let mut out_pkt: *mut AVPacket = std::ptr::null_mut();
+        if plan == RemuxPlan::Hybrid {
+            dec_frame = av_frame_alloc();
+            out_pkt = av_packet_alloc();
+            if dec_frame.is_null() || out_pkt.is_null() {
+                av_frame_free(&mut dec_frame);
+                av_packet_free(&mut out_pkt);
+                av_packet_free(&mut pkt);
+                fail_remux!(FfmpegError::Probe(
+                    "av_frame_alloc/av_packet_alloc returned null (hybrid remux)".into()
+                ));
+            }
         }
 
         let mut job = JobCtx::new(tag, telemetry, segment_dir);
         let mut write_error: Option<FfmpegError> = None;
+        let mut decode_errors_logged: u32 = 0;
+        let mut audio = AudioPipeline::new(audio_sample_rate, u32::from(preset.audio_channels));
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -616,36 +1189,91 @@ fn run_remux(
                 av_packet_unref(pkt);
                 continue;
             }
-            let in_st = *streams_ptr.add(in_st_idx);
-            let out_st = *fmtctx_streams(out_ctx).add(in_st_idx);
-            if in_st.is_null() || out_st.is_null() {
+
+            if plan == RemuxPlan::Hybrid && in_st_idx == a_idx as usize {
+                // Audio: decode → resample → AAC/MP3, then write the encoded
+                // packets into the same muxer as the copied video.
+                let res = drain_audio_frames(
+                    a_dec_ctx,
+                    a_enc_ctx,
+                    pkt,
+                    dec_frame,
+                    &mut audio,
+                    out_pkt,
+                    out_ctx,
+                    out_a_idx,
+                    &mut job,
+                    tag,
+                    &mut decode_errors_logged,
+                );
+                av_packet_unref(pkt);
+                if let Err(e) = res {
+                    write_error = Some(e);
+                    break;
+                }
+                continue;
+            }
+
+            if in_st_idx != v_idx as usize && in_st_idx != a_idx as usize {
+                // Dropped stream (subtitle/attachment/extra audio track).
                 av_packet_unref(pkt);
                 continue;
             }
 
-            av_packet_rescale_ts(pkt, (*in_st).time_base, (*out_st).time_base);
-            (*pkt).pos = -1;
-
-            // Capture before the write consumes the packet.
-            let pts = (*pkt).pts;
-            let tb = (*out_st).time_base;
-            let ret = av_interleaved_write_frame(out_ctx, pkt);
-            if ret < 0 {
-                write_error = Some(ffmpeg_err("av_interleaved_write_frame (remux)", ret));
+            let in_st = *streams_ptr.add(in_st_idx);
+            let out_idx = if in_st_idx == v_idx as usize {
+                out_v_idx
+            } else {
+                out_a_idx
+            };
+            if in_st.is_null() || out_idx < 0 {
                 av_packet_unref(pkt);
+                continue;
+            }
+            let res = copy_packet_to_muxer(pkt, in_st, out_ctx, out_idx, &mut job);
+            av_packet_unref(pkt);
+            if let Err(e) = res {
+                write_error = Some(e);
                 break;
             }
-            job.record(pts, tb);
-            av_packet_unref(pkt);
+        }
+
+        // Flush the hybrid audio encoder so the last frames reach the muxer.
+        if plan == RemuxPlan::Hybrid && write_error.is_none() && !a_enc_ctx.is_null() {
+            if let Err(e) = audio.drain(a_enc_ctx, out_pkt, out_ctx, out_a_idx, &mut job, true) {
+                write_error = Some(e);
+            }
+            if write_error.is_none() {
+                if let Err(e) = encode_and_write(
+                    a_enc_ctx,
+                    std::ptr::null(),
+                    out_pkt,
+                    out_ctx,
+                    out_a_idx,
+                    codctx_time_base(a_enc_ctx),
+                    &mut job,
+                ) {
+                    write_error = Some(e);
+                }
+            }
         }
 
         av_packet_free(&mut pkt);
+        av_packet_free(&mut out_pkt);
+        av_frame_free(&mut dec_frame);
+        audio.free();
         let ret = av_write_trailer(out_ctx);
         if ret < 0 {
             diag::log(format!("{tag} remux av_write_trailer rc={ret}"));
         }
-        avformat_free_context(out_ctx);
-        avformat_close_input(&mut in_ctx);
+        cleanup_transcode(
+            in_ctx,
+            out_ctx,
+            std::ptr::null_mut(),
+            a_dec_ctx,
+            std::ptr::null_mut(),
+            a_enc_ctx,
+        );
 
         if let Some(e) = write_error {
             return Err(e);
@@ -675,19 +1303,18 @@ fn run_transcode(
 
     unsafe {
         // ── Open + seek input ─────────────────────────────────────────────
+        let mut in_opts = input_open_options();
         let mut in_ctx: *mut AVFormatContext = std::ptr::null_mut();
-        let ret = avformat_open_input(
-            &mut in_ctx,
-            url_c.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        );
+        let ret = avformat_open_input(&mut in_ctx, url_c.as_ptr(), std::ptr::null(), &mut in_opts);
+        av_dict_free(&mut in_opts);
         diag::log(format!("{tag} transcode avformat_open_input rc={ret}"));
         if ret < 0 {
             return Err(ffmpeg_err("avformat_open_input (transcode)", ret));
         }
         let ret = avformat_find_stream_info(in_ctx, std::ptr::null_mut());
-        diag::log(format!("{tag} transcode avformat_find_stream_info rc={ret}"));
+        diag::log(format!(
+            "{tag} transcode avformat_find_stream_info rc={ret}"
+        ));
         if ret < 0 {
             avformat_close_input(&mut in_ctx);
             return Err(ffmpeg_err("avformat_find_stream_info (transcode)", ret));
@@ -744,15 +1371,32 @@ fn run_transcode(
             }
             let ret = avcodec_parameters_to_context(v_dec_ctx, (*in_st).codecpar);
             if ret < 0 {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut());
-                return Err(ffmpeg_err("avcodec_parameters_to_context(video decoder)", ret));
+                cleanup_transcode(
+                    in_ctx,
+                    std::ptr::null_mut(),
+                    v_dec_ctx,
+                    a_dec_ctx,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                return Err(ffmpeg_err(
+                    "avcodec_parameters_to_context(video decoder)",
+                    ret,
+                ));
             }
             let ret = avcodec_open2(v_dec_ctx, v_dec_codec, std::ptr::null_mut());
             diag::log(format!(
                 "{tag} transcode avcodec_open2(video decoder {dec_name}) rc={ret}"
             ));
             if ret < 0 {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut());
+                cleanup_transcode(
+                    in_ctx,
+                    std::ptr::null_mut(),
+                    v_dec_ctx,
+                    a_dec_ctx,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
                 return Err(ffmpeg_err(
                     format!("avcodec_open2(video decoder {dec_name})"),
                     ret,
@@ -760,30 +1404,19 @@ fn run_transcode(
             }
         }
         if a_idx >= 0 && !a_dec_codec.is_null() {
-            let in_st = *streams_ptr.add(a_idx as usize);
-            let dec_name = codec_display_name((*(*in_st).codecpar).codec_id);
-            a_dec_ctx = avcodec_alloc_context3(a_dec_codec);
-            if a_dec_ctx.is_null() {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
-                return Err(FfmpegError::Probe(
-                    "avcodec_alloc_context3(audio decoder) returned null".into(),
-                ));
-            }
-            let ret = avcodec_parameters_to_context(a_dec_ctx, (*in_st).codecpar);
-            if ret < 0 {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut());
-                return Err(ffmpeg_err("avcodec_parameters_to_context(audio decoder)", ret));
-            }
-            let ret = avcodec_open2(a_dec_ctx, a_dec_codec, std::ptr::null_mut());
-            diag::log(format!(
-                "{tag} transcode avcodec_open2(audio decoder {dec_name}) rc={ret}"
-            ));
-            if ret < 0 {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut());
-                return Err(ffmpeg_err(
-                    format!("avcodec_open2(audio decoder {dec_name})"),
-                    ret,
-                ));
+            match open_audio_decoder(streams_ptr, a_idx, a_dec_codec, tag) {
+                Ok(ctx) => a_dec_ctx = ctx,
+                Err(e) => {
+                    cleanup_transcode(
+                        in_ctx,
+                        std::ptr::null_mut(),
+                        v_dec_ctx,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                    return Err(e);
+                }
             }
         }
 
@@ -819,7 +1452,14 @@ fn run_transcode(
                 diag::log(format!(
                     "{tag} transcode failed: no H.264 encoder available in libavcodec"
                 ));
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut());
+                cleanup_transcode(
+                    in_ctx,
+                    std::ptr::null_mut(),
+                    v_dec_ctx,
+                    a_dec_ctx,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
                 return Err(FfmpegError::Probe(
                     "no H.264 encoder available (libx264 missing)".into(),
                 ));
@@ -845,7 +1485,14 @@ fn run_transcode(
                 diag::log(format!(
                     "{tag} transcode failed: no encoder for audio codec {name} (id={a_codec_id})"
                 ));
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut());
+                cleanup_transcode(
+                    in_ctx,
+                    std::ptr::null_mut(),
+                    v_dec_ctx,
+                    a_dec_ctx,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
                 return Err(FfmpegError::Probe(format!(
                     "no encoder for audio codec {name} (id={a_codec_id})"
                 )));
@@ -882,7 +1529,14 @@ fn run_transcode(
         if want_video {
             v_enc_ctx = avcodec_alloc_context3(v_enc_codec);
             if v_enc_ctx.is_null() {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, std::ptr::null_mut(), std::ptr::null_mut());
+                cleanup_transcode(
+                    in_ctx,
+                    std::ptr::null_mut(),
+                    v_dec_ctx,
+                    a_dec_ctx,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
                 return Err(FfmpegError::Probe(
                     "avcodec_alloc_context3(video encoder) returned null".into(),
                 ));
@@ -912,44 +1566,37 @@ fn run_transcode(
             ));
             if ret < 0 {
                 let name = v_enc_name.unwrap_or_else(|| "h264".into());
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, v_enc_ctx, std::ptr::null_mut());
-                return Err(ffmpeg_err(format!("avcodec_open2(video encoder {name})"), ret));
+                cleanup_transcode(
+                    in_ctx,
+                    std::ptr::null_mut(),
+                    v_dec_ctx,
+                    a_dec_ctx,
+                    v_enc_ctx,
+                    std::ptr::null_mut(),
+                );
+                return Err(ffmpeg_err(
+                    format!("avcodec_open2(video encoder {name})"),
+                    ret,
+                ));
             }
         }
 
         let mut a_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
         let audio_sample_rate = preset.audio_sample_rate.unwrap_or(48_000) as i32;
         if !a_enc_codec.is_null() && !a_dec_ctx.is_null() {
-            a_enc_ctx = avcodec_alloc_context3(a_enc_codec);
-            if a_enc_ctx.is_null() {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, v_enc_ctx, std::ptr::null_mut());
-                return Err(FfmpegError::Probe(
-                    "avcodec_alloc_context3(audio encoder) returned null".into(),
-                ));
-            }
-            codctx_set_sample_rate(a_enc_ctx, audio_sample_rate);
-            // Set the time base *before* opening: encoders derive packet
-            // timestamps from it, and the value must match the output stream's.
-            codctx_set_time_base(a_enc_ctx, AVRational::new(1, audio_sample_rate));
-            codctx_set_sample_fmt(a_enc_ctx, AV_SAMPLE_FMT_FLTP);
-            let layout = if preset.audio_channels == 1 {
-                AVChannelLayout::mono()
-            } else {
-                AVChannelLayout::stereo()
-            };
-            codctx_set_ch_layout(a_enc_ctx, layout);
-            codctx_set_bit_rate(a_enc_ctx, preset.audio_bitrate as i64);
-            let ret = avcodec_open2(a_enc_ctx, a_enc_codec, std::ptr::null_mut());
-            diag::log(format!(
-                "{tag} transcode avcodec_open2(audio encoder {}) rc={ret}",
-                preset.audio_codec
-            ));
-            if ret < 0 {
-                cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
-                return Err(ffmpeg_err(
-                    format!("avcodec_open2(audio encoder {})", preset.audio_codec),
-                    ret,
-                ));
+            match open_audio_encoder(preset, a_codec_id, tag) {
+                Ok((ctx, _name)) => a_enc_ctx = ctx,
+                Err(e) => {
+                    cleanup_transcode(
+                        in_ctx,
+                        std::ptr::null_mut(),
+                        v_dec_ctx,
+                        a_dec_ctx,
+                        v_enc_ctx,
+                        std::ptr::null_mut(),
+                    );
+                    return Err(e);
+                }
             }
         }
 
@@ -962,7 +1609,14 @@ fn run_transcode(
             playlist_c.as_ptr(),
         );
         if ret < 0 || out_ctx.is_null() {
-            cleanup_transcode(in_ctx, std::ptr::null_mut(), v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
+            cleanup_transcode(
+                in_ctx,
+                std::ptr::null_mut(),
+                v_dec_ctx,
+                a_dec_ctx,
+                v_enc_ctx,
+                a_enc_ctx,
+            );
             return Err(ffmpeg_err(
                 "avformat_alloc_output_context2 (transcode)",
                 ret,
@@ -1011,7 +1665,16 @@ fn run_transcode(
         let mut dict: *mut AVDictionary = std::ptr::null_mut();
         let seg_secs = preset.hls_segment_secs.to_string();
         let seg_secs_c = CString::new(seg_secs.as_str()).unwrap();
+        // Same early first-segment cut as the remux path.
+        let init_secs = preset.hls_segment_secs.min(2).to_string();
+        let init_secs_c = CString::new(init_secs.as_str()).unwrap();
         av_dict_set(&mut dict, c"hls_time".as_ptr(), seg_secs_c.as_ptr(), 0);
+        av_dict_set(
+            &mut dict,
+            c"hls_init_time".as_ptr(),
+            init_secs_c.as_ptr(),
+            0,
+        );
         av_dict_set(&mut dict, c"hls_list_size".as_ptr(), c"0".as_ptr(), 0);
         av_dict_set(
             &mut dict,
@@ -1049,7 +1712,7 @@ fn run_transcode(
         }
 
         let mut sws: *mut SwsContext = std::ptr::null_mut();
-        let mut swr: *mut SwrContext = std::ptr::null_mut();
+        let mut audio = AudioPipeline::new(audio_sample_rate, u32::from(preset.audio_channels));
         let mut enc_vframe: *mut AVFrame = std::ptr::null_mut();
         let mut video_out_dims = (0i32, 0i32);
         if !v_enc_ctx.is_null() {
@@ -1063,7 +1726,14 @@ fn run_transcode(
             );
             enc_vframe = av_frame_alloc();
             if enc_vframe.is_null() {
-                free_loop_state(&mut in_pkt, &mut out_pkt, &mut dec_frame, &mut enc_vframe, &mut sws, &mut swr);
+                free_loop_state(
+                    &mut in_pkt,
+                    &mut out_pkt,
+                    &mut dec_frame,
+                    &mut enc_vframe,
+                    &mut sws,
+                    &mut audio,
+                );
                 cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
                 return Err(FfmpegError::Probe(
                     "av_frame_alloc(encoder frame) returned null".into(),
@@ -1074,7 +1744,14 @@ fn run_transcode(
             frame_set_format(enc_vframe, AV_PIX_FMT_YUV420P);
             let ret = av_frame_get_buffer(enc_vframe, 32);
             if ret < 0 {
-                free_loop_state(&mut in_pkt, &mut out_pkt, &mut dec_frame, &mut enc_vframe, &mut sws, &mut swr);
+                free_loop_state(
+                    &mut in_pkt,
+                    &mut out_pkt,
+                    &mut dec_frame,
+                    &mut enc_vframe,
+                    &mut sws,
+                    &mut audio,
+                );
                 cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
                 return Err(ffmpeg_err("av_frame_get_buffer(encoder frame)", ret));
             }
@@ -1146,9 +1823,8 @@ fn run_transcode(
                                 std::ptr::null(),
                             );
                             if sws.is_null() {
-                                fatal = Some(FfmpegError::Probe(
-                                    "sws_getContext returned null".into(),
-                                ));
+                                fatal =
+                                    Some(FfmpegError::Probe("sws_getContext returned null".into()));
                                 av_frame_unref(dec_frame);
                                 break 'decode;
                             }
@@ -1220,105 +1896,22 @@ fn run_transcode(
                     }
                     av_frame_unref(dec_frame);
                 }
-            } else if stream_idx == a_idx && !a_dec_ctx.is_null() {
-                let r = avcodec_send_packet(a_dec_ctx, in_pkt);
-                if r < 0 && r != AVERROR_EAGAIN && decode_errors_logged < 3 {
-                    decode_errors_logged += 1;
-                    diag::log(format!(
-                        "{tag} transcode avcodec_send_packet(audio) rc={r}: {}",
-                        av_err2str(r)
-                    ));
-                }
-                loop {
-                    let r = avcodec_receive_frame(a_dec_ctx, dec_frame);
-                    if r == AVERROR_EAGAIN || r == AVERROR_EOF {
-                        break;
-                    }
-                    if r < 0 {
-                        if decode_errors_logged < 3 {
-                            decode_errors_logged += 1;
-                            diag::log(format!(
-                                "{tag} transcode avcodec_receive_frame(audio) rc={r}: {}",
-                                av_err2str(r)
-                            ));
-                        }
-                        break;
-                    }
-
-                    if !a_enc_ctx.is_null() {
-                        // Resample if needed
-                        if swr.is_null() {
-                            let src_layout = frame_ch_layout(dec_frame);
-                            let dst_layout = if preset.audio_channels == 1 {
-                                AVChannelLayout::mono()
-                            } else {
-                                AVChannelLayout::stereo()
-                            };
-                            let src_sr = frame_sample_rate(dec_frame);
-                            let dst_sr = audio_sample_rate;
-                            let ret = swr_alloc_set_opts2(
-                                &mut swr,
-                                &dst_layout,
-                                AV_SAMPLE_FMT_FLTP,
-                                dst_sr,
-                                src_layout,
-                                frame_format(dec_frame) as AVSampleFormat,
-                                src_sr,
-                                0,
-                                std::ptr::null_mut(),
-                            );
-                            if ret < 0 || swr.is_null() {
-                                fatal = Some(ffmpeg_err("swr_alloc_set_opts2", ret));
-                                av_frame_unref(dec_frame);
-                                break 'decode;
-                            }
-                            let ret = swr_init(swr);
-                            if ret < 0 {
-                                fatal = Some(ffmpeg_err("swr_init", ret));
-                                av_frame_unref(dec_frame);
-                                break 'decode;
-                            }
-                        }
-                        let mut resamp = av_frame_alloc();
-                        if resamp.is_null() {
-                            fatal = Some(FfmpegError::Probe(
-                                "av_frame_alloc(resampled) returned null".into(),
-                            ));
-                            av_frame_unref(dec_frame);
-                            break 'decode;
-                        }
-                        let ret = swr_convert_frame(swr, resamp, dec_frame);
-                        if ret < 0 {
-                            av_frame_free(&mut resamp);
-                            fatal = Some(ffmpeg_err("swr_convert_frame", ret));
-                            av_frame_unref(dec_frame);
-                            break 'decode;
-                        }
-                        frame_set_pts(
-                            resamp,
-                            av_rescale_q(
-                                frame_pts(resamp),
-                                codctx_time_base(a_dec_ctx),
-                                codctx_time_base(a_enc_ctx),
-                            ),
-                        );
-                        if let Err(e) = encode_and_write(
-                            a_enc_ctx,
-                            resamp,
-                            out_pkt,
-                            out_ctx,
-                            out_a_idx,
-                            codctx_time_base(a_enc_ctx),
-                            &mut job,
-                        ) {
-                            av_frame_free(&mut resamp);
-                            fatal = Some(e);
-                            av_frame_unref(dec_frame);
-                            break 'decode;
-                        }
-                        av_frame_free(&mut resamp);
-                    }
-                    av_frame_unref(dec_frame);
+            } else if stream_idx == a_idx && !a_dec_ctx.is_null() && !a_enc_ctx.is_null() {
+                if let Err(e) = drain_audio_frames(
+                    a_dec_ctx,
+                    a_enc_ctx,
+                    in_pkt,
+                    dec_frame,
+                    &mut audio,
+                    out_pkt,
+                    out_ctx,
+                    out_a_idx,
+                    &mut job,
+                    tag,
+                    &mut decode_errors_logged,
+                ) {
+                    fatal = Some(e);
+                    break 'decode;
                 }
             }
             av_packet_unref(in_pkt);
@@ -1339,16 +1932,21 @@ fn run_transcode(
             }
         }
         if fatal.is_none() && !a_enc_ctx.is_null() {
-            if let Err(e) = encode_and_write(
-                a_enc_ctx,
-                std::ptr::null(),
-                out_pkt,
-                out_ctx,
-                out_a_idx,
-                codctx_time_base(a_enc_ctx),
-                &mut job,
-            ) {
+            if let Err(e) = audio.drain(a_enc_ctx, out_pkt, out_ctx, out_a_idx, &mut job, true) {
                 fatal = Some(e);
+            }
+            if fatal.is_none() {
+                if let Err(e) = encode_and_write(
+                    a_enc_ctx,
+                    std::ptr::null(),
+                    out_pkt,
+                    out_ctx,
+                    out_a_idx,
+                    codctx_time_base(a_enc_ctx),
+                    &mut job,
+                ) {
+                    fatal = Some(e);
+                }
             }
         }
 
@@ -1356,9 +1954,7 @@ fn run_transcode(
         if !sws.is_null() {
             sws_freeContext(sws);
         }
-        if !swr.is_null() {
-            swr_free(&mut swr);
-        }
+        audio.free();
         if !enc_vframe.is_null() {
             av_frame_free(&mut enc_vframe);
         }
@@ -1440,7 +2036,7 @@ unsafe fn free_loop_state(
     dec_frame: &mut *mut AVFrame,
     enc_vframe: &mut *mut AVFrame,
     sws: &mut *mut SwsContext,
-    swr: &mut *mut SwrContext,
+    audio: &mut AudioPipeline,
 ) {
     if !in_pkt.is_null() {
         av_packet_free(in_pkt);
@@ -1458,9 +2054,7 @@ unsafe fn free_loop_state(
         sws_freeContext(*sws);
         *sws = std::ptr::null_mut();
     }
-    if !swr.is_null() {
-        swr_free(swr);
-    }
+    audio.free();
 }
 
 unsafe fn cleanup_transcode(

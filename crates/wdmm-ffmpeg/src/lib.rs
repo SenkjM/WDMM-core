@@ -30,8 +30,9 @@
 
 #![allow(dead_code)]
 
-pub mod preset;
 pub mod diag; // always compiled — diagnostics must work without libav
+pub mod plan; // always compiled — pure remux/hybrid decision rules, host-testable
+pub mod preset;
 mod sys; // always compiled — preset.rs uses its pub const values (AV_CODEC_ID_*)
 
 #[cfg(feature = "ffmpeg")]
@@ -40,15 +41,18 @@ mod transcoder;
 #[cfg(feature = "ffmpeg")]
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "ffmpeg")]
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "ffmpeg")]
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub use plan::{
+    hybrid_audio_codec_id, remux_dropped_streams, remux_plan, remux_stream_selection, RemuxPlan,
+};
 pub use wdmm_core::models::TranscodePreset;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -93,9 +97,10 @@ pub struct ProgressSnapshot {
 /// Encoder selection actually used by a job (§7.3).
 #[derive(Clone, Debug, Default)]
 pub struct EncoderInfo {
-    /// `"remux"` or `"transcode"`.
+    /// `"remux"`, `"hybrid"` (video copied, audio re-encoded) or `"transcode"`.
     pub mode: String,
-    /// Actual video encoder name; `None` for a remux or when video is dropped.
+    /// Actual video encoder name; `None` for a remux, `"copy"` for hybrid
+    /// remux (video packets are copied, not re-encoded).
     pub video: Option<String>,
     /// Actual audio encoder name, or `"copy"` for stream copy.
     pub audio: Option<String>,
@@ -129,7 +134,8 @@ impl ProgressState {
 
     /// Start the wall clock — called by the job thread when it begins working.
     pub(crate) fn start(&self) {
-        self.started_epoch_ms.store(Self::now_ms(), Ordering::Relaxed);
+        self.started_epoch_ms
+            .store(Self::now_ms(), Ordering::Relaxed);
     }
 
     /// Record a packet at media time `pts_ms` (monotonic, never decreases).
@@ -305,18 +311,18 @@ impl JobHandle {
     /// removes the segment directory, so this only surfaces the error text.
     pub fn take_result(&mut self) -> Option<FfmpegResult<()>> {
         let thread = self.thread.take()?;
-        Some(thread.join().unwrap_or_else(|_| {
-            Err(FfmpegError::Io(std::io::Error::other("thread panic")))
-        }))
+        Some(
+            thread
+                .join()
+                .unwrap_or_else(|_| Err(FfmpegError::Io(std::io::Error::other("thread panic")))),
+        )
     }
 
     /// Block until the background thread finishes; return its result.
     pub fn join(mut self) -> FfmpegResult<()> {
         if let Some(t) = self.thread.take() {
-
-            t.join().map_err(|_| {
-                FfmpegError::Io(std::io::Error::other("thread panic"))
-            })?
+            t.join()
+                .map_err(|_| FfmpegError::Io(std::io::Error::other("thread panic")))?
         } else {
             Ok(())
         }
@@ -354,14 +360,28 @@ impl Drop for JobHandle {
 
 #[cfg(not(feature = "ffmpeg"))]
 impl JobHandle {
-    pub fn segment_dir(&self) -> &Path { &self.segment_dir }
+    pub fn segment_dir(&self) -> &Path {
+        &self.segment_dir
+    }
     pub fn cancel(&self) {}
-    pub fn is_running(&self) -> bool { false }
-    pub fn take_result(&mut self) -> Option<FfmpegResult<()>> { None }
-    pub fn join(self) -> FfmpegResult<()> { Ok(()) }
-    pub fn progress(&self) -> ProgressSnapshot { ProgressSnapshot::default() }
-    pub fn encoder_info(&self) -> EncoderInfo { EncoderInfo::default() }
-    pub fn warnings(&self) -> Vec<String> { Vec::new() }
+    pub fn is_running(&self) -> bool {
+        false
+    }
+    pub fn take_result(&mut self) -> Option<FfmpegResult<()>> {
+        None
+    }
+    pub fn join(self) -> FfmpegResult<()> {
+        Ok(())
+    }
+    pub fn progress(&self) -> ProgressSnapshot {
+        ProgressSnapshot::default()
+    }
+    pub fn encoder_info(&self) -> EncoderInfo {
+        EncoderInfo::default()
+    }
+    pub fn warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(not(feature = "ffmpeg"))]
@@ -443,7 +463,9 @@ pub(crate) fn codec_name(codec: *const sys::AVCodec, codec_id: u32) -> String {
         if codec.is_null() {
             return format!("{}", codec_id);
         }
-        let name_ptr = *(codec as *const u8).add(8).cast::<*const std::ffi::c_char>();
+        let name_ptr = *(codec as *const u8)
+            .add(8)
+            .cast::<*const std::ffi::c_char>();
         if name_ptr.is_null() {
             return format!("{}", codec_id);
         }
