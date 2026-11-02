@@ -287,6 +287,7 @@ extern "C" {
     pub fn avcodec_find_decoder_by_name(name: *const c_char) -> *const AVCodec;
     pub fn avcodec_find_encoder(id: AVCodecID) -> *const AVCodec;
     pub fn avcodec_find_encoder_by_name(name: *const c_char) -> *const AVCodec;
+    pub fn avcodec_get_name(id: AVCodecID) -> *const c_char;
     pub fn avcodec_alloc_context3(codec: *const AVCodec) -> *mut AVCodecContext;
     pub fn avcodec_free_context(avctx: *mut *mut AVCodecContext);
     pub fn avcodec_parameters_to_context(codec: *mut AVCodecContext, par: *const AVCodecParameters) -> c_int;

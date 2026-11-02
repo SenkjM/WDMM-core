@@ -26,7 +26,7 @@ use wdmm_dlna::{
     DlnaSession, SsdpDiscovery, SUBTITLE_PROTOCOL_INFO,
 };
 use wdmm_drivers::WdmmVfs;
-use wdmm_proxy::{BindMode, BoxStream, ProxyHandle};
+use wdmm_proxy::{BindMode, BoxStream, HlsProgress, ProxyHandle};
 
 use crate::{
     create_account_driver, driver_range_stream, global_library_db, proxy_cell, ptr_to_str, rt,
@@ -107,6 +107,36 @@ impl SubtitleCandidate {
     }
 }
 
+/// High-level cast phase (contract §3). The `state` key keeps its old
+/// renderer-transport meaning; `phase` describes the *preparation* stage so the
+/// UI can show "warming up / speed 1.8×" before the renderer gets a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SessionPhase {
+    /// Nothing is playing (stopped before the renderer was ever pointed at it).
+    #[default]
+    Idle,
+    /// HLS transcode warming up; the renderer has *not* been given the playlist.
+    Warming,
+    /// The renderer received the media URL and is playing (or paused).
+    Playing,
+    /// The renderer reported end of stream.
+    Ended,
+    /// The HLS job failed; `error` carries the precise reason.
+    Failed,
+}
+
+impl SessionPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Warming => "warming",
+            Self::Playing => "playing",
+            Self::Ended => "ended",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Everything the renderer is currently pointing at.
 struct SessionEntry {
     handle: u32,
@@ -131,6 +161,12 @@ struct SessionEntry {
     subtitle_candidates: Vec<SubtitleCandidate>,
     selected_subtitle: Option<SubtitleCandidate>,
     subtitle_token: Option<String>,
+    /// Preparation phase (contract §3).
+    phase: SessionPhase,
+    /// DIDL document handed to the renderer (re-sent by `cast`).
+    didl: String,
+    /// Failure reason for `phase == Failed`.
+    last_error: Option<String>,
 }
 
 /// Freshly prepared media resources before they are handed to a renderer.
@@ -146,6 +182,27 @@ struct PreparedMedia {
     selected_subtitle: Option<SubtitleCandidate>,
     subtitle_token: Option<String>,
     didl: String,
+    /// HLS job started without waiting for the playlist (`register_hls_nowait`).
+    warming: bool,
+}
+
+/// Remember where the diagnostics log lives, so a developer can pull it with
+/// `adb exec-out run-as … cat files/wdmm-hls-debug.log` (§7.4).
+pub(crate) fn init_hls_diag(db_path: &str) {
+    static INIT: OnceLock<()> = OnceLock::new();
+    // In-memory databases have no directory to write next to.
+    if db_path == ":memory:" {
+        return;
+    }
+    INIT.get_or_init(|| {
+        let Some(dir) = std::path::Path::new(db_path).parent() else {
+            return;
+        };
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        wdmm_ffmpeg::diag::set_file(Some(dir.join("wdmm-hls-debug.log")));
+    });
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────
@@ -589,6 +646,7 @@ async fn prepare_media(
     size: u64,
     preset_id: Option<&str>,
     force_direct: bool,
+    warmup: bool,
     ui_lang: &str,
 ) -> Result<PreparedMedia, String> {
     let size = resolve_size(Arc::clone(&driver), remote_path, size).await;
@@ -612,43 +670,54 @@ async fn prepare_media(
     // `force_direct`, or the passthrough preset, means the renderer fetches the
     // original bytes from the proxy; anything else goes through HLS.
     let wants_direct = force_direct || matches!(preset_id, Some("passthrough"));
-    let (provider, media_url, hls_token): (&'static str, String, Option<String>) = if wants_direct {
-        (
-            "direct",
-            format!("http://{lan_ip}:{port}{}", registration.path_template),
-            None,
-        )
-    } else {
-        let Some(preset_id) = preset_id else {
-            handle.unregister(&stream_token);
-            return Err("preset_id required for a transcoded cast".to_string());
+    let (provider, media_url, hls_token, warming): (&'static str, String, Option<String>, bool) =
+        if wants_direct {
+            (
+                "direct",
+                format!("http://{lan_ip}:{port}{}", registration.path_template),
+                None,
+                false,
+            )
+        } else {
+            let Some(preset_id) = preset_id else {
+                handle.unregister(&stream_token);
+                return Err("preset_id required for a transcoded cast".to_string());
+            };
+            let preset = match global_library_db().get_transcode_preset(preset_id) {
+                Ok(Some(preset)) => preset,
+                Ok(None) => {
+                    handle.unregister(&stream_token);
+                    return Err(format!("transcode preset not found: {preset_id}"));
+                }
+                Err(e) => {
+                    handle.unregister(&stream_token);
+                    return Err(format!("transcode preset: {e}"));
+                }
+            };
+            // §3: warm-up returns as soon as the job thread exists; the
+            // renderer is only pointed at the playlist after `cast`.
+            let registered = if warmup {
+                handle
+                    .register_hls_nowait(renderer.usn.clone(), loopback_url, preset, None, None)
+                    .await
+            } else {
+                handle
+                    .register_hls(renderer.usn.clone(), loopback_url, preset, None, None)
+                    .await
+            };
+            match registered {
+                Ok(hls) => (
+                    "hls",
+                    format!("http://{lan_ip}:{port}{}", hls.playlist_template),
+                    Some(hls.token),
+                    warmup,
+                ),
+                Err(e) => {
+                    handle.unregister(&stream_token);
+                    return Err(format!("hls registration failed: {e}"));
+                }
+            }
         };
-        let preset = match global_library_db().get_transcode_preset(preset_id) {
-            Ok(Some(preset)) => preset,
-            Ok(None) => {
-                handle.unregister(&stream_token);
-                return Err(format!("transcode preset not found: {preset_id}"));
-            }
-            Err(e) => {
-                handle.unregister(&stream_token);
-                return Err(format!("transcode preset: {e}"));
-            }
-        };
-        match handle
-            .register_hls(renderer.usn.clone(), loopback_url, preset, None, None)
-            .await
-        {
-            Ok(hls) => (
-                "hls",
-                format!("http://{lan_ip}:{port}{}", hls.playlist_template),
-                Some(hls.token),
-            ),
-            Err(e) => {
-                handle.unregister(&stream_token);
-                return Err(format!("hls registration failed: {e}"));
-            }
-        }
-    };
 
     let mime = mime_for(name).to_string();
     let mime_ext = extension(name).to_uppercase();
@@ -704,6 +773,7 @@ async fn prepare_media(
         selected_subtitle,
         subtitle_token,
         didl,
+        warming,
     })
 }
 
@@ -742,6 +812,9 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         .unwrap_or(true);
     let preset_id = opt_string(cfg, "preset_id");
     let ui_lang = opt_string(cfg, "ui_lang").unwrap_or_default();
+    // §3: warm-up is the default for HLS casts; `warmup:false` keeps the old
+    // (blocking, up to 20 s) behaviour as an emergency switch.
+    let warmup = cfg.get("warmup").and_then(Value::as_bool).unwrap_or(true);
 
     let renderer = DlnaRenderer {
         usn: renderer_usn,
@@ -757,6 +830,13 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
     let lan_ip = lan_ip_for(renderer_ip)?;
     let proxy = ensure_lan_proxy(lan_ip).await?;
 
+    let wants_hls =
+        !(force_direct || matches!(preset_id.as_deref(), Some("passthrough")));
+    if wants_hls {
+        // §7.4: one fresh diagnostics window per HLS session.
+        wdmm_ffmpeg::diag::clear();
+    }
+
     let prepared = prepare_media(
         &proxy,
         lan_ip,
@@ -767,6 +847,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         size,
         preset_id.as_deref(),
         force_direct,
+        warmup,
         &ui_lang,
     )
     .await?;
@@ -783,15 +864,22 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
             return Err(format!("open renderer failed: {e}"));
         }
     };
-    if let Err(e) = session.start(&prepared.media_url, &prepared.didl).await {
-        unregister_media(
-            &proxy,
-            Some(&prepared.stream_token),
-            prepared.hls_token.as_deref(),
-            prepared.subtitle_token.as_deref(),
-        );
-        return Err(format!("SetAVTransportURI failed: {e}"));
-    }
+    // Warming: do not touch the renderer yet — `cast` does that once the
+    // playlist is actually on disk (the renderer would 404 in 46 ms otherwise).
+    let phase = if prepared.warming {
+        SessionPhase::Warming
+    } else {
+        if let Err(e) = session.start(&prepared.media_url, &prepared.didl).await {
+            unregister_media(
+                &proxy,
+                Some(&prepared.stream_token),
+                prepared.hls_token.as_deref(),
+                prepared.subtitle_token.as_deref(),
+            );
+            return Err(format!("SetAVTransportURI failed: {e}"));
+        }
+        SessionPhase::Playing
+    };
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     let entry = SessionEntry {
@@ -817,6 +905,9 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         subtitle_candidates: prepared.subtitle_candidates,
         selected_subtitle: prepared.selected_subtitle,
         subtitle_token: prepared.subtitle_token,
+        phase,
+        didl: prepared.didl,
+        last_error: None,
     };
     put_session(entry);
 
@@ -826,6 +917,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         "url": prepared.media_url,
         "provider": prepared.provider,
         "protocol_info": prepared.protocol_info,
+        "phase": phase.as_str(),
         "compat": compat_json(&name, prepared.provider),
     }))
 }
@@ -840,7 +932,7 @@ async fn apply_cmd(entry: &mut SessionEntry, cmd: &Value) -> Result<(), String> 
     match command.as_str() {
         "play" => entry.session.play().await.map_err(|e| e.to_string()),
         "pause" => entry.session.pause().await.map_err(|e| e.to_string()),
-        "stop" => entry.session.stop().await.map_err(|e| e.to_string()),
+        "stop" => stop_session(entry).await,
         "seek" => {
             let position_ms = cmd
                 .get("position_ms")
@@ -854,8 +946,68 @@ async fn apply_cmd(entry: &mut SessionEntry, cmd: &Value) -> Result<(), String> 
         }
         "select" => select_media(entry, cmd).await,
         "subtitle" => select_subtitle(entry, cmd).await,
+        "cast" => cast_to_renderer(entry).await,
         other => Err(format!("unknown cmd: {other}")),
     }
+}
+
+/// Gate for the `cast` command (§3): only a warming session whose playlist is
+/// already on disk may point the renderer at it.
+fn cast_precondition(phase: SessionPhase, playlist_ready: bool) -> Result<(), &'static str> {
+    if phase != SessionPhase::Warming {
+        return Err("not warming");
+    }
+    if !playlist_ready {
+        return Err("playlist not ready");
+    }
+    Ok(())
+}
+
+/// Common `stop` phase transition. Returns whether the renderer must also be
+/// stopped (it must not when it was never pointed at the media).
+fn stop_phase_transition(phase: &mut SessionPhase) -> bool {
+    let needs_renderer_stop = matches!(*phase, SessionPhase::Playing | SessionPhase::Ended);
+    *phase = SessionPhase::Idle;
+    needs_renderer_stop
+}
+
+/// `{"cmd":"stop"}`: in warm-up nothing was sent to the renderer yet, so only
+/// the transcode job + proxy tokens are released and the phase goes `idle`.
+async fn stop_session(entry: &mut SessionEntry) -> Result<(), String> {
+    let result = if matches!(entry.phase, SessionPhase::Playing | SessionPhase::Ended) {
+        entry.session.stop().await.map_err(|e| e.to_string())
+    } else {
+        // Warming / failed / idle: cancelling the job and releasing the proxy
+        // tokens is the whole stop — do not touch the renderer.
+        let hls = entry.hls_token.take();
+        let subtitle = entry.subtitle_token.take();
+        unregister_media(
+            &entry.proxy,
+            Some(&entry.stream_token),
+            hls.as_deref(),
+            subtitle.as_deref(),
+        );
+        Ok(())
+    };
+    let _ = stop_phase_transition(&mut entry.phase);
+    result
+}
+
+/// `{"cmd":"cast"}`: hand the renderer the playlist once it is ready, then play.
+async fn cast_to_renderer(entry: &mut SessionEntry) -> Result<(), String> {
+    let playlist_ready = entry
+        .hls_token
+        .as_deref()
+        .and_then(|token| entry.proxy.hls_progress(token))
+        .is_some_and(|progress| progress.playlist_ready);
+    cast_precondition(entry.phase, playlist_ready)?;
+    entry
+        .session
+        .start(&entry.media_url, &entry.didl)
+        .await
+        .map_err(|e| format!("SetAVTransportURI failed: {e}"))?;
+    entry.phase = SessionPhase::Playing;
+    Ok(())
 }
 
 /// Switch the session to another file (next episode, or a manual pick).
@@ -870,6 +1022,14 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
     let driver = Arc::clone(&entry.driver);
     let lan_ip = entry.lan_ip;
 
+    let wants_hls = !(force_direct || matches!(preset_id.as_deref(), Some("passthrough")));
+    if wants_hls {
+        wdmm_ffmpeg::diag::clear();
+    }
+
+    // Switching media is synchronous: `switch_to` must only see a ready
+    // playlist, so the warm-up path is not used here (the current renderer is
+    // already playing — a `warming` phase would stop the UI from knowing).
     let prepared = prepare_media(
         &proxy,
         lan_ip,
@@ -880,6 +1040,7 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
         size,
         preset_id.as_deref(),
         force_direct,
+        false,
         &entry.ui_lang,
     )
     .await?;
@@ -918,6 +1079,9 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
     entry.subtitle_candidates = prepared.subtitle_candidates;
     entry.selected_subtitle = prepared.selected_subtitle;
     entry.subtitle_token = prepared.subtitle_token;
+    entry.didl = prepared.didl;
+    entry.phase = SessionPhase::Playing;
+    entry.last_error = None;
     Ok(())
 }
 
@@ -966,6 +1130,7 @@ async fn select_subtitle(entry: &mut SessionEntry, cmd: &Value) -> Result<(), St
         &entry.protocol_info,
         subtitle_url.as_deref(),
     );
+    entry.didl = didl.clone();
     // Re-send the URI (with the new metadata) and play: renderers do not pick
     // up a subtitle-only metadata change any other way.
     entry
@@ -975,12 +1140,72 @@ async fn select_subtitle(entry: &mut SessionEntry, cmd: &Value) -> Result<(), St
         .map_err(|e| e.to_string())
 }
 
+/// Recompute the cast phase from the HLS job telemetry + renderer tick.
+///
+/// Returns the fresh [`HlsProgress`] (if any) so [`state_json`] can expose the
+/// encoder/diagnostics fields without a second lock acquisition.
+fn refresh_phase(entry: &mut SessionEntry, tick: &wdmm_dlna::TickResult) -> Option<HlsProgress> {
+    let progress = entry
+        .hls_token
+        .as_deref()
+        .and_then(|token| entry.proxy.hls_progress(token));
+    if entry.provider == "hls" {
+        if let Some(progress) = &progress {
+            if let Some(error) = &progress.error {
+                // §3 hard requirement: a failed transcode surfaces immediately,
+                // never "thread alive, UI waits 20 s".
+                entry.phase = SessionPhase::Failed;
+                entry.last_error = Some(error.clone());
+            } else if entry.phase == SessionPhase::Warming
+                && progress.ended
+                && !progress.playlist_ready
+            {
+                entry.phase = SessionPhase::Failed;
+                entry.last_error =
+                    Some("transcode job exited before writing the HLS playlist".to_string());
+            }
+        }
+    }
+    match entry.phase {
+        SessionPhase::Warming
+        | SessionPhase::Failed
+        | SessionPhase::Idle => {}
+        SessionPhase::Playing | SessionPhase::Ended => {
+            entry.phase = if tick.ended {
+                SessionPhase::Ended
+            } else {
+                SessionPhase::Playing
+            };
+        }
+    }
+    progress
+}
+
+/// `null` until the job has produced at least 3 s of media, then whether the
+/// encoder keeps up with realtime (§3 `estimated_realtime`).
+fn estimate_realtime(content_ms: i64, speed: f64) -> Option<bool> {
+    (content_ms >= 3_000).then_some(speed >= 1.0)
+}
+
 /// Full state document for one tick.
-fn state_json(entry: &SessionEntry, tick: &wdmm_dlna::TickResult) -> Value {
+fn state_json(
+    entry: &SessionEntry,
+    tick: &wdmm_dlna::TickResult,
+    progress: Option<&HlsProgress>,
+) -> Value {
     let ended_reason = match tick.ended_reason {
         Some(reason) => Value::String(reason.to_string()),
         None => Value::Null,
     };
+    let encoder = progress.map(|p| p.encoder.clone()).unwrap_or_default();
+    let speed = progress.map_or(0.0, |p| p.speed);
+    let content_ms = progress.map_or(0, |p| p.content_ms);
+    let wall_ms = progress.map_or(0, |p| p.wall_ms);
+    let playlist_ready = progress.is_some_and(|p| p.playlist_ready);
+    let segments = progress.map_or(0, |p| p.segments);
+    // Only meaningful once the job has produced at least 3 s of media.
+    let estimated_realtime = estimate_realtime(content_ms, speed);
+    let warnings = progress.map(|p| p.warnings.clone()).unwrap_or_default();
     json!({
         "ok": true,
         "state": if tick.ended { "ended" } else { "casting" },
@@ -1000,6 +1225,20 @@ fn state_json(entry: &SessionEntry, tick: &wdmm_dlna::TickResult) -> Value {
             .collect::<Vec<_>>(),
         "selected_subtitle": entry.selected_subtitle.as_ref().map(SubtitleCandidate::to_json),
         "compat": compat_json(&entry.name, entry.provider),
+        // ── contract §3 / §7.3 ──────────────────────────────────────────────
+        "phase": entry.phase.as_str(),
+        "encode_speed": speed,
+        "encode_content_ms": content_ms,
+        "encode_wall_ms": wall_ms,
+        "playlist_ready": playlist_ready,
+        "segments": segments,
+        "estimated_realtime": estimated_realtime,
+        "error": entry.last_error,
+        "encode_mode": encoder.mode,
+        "video_encoder": encoder.video,
+        "audio_encoder": encoder.audio,
+        "encode_warnings": warnings,
+        "diagnostics": wdmm_ffmpeg::diag::tail(40),
     })
 }
 
@@ -1011,12 +1250,20 @@ fn state_json(entry: &SessionEntry, tick: &wdmm_dlna::TickResult) -> Value {
 /// ```json
 /// {"renderer_location":"http://…/desc.xml","renderer_usn":"uuid:…",
 ///  "account_id":"…","remote_path":"/dir/movie.mkv","name":"movie.mkv",
-///  "size":123,"preset_id":null,"force_direct":true,"ui_lang":"zh"}
+///  "size":123,"preset_id":null,"force_direct":true,"warmup":true,"ui_lang":"zh"}
 /// ```
 ///
+/// `warmup` defaults to `true`: an HLS cast then starts the transcode and
+/// returns immediately with `"phase":"warming"`; the caller polls
+/// [`wdmm_dlna_session_state`] and sends `{"cmd":"cast"}` once
+/// `playlist_ready` is true. `"warmup":false` restores the old behaviour of
+/// blocking up to 20 s for the playlist. Direct casts ignore `warmup` and
+/// always return `"phase":"playing"`.
+///
 /// Returns `{"ok":true,"handle":N,"url":"…","provider":"direct"|"hls",
-/// "protocol_info":"…","compat":{…}}` or `{"ok":false,"error":"…"}`.
-/// Caller must free the result via [`crate::wdmm_ffi_free_string`].
+/// "protocol_info":"…","phase":"playing"|"warming","compat":{…}}` or
+/// `{"ok":false,"error":"…"}`. Caller must free the result via
+/// [`crate::wdmm_ffi_free_string`].
 ///
 /// # Safety
 /// `config_json` must be a valid null-terminated UTF-8 C string (or null).
@@ -1040,8 +1287,15 @@ pub extern "C" fn wdmm_dlna_session_start(config_json: *const c_char) -> FfiStri
 ///
 /// Returns `{"ok":true,"state":…,"transport":…,"position_ms":…,
 /// "duration_ms":…,"ended":bool,"ended_reason":"eof"|"stopped_by_device"|null,
-/// "subtitle_candidates":[…],"selected_subtitle":{…}|null,"compat":{…}}`, or
-/// `{"ok":false,"error":"…"}` for an unknown handle / renderer failure.
+/// "subtitle_candidates":[…],"selected_subtitle":{…}|null,"compat":{…}}` plus
+/// the contract §3 warm-up keys:
+/// `phase` (`warming`/`playing`/`ended`/`failed`/`idle`), `encode_speed`
+/// (0.0 when direct/unknown), `encode_content_ms`, `encode_wall_ms`,
+/// `playlist_ready`, `segments`, `estimated_realtime` (bool|null),
+/// `error` (string|null, set when `phase == "failed"`), and the §7.3
+/// diagnostics keys `encode_mode`, `video_encoder`, `audio_encoder`,
+/// `encode_warnings`, `diagnostics`.
+/// Returns `{"ok":false,"error":"…"}` for an unknown handle / renderer failure.
 #[no_mangle]
 pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString {
     let Some(mut entry) = take_session(handle) else {
@@ -1049,7 +1303,10 @@ pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString {
     };
     let result = rt().block_on(entry.session.tick());
     let value = match result {
-        Ok(tick) => state_json(&entry, &tick),
+        Ok(tick) => {
+            let progress = refresh_phase(&mut entry, &tick);
+            state_json(&entry, &tick, progress.as_ref())
+        }
         Err(e) => json!({"ok": false, "error": e.to_string()}),
     };
     put_session(entry);
@@ -1061,8 +1318,13 @@ pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString {
 /// `cmd_json` forms: `{"cmd":"play"}`, `{"cmd":"pause"}`, `{"cmd":"stop"}`,
 /// `{"cmd":"seek","position_ms":60000}`,
 /// `{"cmd":"select","remote_path":"/dir/b.mkv","name":"b.mkv","size":0,
-/// "preset_id":null}` and `{"cmd":"subtitle","path":"/dir/b.zh.srt"}`
-/// (`path:null` turns subtitles off).
+/// "preset_id":null}`, `{"cmd":"subtitle","path":"/dir/b.zh.srt"}`
+/// (`path:null` turns subtitles off) and `{"cmd":"cast"}`.
+///
+/// `cast` is only valid while `phase == "warming"` and `playlist_ready` is
+/// true; it sends the playlist URL to the renderer and moves the phase to
+/// `playing`. While warming, `stop` cancels the transcode job without touching
+/// the renderer and moves the phase to `idle`.
 ///
 /// Returns `"ok"` on success or `{"ok":false,"error":"…"}`.
 #[no_mangle]
@@ -1454,5 +1716,77 @@ mod tests {
             "192.168.1.20".parse::<IpAddr>().unwrap()
         );
         assert!(renderer_ip_from_location("not a url").is_err());
+    }
+
+    // ── §3 warm-up phase machine ─────────────────────────────────────────────
+
+    #[test]
+    fn phase_strings_cover_all_states() {
+        assert_eq!(SessionPhase::Idle.as_str(), "idle");
+        assert_eq!(SessionPhase::Warming.as_str(), "warming");
+        assert_eq!(SessionPhase::Playing.as_str(), "playing");
+        assert_eq!(SessionPhase::Ended.as_str(), "ended");
+        assert_eq!(SessionPhase::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn cast_rejected_until_playlist_is_ready() {
+        assert_eq!(
+            cast_precondition(SessionPhase::Playing, true),
+            Err("not warming")
+        );
+        assert_eq!(
+            cast_precondition(SessionPhase::Idle, true),
+            Err("not warming")
+        );
+        assert_eq!(
+            cast_precondition(SessionPhase::Warming, false),
+            Err("playlist not ready")
+        );
+        assert_eq!(cast_precondition(SessionPhase::Warming, true), Ok(()));
+    }
+
+    #[test]
+    fn stop_while_warming_skips_renderer_and_resets_phase() {
+        let mut phase = SessionPhase::Warming;
+        assert!(
+            !stop_phase_transition(&mut phase),
+            "warming stop must not touch the renderer"
+        );
+        assert_eq!(phase, SessionPhase::Idle);
+        assert_eq!(phase.as_str(), "idle");
+
+        let mut phase = SessionPhase::Playing;
+        assert!(
+            stop_phase_transition(&mut phase),
+            "playing stop still stops the renderer"
+        );
+        assert_eq!(phase, SessionPhase::Idle);
+
+        // Failed/idle sessions never reached the renderer either.
+        let mut phase = SessionPhase::Failed;
+        assert!(!stop_phase_transition(&mut phase));
+        assert_eq!(phase, SessionPhase::Idle);
+        let mut phase = SessionPhase::Idle;
+        assert!(!stop_phase_transition(&mut phase));
+        assert_eq!(phase, SessionPhase::Idle);
+    }
+
+    #[test]
+    fn estimated_realtime_needs_three_seconds_of_media() {
+        assert_eq!(estimate_realtime(0, 0.0), None);
+        assert_eq!(estimate_realtime(2_999, 2.0), None);
+        assert_eq!(estimate_realtime(3_000, 1.0), Some(true));
+        assert_eq!(estimate_realtime(3_000, 0.99), Some(false));
+    }
+
+    #[test]
+    fn diagnostics_tail_is_available_without_the_ffmpeg_feature() {
+        // §7.3/§7.4: the failed-phase `diagnostics` key must always exist.
+        wdmm_ffmpeg::diag::clear();
+        wdmm_ffmpeg::diag::log("transcode job start");
+        let lines = wdmm_ffmpeg::diag::tail(40);
+        assert!(lines.last().unwrap().contains("transcode job start"));
+        wdmm_ffmpeg::diag::clear();
     }
 }

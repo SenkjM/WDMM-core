@@ -47,6 +47,10 @@ use tokio::sync::oneshot;
 use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 
+/// Progress telemetry re-exported from [`wdmm_ffmpeg`] so callers (FFI) only
+/// depend on this crate for cast progress.
+pub use wdmm_ffmpeg::{EncoderInfo, ProgressSnapshot};
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -139,6 +143,11 @@ struct HlsSession {
     input_url: String,
     /// Transcode preset — preserved for seek restarts.
     preset: wdmm_ffmpeg::TranscodePreset,
+    /// Set once the transcode thread has finished and its result was taken.
+    job_ended: bool,
+    /// The job's error text (only when it ended with an error). Cached because
+    /// `JobHandle::take_result` consumes the join handle.
+    job_error: Option<String>,
 }
 
 /// Result of a successful `register_hls` call.
@@ -154,6 +163,89 @@ pub struct HlsRegistration {
     pub token: String,
     /// URL path to the master playlist, e.g. `"/h/3f7a…/index.m3u8"`.
     pub playlist_template: String,
+}
+
+/// Live progress of one HLS transcode session (§2 / §7.3).
+#[derive(Debug, Clone)]
+pub struct HlsProgress {
+    /// `index.m3u8` exists and is non-empty.
+    pub playlist_ready: bool,
+    /// Number of `seg*.ts` files already on disk.
+    pub segments: u32,
+    /// Media time written so far (monotonic).
+    pub content_ms: i64,
+    /// Wall-clock time since the job thread started.
+    pub wall_ms: u64,
+    /// `content_ms / wall_ms`; `0.0` before the wall clock starts.
+    pub speed: f64,
+    /// The transcode thread has finished.
+    pub ended: bool,
+    /// Error text when the thread ended with an error.
+    pub error: Option<String>,
+    /// Encoder selection actually used (§7.3).
+    pub encoder: EncoderInfo,
+    /// Deduplicated encoder warnings, capped at 8 (§7.3).
+    pub warnings: Vec<String>,
+}
+
+/// Derive [`HlsProgress`] from a segment directory + job telemetry.
+///
+/// Reads the filesystem directly (no per-segment synchronization state): the
+/// job thread is the only writer, so a directory listing is enough.
+fn derive_hls_progress(
+    segment_dir: &std::path::Path,
+    snapshot: ProgressSnapshot,
+    ended: bool,
+    error: Option<String>,
+    encoder: EncoderInfo,
+    warnings: Vec<String>,
+) -> HlsProgress {
+    let playlist_ready = std::fs::metadata(segment_dir.join("index.m3u8"))
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+
+    let mut segments = 0u32;
+    if let Ok(entries) = std::fs::read_dir(segment_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("seg") && name.ends_with(".ts") {
+                segments += 1;
+            }
+        }
+    }
+
+    let speed = if snapshot.wall_ms == 0 {
+        0.0
+    } else {
+        snapshot.content_ms as f64 / snapshot.wall_ms as f64
+    };
+
+    // Deduplicate while preserving order, keep at most 8.
+    let mut seen: Vec<String> = Vec::new();
+    let warnings: Vec<String> = warnings
+        .into_iter()
+        .filter(|w| {
+            if seen.len() >= 8 || seen.iter().any(|s| s == w) {
+                false
+            } else {
+                seen.push(w.clone());
+                true
+            }
+        })
+        .collect();
+
+    HlsProgress {
+        playlist_ready,
+        segments,
+        content_ms: snapshot.content_ms,
+        wall_ms: snapshot.wall_ms,
+        speed,
+        ended,
+        error,
+        encoder,
+        warnings,
+    }
 }
 
 /// How long [`ProxyHandle::register_hls`] waits for the transcode job to write
@@ -406,6 +498,40 @@ impl ProxyHandle {
         ttl_secs: Option<u64>,
         allowed_peers: Option<Vec<IpAddr>>,
     ) -> ProxyResult<HlsRegistration> {
+        self.start_hls_session(device_id, input_url, preset, ttl_secs, allowed_peers, true)
+            .await
+    }
+
+    /// Start an HLS transcode session **without** waiting for the playlist.
+    ///
+    /// This is the warm-up path of contract §3: the FFI returns a `warming`
+    /// phase to the UI and only points the renderer at `index.m3u8` once
+    /// [`hls_progress`](Self::hls_progress) reports `playlist_ready` (the
+    /// `cast` command). [`register_hls`](Self::register_hls) keeps blocking
+    /// until the playlist exists for callers that need the old guarantee.
+    pub async fn register_hls_nowait(
+        &self,
+        device_id: impl Into<String>,
+        input_url: impl Into<String>,
+        preset: wdmm_ffmpeg::TranscodePreset,
+        ttl_secs: Option<u64>,
+        allowed_peers: Option<Vec<IpAddr>>,
+    ) -> ProxyResult<HlsRegistration> {
+        self.start_hls_session(device_id, input_url, preset, ttl_secs, allowed_peers, false)
+            .await
+    }
+
+    /// Shared implementation of [`register_hls`](Self::register_hls) and
+    /// [`register_hls_nowait`](Self::register_hls_nowait).
+    async fn start_hls_session(
+        &self,
+        device_id: impl Into<String>,
+        input_url: impl Into<String>,
+        preset: wdmm_ffmpeg::TranscodePreset,
+        ttl_secs: Option<u64>,
+        allowed_peers: Option<Vec<IpAddr>>,
+        wait_for_playlist_file: bool,
+    ) -> ProxyResult<HlsRegistration> {
         self.ensure_server().await?;
         let device_id = device_id.into();
         let input_url = input_url.into();
@@ -431,17 +557,27 @@ impl ProxyHandle {
         .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
         let segment_dir = job.segment_dir.clone();
         // The renderer fetches the playlist as soon as we hand it the URL, so
-        // the file must exist before this call returns.
-        wait_for_playlist(&segment_dir, &mut job)
-            .await
-            .map_err(ProxyError::Ffmpeg)?;
+        // the file must exist before this call returns — unless the caller is
+        // the §3 warm-up path, which waits for `playlist_ready` in the UI.
+        if wait_for_playlist_file {
+            wait_for_playlist(&segment_dir, &mut job)
+                .await
+                .map_err(ProxyError::Ffmpeg)?;
+        }
         let token = new_token();
         let playlist_template = format!("/h/{token}/index.m3u8");
         {
             let mut g = self.shared.lock().unwrap();
             g.hls_sessions.insert(
                 token.clone(),
-                HlsSession { segment_dir, job, input_url: input_url.clone(), preset },
+                HlsSession {
+                    segment_dir,
+                    job,
+                    input_url: input_url.clone(),
+                    preset,
+                    job_ended: false,
+                    job_error: None,
+                },
             );
             g.device_media_map.insert((device_id, input_url), token.clone());
             let now = SystemTime::now();
@@ -489,6 +625,8 @@ impl ProxyHandle {
         if let Some(session) = g.hls_sessions.get_mut(token) {
             session.segment_dir = new_segment_dir;
             session.job = new_job;
+            session.job_ended = false;
+            session.job_error = None;
         }
         Ok(())
     }
@@ -501,6 +639,35 @@ impl ProxyHandle {
         g.device_media_map.retain(|_, t| t != token);
         g.hls_sessions.remove(token);
         g.token_meta.remove(token);
+    }
+
+    /// Live progress of an HLS session (§2 / §7.3), or `None` for unknown
+    /// tokens.
+    ///
+    /// Sync: reads the segment directory + the job's shared telemetry, and
+    /// caches the job result once the thread has finished (calling
+    /// `take_result` twice would lose the error text).
+    pub fn hls_progress(&self, token: &str) -> Option<HlsProgress> {
+        let mut g = self.shared.lock().unwrap();
+        let session = g.hls_sessions.get_mut(token)?;
+        if !session.job_ended && !session.job.is_running() {
+            session.job_ended = true;
+            session.job_error = match session.job.take_result() {
+                Some(Err(e)) => Some(e.to_string()),
+                _ => None,
+            };
+        }
+        let snapshot = session.job.progress();
+        let encoder = session.job.encoder_info();
+        let warnings = session.job.warnings();
+        Some(derive_hls_progress(
+            &session.segment_dir,
+            snapshot,
+            session.job_ended,
+            session.job_error.clone(),
+            encoder,
+            warnings,
+        ))
     }
 
     /// Gracefully stop the proxy. The handle is still usable; the server will
@@ -1070,6 +1237,106 @@ mod tests {
     fn hls_test_media() -> Option<PathBuf> {
         let path = PathBuf::from(std::env::var_os("WDMM_HLS_TEST_MEDIA")?);
         path.is_file().then_some(path)
+    }
+
+    // ── hls_progress derived state (§2) ──────────────────────────────────────
+    //
+    // Exercises the filesystem + telemetry derivation directly: no media and no
+    // libav needed, so these run on every host (including Windows).
+
+    fn unique_seg_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wdmm-hls-progress-{}-{}-{}",
+            std::process::id(),
+            name,
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn hls_progress_derives_not_ready_state() {
+        let dir = unique_seg_dir("not-ready");
+        let progress = derive_hls_progress(
+            &dir,
+            ProgressSnapshot::default(),
+            false,
+            None,
+            EncoderInfo::default(),
+            Vec::new(),
+        );
+        assert!(!progress.playlist_ready);
+        assert_eq!(progress.segments, 0);
+        assert_eq!(progress.content_ms, 0);
+        assert_eq!(progress.wall_ms, 0);
+        assert_eq!(progress.speed, 0.0, "no wall clock ⇒ speed 0.0");
+        assert!(!progress.ended);
+        assert!(progress.error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hls_progress_derives_ready_state_with_speed() {
+        let dir = unique_seg_dir("ready");
+        std::fs::write(dir.join("index.m3u8"), b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n").unwrap();
+        std::fs::write(dir.join("seg0.ts"), b"x").unwrap();
+        std::fs::write(dir.join("seg1.ts"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
+        let progress = derive_hls_progress(
+            &dir,
+            ProgressSnapshot { content_ms: 8_000, wall_ms: 4_000, packets: 42 },
+            false,
+            None,
+            EncoderInfo {
+                mode: "transcode".into(),
+                video: Some("libx264".into()),
+                audio: Some("aac".into()),
+                hw_requested: true,
+                hw_available: false,
+            },
+            vec!["w".into()],
+        );
+        assert!(progress.playlist_ready, "non-empty index.m3u8 ⇒ ready");
+        assert_eq!(progress.segments, 2, "only seg*.ts files count");
+        assert_eq!(progress.content_ms, 8_000);
+        assert_eq!(progress.wall_ms, 4_000);
+        assert!((progress.speed - 2.0).abs() < f64::EPSILON);
+        assert!(!progress.ended);
+        assert!(progress.error.is_none());
+        assert_eq!(progress.encoder.mode, "transcode");
+        assert_eq!(progress.encoder.video.as_deref(), Some("libx264"));
+        assert_eq!(progress.encoder.audio.as_deref(), Some("aac"));
+        assert!(!progress.encoder.hw_available);
+        assert_eq!(progress.warnings, vec!["w".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hls_progress_reports_ended_error_and_dedupes_warnings() {
+        let dir = unique_seg_dir("ended");
+        let progress = derive_hls_progress(
+            &dir,
+            ProgressSnapshot { content_ms: 1_000, wall_ms: 2_000, packets: 3 },
+            true,
+            Some("avcodec_open2(video encoder libx264) failed: boom (rc=-1)".into()),
+            EncoderInfo::default(),
+            vec!["dup".into(), "dup".into(), "b".into()],
+        );
+        assert!(progress.ended);
+        assert!(progress.error.as_deref().unwrap_or("").contains("avcodec_open2"));
+        assert!(progress.speed < 1.0);
+        assert_eq!(progress.warnings, vec!["dup".to_string(), "b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hls_progress_unknown_token_is_none() {
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
+        assert!(proxy.hls_progress("deadbeef00deadbeef00deadbeef00aa").is_none());
     }
 
     #[tokio::test]

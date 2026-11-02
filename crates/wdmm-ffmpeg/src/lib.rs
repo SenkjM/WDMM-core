@@ -31,6 +31,7 @@
 #![allow(dead_code)]
 
 pub mod preset;
+pub mod diag; // always compiled — diagnostics must work without libav
 mod sys; // always compiled — preset.rs uses its pub const values (AV_CODEC_ID_*)
 
 #[cfg(feature = "ffmpeg")]
@@ -39,10 +40,13 @@ mod transcoder;
 #[cfg(feature = "ffmpeg")]
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "ffmpeg")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "ffmpeg")]
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use wdmm_core::models::TranscodePreset;
@@ -67,6 +71,107 @@ pub type FfmpegResult<T> = std::result::Result<T, FfmpegError>;
 /// unavailable) without probing [`open_job`].
 pub const fn is_available() -> bool {
     cfg!(feature = "ffmpeg")
+}
+
+// ── Progress telemetry (§1) ───────────────────────────────────────────────────
+
+/// Snapshot of an HLS job's write progress.
+///
+/// `content_ms` is monotonic: it only grows as packets are written, and stays
+/// `0` until the muxer has accepted its first packet. `wall_ms` counts from the
+/// moment the job thread actually started working (not from `open_job`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProgressSnapshot {
+    /// Media time of the last packet handed to the muxer, in milliseconds.
+    pub content_ms: i64,
+    /// Wall-clock milliseconds since the job thread started.
+    pub wall_ms: u64,
+    /// Packets written (remux) or encoded frames (transcode).
+    pub packets: u64,
+}
+
+/// Encoder selection actually used by a job (§7.3).
+#[derive(Clone, Debug, Default)]
+pub struct EncoderInfo {
+    /// `"remux"` or `"transcode"`.
+    pub mode: String,
+    /// Actual video encoder name; `None` for a remux or when video is dropped.
+    pub video: Option<String>,
+    /// Actual audio encoder name, or `"copy"` for stream copy.
+    pub audio: Option<String>,
+    /// The preset asked for a hardware encoder.
+    pub hw_requested: bool,
+    /// `h264_mediacodec` was present in the linked libavcodec.
+    pub hw_available: bool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Shared progress cell written by the job thread and read by [`JobHandle`].
+#[derive(Debug, Default)]
+pub(crate) struct ProgressState {
+    started_epoch_ms: AtomicU64,
+    content_ms: AtomicI64,
+    packets: AtomicU64,
+    encoder: Mutex<EncoderInfo>,
+    warnings: Mutex<Vec<String>>,
+}
+
+impl ProgressState {
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Start the wall clock — called by the job thread when it begins working.
+    pub(crate) fn start(&self) {
+        self.started_epoch_ms.store(Self::now_ms(), Ordering::Relaxed);
+    }
+
+    /// Record a packet at media time `pts_ms` (monotonic, never decreases).
+    pub(crate) fn note_written(&self, pts_ms: i64) {
+        self.content_ms.fetch_max(pts_ms.max(0), Ordering::Relaxed);
+        self.packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> ProgressSnapshot {
+        let started = self.started_epoch_ms.load(Ordering::Relaxed);
+        let wall_ms = if started == 0 {
+            0
+        } else {
+            Self::now_ms().saturating_sub(started)
+        };
+        ProgressSnapshot {
+            content_ms: self.content_ms.load(Ordering::Relaxed),
+            wall_ms,
+            packets: self.packets.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn set_encoder(&self, info: EncoderInfo) {
+        *lock(&self.encoder) = info;
+    }
+
+    pub(crate) fn encoder(&self) -> EncoderInfo {
+        lock(&self.encoder).clone()
+    }
+
+    /// Record a deduplicated warning (max 8 retained).
+    pub(crate) fn warn(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        let mut warnings = lock(&self.warnings);
+        if warnings.len() < 8 && !warnings.iter().any(|w| w == &msg) {
+            warnings.push(msg);
+        }
+    }
+
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        lock(&self.warnings).clone()
+    }
 }
 
 // ── Probe results ─────────────────────────────────────────────────────────────
@@ -159,6 +264,8 @@ pub struct JobHandle {
     pub segment_dir: PathBuf,
     cancel: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<FfmpegResult<()>>>,
+    /// Live progress + encoder info shared with the job thread.
+    telemetry: Arc<ProgressState>,
 }
 
 /// Stub handle used when the `ffmpeg` feature is off. `open_job` always
@@ -214,6 +321,21 @@ impl JobHandle {
             Ok(())
         }
     }
+
+    /// Monotonic write progress (§1). Safe to call while the job runs.
+    pub fn progress(&self) -> ProgressSnapshot {
+        self.telemetry.snapshot()
+    }
+
+    /// Encoder selection used by the job (§7.3).
+    pub fn encoder_info(&self) -> EncoderInfo {
+        self.telemetry.encoder()
+    }
+
+    /// Deduplicated warnings collected by the job (§7.3).
+    pub fn warnings(&self) -> Vec<String> {
+        self.telemetry.warnings()
+    }
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -237,6 +359,9 @@ impl JobHandle {
     pub fn is_running(&self) -> bool { false }
     pub fn take_result(&mut self) -> Option<FfmpegResult<()>> { None }
     pub fn join(self) -> FfmpegResult<()> { Ok(()) }
+    pub fn progress(&self) -> ProgressSnapshot { ProgressSnapshot::default() }
+    pub fn encoder_info(&self) -> EncoderInfo { EncoderInfo::default() }
+    pub fn warnings(&self) -> Vec<String> { Vec::new() }
 }
 
 #[cfg(not(feature = "ffmpeg"))]
@@ -263,6 +388,8 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_t = cancel.clone();
+    let telemetry = Arc::new(ProgressState::default());
+    let telemetry_t = Arc::clone(&telemetry);
     let input_url = opts.input_url.clone();
     let preset = opts.preset.clone();
     let preset_id = preset.id.clone();
@@ -271,7 +398,17 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
 
     let thread = std::thread::Builder::new()
         .name(format!("wdmm-hls-{}", id))
-        .spawn(move || transcoder::run_hls_job(&input_url, &preset, start_offset, &dir, cancel_t))?;
+        .spawn(move || {
+            transcoder::run_hls_job(
+                &input_url,
+                &preset,
+                start_offset,
+                &dir,
+                cancel_t,
+                &telemetry_t,
+                &id,
+            )
+        })?;
 
     tracing::debug!(
         "wdmm-ffmpeg: open_job preset={} seg_dir={}",
@@ -283,6 +420,7 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
         segment_dir,
         cancel,
         thread: Some(thread),
+        telemetry,
     })
 }
 
@@ -365,5 +503,44 @@ mod tests {
         assert!(o.input_url.is_empty());
         assert_eq!(o.preset.id, "passthrough");
         assert_eq!(o.start_offset_secs, 0.0);
+    }
+
+    // ── Progress telemetry (§1) ───────────────────────────────────────────────
+
+    #[test]
+    fn progress_is_monotonic_and_counts_packets() {
+        let state = ProgressState::default();
+        let initial = state.snapshot();
+        assert_eq!(initial.content_ms, 0, "no output yet ⇒ content_ms 0");
+        assert_eq!(initial.packets, 0);
+        assert_eq!(initial.wall_ms, 0, "wall clock starts with the job thread");
+
+        state.start();
+        state.note_written(1_000);
+        let first = state.snapshot();
+        assert_eq!(first.content_ms, 1_000);
+        assert_eq!(first.packets, 1);
+
+        // A packet with an older PTS must never move content_ms backwards.
+        state.note_written(500);
+        let second = state.snapshot();
+        assert_eq!(second.content_ms, 1_000);
+        assert_eq!(second.packets, 2);
+        assert!(second.wall_ms >= first.wall_ms);
+
+        state.note_written(2_500);
+        assert_eq!(state.snapshot().content_ms, 2_500);
+    }
+
+    #[test]
+    fn warnings_are_deduplicated_and_capped() {
+        let state = ProgressState::default();
+        state.warn("h264_mediacodec 不可用，已回退 libx264");
+        state.warn("h264_mediacodec 不可用，已回退 libx264");
+        assert_eq!(state.warnings().len(), 1);
+        for i in 0..20 {
+            state.warn(format!("warn-{i}"));
+        }
+        assert_eq!(state.warnings().len(), 8);
     }
 }

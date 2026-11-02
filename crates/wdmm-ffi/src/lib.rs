@@ -3130,6 +3130,9 @@ pub extern "C" fn wdmm_library_init(path: *const c_char) -> FfiString {
             std::path::Path::new(p).parent().map(|d| d.join("api-token"))
         }
     });
+    // §7.4: mirror the HLS transcode diagnostics next to the token file so a
+    // developer can pull `wdmm-hls-debug.log` with `adb exec-out run-as`.
+    dlna_session::init_hls_diag(p);
     // OnceLock::set: if already initialised this call is a no-op (returns Ok(())).
     // We do NOT use get_or_init because its closure cannot propagate errors —
     // a panic inside get_or_init would abort the process in release builds
