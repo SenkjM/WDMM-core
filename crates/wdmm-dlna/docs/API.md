@@ -71,6 +71,10 @@ Fetch device description, parse AVTransport `controlURL`, build client.
 ### `async fn AvTransportClient::set_uri(&self, instance_id: u32, uri: &str) -> DlnaResult<()>`
 `SetAVTransportURI` SOAP action. Accepts an empty `CurrentURIMetaData`.
 
+### `async fn AvTransportClient::set_uri_with_metadata(&self, instance_id: u32, uri: &str, metadata_xml: &str) -> DlnaResult<()>`
+`SetAVTransportURI` with a DIDL-Lite `CurrentURIMetaData` payload. Build the
+metadata with [`build_didl_lite`].
+
 ### `async fn AvTransportClient::play(&self, instance_id: u32, speed: u8) -> DlnaResult<()>`
 `Play` SOAP action.
 
@@ -80,6 +84,106 @@ Fetch device description, parse AVTransport `controlURL`, build client.
 
 ### `async fn AvTransportClient::seek(&self, instance_id: u32, unit: &str, target: &str) -> DlnaResult<()>`
 `unit` is e.g. `"REL_TIME"` / `"TRACK_NR"`.
+
+### `async fn AvTransportClient::get_position_info(&self, instance_id: u32) -> DlnaResult<PositionInfo>`
+`GetPositionInfo` — `track`, `track_duration`, `track_uri`, `rel_time`, `abs_time`
+(all `HH:MM:SS` strings except `track`).
+
+### `async fn AvTransportClient::get_transport_info(&self, instance_id: u32) -> DlnaResult<TransportInfo>`
+`GetTransportInfo` — `state: TransportState`, `status: String`, `speed: String`.
+`TransportState::as_str()` yields the canonical UPnP string.
+
+---
+
+## ConnectionManager client (`wdmm_dlna::ConnectionManagerClient`)
+
+Ports Dart `_connMgrControlUrl` / `_soapConnMgr` / `_getSinkProtocolInfo` /
+`_negotiateProtocolInfo`.
+
+### `fn ConnectionManagerClient::new(control_url: impl Into<String>) -> Self`
+Construct from an already-resolved control URL (tests / pre-resolved callers).
+
+### `async fn ConnectionManagerClient::from_renderer(renderer: &DlnaRenderer) -> DlnaResult<Self>`
+Fetch device description, parse the
+`urn:schemas-upnp-org:service:ConnectionManager:1` `controlURL`. Returns
+`Cast` when the description is unreachable or has no ConnectionManager service
+(Dart treats that case as an empty sink list).
+
+### `fn ConnectionManagerClient::control_url(&self) -> &str`
+
+### `async fn ConnectionManagerClient::get_sink_protocol_info(&self) -> DlnaResult<Vec<String>>`
+`GetProtocolInfo` → the `<Sink>` list split on `,`, trimmed, empty entries
+dropped. SOAP/transport failures are `Cast`; use `unwrap_or_default()` for
+Dart's "empty list on failure" behaviour.
+
+### `fn ConnectionManagerClient::negotiate(&self, mime: &str, mime_ext: &str, sink: &[String]) -> String`
+Pick the `protocolInfo` to embed in DIDL-Lite: (1) first sink entry whose third
+field equals `mime` verbatim, (2) first `video/*` / `*/*` entry rewritten to
+`mime` (keeping its fourth field, or appending `DLNA.ORG_OP=01` when absent),
+(3) fallback `http-get:*:<mime>:DLNA.ORG_OP=01`. `mime_ext` is accepted for FFI
+compatibility but does not affect the decision (Dart parity).
+
+### `fn wdmm_dlna::connection_manager::negotiate_protocol_info(mime: &str, sink: &[String]) -> String`
+Pure version of the same negotiation, for callers with an already-fetched sink
+list.
+
+---
+
+## DIDL-Lite builder (`wdmm_dlna::didl`)
+
+### `struct DidlRes { url: String, protocol_info: String }`
+One `<res>` of the DIDL item; `DidlRes::new(url, protocol_info)` is a
+convenience constructor.
+
+### `const SUBTITLE_PROTOCOL_INFO: &str = "http-get:*:text/plain:DLNA.ORG_PN=*";`
+`protocolInfo` for the sidecar-subtitle `<res>` (second resource).
+
+### `fn build_didl_lite(title: &str, resources: &[DidlRes]) -> String`
+Byte-identical to Dart `_didlLite`: `<DIDL-Lite>` wrapper, one video `item`
+(`object.item.videoItem`), one `<res>` per resource. Title, URLs and
+`protocolInfo` are XML-escaped (`& < > " '`).
+
+---
+
+## Cast session (`wdmm_dlna::DlnaSession`)
+
+Pure protocol state machine over AVTransport — no driver, proxy or transcoding
+dependencies. One session per renderer.
+
+### `async fn DlnaSession::open(renderer: &DlnaRenderer) -> DlnaResult<Self>`
+Fetch description → resolve AVTransport control URL → idle session.
+
+### `async fn DlnaSession::start(&mut self, media_url: &str, didl: &str) -> DlnaResult<()>`
+`SetAVTransportURI` (with DIDL metadata) + `Play(Speed=1)`.
+
+### `async fn DlnaSession::play(&mut self) -> DlnaResult<()>`
+### `async fn DlnaSession::pause(&mut self) -> DlnaResult<()>`
+### `async fn DlnaSession::stop(&mut self) -> DlnaResult<()>`
+Arms the `local_stop` guard so the following `STOPPED` observation is not
+reported as `ended`.
+
+### `async fn DlnaSession::seek(&mut self, position_ms: i64) -> DlnaResult<()>`
+`Seek REL_TIME` with an `HH:MM:SS` target (negative inputs clamp to zero).
+
+### `async fn DlnaSession::switch_to(&mut self, media_url: &str, didl: &str) -> DlnaResult<()>`
+Next-episode switch: same `SetAVTransportURI` + `Play` sequence, no explicit
+`Stop` (Dart parity).
+
+### `async fn DlnaSession::tick(&mut self) -> DlnaResult<TickResult>`
+One poll (`GetTransportInfo` + `GetPositionInfo`).
+
+### `struct TickResult`
+`transport: String` (canonical UPnP state), `position_ms: i64`,
+`duration_ms: i64`, `ended: bool`.
+
+`ended` is `true` on the first `STOPPED` observation after a non-`STOPPED` one,
+when the stop was not locally initiated. `local_stop` is *consumed once*: the
+tick that observes `STOPPED` clears it, so one `stop()` suppresses exactly one
+`ended`; ticks that still see `PLAYING`/`TRANSITIONING` keep it armed.
+
+### Accessors
+`renderer() -> &DlnaRenderer`, `media_url() -> &str`, `didl_metadata() -> &str`.
+
 
 ---
 

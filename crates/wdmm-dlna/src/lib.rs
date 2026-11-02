@@ -1,9 +1,13 @@
-//! `wdmm-dlna` — DLNA/UPnP SSDP discovery + AVTransport SOAP control.
+//! `wdmm-dlna` — DLNA/UPnP SSDP discovery + SOAP control of renderers.
 //!
 //! ## Ownership
 //! Per constraints §3 the Rust core owns:
 //! - SSDP renderer discovery ([`SsdpDiscovery`])
 //! - AVTransport SOAP control ([`avtransport::AvTransportClient`])
+//! - ConnectionManager protocol negotiation
+//!   ([`connection_manager::ConnectionManagerClient`])
+//! - DIDL-Lite metadata building ([`didl::build_didl_lite`])
+//! - the cast session state machine ([`session::DlnaSession`])
 //! - the unified local proxy, now in the dedicated [`wdmm_proxy`] crate
 //!   (re-exported here as [`ProxyHandle`] for convenience).
 //!
@@ -13,11 +17,20 @@
 #![forbid(unsafe_code)]
 
 pub mod avtransport;
+pub mod connection_manager;
+pub mod didl;
 pub mod gena;
 pub mod rendering_control;
+pub mod session;
 
+pub use connection_manager::ConnectionManagerClient;
+pub use didl::{build_didl_lite, DidlRes, SUBTITLE_PROTOCOL_INFO};
 pub use gena::{GenaEvent, GenaSubscription};
 pub use rendering_control::RenderingControlClient;
+pub use session::{DlnaSession, TickResult};
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -147,7 +160,8 @@ pub struct DlnaCastService {
 /// `eventSubURL` of the named UPnP service type, if present.
 ///
 /// `url_tag` is `"controlURL"` for SOAP control or `"eventSubURL"` for GENA
-/// event subscriptions. Used by `avtransport`, `rendering_control`, and `gena`.
+/// event subscriptions. Used by `avtransport`, `rendering_control`,
+/// `connection_manager`, and `gena`.
 pub(crate) fn parse_service_url(xml: &str, service_type: &str, url_tag: &str) -> Option<String> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
@@ -201,7 +215,27 @@ pub(crate) fn parse_service_url(xml: &str, service_type: &str, url_tag: &str) ->
     None
 }
 
+/// Fetch a UPnP device description document and return its XML body.
+///
+/// Shared by the service clients so they agree on error mapping. Non-2xx
+/// responses are reported as [`DlnaError::Cast`].
+pub(crate) async fn fetch_description(location: &str) -> DlnaResult<String> {
+    let resp = reqwest::get(location)
+        .await
+        .map_err(|e| DlnaError::Cast(format!("device description fetch failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(DlnaError::Cast(format!(
+            "device description returned {}",
+            resp.status()
+        )));
+    }
+    resp.text()
+        .await
+        .map_err(|e| DlnaError::Cast(format!("device description read failed: {e}")))
+}
+
 impl DlnaCastService {
+
     pub fn new() -> Self {
         Self {
             discovery: SsdpDiscovery::new(),

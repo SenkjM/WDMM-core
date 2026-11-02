@@ -62,6 +62,18 @@ impl TransportState {
             _ => Self::Other(s.to_owned()),
         }
     }
+
+    /// Canonical UPnP string for this state (`"PLAYING"`, `"STOPPED"`, ...).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Playing => "PLAYING",
+            Self::PausedPlayback => "PAUSED_PLAYBACK",
+            Self::Stopped => "STOPPED",
+            Self::Transitioning => "TRANSITIONING",
+            Self::NoMediaPresent => "NO_MEDIA_PRESENT",
+            Self::Other(s) => s,
+        }
+    }
 }
 
 /// Information returned by `GetTransportInfo`.
@@ -99,12 +111,26 @@ impl AvTransportClient {
 
     /// `SetAVTransportURI` — point the renderer at a media URL.
     pub async fn set_uri(&self, instance_id: u32, uri: &str) -> DlnaResult<()> {
-        let body = soap_action(
+        self.set_uri_with_metadata(instance_id, uri, "").await
+    }
+
+    /// `SetAVTransportURI` with a DIDL-Lite `CurrentURIMetaData` payload.
+    ///
+    /// Renderers that render titles/subtitles from metadata need this; plain
+    /// URL casting can keep using [`AvTransportClient::set_uri`].
+    pub async fn set_uri_with_metadata(
+        &self,
+        instance_id: u32,
+        uri: &str,
+        metadata_xml: &str,
+    ) -> DlnaResult<()> {
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "SetAVTransportURI",
             &[
                 ("<InstanceID>", &instance_id.to_string()),
                 ("<CurrentURI>", uri),
-                ("<CurrentURIMetaData>", ""), // empty DIDL-Lite is accepted by most renderers
+                ("<CurrentURIMetaData>", metadata_xml),
             ],
         );
         self.post_action("SetAVTransportURI", &body).await
@@ -113,7 +139,8 @@ impl AvTransportClient {
     /// `Play` — start playback at `Speed=1`.
     pub async fn play(&self, instance_id: u32, speed: u8) -> DlnaResult<()> {
         let speed_str = speed.to_string();
-        let body = soap_action(
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "Play",
             &[
                 ("<InstanceID>", &instance_id.to_string()),
@@ -125,7 +152,8 @@ impl AvTransportClient {
 
     /// `Pause`.
     pub async fn pause(&self, instance_id: u32) -> DlnaResult<()> {
-        let body = soap_action(
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "Pause",
             &[("<InstanceID>", &instance_id.to_string())],
         );
@@ -134,7 +162,8 @@ impl AvTransportClient {
 
     /// `Stop`.
     pub async fn stop(&self, instance_id: u32) -> DlnaResult<()> {
-        let body = soap_action(
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "Stop",
             &[("<InstanceID>", &instance_id.to_string())],
         );
@@ -143,7 +172,8 @@ impl AvTransportClient {
 
     /// `Seek` — `unit` is `REL_TIME` / `TRACK_NR` / `ABS_COUNT` etc.
     pub async fn seek(&self, instance_id: u32, unit: &str, target: &str) -> DlnaResult<()> {
-        let body = soap_action(
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "Seek",
             &[
                 ("<InstanceID>", &instance_id.to_string()),
@@ -155,29 +185,21 @@ impl AvTransportClient {
     }
 
     async fn post_action(&self, action: &str, body: &str) -> DlnaResult<()> {
-        let soap_action = format!("\"{AVTRANSPORT_SERVICE_TYPE}#{action}\"");
-        let resp = self
-            .client
-            .post(&self.control_url)
-            .header("Content-Type", "text/xml; charset=utf-8")
-            .header("SOAPACTION", &soap_action)
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| DlnaError::Cast(format!("soap request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            return Err(DlnaError::Cast(format!(
-                "soap action {action} returned {}",
-                resp.status()
-            )));
-        }
-        Ok(())
+        post_soap(
+            &self.client,
+            &self.control_url,
+            AVTRANSPORT_SERVICE_TYPE,
+            action,
+            body,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// `GetPositionInfo` — current track and playback position.
     pub async fn get_position_info(&self, instance_id: u32) -> DlnaResult<PositionInfo> {
-        let body = soap_action(
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "GetPositionInfo",
             &[("<InstanceID>", &instance_id.to_string())],
         );
@@ -196,7 +218,8 @@ impl AvTransportClient {
 
     /// `GetTransportInfo` — current transport state (playing / paused / stopped).
     pub async fn get_transport_info(&self, instance_id: u32) -> DlnaResult<TransportInfo> {
-        let body = soap_action(
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "GetTransportInfo",
             &[("<InstanceID>", &instance_id.to_string())],
         );
@@ -215,37 +238,34 @@ impl AvTransportClient {
 
     /// Like `post_action` but returns the response body text for parsing.
     async fn post_action_with_response(&self, action: &str, body: &str) -> DlnaResult<String> {
-        let soap_action_hdr = format!("\"{AVTRANSPORT_SERVICE_TYPE}#{action}\"");
-        let resp = self
-            .client
-            .post(&self.control_url)
-            .header("Content-Type", "text/xml; charset=utf-8")
-            .header("SOAPACTION", &soap_action_hdr)
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| DlnaError::Cast(format!("soap request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(DlnaError::Cast(format!(
-                "soap action {action} returned {}",
-                resp.status()
-            )));
-        }
-        resp.text().await.map_err(|e| DlnaError::Cast(format!("body read failed: {e}")))
+        post_soap(
+            &self.client,
+            &self.control_url,
+            AVTRANSPORT_SERVICE_TYPE,
+            action,
+            body,
+        )
+        .await
     }
 }
 
-/// Build a SOAP envelope body for an AVTransport action.
-fn soap_action(action: &str, args: &[(&str, &str)]) -> String {
+/// Build a SOAP envelope body for an UPnP service action.
+///
+/// `service_type` is the full `urn:schemas-upnp-org:service:...:1` name used in
+/// the `xmlns:u` attribute and the `SOAPACTION` header. Values are XML-escaped
+/// for `&`, `<` and `>`; tags are passed as `"<Tag>"`.
+pub(crate) fn soap_envelope(
+    service_type: &str,
+    action: &str,
+    args: &[(&str, &str)],
+) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
     s.push_str(&format!(
         "<s:Envelope xmlns:s=\"{SOAP_ENVELOPE_NS}\" s:encodingStyle=\"{SOAP_ENCODING_NS}\">"
     ));
     s.push_str("<s:Body>");
-    s.push_str(&format!(
-        "<u:{action} xmlns:u=\"{AVTRANSPORT_SERVICE_TYPE}\">"
-    ));
+    s.push_str(&format!("<u:{action} xmlns:u=\"{service_type}\">"));
     for (tag, val) in args {
         // Basic XML-escape of ampersand/angle brackets in values.
         let v = val
@@ -258,6 +278,39 @@ fn soap_action(action: &str, args: &[(&str, &str)]) -> String {
     s.push_str("</s:Body>");
     s.push_str("</s:Envelope>");
     s
+}
+
+/// POST a SOAP envelope to `control_url` and return the response body.
+///
+/// Sets `SOAPACTION: "<service_type>#<action>"` and
+/// `Content-Type: text/xml; charset=utf-8` — the UPnP device-control shape
+/// shared by AVTransport, ConnectionManager and RenderingControl. Non-2xx
+/// responses become [`DlnaError::Cast`].
+pub(crate) async fn post_soap(
+    client: &Client,
+    control_url: &str,
+    service_type: &str,
+    action: &str,
+    body: &str,
+) -> DlnaResult<String> {
+    let soap_action_hdr = format!("\"{service_type}#{action}\"");
+    let resp = client
+        .post(control_url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .header("SOAPACTION", &soap_action_hdr)
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|e| DlnaError::Cast(format!("soap request failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(DlnaError::Cast(format!(
+            "soap action {action} returned {}",
+            resp.status()
+        )));
+    }
+    resp.text()
+        .await
+        .map_err(|e| DlnaError::Cast(format!("body read failed: {e}")))
 }
 
 /// Extract named text values from a SOAP response envelope.
@@ -309,22 +362,7 @@ pub(crate) fn extract_soap_values<'t>(
 /// Fetch the device description at `renderer.location` and return the
 /// AVTransport service control URL (absolute).
 pub async fn resolve_avtransport_control_url(renderer: &DlnaRenderer) -> DlnaResult<String> {
-    let client = Client::new();
-    let resp = client
-        .get(&renderer.location)
-        .send()
-        .await
-        .map_err(|e| DlnaError::Cast(format!("device description fetch failed: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(DlnaError::Cast(format!(
-            "device description returned {}",
-            resp.status()
-        )));
-    }
-    let xml = resp
-        .text()
-        .await
-        .map_err(|e| DlnaError::Cast(format!("body read failed: {e}")))?;
+    let xml = crate::fetch_description(&renderer.location).await?;
     let relative = parse_avtransport_control_url(&xml)
         .ok_or_else(|| DlnaError::Cast("AVTransport service not found in description".into()))?;
     let base = Url::parse(&renderer.location)
@@ -433,7 +471,7 @@ mod tests {
 
     #[test]
     fn soap_envelope_shape() {
-        let body = soap_action("Play", &[
+        let body = soap_envelope(AVTRANSPORT_SERVICE_TYPE, "Play", &[
             ("<InstanceID>", "0"),
             ("<Speed>", "1"),
         ]);
@@ -445,7 +483,8 @@ mod tests {
 
     #[test]
     fn soap_envelope_escapes_values() {
-        let body = soap_action(
+        let body = soap_envelope(
+            AVTRANSPORT_SERVICE_TYPE,
             "SetAVTransportURI",
             &[("<CurrentURI>", "http://h.x/a?b=1&c=2")],
         );
