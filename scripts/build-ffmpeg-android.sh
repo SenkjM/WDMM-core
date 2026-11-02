@@ -154,6 +154,15 @@ EXTRA_LDFLAGS="-L${X264_INSTALL}/lib -L${SYSROOT}/usr/lib/${TRIPLE}/${MIN_API} -
 EXTRA_LIBS="-lm -ldl -lc"
 PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
 
+# MediaCodec hardware encoders (task-12): --enable-jni is a hard configure
+# requirement for --enable-mediacodec (configure:7066). The app never calls
+# av_jni_set_java_vm(), so mediacodecenc.c takes the NDK libmediandk path
+# (use_ndk_codec = !av_jni_get_java_vm(), mediacodecenc.c:196-197) and accepts
+# software AV_PIX_FMT_NV12/YUV420P frames through a ByteBuffer
+# (avc_pix_fmts mediacodecenc.c:96-101, copy_frame_to_buffer:469-494) — no
+# EGL/Surface pipeline is required. libmediandk is a platform library, so this
+# does not affect the --disable-nonfree policy.
+
 ./configure \
   --enable-shared \
   --disable-static \
@@ -167,6 +176,9 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
   --enable-gpl \
   --enable-libx264 \
   --enable-encoder=libx264 \
+  --enable-jni \
+  --enable-mediacodec \
+  --enable-encoder=h264_mediacodec,hevc_mediacodec \
   --enable-decoder=h264 \
   --enable-decoder=hevc \
   --enable-decoder=aac \
