@@ -2738,6 +2738,176 @@ pub unsafe extern "C" fn wdmm_proxy_renew_stream_callback(
     FfiString::ok()
 }
 
+// ── Account-scoped streaming back-source ─────────────────────────────────────
+
+/// Chunk size for driver-backed Range streams.
+///
+/// Media bytes are fetched from the account driver in chunks of this size and
+/// handed to the proxy as they arrive, so a multi-GB cast never materialises in
+/// memory (the old Dart callback path read the whole Range in one go).
+pub(crate) const STREAM_CHUNK: u64 = 1024 * 1024;
+
+/// Resolve an account id to a driver via the DB → config → registry path.
+pub(crate) fn create_account_driver(
+    account_id: &str,
+) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, String> {
+    let account = match global_library_db().get_account(account_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err("account not found".into()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let config = build_driver_config(&account)?;
+    let driver = wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config)
+        .map_err(|e| format!("driver: {e}"))?;
+    Ok(std::sync::Arc::from(driver))
+}
+
+/// Build the chunked `ranges_fn` body for a driver path.
+///
+/// `start`/`end` follow `ProxyHandle::register_driver` semantics: both
+/// inclusive, `end < 0` means "to EOF". When `size > 0` the stream stops at
+/// `size - 1` (no trailing EOF probe); when `size == 0` it probes until the
+/// driver returns an empty chunk.
+///
+/// The driver is awaited directly instead of via `rt().block_on`: the proxy
+/// polls this stream inside its own Tokio runtime (the FFI `rt()`), and
+/// blocking on that runtime from within itself would panic with
+/// "Cannot start a runtime from within a runtime".
+pub(crate) fn driver_range_stream(
+    driver: std::sync::Arc<dyn wdmm_drivers::WdmmVfs>,
+    path: String,
+    size: u64,
+    start: i64,
+    end: i64,
+) -> wdmm_proxy::BoxStream {
+    let last: Option<u64> = if size > 0 {
+        let requested = if end < 0 { size - 1 } else { (end as u64).min(size - 1) };
+        Some(requested)
+    } else if end < 0 {
+        None
+    } else {
+        Some(end as u64)
+    };
+
+    let first = start.max(0) as u64;
+    let stream = futures::stream::try_unfold(first, move |pos: u64| {
+        let driver = std::sync::Arc::clone(&driver);
+        let path = path.clone();
+        async move {
+            if let Some(last) = last {
+                if pos > last {
+                    return Ok(None);
+                }
+            }
+            let chunk_end = match last {
+                Some(last) => pos.saturating_add(STREAM_CHUNK - 1).min(last),
+                None => pos.saturating_add(STREAM_CHUNK - 1),
+            };
+            let bytes = wdmm_drivers::WdmmVfs::get_content_range(&*driver, &path, pos, Some(chunk_end))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            let next = pos.saturating_add(bytes.len() as u64);
+            Ok(Some((bytes::Bytes::from(bytes), next)))
+        }
+    });
+    Box::pin(stream)
+}
+
+/// Register a driver-backed chunked stream on the running proxy.
+pub(crate) fn register_account_stream(
+    handle: &wdmm_proxy::ProxyHandle,
+    driver: std::sync::Arc<dyn wdmm_drivers::WdmmVfs>,
+    remote_path: String,
+    name: Option<String>,
+    size: u64,
+) -> Result<wdmm_proxy::Registration, String> {
+    let path = remote_path;
+    rt().block_on(handle.register_driver(size, name, None, None, move |start, end| {
+        driver_range_stream(std::sync::Arc::clone(&driver), path.clone(), size, start, end)
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// `{"token","path_template","host","port"}` for a fresh registration.
+pub(crate) fn proxy_registration_json(
+    handle: &wdmm_proxy::ProxyHandle,
+    token: &str,
+    path_template: &str,
+) -> serde_json::Value {
+    let addr = handle.addr();
+    let port = addr.map(|a| a.port()).unwrap_or(0);
+    let host = addr
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    serde_json::json!({
+        "token":         token,
+        "path_template": path_template,
+        "host":          host,
+        "port":          port,
+    })
+}
+
+/// Register an account file as a chunked streaming back-source with the proxy.
+///
+/// The proxy URL serves Range requests for `remote_path` on the account's
+/// driver. Bytes are pulled inside Rust in [`STREAM_CHUNK`] slices, so no
+/// player or Dart code ever holds a whole media Range in memory.
+///
+/// ## Parameters
+/// - `account_id`  — account whose driver serves the file.
+/// - `remote_path` — path of the file within that account.
+/// - `name`        — nullable; used only for Content-Type guessing.
+/// - `size`        — known file size in bytes; `0` if unknown (streams to EOF).
+///
+/// ## Returns
+/// ```json
+/// {"token":"3f7a…","path_template":"/s/3f7a…","host":"192.168.1.10","port":N}
+/// ```
+/// or `"error:<message>"`. Caller builds `http://{host}:{port}{path_template}`
+/// and frees the result via [`wdmm_ffi_free_string`].
+#[no_mangle]
+pub extern "C" fn wdmm_proxy_register_account(
+    account_id: *const c_char,
+    remote_path: *const c_char,
+    name: *const c_char,
+    size: u64,
+) -> FfiString {
+    let account_id = match ptr_to_str(account_id) {
+        Some(s) if !s.is_empty() => s,
+        _ => return FfiString::from("error:invalid account_id"),
+    };
+    let remote_path = match ptr_to_str(remote_path) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return FfiString::from("error:invalid remote_path"),
+    };
+    let name_opt: Option<String> = if name.is_null() {
+        None
+    } else {
+        ptr_to_str(name).filter(|s| !s.is_empty()).map(|s| s.to_string())
+    };
+
+    let driver = match create_account_driver(account_id) {
+        Ok(d) => d,
+        Err(e) => return FfiString::from(format!("error:{e}")),
+    };
+
+    let guard = proxy_cell().lock().unwrap();
+    let handle = match guard.as_ref() {
+        Some(h) => h,
+        None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
+    };
+
+    match register_account_stream(handle, driver, remote_path, name_opt, size) {
+        Ok(reg) => {
+            FfiString::from(proxy_registration_json(handle, &reg.token, &reg.path_template).to_string())
+        }
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 /// Discover DLNA/UPnP MediaRenderer devices on the LAN using SSDP.
 ///
 /// `timeout_ms` — discovery window in milliseconds (clamped to 200–10000).
@@ -6812,5 +6982,361 @@ mod tests {
         let a = albums.iter().find(|a| a["cue_id"] == "cue-list-ffi-99").unwrap();
         assert_eq!(a["source_name"], "nas-list");
         assert_eq!(a["title"], "List Disc");
+    }
+
+    // ── Account-scoped chunked streaming back-source ─────────────────────────
+
+    /// In-memory driver: serves `data` by inclusive byte range and records every
+    /// `get_content_range` call so tests can assert chunk boundaries.
+    struct FakeRangeDriver {
+        data: Vec<u8>,
+        calls: Mutex<Vec<(u64, Option<u64>)>>,
+        /// Return a network error on this zero-based call index.
+        fail_at: Option<usize>,
+        /// Return an empty chunk (EOF) for this start offset.
+        empty_at: Option<u64>,
+    }
+
+    impl FakeRangeDriver {
+        fn new(data: Vec<u8>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                data,
+                calls: Mutex::new(Vec::new()),
+                fail_at: None,
+                empty_at: None,
+            })
+        }
+
+        fn failing_at(data: Vec<u8>, at: usize) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                data,
+                calls: Mutex::new(Vec::new()),
+                fail_at: Some(at),
+                empty_at: None,
+            })
+        }
+
+        fn empty_at(data: Vec<u8>, at: u64) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                data,
+                calls: Mutex::new(Vec::new()),
+                fail_at: None,
+                empty_at: Some(at),
+            })
+        }
+
+        fn calls(&self) -> Vec<(u64, Option<u64>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl wdmm_drivers::WdmmVfs for FakeRangeDriver {
+        async fn list(
+            &self,
+            _path: &str,
+        ) -> wdmm_drivers::Result<Vec<wdmm_drivers::CloudFileItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, path: &str) -> wdmm_drivers::Result<wdmm_drivers::CloudFileItem> {
+            Ok(wdmm_drivers::CloudFileItem::local_stream(
+                path,
+                false,
+                self.data.len() as u64,
+                None,
+            ))
+        }
+
+        async fn mkdir(&self, _path: &str) -> wdmm_drivers::Result<()> {
+            Ok(())
+        }
+
+        async fn rename(&self, _old_path: &str, _new_path: &str) -> wdmm_drivers::Result<()> {
+            Ok(())
+        }
+
+        async fn remove(&self, _path: &str) -> wdmm_drivers::Result<()> {
+            Ok(())
+        }
+
+        async fn get_content_range(
+            &self,
+            _path: &str,
+            start: u64,
+            end: Option<u64>,
+        ) -> wdmm_drivers::Result<Vec<u8>> {
+            let idx = {
+                let mut calls = self.calls.lock().unwrap();
+                let idx = calls.len();
+                calls.push((start, end));
+                idx
+            };
+            if self.fail_at == Some(idx) {
+                return Err(wdmm_drivers::DriverError::Network("boom".into()));
+            }
+            if self.empty_at == Some(start) {
+                return Ok(Vec::new());
+            }
+            let s = start as usize;
+            if s >= self.data.len() {
+                return Ok(Vec::new());
+            }
+            let e = end
+                .map(|e| (e as usize).saturating_add(1).min(self.data.len()))
+                .unwrap_or(self.data.len());
+            Ok(self.data[s..e].to_vec())
+        }
+    }
+
+    fn collect_chunks(stream: wdmm_proxy::BoxStream) -> Vec<std::io::Result<bytes::Bytes>> {
+        use futures::StreamExt;
+        rt().block_on(async move {
+            let mut out = Vec::new();
+            let mut stream = stream;
+            while let Some(item) = stream.next().await {
+                out.push(item);
+            }
+            out
+        })
+    }
+
+    fn join_ok(chunks: &[std::io::Result<bytes::Bytes>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend_from_slice(chunk.as_ref().expect("chunk error"));
+        }
+        out
+    }
+
+    #[test]
+    fn driver_range_stream_chunks_known_size() {
+        let _guard = global_test_lock().lock().unwrap();
+        let total = 2 * STREAM_CHUNK + 123;
+        let data: Vec<u8> = (0..total as usize).map(|i| (i % 251) as u8).collect();
+        let driver = FakeRangeDriver::new(data.clone());
+
+        let chunks = collect_chunks(driver_range_stream(
+            driver.clone(),
+            "/v/movie.mkv".into(),
+            total,
+            0,
+            -1,
+        ));
+
+        assert_eq!(chunks.len(), 3, "2 MiB + 123 B must be served in 3 chunks");
+        assert_eq!(chunks[0].as_ref().unwrap().len() as u64, STREAM_CHUNK);
+        assert_eq!(chunks[1].as_ref().unwrap().len() as u64, STREAM_CHUNK);
+        assert_eq!(chunks[2].as_ref().unwrap().len() as u64, 123);
+        assert_eq!(join_ok(&chunks), data);
+        assert_eq!(
+            driver.calls(),
+            vec![
+                (0, Some(STREAM_CHUNK - 1)),
+                (STREAM_CHUNK, Some(2 * STREAM_CHUNK - 1)),
+                (2 * STREAM_CHUNK, Some(total - 1)),
+            ],
+            "known size must not trigger a trailing EOF probe"
+        );
+    }
+
+    #[test]
+    fn driver_range_stream_unknown_size_reads_to_eof() {
+        let _guard = global_test_lock().lock().unwrap();
+        let total = STREAM_CHUNK + 7;
+        let data: Vec<u8> = (0..total as usize).map(|i| (i % 97) as u8).collect();
+        let driver = FakeRangeDriver::new(data.clone());
+
+        let chunks = collect_chunks(driver_range_stream(
+            driver.clone(),
+            "/v/movie.mkv".into(),
+            0,
+            0,
+            -1,
+        ));
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(join_ok(&chunks), data);
+        let calls = driver.calls();
+        assert_eq!(calls.len(), 3, "third call probes past EOF and stops");
+        assert_eq!(calls[2].0, total);
+    }
+
+    #[test]
+    fn driver_range_stream_explicit_range_and_past_end() {
+        let _guard = global_test_lock().lock().unwrap();
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 256) as u8).collect();
+
+        let driver = FakeRangeDriver::new(data.clone());
+        let chunks = collect_chunks(driver_range_stream(
+            driver.clone(),
+            "/v/a.bin".into(),
+            1000,
+            10,
+            19,
+        ));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(join_ok(&chunks), data[10..20].to_vec());
+        assert_eq!(driver.calls(), vec![(10, Some(19))]);
+
+        // A start past the known size yields an empty stream with no driver call.
+        let driver = FakeRangeDriver::new(data);
+        let chunks = collect_chunks(driver_range_stream(
+            driver.clone(),
+            "/v/a.bin".into(),
+            1000,
+            1000,
+            -1,
+        ));
+        assert!(chunks.is_empty());
+        assert!(driver.calls().is_empty());
+    }
+
+    #[test]
+    fn driver_range_stream_empty_chunk_terminates() {
+        let _guard = global_test_lock().lock().unwrap();
+        let driver = FakeRangeDriver::empty_at(vec![0u8; 4096], 0);
+        let chunks = collect_chunks(driver_range_stream(
+            driver.clone(),
+            "/v/e.bin".into(),
+            0,
+            0,
+            -1,
+        ));
+        assert!(chunks.is_empty(), "empty chunk must end the stream, not loop");
+        assert_eq!(driver.calls().len(), 1, "must not re-probe after an empty chunk");
+    }
+
+    #[test]
+    fn driver_range_stream_maps_driver_error() {
+        let _guard = global_test_lock().lock().unwrap();
+        let data = vec![7u8; (2 * STREAM_CHUNK) as usize];
+        let driver = FakeRangeDriver::failing_at(data, 1);
+        let chunks = collect_chunks(driver_range_stream(
+            driver.clone(),
+            "/v/f.bin".into(),
+            2 * STREAM_CHUNK,
+            0,
+            -1,
+        ));
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].is_ok());
+        let err = chunks[1].as_ref().unwrap_err();
+        assert!(err.to_string().contains("boom"), "unexpected error: {err}");
+        assert_eq!(driver.calls().len(), 2, "stream must stop after the error");
+    }
+
+    /// End-to-end: register a fake driver stream on the real proxy, then fetch
+    /// the whole file and a byte range over loopback HTTP.
+    #[test]
+    fn account_stream_serves_through_proxy() {
+        let _guard = global_test_lock().lock().unwrap();
+        let port_str = unsafe { wdmm_proxy_start(c"loopback".as_ptr(), 0) };
+        let port_s = unsafe { CStr::from_ptr(port_str.ptr) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        wdmm_ffi_free_string(port_str);
+        let port: u16 = port_s.parse().expect("proxy_start returns a port");
+
+        let total = STREAM_CHUNK * 2 + 5;
+        let data: Vec<u8> = (0..total as usize).map(|i| (i % 251) as u8).collect();
+        let fake = FakeRangeDriver::new(data.clone());
+
+        let (token, path_template) = {
+            let guard = proxy_cell().lock().unwrap();
+            let handle = guard.as_ref().expect("proxy running");
+            let reg = register_account_stream(
+                handle,
+                fake.clone(),
+                "/media/big.mkv".into(),
+                Some("big.mkv".into()),
+                total,
+            )
+            .expect("register account stream");
+            let json = proxy_registration_json(handle, &reg.token, &reg.path_template);
+            assert_eq!(json["port"], port);
+            assert_eq!(json["host"], "127.0.0.1");
+            assert!(json["path_template"].as_str().unwrap().starts_with("/s/"));
+            (reg.token, reg.path_template)
+        };
+
+        let base = format!("http://127.0.0.1:{port}{path_template}");
+        let (full, status, ranged) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let client = reqwest::Client::new();
+                let full = client
+                    .get(&base)
+                    .send()
+                    .await
+                    .expect("GET")
+                    .bytes()
+                    .await
+                    .expect("body")
+                    .to_vec();
+                let ranged = client
+                    .get(&base)
+                    .header("Range", "bytes=1048576-1048590")
+                    .send()
+                    .await
+                    .expect("GET range");
+                let status = ranged.status();
+                let body = ranged.bytes().await.expect("range body").to_vec();
+                (full, status, body)
+            });
+
+        assert_eq!(full, data, "full GET must stream the entire file");
+        assert_eq!(status, reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            ranged,
+            data[STREAM_CHUNK as usize..STREAM_CHUNK as usize + 15].to_vec()
+        );
+
+        let tok = CString::new(token).unwrap();
+        let r = wdmm_proxy_unregister(tok.as_ptr());
+        wdmm_ffi_free_string(r);
+        let r = wdmm_proxy_stop();
+        wdmm_ffi_free_string(r);
+        assert_eq!(wdmm_proxy_port(), -1);
+    }
+
+    #[test]
+    fn register_account_argument_errors() {
+        let _guard = global_test_lock().lock().unwrap();
+
+        let r = wdmm_proxy_register_account(
+            std::ptr::null(),
+            c"/a.mkv".as_ptr(),
+            std::ptr::null(),
+            1,
+        );
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert_eq!(s, "error:invalid account_id");
+
+        let acct = CString::new("no-such-account").unwrap();
+        let r = wdmm_proxy_register_account(
+            acct.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        );
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert_eq!(s, "error:invalid remote_path");
+
+        let path = CString::new("/a.mkv").unwrap();
+        let r = wdmm_proxy_register_account(
+            acct.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            1,
+        );
+        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
+        wdmm_ffi_free_string(r);
+        assert_eq!(s, "error:account not found");
     }
 }
