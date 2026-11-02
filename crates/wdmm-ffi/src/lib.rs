@@ -2913,8 +2913,9 @@ fn resolve_api_token(db: &LibraryDatabase) -> String {
 //
 // The FFI exposes a process-global library database. Real Android/Windows
 // integration calls `wdmm_library_init(path)` once at app start before any
-// library/KV operation. Production builds panic if the singleton is not
-// initialised; test builds fall back to `:memory:` automatically.
+// library/KV operation. Production builds return an error string from
+// wdmm_library_init on failure (no panic); the caller must check and abort
+// cleanly. Test builds fall back to `:memory:` automatically.
 
 static LIBRARY_DB: OnceLock<std::sync::Arc<LibraryDatabase>> = OnceLock::new();
 
@@ -2957,13 +2958,20 @@ pub extern "C" fn wdmm_library_init(path: *const c_char) -> FfiString {
             std::path::Path::new(p).parent().map(|d| d.join("api-token"))
         }
     });
-    // OnceLock: if already set this call is a no-op.
-    LIBRARY_DB.get_or_init(|| {
-        std::sync::Arc::new(
-            LibraryDatabase::open(std::path::Path::new(p))
-                .expect("FFI: failed to open library DB at given path"),
-        )
-    });
+    // OnceLock::set: if already initialised this call is a no-op (returns Ok(())).
+    // We do NOT use get_or_init because its closure cannot propagate errors —
+    // a panic inside get_or_init would abort the process in release builds
+    // (panic = "abort") before we could return a useful error string to Dart.
+    if LIBRARY_DB.get().is_none() {
+        match LibraryDatabase::open(std::path::Path::new(p)) {
+            Ok(db) => {
+                // Another thread could have raced us; set() returns Err if
+                // already filled, which is fine — both openers succeeded.
+                let _ = LIBRARY_DB.set(std::sync::Arc::new(db));
+            }
+            Err(e) => return FfiString::from(format!("error:library_init:{e}")),
+        }
+    }
     FfiString::ok()
 }
 
