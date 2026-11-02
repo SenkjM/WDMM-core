@@ -170,16 +170,29 @@ Next-episode switch: same `SetAVTransportURI` + `Play` sequence, no explicit
 `Stop` (Dart parity).
 
 ### `async fn DlnaSession::tick(&mut self) -> DlnaResult<TickResult>`
-One poll (`GetTransportInfo` + `GetPositionInfo`).
+One poll (`GetTransportInfo`, plus `GetPositionInfo` while the transport is not
+`STOPPED`). Nothing is polled before `open`; `last_transport` starts as
+`"STOPPED"`, so an idle renderer reporting `STOPPED` is not an `ended` event.
 
 ### `struct TickResult`
 `transport: String` (canonical UPnP state), `position_ms: i64`,
-`duration_ms: i64`, `ended: bool`.
+`duration_ms: i64`, `ended: bool`, `ended_reason: Option<&'static str>`.
 
 `ended` is `true` on the first `STOPPED` observation after a non-`STOPPED` one,
 when the stop was not locally initiated. `local_stop` is *consumed once*: the
 tick that observes `STOPPED` clears it, so one `stop()` suppresses exactly one
 `ended`; ticks that still see `PLAYING`/`TRANSITIONING` keep it armed.
+
+`ended_reason` is `None` when `ended` is `false`, otherwise:
+
+- `"eof"` — the last position observed while still playing is within
+  `EOF_TOLERANCE_MS` (2000 ms) of the track duration;
+- `"stopped_by_device"` — anything else, including an unknown/zero duration.
+
+`position_ms`/`duration_ms` on a `STOPPED` tick are the last values observed
+while playing: renderers usually zero the position once stopped, which is why
+the heuristic uses the stored pre-stop position and why `GetPositionInfo` is
+skipped on `STOPPED`.
 
 ### Accessors
 `renderer() -> &DlnaRenderer`, `media_url() -> &str`, `didl_metadata() -> &str`.

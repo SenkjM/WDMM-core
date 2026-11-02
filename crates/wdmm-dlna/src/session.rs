@@ -16,9 +16,31 @@
 //! Subsequent `STOPPED` ticks are quiet anyway because `last_transport` is
 //! already `STOPPED`; the flag is cleared only on the `STOPPED` observation
 //! (ticks that still see `PLAYING`/`TRANSITIONING` keep it armed).
+//!
+//! ## End reason
+//!
+//! A renderer has no authoritative "playback finished" signal, so when
+//! [`TickResult::ended`] fires, [`TickResult::ended_reason`] is derived from
+//! the last position observed while still playing: `"eof"` when that position
+//! is within [`EOF_TOLERANCE_MS`] of the track duration, `"stopped_by_device"`
+//! otherwise (including when the duration is unknown). Positions reported after
+//! the renderer already flipped to `STOPPED` are ignored because most DMRs zero
+//! them out.
+//!
+//! `last_transport` starts as `"STOPPED"`: a `STOPPED` observation before
+//! [`DlnaSession::start`] is not a playback transition and must not report
+//! `ended`.
 
 use crate::avtransport::AvTransportClient;
 use crate::{DlnaRenderer, DlnaResult};
+
+/// How close the last playing position must be to the track duration for an
+/// end to be classified as `"eof"` rather than `"stopped_by_device"`.
+///
+/// A DLNA renderer gives no authoritative end-of-media signal; this heuristic
+/// compares the last position observed while still playing with the reported
+/// duration. 2 seconds absorbs the poll interval plus renderer position drift.
+pub const EOF_TOLERANCE_MS: i64 = 2_000;
 
 /// One poll result from [`DlnaSession::tick`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +55,10 @@ pub struct TickResult {
     pub duration_ms: i64,
     /// The renderer reached `STOPPED` on its own (natural end of media).
     pub ended: bool,
+    /// Why playback ended: `Some("eof")` (played to the end),
+    /// `Some("stopped_by_device")` (renderer stopped away from the end), or
+    /// `None` when `ended` is `false`.
+    pub ended_reason: Option<&'static str>,
 }
 
 /// A cast session bound to one renderer.
@@ -48,8 +74,13 @@ pub struct DlnaSession {
     /// Set by local [`DlnaSession::stop`], consumed once by `tick`.
     local_stop: bool,
     /// Transport string observed by the previous `tick` (or implied by the
-    /// last command).
+    /// last command). Starts as `"STOPPED"`: nothing has played yet.
     last_transport: String,
+    /// Last position observed while the transport was not `STOPPED`; used for
+    /// the [`TickResult::ended_reason`] heuristic.
+    last_playing_position_ms: Option<i64>,
+    /// Last track duration observed while the transport was not `STOPPED`.
+    duration_ms: i64,
 }
 
 impl DlnaSession {
@@ -63,7 +94,9 @@ impl DlnaSession {
             media_url: String::new(),
             didl: String::new(),
             local_stop: false,
-            last_transport: String::new(),
+            last_transport: "STOPPED".to_string(),
+            last_playing_position_ms: None,
+            duration_ms: 0,
         })
     }
 
@@ -89,6 +122,8 @@ impl DlnaSession {
         self.media_url = media_url.to_string();
         self.didl = didl.to_string();
         self.local_stop = false;
+        self.last_playing_position_ms = None;
+        self.duration_ms = 0;
         // We just asked for playback; a subsequent STOPPED is a natural end.
         self.last_transport = "PLAYING".to_string();
         Ok(())
@@ -98,6 +133,7 @@ impl DlnaSession {
     pub async fn play(&mut self) -> DlnaResult<()> {
         self.av.play(0, 1).await?;
         self.local_stop = false;
+        // Keep the last position/duration: it is still the same track.
         self.last_transport = "PLAYING".to_string();
         Ok(())
     }
@@ -134,14 +170,36 @@ impl DlnaSession {
     ///
     /// Performs `GetTransportInfo` + `GetPositionInfo`. `ended` is `true` on the
     /// first `STOPPED` observation after a non-`STOPPED` one when the stop was
-    /// not locally initiated (see the module docs).
+    /// not locally initiated (see the module docs); `ended_reason` then
+    /// distinguishes `"eof"` from `"stopped_by_device"` using the last position
+    /// observed while still playing.
+    ///
+    /// Position and duration are only refreshed while the transport is not
+    /// `STOPPED`: after a renderer-side stop most DMRs report zeroed positions,
+    /// which would defeat the end-reason heuristic. `GetPositionInfo` is
+    /// skipped entirely on a `STOPPED` observation.
     pub async fn tick(&mut self) -> DlnaResult<TickResult> {
         let info = self.av.get_transport_info(0).await?;
-        let position = self.av.get_position_info(0).await?;
         let transport = info.state.as_str().to_string();
+
+        if transport != "STOPPED" {
+            let position = self.av.get_position_info(0).await?;
+            self.last_playing_position_ms = Some(parse_duration_ms(&position.rel_time));
+            self.duration_ms = parse_duration_ms(&position.track_duration);
+        }
 
         let ended =
             transport == "STOPPED" && self.last_transport != "STOPPED" && !self.local_stop;
+        let ended_reason = if ended {
+            let position = self.last_playing_position_ms.unwrap_or(0);
+            if self.duration_ms > 0 && position + EOF_TOLERANCE_MS >= self.duration_ms {
+                Some("eof")
+            } else {
+                Some("stopped_by_device")
+            }
+        } else {
+            None
+        };
         if transport == "STOPPED" {
             // Consumed once: suppress only the observation that matches stop().
             self.local_stop = false;
@@ -150,9 +208,10 @@ impl DlnaSession {
 
         Ok(TickResult {
             transport,
-            position_ms: parse_duration_ms(&position.rel_time),
-            duration_ms: parse_duration_ms(&position.track_duration),
+            position_ms: self.last_playing_position_ms.unwrap_or(0),
+            duration_ms: self.duration_ms,
             ended,
+            ended_reason,
         })
     }
 }
@@ -239,7 +298,11 @@ mod tests {
         )
     }
 
-    const POS_RESP: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><Track>1</Track><TrackDuration>0:01:00</TrackDuration><TrackURI>http://media/a.mkv</TrackURI><RelTime>0:00:10</RelTime><AbsTime>0:00:10</AbsTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"#;
+    fn pos_resp(rel_time: &str, track_duration: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetPositionInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><Track>1</Track><TrackDuration>{track_duration}</TrackDuration><TrackURI>http://media/a.mkv</TrackURI><RelTime>{rel_time}</RelTime><AbsTime>{rel_time}</AbsTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"
+        )
+    }
 
     fn renderer(server: &FakeHttpServer) -> DlnaRenderer {
         DlnaRenderer {
@@ -249,11 +312,18 @@ mod tests {
         }
     }
 
-    /// Fake DMR: description GET, AVTransport SOAP actions, and a transport
-    /// state script advanced once per `GetTransportInfo` call.
-    async fn spawn_mock_renderer(states: Vec<&'static str>) -> FakeHttpServer {
+    /// Fake DMR: description GET, AVTransport SOAP actions, a transport state
+    /// script advanced once per `GetTransportInfo` call, and a position script
+    /// (`(RelTime, TrackDuration)`) advanced once per `GetPositionInfo` call.
+    /// Position defaults to `("0:00:10", "0:01:00")` when the script runs out.
+    async fn spawn_mock_renderer_with_positions(
+        states: Vec<&'static str>,
+        positions: Vec<(&'static str, &'static str)>,
+    ) -> FakeHttpServer {
         let states = Arc::new(states);
+        let positions = Arc::new(positions);
         let query_count = Arc::new(AtomicUsize::new(0));
+        let position_count = Arc::new(AtomicUsize::new(0));
         spawn_fake_http(move |req| {
             if req.starts_with("GET ") {
                 FakeResponse::ok(DESC_XML)
@@ -262,7 +332,12 @@ mod tests {
                 let state = states.get(idx).copied().unwrap_or("STOPPED");
                 FakeResponse::ok(transport_resp(state))
             } else if req.contains("GetPositionInfo") {
-                FakeResponse::ok(POS_RESP)
+                let idx = position_count.fetch_add(1, Ordering::SeqCst);
+                let (rel, dur) = positions
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(("0:00:10", "0:01:00"));
+                FakeResponse::ok(pos_resp(rel, dur))
             } else if req.contains("u:SetAVTransportURI")
                 || req.contains("u:Play")
                 || req.contains("u:Pause")
@@ -275,6 +350,11 @@ mod tests {
             }
         })
         .await
+    }
+
+    /// Fake DMR with the default position script (`0:00:10` / `0:01:00`).
+    async fn spawn_mock_renderer(states: Vec<&'static str>) -> FakeHttpServer {
+        spawn_mock_renderer_with_positions(states, Vec::new()).await
     }
 
     fn simple_didl(url: &str) -> String {
@@ -329,6 +409,7 @@ mod tests {
         let first = session.tick().await.unwrap();
         assert_eq!(first.transport, "PLAYING");
         assert!(!first.ended);
+        assert_eq!(first.ended_reason, None);
         assert_eq!(first.position_ms, 10_000);
         assert_eq!(first.duration_ms, 60_000);
 
@@ -336,10 +417,97 @@ mod tests {
         let second = session.tick().await.unwrap();
         assert_eq!(second.transport, "STOPPED");
         assert!(second.ended);
+        // Stopped at 10s of a 60s track → renderer-side stop, not eof.
+        assert_eq!(second.ended_reason, Some("stopped_by_device"));
 
         // Consecutive STOPPED is no longer "ended".
         let third = session.tick().await.unwrap();
         assert!(!third.ended);
+        assert_eq!(third.ended_reason, None);
+    }
+
+    #[tokio::test]
+    async fn ended_reason_eof_when_last_playing_position_near_duration() {
+        let server = spawn_mock_renderer_with_positions(
+            vec!["PLAYING", "PLAYING", "STOPPED"],
+            vec![("0:00:01", "0:00:05"), ("0:00:04.800", "0:00:05")],
+        )
+        .await;
+        let mut session = DlnaSession::open(&renderer(&server)).await.unwrap();
+        session
+            .start("http://media/a.mkv", &simple_didl("http://media/a.mkv"))
+            .await
+            .unwrap();
+
+        let first = session.tick().await.unwrap();
+        assert_eq!(first.transport, "PLAYING");
+        assert_eq!(first.position_ms, 1_000);
+        assert_eq!(first.duration_ms, 5_000);
+        assert_eq!(first.ended_reason, None);
+
+        let second = session.tick().await.unwrap();
+        assert_eq!(second.position_ms, 4_800);
+        assert_eq!(second.ended_reason, None);
+
+        // STOPPED zeroes positions on most DMRs; the stored 4800 ms is used.
+        let third = session.tick().await.unwrap();
+        assert_eq!(third.transport, "STOPPED");
+        assert!(third.ended);
+        assert_eq!(third.ended_reason, Some("eof"));
+        assert_eq!(third.position_ms, 4_800);
+        assert_eq!(third.duration_ms, 5_000);
+    }
+
+    #[tokio::test]
+    async fn ended_reason_stopped_by_device_when_position_far_from_end() {
+        let server = spawn_mock_renderer_with_positions(
+            vec!["PLAYING", "STOPPED"],
+            vec![("0:00:01", "0:00:05")],
+        )
+        .await;
+        let mut session = DlnaSession::open(&renderer(&server)).await.unwrap();
+        session
+            .start("http://media/a.mkv", &simple_didl("http://media/a.mkv"))
+            .await
+            .unwrap();
+
+        assert_eq!(session.tick().await.unwrap().position_ms, 1_000);
+        let stopped = session.tick().await.unwrap();
+        assert!(stopped.ended);
+        assert_eq!(stopped.ended_reason, Some("stopped_by_device"));
+    }
+
+    #[tokio::test]
+    async fn ended_reason_stopped_by_device_when_duration_unknown() {
+        let server = spawn_mock_renderer_with_positions(
+            vec!["PLAYING", "STOPPED"],
+            vec![("0:00:01", "NOT_IMPLEMENTED")],
+        )
+        .await;
+        let mut session = DlnaSession::open(&renderer(&server)).await.unwrap();
+        session
+            .start("http://media/a.mkv", &simple_didl("http://media/a.mkv"))
+            .await
+            .unwrap();
+
+        let playing = session.tick().await.unwrap();
+        assert_eq!(playing.duration_ms, 0);
+        let stopped = session.tick().await.unwrap();
+        assert!(stopped.ended);
+        assert_eq!(stopped.ended_reason, Some("stopped_by_device"));
+    }
+
+    #[tokio::test]
+    async fn stopped_before_start_is_not_ended() {
+        // `open` initialises last_transport to "STOPPED": an idle renderer that
+        // already reports STOPPED is not a playback transition.
+        let server = spawn_mock_renderer(vec!["STOPPED"]).await;
+        let mut session = DlnaSession::open(&renderer(&server)).await.unwrap();
+        let tick = session.tick().await.unwrap();
+        assert_eq!(tick.transport, "STOPPED");
+        assert!(!tick.ended);
+        assert_eq!(tick.ended_reason, None);
+        assert_eq!(tick.position_ms, 0);
     }
 
     #[tokio::test]
