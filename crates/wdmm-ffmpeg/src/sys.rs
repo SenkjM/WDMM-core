@@ -58,8 +58,8 @@ pub const AV_PIX_FMT_YUV420P: AVPixelFormat = 0;
 pub const AV_SAMPLE_FMT_FLTP: AVSampleFormat = 8;
 pub const AV_SAMPLE_FMT_S16P: AVSampleFormat = 6;
 
-// AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX
-pub const AV_ROUND_NEAR_INF_PASS: u32 = 5 | (1 << 15);
+// AV_ROUND_NEAR_INF (5) | AV_ROUND_PASS_MINMAX (8192 = 1 << 13)
+pub const AV_ROUND_NEAR_INF_PASS: u32 = 5 | (1 << 13);
 
 // ── AVRational (8 bytes) ──────────────────────────────────────────────────────
 
@@ -98,12 +98,12 @@ impl AVChannelLayout {
             _opaque: 0,
         }
     }
-    /// Mono (AV_CHANNEL_ORDER_NATIVE, mask = FL = 1).
+    /// Mono (AV_CHANNEL_ORDER_NATIVE, mask = AV_CH_LAYOUT_MONO = FC = 4).
     pub const fn mono() -> Self {
         Self {
             order: 1,
             nb_channels: 1,
-            _u: 1,
+            _u: 4,
             _opaque: 0,
         }
     }
