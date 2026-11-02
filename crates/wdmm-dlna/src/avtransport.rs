@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::{DlnaError, DlnaResult, DlnaRenderer};
 
-const AVTRANSPORT_SERVICE_TYPE: &str = "urn:schemas-upnp-org:service:AVTransport:1";
+pub(crate) const AVTRANSPORT_SERVICE_TYPE: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const SOAP_ENVELOPE_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const SOAP_ENCODING_NS: &str = "http://schemas.xmlsoap.org/soap/encoding/";
 

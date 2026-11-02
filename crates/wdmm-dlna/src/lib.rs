@@ -234,6 +234,103 @@ pub(crate) async fn fetch_description(location: &str) -> DlnaResult<String> {
         .map_err(|e| DlnaError::Cast(format!("device description read failed: {e}")))
 }
 
+/// Device description fields the discovery UI needs.
+///
+/// Only the handful of fields the renderer picker displays are extracted; the
+/// raw XML stays inside this crate. Missing or empty elements are `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RendererDescription {
+    pub friendly_name: Option<String>,
+    pub model_name: Option<String>,
+    pub manufacturer: Option<String>,
+    pub model_number: Option<String>,
+    /// The description advertises the AVTransport service.
+    pub has_avtransport: bool,
+}
+
+/// Fetch the device description at `location` and extract the fields above.
+///
+/// Fails only when the description cannot be fetched (non-2xx is
+/// [`DlnaError::Cast`]); malformed XML yields default fields instead of an
+/// error so one broken renderer cannot break the discovery list.
+pub async fn describe_renderer(location: &str) -> DlnaResult<RendererDescription> {
+    let xml = fetch_description(location).await?;
+    Ok(parse_renderer_description(&xml))
+}
+
+/// Parse a UPnP device description into [`RendererDescription`].
+///
+/// Looks at the first occurrence of each tag inside `<device>` and trims the
+/// text; malformed XML never panics.
+pub fn parse_renderer_description(xml: &str) -> RendererDescription {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut desc = RendererDescription::default();
+    let mut device_depth = 0usize;
+    // Tag currently being read, as one of the four fields we care about.
+    let mut current: Option<&'static str> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = e.name().local_name();
+                let name = local.as_ref();
+                if name == b"device" {
+                    device_depth += 1;
+                }
+                current = if device_depth > 0 {
+                    match name {
+                        b"friendlyName" => Some("friendlyName"),
+                        b"modelName" => Some("modelName"),
+                        b"manufacturer" => Some("manufacturer"),
+                        b"modelNumber" => Some("modelNumber"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            }
+            Ok(Event::Text(t)) if device_depth > 0 => {
+                if let Some(tag) = current {
+                    if let Ok(text) = t.unescape() {
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            let slot = match tag {
+                                "friendlyName" => &mut desc.friendly_name,
+                                "modelName" => &mut desc.model_name,
+                                "manufacturer" => &mut desc.manufacturer,
+                                _ => &mut desc.model_number,
+                            };
+                            if slot.is_none() {
+                                *slot = Some(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = e.name().local_name();
+                let name = local.as_ref();
+                if name == b"device" {
+                    device_depth = device_depth.saturating_sub(1);
+                }
+                current = None;
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    desc.has_avtransport =
+        parse_service_url(xml, avtransport::AVTRANSPORT_SERVICE_TYPE, "controlURL").is_some();
+    desc
+}
+
 impl DlnaCastService {
 
     pub fn new() -> Self {
@@ -272,6 +369,23 @@ mod tests {
 
     const RESP: &str = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nLocation: http://192.168.1.20:49152/desc.xml\r\nSERVER: Linux UPnP/1.0 TV/1.0\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nUSN: uuid:tv-1::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
 
+    const DESC_FULL: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+    <friendlyName> Living Room TV </friendlyName>
+    <manufacturer>Acme</manufacturer>
+    <modelName>SmartTV 9000</modelName>
+    <modelNumber>9000-X</modelNumber>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <controlURL>/ctl/AVTransport</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
     #[test]
     fn parses_ssdp_response() {
         let r = parse_response(RESP).unwrap();
@@ -279,6 +393,52 @@ mod tests {
         assert!(r.usn.starts_with("uuid:tv-1"));
         assert_eq!(r.server.as_deref(), Some("Linux UPnP/1.0 TV/1.0"));
         assert!(parse_response("NOTIFY * HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn parses_renderer_description() {
+        let d = parse_renderer_description(DESC_FULL);
+        assert_eq!(d.friendly_name.as_deref(), Some("Living Room TV"));
+        assert_eq!(d.manufacturer.as_deref(), Some("Acme"));
+        assert_eq!(d.model_name.as_deref(), Some("SmartTV 9000"));
+        assert_eq!(d.model_number.as_deref(), Some("9000-X"));
+        assert!(d.has_avtransport);
+
+        let bare = parse_renderer_description(
+            "<root><device><friendlyName>Bedroom</friendlyName></device></root>",
+        );
+        assert_eq!(bare.friendly_name.as_deref(), Some("Bedroom"));
+        assert_eq!(bare.model_name, None);
+        assert_eq!(bare.manufacturer, None);
+        assert_eq!(bare.model_number, None);
+        assert!(!bare.has_avtransport);
+
+        // Malformed XML must not panic; whatever was parsed before the error is
+        // kept and the service check simply fails.
+        let broken = parse_renderer_description("<root><device><friendlyName>X</device>");
+        assert!(!broken.has_avtransport);
+    }
+
+    #[tokio::test]
+    async fn describe_renderer_fetches_and_parses_description() {
+        let server = crate::test_support::spawn_fake_http(|req| {
+            if req.starts_with("GET ") {
+                crate::test_support::FakeResponse::ok(DESC_FULL)
+            } else {
+                crate::test_support::FakeResponse::not_found()
+            }
+        })
+        .await;
+        let desc = describe_renderer(&server.url("/desc.xml")).await.unwrap();
+        assert_eq!(desc.friendly_name.as_deref(), Some("Living Room TV"));
+        assert_eq!(desc.model_name.as_deref(), Some("SmartTV 9000"));
+        assert!(desc.has_avtransport);
+
+        let failing = crate::test_support::spawn_fake_http(|_| {
+            crate::test_support::FakeResponse::not_found()
+        })
+        .await;
+        assert!(describe_renderer(&failing.url("/desc.xml")).await.is_err());
     }
 
     #[tokio::test]

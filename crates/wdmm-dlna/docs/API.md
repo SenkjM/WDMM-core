@@ -25,6 +25,23 @@ A DLNA renderer discovered via SSDP.
 Fields: `usn: String` (stable unique id), `location: String` (description XML URL),
 `server: Option<String>` (display hint).
 
+### `struct RendererDescription`
+Display fields extracted from a device description XML, plus whether the device
+advertises AVTransport (i.e. can be cast to).
+Fields: `friendly_name`, `model_name`, `manufacturer`, `model_number`
+(all `Option<String>`) and `has_avtransport: bool`.
+
+### `async fn describe_renderer(location: &str) -> DlnaResult<RendererDescription>`
+Fetch the description at `location` and parse it. Only fetch/HTTP failures are
+errors; malformed XML yields default fields so one broken renderer cannot break
+the discovery list.
+
+### `fn parse_renderer_description(xml: &str) -> RendererDescription`
+Pure parser behind [`describe_renderer`]: takes the first non-empty occurrence
+of each tag inside `<device>`, and sets `has_avtransport` when the description
+contains `urn:schemas-upnp-org:service:AVTransport:1` with a `controlURL`.
+Malformed XML never panics.
+
 ---
 
 ## SSDP discovery (`wdmm_dlna::SsdpDiscovery`)
