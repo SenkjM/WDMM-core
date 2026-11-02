@@ -156,6 +156,57 @@ pub struct HlsRegistration {
     pub playlist_template: String,
 }
 
+/// How long [`ProxyHandle::register_hls`] waits for the transcode job to write
+/// its first `index.m3u8`.
+///
+/// Renderers fetch the playlist the moment `SetAVTransportURI` returns (Kodi
+/// does it in ~50 ms), so returning before the muxer has created the file makes
+/// the renderer see `404` and abort playback.
+const HLS_PLAYLIST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long [`serve_hls`] waits for a file that is not on disk yet before
+/// answering `404`. A running transcode keeps appending segments, so a fetch
+/// can legitimately arrive a few hundred ms before the file exists.
+const HLS_SEGMENT_WAIT: Duration = Duration::from_secs(5);
+
+/// Poll interval used by both HLS waits.
+const HLS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Block until `dir/index.m3u8` exists and is non-empty.
+///
+/// Fails fast when the transcode thread exits first (unsupported input, missing
+/// codec) rather than burning the full timeout, and reports the job's own error
+/// text so callers can surface it to the user.
+async fn wait_for_playlist(
+    dir: &std::path::Path,
+    job: &mut wdmm_ffmpeg::JobHandle,
+) -> Result<(), String> {
+    let playlist = dir.join("index.m3u8");
+    let deadline = tokio::time::Instant::now() + HLS_PLAYLIST_TIMEOUT;
+    loop {
+        if let Ok(meta) = tokio::fs::metadata(&playlist).await {
+            if meta.len() > 0 {
+                return Ok(());
+            }
+        }
+        if !job.is_running() {
+            return Err(match job.take_result() {
+                Some(Err(e)) => {
+                    format!("transcode job failed before writing the HLS playlist: {e}")
+                }
+                _ => "transcode job exited before writing the HLS playlist".to_string(),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out after {}s waiting for the HLS playlist",
+                HLS_PLAYLIST_TIMEOUT.as_secs()
+            ));
+        }
+        tokio::time::sleep(HLS_POLL_INTERVAL).await;
+    }
+}
+
 // ── Shared server state ───────────────────────────────────────────────────────
 
 struct Shared {
@@ -371,7 +422,7 @@ impl ProxyHandle {
             self.unregister_hls(&token);
         }
 
-        let job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+        let mut job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
             input_url: input_url.clone(),
             preset: preset.clone(),
             start_offset_secs: 0.0,
@@ -379,6 +430,11 @@ impl ProxyHandle {
         })
         .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
         let segment_dir = job.segment_dir.clone();
+        // The renderer fetches the playlist as soon as we hand it the URL, so
+        // the file must exist before this call returns.
+        wait_for_playlist(&segment_dir, &mut job)
+            .await
+            .map_err(ProxyError::Ffmpeg)?;
         let token = new_token();
         let playlist_template = format!("/h/{token}/index.m3u8");
         {
@@ -414,7 +470,7 @@ impl ProxyHandle {
                 Some(s) => (s.input_url.clone(), s.preset.clone()),
             }
         };
-        let new_job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+        let mut new_job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
             input_url: input_url.clone(),
             preset: preset.clone(),
             start_offset_secs: offset_secs,
@@ -422,6 +478,12 @@ impl ProxyHandle {
         })
         .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
         let new_segment_dir = new_job.segment_dir.clone();
+        // Same rule as `register_hls`: the renderer refetches `index.m3u8`
+        // immediately after the seek, so the new playlist must already exist.
+        // On failure the old session (and its playlist) stays untouched.
+        wait_for_playlist(&new_segment_dir, &mut new_job)
+            .await
+            .map_err(ProxyError::Ffmpeg)?;
         // Atomically replace the session — old job drops here, killing the old process.
         let mut g = self.shared.lock().unwrap();
         if let Some(session) = g.hls_sessions.get_mut(token) {
@@ -795,6 +857,25 @@ async fn serve_hls(
     };
 
     let file_path = segment_dir.join(&seg);
+    // A running transcode appends segments as it goes, so a request can arrive
+    // slightly before the file is flushed. Wait briefly instead of 404-ing: a
+    // single early 404 makes the renderer drop the whole session.
+    let wants_playlist = seg.ends_with(".m3u8");
+    let deadline = tokio::time::Instant::now() + HLS_SEGMENT_WAIT;
+    loop {
+        let ready = match tokio::fs::metadata(&file_path).await {
+            Ok(meta) => !wants_playlist || meta.len() > 0,
+            Err(_) => false,
+        };
+        if ready {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        tokio::time::sleep(HLS_POLL_INTERVAL).await;
+    }
+
     let file = tokio::fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -980,14 +1061,42 @@ mod tests {
     }
 
     // ── HLS skeleton ─────────────────────────────────────────────────────────
+    //
+    // These drive a real in-process libav transcode. Set `WDMM_HLS_TEST_MEDIA`
+    // to a small media file and build with the `wdmm-ffmpeg/ffmpeg` feature to
+    // exercise them; without either prerequisite they skip instead of failing.
+
+    /// Media file for the HLS integration tests.
+    fn hls_test_media() -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os("WDMM_HLS_TEST_MEDIA")?);
+        path.is_file().then_some(path)
+    }
+
+    #[tokio::test]
+    async fn proxy_hls_register_reports_missing_ffmpeg() {
+        // Contract for a build without the `ffmpeg` feature: registration fails
+        // with a typed error the FFI layer can surface, never a panic.
+        if wdmm_ffmpeg::is_available() {
+            return;
+        }
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
+        let err = proxy
+            .register_hls(
+                "device-1",
+                "/nonexistent/media.mp4",
+                wdmm_ffmpeg::preset::preset_passthrough(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::Ffmpeg(_)), "got {err:?}");
+        proxy.stop();
+    }
 
     #[tokio::test]
     async fn proxy_hls_register_serve_unregister() {
-        let path = std::env::temp_dir().join(format!(
-            "wdmm-hls-reg-{}.mp4",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"stub").unwrap();
+        let Some(path) = hls_test_media() else { return };
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
@@ -999,24 +1108,21 @@ mod tests {
         assert!(reg.playlist_template.starts_with("/h/"));
         assert!(reg.playlist_template.ends_with("/index.m3u8"));
 
-        // Stub: segment dir is created but index.m3u8 is never written → 404.
+        // `register_hls` returns only once the muxer wrote the playlist, so the
+        // renderer's immediate fetch must succeed (this is what Kodi broke on).
         let addr = proxy.addr().unwrap();
         let url = format!("http://{addr}{}", reg.playlist_template);
         let r = reqwest::Client::new().get(&url).send().await.unwrap();
-        assert_eq!(r.status(), 404, "stub m3u8 must not exist yet");
+        assert_eq!(r.status(), 200, "playlist must be servable at once");
+        assert!(r.text().await.unwrap().contains("#EXTM3U"));
 
         proxy.unregister_hls(&reg.token);
         proxy.stop();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn proxy_hls_seek_ok() {
-        let path = std::env::temp_dir().join(format!(
-            "wdmm-hls-seek-{}.mp4",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"stub").unwrap();
+        let Some(path) = hls_test_media() else { return };
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
@@ -1024,21 +1130,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Seek to 30 s — creates a new job+segment_dir; must not error in stub mode.
+        // Seek to 30 s — creates a new job+segment_dir; the new playlist must
+        // be ready before `seek_hls` returns.
         proxy.seek_hls(&reg.token, 30.0).await.unwrap();
 
         proxy.unregister_hls(&reg.token);
         proxy.stop();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn proxy_hls_one_transcode_per_device_media() {
-        let path = std::env::temp_dir().join(format!(
-            "wdmm-hls-collision-{}.mp4",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"stub").unwrap();
+        let Some(path) = hls_test_media() else { return };
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
 
@@ -1065,6 +1167,5 @@ mod tests {
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 2);
 
         proxy.stop();
-        let _ = std::fs::remove_file(&path);
     }
 }

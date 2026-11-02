@@ -32,6 +32,7 @@
 
 pub mod preset;
 mod sys; // always compiled — preset.rs uses its pub const values (AV_CODEC_ID_*)
+
 #[cfg(feature = "ffmpeg")]
 mod transcoder;
 
@@ -59,6 +60,14 @@ pub enum FfmpegError {
 }
 
 pub type FfmpegResult<T> = std::result::Result<T, FfmpegError>;
+
+/// Whether the in-process FFmpeg pipeline is compiled in.
+///
+/// Callers use this to skip transcode work (and to explain *why* it is
+/// unavailable) without probing [`open_job`].
+pub const fn is_available() -> bool {
+    cfg!(feature = "ffmpeg")
+}
 
 // ── Probe results ─────────────────────────────────────────────────────────────
 
@@ -175,6 +184,25 @@ impl JobHandle {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// Non-blocking check: is the transcode thread still running?
+    ///
+    /// Used by callers that need to fail fast when a job dies before writing its
+    /// first output (e.g. unsupported input) instead of waiting out a timeout.
+    pub fn is_running(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// Take the finished thread's result without consuming the handle.
+    ///
+    /// Returns `None` while the job is still running. Dropping the handle still
+    /// removes the segment directory, so this only surfaces the error text.
+    pub fn take_result(&mut self) -> Option<FfmpegResult<()>> {
+        let thread = self.thread.take()?;
+        Some(thread.join().unwrap_or_else(|_| {
+            Err(FfmpegError::Io(std::io::Error::other("thread panic")))
+        }))
+    }
+
     /// Block until the background thread finishes; return its result.
     pub fn join(mut self) -> FfmpegResult<()> {
         if let Some(t) = self.thread.take() {
@@ -206,6 +234,8 @@ impl Drop for JobHandle {
 impl JobHandle {
     pub fn segment_dir(&self) -> &Path { &self.segment_dir }
     pub fn cancel(&self) {}
+    pub fn is_running(&self) -> bool { false }
+    pub fn take_result(&mut self) -> Option<FfmpegResult<()>> { None }
     pub fn join(self) -> FfmpegResult<()> { Ok(()) }
 }
 

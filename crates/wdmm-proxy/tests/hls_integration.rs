@@ -37,7 +37,18 @@ async fn create_test_video() -> PathBuf {
 
 #[tokio::test]
 async fn hls_job_produces_segments() {
-    let video = create_test_video().await;
+    if !wdmm_ffmpeg::is_available() {
+        // Nothing to transcode with: a build without the `ffmpeg` feature can
+        // never open a job, so this is a skip, not a failure.
+        eprintln!("skip: wdmm-ffmpeg was built without the `ffmpeg` feature");
+        return;
+    }
+    // Point `WDMM_HLS_TEST_MEDIA` at any real media file to avoid needing a
+    // system `ffmpeg` on PATH just to synthesise one.
+    let video = match std::env::var_os("WDMM_HLS_TEST_MEDIA") {
+        Some(p) if PathBuf::from(&p).is_file() => PathBuf::from(p),
+        _ => create_test_video().await,
+    };
 
     let handle = open_job(JobOpts {
         input_url: video.to_string_lossy().into_owned(),
