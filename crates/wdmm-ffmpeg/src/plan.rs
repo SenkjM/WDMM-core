@@ -206,7 +206,6 @@ pub fn hw_gop_size(fps_num: i32, fps_den: i32) -> i32 {
     ((2.0 * fps).round() as i32).max(1)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,10 +327,7 @@ mod tests {
         let hw = choose_video_encoder(Some("h264"), true, true, true);
         assert_eq!(fallback_warning(hw, HW_H264_ENCODER, None), None);
         let not_preferred = choose_video_encoder(Some("h264"), false, true, true);
-        assert_eq!(
-            fallback_warning(not_preferred, HW_H264_ENCODER, None),
-            None
-        );
+        assert_eq!(fallback_warning(not_preferred, HW_H264_ENCODER, None), None);
         let unavailable = choose_video_encoder(Some("h264"), true, false, false);
         let msg = fallback_warning(unavailable, HW_H264_ENCODER, None).unwrap();
         assert!(msg.contains(HW_H264_ENCODER), "{msg}");
@@ -366,4 +362,3 @@ mod tests {
         assert_eq!(hw_gop_size(0, 0), 60);
     }
 }
-

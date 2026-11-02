@@ -660,7 +660,10 @@ extern "C" {
     // misc
     pub fn av_strerror(errnum: c_int, errbuf: *mut c_char, errbuf_size: usize) -> c_int;
     pub fn av_rescale_q(a: i64, bq: AVRational, cq: AVRational) -> i64;
-    pub fn av_q2d(q: AVRational) -> f64;
+    // NOTE: av_q2d() is intentionally absent — FFmpeg 7 made it a static inline
+    // in libavutil/rational.h, so libavutil.so no longer exports it. Referencing
+    // it leaves an undefined symbol in our .so and dlopen() fails on device.
+    // Use `q2d()` below instead.
     pub fn av_find_best_stream(
         ic: *const AVFormatContext,
         t: AVMediaType,
@@ -672,6 +675,18 @@ extern "C" {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// `av_q2d` replacement.
+///
+/// FFmpeg 7 turned `av_q2d()` into a `static inline` in `libavutil/rational.h`
+/// (`rational.h:104`), so `libavutil.so` carries no `av_q2d` symbol any more.
+/// Declaring it `extern` here left an undefined symbol inside libwdmm_ffi.so,
+/// and Android's linker then refused to load the whole library
+/// (`dlopen failed: cannot locate symbol "av_q2d"`), which surfaced as
+/// "wdmm_library_init: FFI library unavailable" and a dead library DB.
+pub fn q2d(q: AVRational) -> f64 {
+    q.num as f64 / q.den as f64
+}
 
 /// Convert an FFmpeg error code to a human-readable string.
 #[cfg(feature = "ffmpeg")]

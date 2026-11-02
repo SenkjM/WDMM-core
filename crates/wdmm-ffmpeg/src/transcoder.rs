@@ -159,7 +159,11 @@ pub fn probe_url(url: &str) -> FfmpegResult<ProbeResult> {
                 AVMEDIA_TYPE_VIDEO => {
                     // framerate is not in codecpar; read AVStream.r_frame_rate
                     // (@216/@220 on LP64 — see `stream_r_frame_rate`, `+56` is nb_frames).
-                    let fps_raw = av_q2d(stream_r_frame_rate(st));
+                    // Feel free to compute num/den by hand: FFmpeg 7 made
+                    // av_q2d() a static inline in rational.h, so the shared
+                    // library no longer exports it and calling it would leave
+                    // an undefined symbol that makes dlopen fail on device.
+                    let fps_raw = q2d(stream_r_frame_rate(st));
                     video.push(VideoStream {
                         index: (*st).index as u32,
                         codec: codec_name,
@@ -1798,9 +1802,8 @@ fn run_transcode(
             let hw_present = !hw_codec.is_null();
             let mut hw_open_error: Option<String> = None;
             if hw_present {
-                match open_hw_video_encoder(
-                    tag, hw_name, hw_codec, preset, out_w, out_h, framerate,
-                ) {
+                match open_hw_video_encoder(tag, hw_name, hw_codec, preset, out_w, out_h, framerate)
+                {
                     Ok((ctx, pix_fmt)) => {
                         v_enc_ctx = ctx;
                         v_enc_codec = hw_codec;
@@ -1936,7 +1939,11 @@ fn run_transcode(
         }
 
         telemetry.set_encoder(EncoderInfo {
-            mode: if hw_available { "hw".into() } else { "sw".into() },
+            mode: if hw_available {
+                "hw".into()
+            } else {
+                "sw".into()
+            },
             video: v_enc_name.clone(),
             audio: if audio_stream_present {
                 Some(if a_codec_id == 0 {
