@@ -1232,6 +1232,7 @@ mod tests {
             force_direct: true,
             override_name: Some("TV".into()),
             updated_at: String::new(),
+            preset_id: None,
         })
         .unwrap();
         lib.save_kv("sync_interval", "off").unwrap();

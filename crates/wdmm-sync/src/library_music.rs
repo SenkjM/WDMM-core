@@ -620,7 +620,7 @@ impl SyncEngine for LibrarySyncEngine {
                 }
                 continue;
             }
-            if t.rev > last_seq && !( !cursor_parts.is_empty() && t.rev <= base_up_to ) {
+            if t.rev > last_seq && (cursor_parts.is_empty() || t.rev > base_up_to) {
                 to_upload.push(t.clone());
             }
         }

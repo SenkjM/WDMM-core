@@ -700,7 +700,7 @@ impl SyncEngine for MangaLibrarySyncEngine {
                 }
                 continue;
             }
-            if m.rev > last_seq && !(!cursor_parts.is_empty() && m.rev <= base_up_to) {
+            if m.rev > last_seq && (cursor_parts.is_empty() || m.rev > base_up_to) {
                 to_upload.push(Self::row_with_pages(&self.db, m)?);
             }
         }
