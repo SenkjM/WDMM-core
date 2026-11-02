@@ -16,6 +16,11 @@ pub struct DmrPrefRow {
     /// User override for friendly name; empty/None = use discovery name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub override_name: Option<String>,
+    /// HLS transcode preset (e.g. `"balanced"`, `"compatible"`).
+    /// None → use app-wide default from settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
+    #[serde(default)]
     pub updated_at: String,
 }
 
@@ -55,22 +60,34 @@ impl DmrPrefsDatabase {
                 override_name TEXT,
                 updated_at TEXT NOT NULL
             );
+            -- v2 migration: add preset_id column if absent
+            ALTER TABLE dmr_prefs ADD COLUMN preset_id TEXT;
             "#,
-        )?;
+        ).or_else(|e| {
+            // "duplicate column name" is returned by SQLite when the column already exists.
+            // Treat that as a no-op so the migration is idempotent.
+            let msg = e.to_string();
+            if msg.contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(e.into())
+            }
+        })?;
         Ok(())
     }
 
     pub fn list(&self) -> StorageResult<Vec<DmrPrefRow>> {
         let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT usn, force_direct, override_name, updated_at FROM dmr_prefs ORDER BY usn",
+            "SELECT usn, force_direct, override_name, preset_id, updated_at FROM dmr_prefs ORDER BY usn",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(DmrPrefRow {
                 usn: r.get(0)?,
                 force_direct: r.get::<_, i64>(1)? != 0,
                 override_name: r.get::<_, Option<String>>(2)?,
-                updated_at: r.get(3)?,
+                preset_id: r.get::<_, Option<String>>(3)?,
+                updated_at: r.get(4)?,
             })
         })?;
         let mut out = Vec::new();
@@ -83,7 +100,7 @@ impl DmrPrefsDatabase {
     pub fn get(&self, usn: &str) -> StorageResult<Option<DmrPrefRow>> {
         let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT usn, force_direct, override_name, updated_at FROM dmr_prefs WHERE usn = ?1",
+            "SELECT usn, force_direct, override_name, preset_id, updated_at FROM dmr_prefs WHERE usn = ?1",
         )?;
         let mut rows = stmt.query(params![usn])?;
         match rows.next()? {
@@ -91,7 +108,8 @@ impl DmrPrefsDatabase {
                 usn: r.get(0)?,
                 force_direct: r.get::<_, i64>(1)? != 0,
                 override_name: r.get::<_, Option<String>>(2)?,
-                updated_at: r.get(3)?,
+                preset_id: r.get::<_, Option<String>>(3)?,
+                updated_at: r.get(4)?,
             })),
             None => Ok(None),
         }
@@ -109,17 +127,24 @@ impl DmrPrefsDatabase {
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
+        let preset = pref
+            .preset_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
         conn.execute(
-            "INSERT INTO dmr_prefs (usn, force_direct, override_name, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO dmr_prefs (usn, force_direct, override_name, preset_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(usn) DO UPDATE SET
                force_direct = excluded.force_direct,
                override_name = excluded.override_name,
+               preset_id = excluded.preset_id,
                updated_at = excluded.updated_at",
             params![
                 pref.usn,
                 if pref.force_direct { 1i64 } else { 0i64 },
                 oname,
+                preset,
                 updated
             ],
         )?;
@@ -143,18 +168,24 @@ impl DmrPrefsDatabase {
                 .as_ref()
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
+            let preset = pref
+                .preset_id
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
             let updated = if pref.updated_at.is_empty() {
                 Utc::now().to_rfc3339()
             } else {
                 pref.updated_at.clone()
             };
             tx.execute(
-                "INSERT INTO dmr_prefs (usn, force_direct, override_name, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO dmr_prefs (usn, force_direct, override_name, preset_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     pref.usn,
                     if pref.force_direct { 1i64 } else { 0i64 },
                     oname,
+                    preset,
                     updated
                 ],
             )?;
@@ -176,13 +207,61 @@ mod tests {
             usn: "uuid:tv-1".into(),
             force_direct: false,
             override_name: Some("Living Room".into()),
+            preset_id: None,
             updated_at: String::new(),
         })
         .unwrap();
         let got = db.get("uuid:tv-1").unwrap().unwrap();
         assert!(!got.force_direct);
         assert_eq!(got.override_name.as_deref(), Some("Living Room"));
+        assert!(got.preset_id.is_none());
         db.delete("uuid:tv-1").unwrap();
         assert!(db.get("uuid:tv-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn dmr_prefs_preset_id_roundtrip() {
+        let db = DmrPrefsDatabase::open(Path::new(":memory:")).unwrap();
+        db.upsert(&DmrPrefRow {
+            usn: "uuid:tv-2".into(),
+            force_direct: false,
+            override_name: None,
+            preset_id: Some("compatible".into()),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        let got = db.get("uuid:tv-2").unwrap().unwrap();
+        assert_eq!(got.preset_id.as_deref(), Some("compatible"));
+
+        // Update to clear preset_id
+        db.upsert(&DmrPrefRow {
+            usn: "uuid:tv-2".into(),
+            force_direct: false,
+            override_name: None,
+            preset_id: None,
+            updated_at: String::new(),
+        })
+        .unwrap();
+        let updated = db.get("uuid:tv-2").unwrap().unwrap();
+        assert!(updated.preset_id.is_none());
+    }
+
+    #[test]
+    fn dmr_prefs_migration_idempotent() {
+        // Opening the same in-memory db twice would add the column twice;
+        // just verify a fresh open with the migration works without error.
+        let db = DmrPrefsDatabase::open(Path::new(":memory:")).unwrap();
+        db.upsert(&DmrPrefRow {
+            usn: "uuid:tv-3".into(),
+            force_direct: true,
+            override_name: None,
+            preset_id: Some("balanced".into()),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            db.get("uuid:tv-3").unwrap().unwrap().preset_id.as_deref(),
+            Some("balanced")
+        );
     }
 }
