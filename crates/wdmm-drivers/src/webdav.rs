@@ -20,7 +20,17 @@ pub struct WebDavDriver {
 
 impl WebDavDriver {
     pub fn new(url: &str, username: &str, password: &str) -> Result<Self> {
-        let base = Url::parse(url).map_err(|e| DriverError::Config(e.to_string()))?;
+        // Ensure the base URL ends with '/' so that Url::join treats every
+        // relative segment as a child rather than replacing the last path
+        // component.  e.g. "https://host/dav" → "https://host/dav/" so that
+        // join("Music/sub") produces "https://host/dav/Music/sub" instead of
+        // the incorrect "https://host/Music/sub".
+        let normalised = if url.ends_with('/') {
+            url.to_string()
+        } else {
+            format!("{}/", url)
+        };
+        let base = Url::parse(&normalised).map_err(|e| DriverError::Config(e.to_string()))?;
 
         let auth_header;
         let mut client_builder = Client::builder();
@@ -399,6 +409,37 @@ mod tests {
         assert_eq!(driver.join_path("/Music/track.mp3"), "https://example.com/dav/Music/track.mp3");
     }
 
+    /// Base URL without trailing slash must not drop the last path component.
+    /// Regression test for: Url::join("Music/sub") on "https://host/dav" (no
+    /// trailing slash) was producing "https://host/Music/sub" instead of
+    /// "https://host/dav/Music/sub".
+    #[test]
+    fn url_joining_no_trailing_slash() {
+        let driver = WebDavDriver::new("https://example.com/dav", "", "").unwrap();
+        // Single segment
+        assert_eq!(
+            driver.join_path("/Music"),
+            "https://example.com/dav/Music",
+            "single segment must preserve base path"
+        );
+        // Multi-segment subdirectory
+        assert_eq!(
+            driver.join_path("/Music/sub"),
+            "https://example.com/dav/Music/sub",
+            "multi-segment must preserve base path"
+        );
+    }
+
+    /// Nextcloud-style base URL (no trailing slash on deep path).
+    #[test]
+    fn url_joining_nextcloud_style() {
+        let driver = WebDavDriver::new("https://cloud.example.com/remote.php/webdav", "", "").unwrap();
+        assert_eq!(
+            driver.join_path("/Photos/holiday"),
+            "https://cloud.example.com/remote.php/webdav/Photos/holiday"
+        );
+    }
+
     // ── Fixture-based PROPFIND parser tests ─────────────────────────────────────
     //
     // These exercise parse_propfind_response against a realistic WebDAV
@@ -656,6 +697,93 @@ mod tests {
             .rename("/old.mp3", "/new.mp3")
             .await
             .expect("rename should succeed");
+    }
+
+    // ── Live integration tests against a configurable WebDAV server ──────────
+    //
+    // Credentials and endpoint come from environment variables — never hardcoded:
+    //
+    //   WDMM_TEST_WEBDAV_URL       base URL without trailing slash, e.g.
+    //                              "http://192.168.0.107:5244/dav"
+    //   WDMM_TEST_WEBDAV_USER      username
+    //   WDMM_TEST_WEBDAV_PASS      password
+    //   WDMM_TEST_WEBDAV_SUBDIR    a directory that exists under the root, e.g. "Local"
+    //
+    // Tests are skipped when any variable is absent (env var not set = no live
+    // server available).  They are also marked #[ignore] so they never run in
+    // CI or plain `cargo test`; use `cargo test -- --ignored` to opt in.
+    //
+    // These tests verify the no-trailing-slash URL normalisation fix: a base URL
+    // without a trailing slash must produce correct sub-path URLs so that
+    // PROPFIND on "/subdir" hits <base>/subdir, not /<subdir>.
+
+    /// Returns (url, user, pass, subdir) from env, or None to skip.
+    fn live_webdav_config() -> Option<(String, String, String, String)> {
+        let url = std::env::var("WDMM_TEST_WEBDAV_URL").ok()?;
+        let user = std::env::var("WDMM_TEST_WEBDAV_USER").unwrap_or_default();
+        let pass = std::env::var("WDMM_TEST_WEBDAV_PASS").unwrap_or_default();
+        let sub = std::env::var("WDMM_TEST_WEBDAV_SUBDIR").unwrap_or_else(|_| "Local".into());
+        Some((url, user, pass, sub))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WDMM_TEST_WEBDAV_URL env var (run with --ignored)"]
+    async fn live_list_root_no_trailing_slash() {
+        let Some((url, user, pass, _)) = live_webdav_config() else {
+            eprintln!("WDMM_TEST_WEBDAV_URL not set — skipping");
+            return;
+        };
+        // Base URL intentionally omits trailing slash (the regression scenario).
+        let base = url.trim_end_matches('/').to_string();
+        let driver = WebDavDriver::new(&base, &user, &pass).unwrap();
+
+        let items = driver.list("/").await.expect("list root should succeed");
+        assert!(!items.is_empty(), "root listing must not be empty");
+
+        // Every raw_url must start with the correct base prefix.
+        let expected_prefix = format!("{}/", base);
+        for item in &items {
+            if let Some(raw) = &item.raw_url {
+                assert!(
+                    raw.starts_with(&expected_prefix),
+                    "raw_url has wrong base (base path was dropped): {raw}\nexpected prefix: {expected_prefix}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WDMM_TEST_WEBDAV_URL + WDMM_TEST_WEBDAV_SUBDIR env vars (run with --ignored)"]
+    async fn live_list_subdirectory_no_trailing_slash() {
+        let Some((url, user, pass, subdir)) = live_webdav_config() else {
+            eprintln!("WDMM_TEST_WEBDAV_URL not set — skipping");
+            return;
+        };
+        // Base URL intentionally omits trailing slash (the regression scenario).
+        let base = url.trim_end_matches('/').to_string();
+        let driver = WebDavDriver::new(&base, &user, &pass).unwrap();
+
+        let path = format!("/{}", subdir.trim_matches('/'));
+        let items = driver
+            .list(&path)
+            .await
+            .unwrap_or_else(|e| panic!("list {path} failed: {e}"));
+
+        assert!(
+            !items.is_empty(),
+            "subdirectory {path} listing must not be empty"
+        );
+
+        // All raw_urls must include the subdirectory component.
+        let expected_fragment = format!("{}{}/", base, path);
+        for item in &items {
+            if let Some(raw) = &item.raw_url {
+                assert!(
+                    raw.starts_with(&expected_fragment) || raw.starts_with(&format!("{}{}", base, path)),
+                    "raw_url missing expected base path fragment.\nexpected prefix: {expected_fragment}\ngot: {raw}"
+                );
+            }
+        }
     }
 }
 
