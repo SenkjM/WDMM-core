@@ -887,6 +887,26 @@ pub struct ProxyHandle {
     handles: Arc<()>,
 }
 
+/// Sanitise a caller-supplied filename for use as a URL path segment.
+///
+/// Renderers only read `A-Za-z0-9`, `.`, `_` and `-` reliably out of a filename,
+/// so everything else (spaces, CJK, brackets) collapses to `_` and the result is
+/// capped at 120 bytes.
+fn url_safe_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(120));
+    for ch in raw.chars() {
+        if out.len() >= 120 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
 impl ProxyHandle {
     /// Create a handle with the given bind mode and port, using the default 10-minute idle timeout.
     ///
@@ -963,6 +983,7 @@ impl ProxyHandle {
                 size,
                 source: BackSource::LocalFile(path),
             },
+            None,
             ttl_secs,
             allowed_peers,
         )
@@ -995,6 +1016,38 @@ impl ProxyHandle {
                 size,
                 source: BackSource::DriverCallback(Arc::new(ranges_fn)),
             },
+            None,
+            ttl_secs,
+            allowed_peers,
+        )
+        .await
+    }
+
+    /// Register a driver Range callback whose URL carries a readable filename.
+    ///
+    /// `url_name` ends up in the URL path (`/s/{token}/{url_name}`), which is how
+    /// a DLNA renderer learns a subtitle's language and label: Kodi parses the
+    /// URL filename, not the DIDL. The proxy only sanitises it to URL-safe
+    /// characters; the token stays the lookup key.
+    pub async fn register_driver_named<F>(
+        &self,
+        size: u64,
+        name: Option<String>,
+        url_name: Option<String>,
+        ttl_secs: Option<u64>,
+        allowed_peers: Option<Vec<IpAddr>>,
+        ranges_fn: F,
+    ) -> ProxyResult<Registration>
+    where
+        F: Fn(i64, i64) -> BoxStream + Send + Sync + 'static,
+    {
+        self.insert_entry(
+            Entry {
+                name,
+                size,
+                source: BackSource::DriverCallback(Arc::new(ranges_fn)),
+            },
+            url_name,
             ttl_secs,
             allowed_peers,
         )
@@ -1332,12 +1385,20 @@ impl ProxyHandle {
     async fn insert_entry(
         &self,
         entry: Entry,
+        url_name: Option<String>,
         ttl_secs: Option<u64>,
         allowed_peers: Option<Vec<IpAddr>>,
     ) -> ProxyResult<Registration> {
         self.ensure_server().await?;
         let token = new_token();
-        let path_template = format!("/s/{token}");
+        // A subtitle keeps the token as the lookup key and appends a readable
+        // filename: DLNA renderers derive the subtitle language and label from the
+        // URL *filename*, never from DIDL attributes (Kodi:
+        // `CUtil::GetExternalStreamDetailsFromFilename`).
+        let path_template = match url_name.as_deref() {
+            Some(name) if !name.is_empty() => format!("/s/{token}/{}", url_safe_name(name)),
+            _ => format!("/s/{token}"),
+        };
         {
             let mut g = self.shared.lock().unwrap();
             g.entries.insert(token.clone(), entry);
@@ -1372,6 +1433,7 @@ impl ProxyHandle {
         let shared_for_router = Arc::clone(&self.shared);
         let app = Router::new()
             .route("/s/:token", get(serve))
+            .route("/s/:token/:name", get(serve_named))
             .route("/h/:token/*seg", get(serve_hls))
             .with_state(shared_for_router);
 
@@ -1517,6 +1579,30 @@ async fn serve(
     State(shared): State<Arc<Mutex<Shared>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     AxumPath(token): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    serve_token(token, shared, peer, headers).await
+}
+
+/// `/s/:token/:name` — the same resource with a renderer-readable filename.
+///
+/// DLNA renderers derive a subtitle's language and label from the URL filename
+/// (Kodi: `CUtil::GetExternalStreamDetailsFromFilename`), so subtitles are
+/// registered under a path that ends with `<stem>[.<lang>][.<title>].<ext>`.
+/// The name is decoration only: the token stays the lookup key.
+async fn serve_named(
+    State(shared): State<Arc<Mutex<Shared>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    AxumPath((token, _name)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    serve_token(token, shared, peer, headers).await
+}
+
+async fn serve_token(
+    token: String,
+    shared: Arc<Mutex<Shared>>,
+    peer: SocketAddr,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     // Extract what we need and reset the idle timer — all under one lock.
@@ -2088,6 +2174,68 @@ mod tests {
 
         proxy.stop();
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── subtitle lane (named registration) ────────────────────────────────────
+
+    #[test]
+    fn url_safe_name_keeps_language_tokens() {
+        assert_eq!(
+            url_safe_name("ep01.jpn.Full subtitles.ass"),
+            "ep01.jpn.Full_subtitles.ass"
+        );
+        assert_eq!(url_safe_name("中文 标题.ass"), "_____.ass");
+        assert_eq!(url_safe_name(&"a".repeat(400)).len(), 120);
+    }
+
+    #[tokio::test]
+    async fn named_registration_exposes_the_filename_in_the_url() {
+        use bytes::Bytes;
+        use std::io;
+
+        let data: Arc<Vec<u8>> = Arc::new(b"[Script Info]\n".to_vec());
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
+        let d = Arc::clone(&data);
+        let reg = proxy
+            .register_driver_named(
+                data.len() as u64,
+                Some("ep01.jpn.ass".into()),
+                Some("ep01.jpn.ass".into()),
+                None,
+                None,
+                move |start, end| {
+                    let chunk = if end < 0 {
+                        d[start as usize..].to_vec()
+                    } else {
+                        d[start as usize..=(end as usize).min(d.len() - 1)].to_vec()
+                    };
+                    let stream = futures::stream::once(async move {
+                        Ok::<Bytes, io::Error>(Bytes::from(chunk))
+                    });
+                    Box::pin(stream) as BoxStream
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            reg.path_template.starts_with("/s/") && reg.path_template.ends_with("/ep01.jpn.ass"),
+            "unexpected path template {}",
+            reg.path_template
+        );
+
+        let addr = proxy.addr().unwrap();
+        let url = format!("http://{addr}{}", reg.path_template);
+        let r = reqwest::Client::new().get(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(
+            r.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/ass"),
+            "the renderer picks the subtitle demuxer from the extension"
+        );
+        assert_eq!(r.bytes().await.unwrap().as_ref(), data.as_slice());
     }
 
     // ── integration: driver callback ──────────────────────────────────────────
