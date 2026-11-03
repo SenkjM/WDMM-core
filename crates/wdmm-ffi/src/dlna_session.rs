@@ -38,8 +38,7 @@ use wdmm_dlna::{
 use wdmm_drivers::WdmmVfs;
 use wdmm_ffmpeg::subtitle::{classify_codec, TrackKind};
 use wdmm_proxy::{
-    BindMode, BoxStream, HlsCacheOptions, HlsProgress, HlsSessionOpts, JobGate, ProxyHandle,
-    AHEAD_SEGMENTS,
+    BindMode, BoxStream, HlsCacheOptions, HlsProgress, HlsSessionOpts, ProxyHandle, AHEAD_SEGMENTS,
 };
 
 use crate::{
@@ -198,34 +197,18 @@ fn update_session(handle: u32, update: impl FnOnce(&mut SessionEntry)) -> bool {
 /// text track as a `webvtt` candidate; bitmap tracks are listed as
 /// `bitmap-unsupported` (never silent — contract §5).
 ///
-/// The probe is a full-stream libav decode, so it must hold the proxy's shared
-/// job gate (contract §3.6): a transcode job in flight wins, and a probe that
-/// cannot get the gate within [`JOB_ACQUIRE_TIMEOUT`] is skipped with an
-/// explanation instead of running a second decode in parallel.
-fn spawn_embedded_probe(
-    handle: u32,
-    loopback_url: String,
-    remote_path: String,
-    gate: Arc<JobGate>,
-) {
+/// The probe only opens the container and calls `avformat_find_stream_info` —
+/// it decodes no media — so it deliberately does *not* take the proxy's shared
+/// job gate. Routing it through the gate made the track list depend on the
+/// cast transcode being idle, which is exactly when the user is looking at the
+/// list; a second metadata read costs a few hundred milliseconds and no encoder.
+fn spawn_embedded_probe(handle: u32, loopback_url: String, remote_path: String) {
     let built = std::thread::Builder::new()
         .name(format!("wdmm-subtitle-probe-{handle}"))
         .spawn(move || {
-            let permit = match gate.acquire(JOB_ACQUIRE_TIMEOUT) {
-                Ok(permit) => permit,
-                Err(e) => {
-                    let message = format!("embedded subtitle probe skipped: {e}");
-                    wdmm_ffmpeg::diag::log(format!("[subtitle] {message}"));
-                    update_session(handle, |entry| {
-                        entry.subtitle_status.message = Some(message);
-                    });
-                    return;
-                }
-            };
             let probe = match wdmm_ffmpeg::probe(&loopback_url) {
                 Ok(probe) => probe,
                 Err(e) => {
-                    drop(permit);
                     let message = format!("embedded subtitle probe failed: {e}");
                     wdmm_ffmpeg::diag::log(format!("[subtitle] {message}"));
                     update_session(handle, |entry| {
@@ -234,7 +217,6 @@ fn spawn_embedded_probe(
                     return;
                 }
             };
-            drop(permit);
             let tracks: Vec<SubtitleCandidate> = probe
                 .subtitles
                 .iter()
@@ -1471,8 +1453,6 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
     };
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    // The embedded-subtitle probe shares the proxy's single-libav-job gate.
-    let probe_gate = proxy.job_gate();
     let subtitle_status = prepared.subtitle_status;
     let subtitle_status_json = subtitle_status.to_json();
     let loopback_url = prepared.loopback_url;
@@ -1513,7 +1493,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
     // cast, but during HLS it only gets the transcoded TS — so embedded text
     // tracks are discovered from the source in the background (contract §3).
     if prepared.provider == "hls" {
-        spawn_embedded_probe(handle, loopback_url, remote_path.clone(), probe_gate);
+        spawn_embedded_probe(handle, loopback_url, remote_path.clone());
     }
 
     Ok(json!({
@@ -1713,12 +1693,10 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
     entry.phase = SessionPhase::Playing;
     entry.last_error = None;
     if entry.provider == "hls" {
-        let gate = entry.proxy.job_gate();
         spawn_embedded_probe(
             entry.handle,
             entry.loopback_url.clone(),
             entry.remote_path.clone(),
-            gate,
         );
     }
     Ok(())
@@ -1890,14 +1868,12 @@ async fn select_embedded_subtitle(
         None => {
             // The background probe may still be running (or the app kept a
             // stale list): probe the source now so the track is classified.
-            // A probe is a full-stream libav decode and shares the proxy's
-            // single-job gate with transcoding (contract §3.6).
-            let gate = entry.proxy.job_gate();
+            // Like the background probe this is a metadata read (one
+            // `avformat_find_stream_info`, no decode), so it must not queue
+            // behind the cast transcode — that is what turned selecting a
+            // subtitle during playback into `transcoding busy`.
             let loopback = entry.loopback_url.clone();
             let probe = tokio::task::spawn_blocking(move || {
-                let _permit = gate
-                    .acquire(JOB_ACQUIRE_TIMEOUT)
-                    .map_err(|e| format!("transcoding busy: {e}"))?;
                 wdmm_ffmpeg::probe(&loopback).map_err(|e| e.to_string())
             })
             .await

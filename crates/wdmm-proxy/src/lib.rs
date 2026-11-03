@@ -590,6 +590,15 @@ async fn spawn_run_shared(
     // drop it first; `JobHandle::drop` cancels and joins on a helper thread, so
     // this returns immediately.
     drop_previous_run(shared, token);
+    // Claim the reopen slot before the open: a seek makes the renderer ask for
+    // several segments at once, and without this mark every one of them would
+    // cancel the other's freshly opened job.
+    {
+        let mut g = shared.lock().unwrap();
+        if let Some(session) = g.hls_sessions.get_mut(token) {
+            session.last_reopen = Some(Instant::now());
+        }
+    }
     let permit = gate
         .acquire_async(JOB_ACQUIRE_TIMEOUT)
         .await
