@@ -864,7 +864,8 @@ pub struct Registration {
 /// Unified local HTTP range proxy handle.
 ///
 /// The server starts lazily on the first `register_*` and shuts down after
-/// `idle_timeout` of inactivity. Dropping the handle stops the server.
+/// `idle_timeout` of inactivity. Dropping *the last* handle stops the server;
+/// clones share one listener, so dropping a clone is harmless.
 #[derive(Clone)]
 pub struct ProxyHandle {
     bind_mode: BindMode,
@@ -877,6 +878,13 @@ pub struct ProxyHandle {
     cache: Arc<TranscodeCache>,
     /// Global transcode admission gate (also used by FFI subtitle extraction).
     gate: Arc<JobGate>,
+    /// Reference marker for handle clones.
+    ///
+    /// `Arc::strong_count(&self.shared)` cannot answer "is this the last
+    /// handle": the axum task and its router hold `Arc`s of the same state for
+    /// as long as the server runs. This marker is cloned only by `Clone`, so
+    /// `strong_count == 1` really means "the last handle is going away".
+    handles: Arc<()>,
 }
 
 impl ProxyHandle {
@@ -909,6 +917,7 @@ impl ProxyHandle {
             shared,
             cache,
             gate,
+            handles: Arc::new(()),
         }
     }
 
@@ -1396,7 +1405,15 @@ impl ProxyHandle {
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
-        self.stop();
+        // Only the last handle may stop the server. Every clone is a live user
+        // of the same listener: FFI DLNA sessions keep one for the session's
+        // lifetime, and temporary clones (e.g. `entry.proxy.clone()` in a
+        // subtitle switch) must not take the listener down while a renderer is
+        // streaming — doing so closes the port, and the renderer's next HTTP
+        // request gets `connection refused` mid-playback.
+        if Arc::strong_count(&self.handles) == 1 {
+            self.stop();
+        }
     }
 }
 
@@ -2032,6 +2049,42 @@ mod tests {
         // Unregister → 404
         proxy.unregister(&reg.token);
         assert_eq!(client.get(&url).send().await.unwrap().status(), 404);
+
+        proxy.stop();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression: a DLNA subtitle switch clones the session's handle and lets
+    /// the clone go out of scope. That must not stop the shared listener, or the
+    /// renderer's next request is refused mid-playback (the cast appears to
+    /// freeze and then times out).
+    #[tokio::test]
+    async fn dropping_a_clone_keeps_the_server_listening() {
+        let path = std::env::temp_dir().join(format!(
+            "wdmm-proxy-clone-test-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"hello clone").unwrap();
+
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
+        let reg = proxy
+            .register_file(&path, Some("clone.bin".into()), None, None)
+            .await
+            .unwrap();
+        let addr = proxy.addr().unwrap();
+        let url = format!("http://{addr}{}", reg.path_template);
+
+        let clone = proxy.clone();
+        drop(clone);
+        assert!(
+            proxy.addr().is_some(),
+            "dropping a clone must not stop the shared server"
+        );
+
+        let client = reqwest::Client::new();
+        let r = client.get(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), b"hello clone");
 
         proxy.stop();
         let _ = std::fs::remove_file(&path);
