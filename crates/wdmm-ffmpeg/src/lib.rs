@@ -211,7 +211,14 @@ pub struct AudioStream {
 pub struct SubtitleStream {
     pub index: u32,
     pub codec: String,
+    /// BCP-47 / ISO 639 language tag from the container (`metadata=language`).
     pub language: Option<String>,
+    /// Human readable track title from the container (`metadata=title`).
+    ///
+    /// Japanese releases commonly ship many subtitle tracks whose only
+    /// identifiable difference is this field, so it has to reach the UI.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -234,6 +241,26 @@ pub fn probe(url: &str) -> FfmpegResult<ProbeResult> {
 /// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
 #[cfg(not(feature = "ffmpeg"))]
 pub fn probe(_url: &str) -> FfmpegResult<ProbeResult> {
+    Err(FfmpegError::Unavailable(
+        "FFmpeg not linked (build with --features ffmpeg)".into(),
+    ))
+}
+
+/// List the embedded subtitle tracks of a media URL.
+///
+/// This is the metadata API for the cast UI: it returns the same track records
+/// that [`probe`] produces (index, codec, `language`, `title`), so callers do
+/// not need a second demux pass just to populate a track picker. It is a thin
+/// wrapper over [`probe`] on purpose — one libav open, one
+/// `avformat_find_stream_info`.
+#[cfg(feature = "ffmpeg")]
+pub fn embedded_subtitle_tracks(url: &str) -> FfmpegResult<Vec<SubtitleStream>> {
+    probe(url).map(|probed| probed.subtitles)
+}
+
+/// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
+#[cfg(not(feature = "ffmpeg"))]
+pub fn embedded_subtitle_tracks(_url: &str) -> FfmpegResult<Vec<SubtitleStream>> {
     Err(FfmpegError::Unavailable(
         "FFmpeg not linked (build with --features ffmpeg)".into(),
     ))

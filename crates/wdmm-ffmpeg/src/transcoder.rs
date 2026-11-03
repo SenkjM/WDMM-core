@@ -198,7 +198,7 @@ pub fn probe_url(url: &str) -> FfmpegResult<ProbeResult> {
                         codec: codec_name,
                         channels: (*cp).ch_layout.nb_channels as u32,
                         sample_rate: (*cp).sample_rate as u32,
-                        language: None, // TODO: read from stream metadata
+                        language: stream_metadata_value(st, "language"),
                     });
                 }
                 3 => {
@@ -206,7 +206,8 @@ pub fn probe_url(url: &str) -> FfmpegResult<ProbeResult> {
                     subs.push(SubtitleStream {
                         index: (*st).index as u32,
                         codec: codec_name,
-                        language: None,
+                        language: stream_metadata_value(st, "language"),
+                        title: stream_metadata_value(st, "title"),
                     });
                 }
                 _ => {}
@@ -238,6 +239,29 @@ unsafe fn cstr_opt(p: *const c_char) -> Option<String> {
     } else {
         Some(CStr::from_ptr(p).to_string_lossy().into_owned())
     }
+}
+
+/// Read one `AVStream` metadata value (`metadata` dictionary @ +80).
+///
+/// Containers store per-track `language` and `title` here (Matroska/MP4), which
+/// is the only way to tell apart e.g. 33 Japanese subtitle tracks that all use
+/// the same codec. Returns `None` for missing or blank values.
+unsafe fn stream_metadata_value(st: *const AVStream, key: &str) -> Option<String> {
+    let dict = stream_metadata(st);
+    if dict.is_null() {
+        return None;
+    }
+    let key_c = CString::new(key).ok()?;
+    let entry = av_dict_get(
+        dict,
+        key_c.as_ptr(),
+        std::ptr::null(),
+        AV_DICT_IGNORE_SUFFIX,
+    );
+    if entry.is_null() {
+        return None;
+    }
+    cstr_opt((*entry).value).filter(|value| !value.trim().is_empty())
 }
 
 /// Turn one decoded `AVSubtitle` into a cue (text + absolute ms window).
@@ -1272,11 +1296,11 @@ fn run_remux(
         }
         if plan == RemuxPlan::Transcode {
             diag::log(format!(
-                "{tag} remux decision: video not MPEG-TS copy compatible → full transcode fallback"
+                "{tag} remux decision: no MPEG-TS copyable A/V stream → full transcode fallback"
             ));
             avformat_close_input(&mut in_ctx);
             return Err(FfmpegError::Probe(
-                "video codec not mpegts-copy-compatible".into(),
+                "no mpegts-copy-compatible audio/video stream".into(),
             ));
         }
 
@@ -1288,7 +1312,12 @@ fn run_remux(
         if plan == RemuxPlan::Hybrid {
             let audio_codec = hybrid_audio_codec_id(&preset.audio_codec);
             diag::log(format!(
-                "{tag} remux hybrid: copying video, re-encoding audio {} → {}",
+                "{tag} remux hybrid: {}re-encoding audio {} → {}",
+                if v_idx >= 0 {
+                    "copying video, "
+                } else {
+                    "audio-only, "
+                },
                 audio_codec_id
                     .map(codec_display_name)
                     .unwrap_or_else(|| "?".into()),
@@ -1336,7 +1365,12 @@ fn run_remux(
             } else {
                 "remux".into()
             },
-            video: Some("copy".into()),
+            // Audio-only sources copy nothing from a video stream.
+            video: if v_idx >= 0 {
+                Some("copy".into())
+            } else {
+                None
+            },
             audio: audio_mode,
             hw_requested: false,
             hw_available: false,
@@ -1665,27 +1699,34 @@ fn run_transcode(
         let want_video = preset.video_codec.is_some();
         let mut v_dec_codec: *const AVCodec = std::ptr::null();
         let mut a_dec_codec: *const AVCodec = std::ptr::null();
-        let v_idx = if want_video {
-            av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &mut v_dec_codec, 0)
-        } else {
-            -1
-        };
+        // Always look for a video stream: audio-only sources (music) must work
+        // even when the preset asks for video, and `decode_video` is what the
+        // pipeline actually does.
+        let v_idx = av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &mut v_dec_codec, 0);
         let a_idx = av_find_best_stream(in_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &mut a_dec_codec, 0);
+        let has_video_stream = v_idx >= 0 && !v_dec_codec.is_null();
+        let decode_video = want_video && has_video_stream;
 
         let nb = fmtctx_nb_streams(in_ctx) as usize;
         let streams_ptr = fmtctx_streams(in_ctx);
         diag::log(format!(
-            "{tag} transcode stream selection: video_idx={v_idx} audio_idx={a_idx} want_video={want_video}"
+            "{tag} transcode stream selection: video_idx={v_idx} audio_idx={a_idx} want_video={want_video} decode_video={decode_video}"
         ));
         log_streams(tag, "transcode", streams_ptr, nb);
 
-        if want_video && (v_idx < 0 || v_dec_codec.is_null()) {
+        if want_video && !has_video_stream {
             diag::log(format!(
-                "{tag} transcode failed: preset requires video but no decodable video stream was found"
+                "{tag} transcode: source has no decodable video stream → audio-only output"
+            ));
+            telemetry.warn("源文件没有视频流，已转为纯音频输出");
+        }
+        if !decode_video && a_idx < 0 {
+            diag::log(format!(
+                "{tag} transcode failed: neither a decodable audio nor video stream was found"
             ));
             avformat_close_input(&mut in_ctx);
             return Err(FfmpegError::Probe(
-                "no decodable video stream for transcode".into(),
+                "no decodable audio or video stream for transcode".into(),
             ));
         }
 
@@ -1693,7 +1734,7 @@ fn run_transcode(
         let mut v_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
         let mut a_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
 
-        if v_idx >= 0 && !v_dec_codec.is_null() {
+        if decode_video && !v_dec_codec.is_null() {
             let in_st = *streams_ptr.add(v_idx as usize);
             let dec_name = codec_display_name((*(*in_st).codecpar).codec_id);
             v_dec_ctx = avcodec_alloc_context3(v_dec_codec);
@@ -1804,7 +1845,7 @@ fn run_transcode(
         }
 
         // ── Open video encoder (hardware probe, then software fallback) ────
-        if want_video {
+        if decode_video {
             let in_st = *streams_ptr.add(v_idx as usize);
             let src_w = (*(*in_st).codecpar).width;
             let src_h = (*(*in_st).codecpar).height;
@@ -1972,6 +2013,25 @@ fn run_transcode(
             }
         }
 
+        // A job with no encoder cannot produce any output: fail before the
+        // muxer writes a header instead of reporting an empty success.
+        if v_enc_ctx.is_null() && a_enc_ctx.is_null() {
+            diag::log(format!(
+                "{tag} transcode failed: no usable video or audio encoder"
+            ));
+            cleanup_transcode(
+                in_ctx,
+                std::ptr::null_mut(),
+                v_dec_ctx,
+                a_dec_ctx,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            return Err(FfmpegError::Probe(
+                "transcode produced no output stream (no encoder opened)".into(),
+            ));
+        }
+
         telemetry.set_encoder(EncoderInfo {
             mode: if hw_available {
                 "hw".into()
@@ -1988,7 +2048,7 @@ fn run_transcode(
             } else {
                 None
             },
-            hw_requested: preset.video_hw_preferred,
+            hw_requested: preset.video_hw_preferred && decode_video,
             hw_available,
         });
 

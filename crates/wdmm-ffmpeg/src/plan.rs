@@ -16,11 +16,20 @@ pub enum RemuxPlan {
 }
 
 /// Decide the remux-stage plan from the best video/audio codec ids.
+///
+/// Audio-only sources (music, no video stream) keep the cheap path too: the
+/// audio track is copied when MPEG-TS can carry it, and otherwise only the
+/// audio is re-encoded — the hybrid machinery already does exactly that and
+/// simply has no video stream to copy alongside.
 pub fn remux_plan(video_codec_id: Option<u32>, audio_codec_id: Option<u32>) -> RemuxPlan {
     let Some(video_id) = video_codec_id else {
-        // No usable video stream: remuxing an audio-only HLS cast is not a
-        // supported shape here, so let the full transcode path handle it.
-        return RemuxPlan::Transcode;
+        return match audio_codec_id {
+            Some(audio_id) if crate::preset::is_mpegts_audio_copy_compatible(audio_id) => {
+                RemuxPlan::Remux
+            }
+            Some(_) => RemuxPlan::Hybrid,
+            None => RemuxPlan::Transcode,
+        };
     };
     if !crate::preset::is_mpegts_video_copy_compatible(video_id) {
         return RemuxPlan::Transcode;
@@ -237,9 +246,22 @@ mod tests {
         // Video not copyable → full transcode.
         assert_eq!(remux_plan(Some(VP9), Some(OPUS)), RemuxPlan::Transcode);
         assert_eq!(remux_plan(Some(AV1), Some(AAC)), RemuxPlan::Transcode);
-        assert_eq!(remux_plan(None, Some(AAC)), RemuxPlan::Transcode);
         // No audio is fine: video-only remux.
         assert_eq!(remux_plan(Some(H264), None), RemuxPlan::Remux);
+        assert_eq!(remux_plan(None, None), RemuxPlan::Transcode);
+    }
+
+    #[test]
+    fn audio_only_sources_stay_on_the_cheap_path() {
+        // Audio-only source (no video stream): copy the audio when MPEG-TS can
+        // carry it, otherwise hybrid re-encodes only the audio.
+        assert_eq!(remux_plan(None, Some(AAC)), RemuxPlan::Remux);
+        assert_eq!(remux_plan(None, Some(MP3)), RemuxPlan::Remux);
+        assert_eq!(remux_plan(None, Some(AC3)), RemuxPlan::Remux);
+        assert_eq!(remux_plan(None, Some(EAC3)), RemuxPlan::Remux);
+        assert_eq!(remux_plan(None, Some(OPUS)), RemuxPlan::Hybrid);
+        assert_eq!(remux_plan(None, Some(FLAC)), RemuxPlan::Hybrid);
+        // Nothing playable at all still falls back to the transcode path.
         assert_eq!(remux_plan(None, None), RemuxPlan::Transcode);
     }
 

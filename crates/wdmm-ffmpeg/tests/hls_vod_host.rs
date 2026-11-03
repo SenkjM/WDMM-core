@@ -14,6 +14,9 @@
 //! $env:WDMM_HLS_TEST_MEDIA_HEAD='E:\test\video\1.m4v'
 //! $env:WDMM_HLS_TEST_MEDIA_TAIL='E:\test\video\2.mp4'
 //! $env:WDMM_HLS_TEST_MEDIA_TRANSCODE='E:\test\video\_env\transcode.mkv'
+//! $env:WDMM_HLS_TEST_MEDIA_AUDIO='E:\test\video\_env\audio-only.m4a'
+//! $env:WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID='E:\test\video\_env\audio-only.flac'
+//! $env:WDMM_HLS_TEST_MEDIA_SUBTITLES='E:\test\video\_env\subtitles.mkv'
 //! cargo test -p wdmm-ffmpeg --features ffmpeg --test hls_vod_host -- --ignored --test-threads=1
 //! ```
 
@@ -220,4 +223,206 @@ fn transcode_path_produces_a_full_vod_playlist() {
     );
     drop(job);
     let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Assert the job produced a real audio-only HLS output (playlist + segments).
+fn assert_audio_only_output(
+    job: &mut wdmm_ffmpeg::JobHandle,
+    out_dir: &Path,
+    tag: &str,
+    min_segments: usize,
+) -> Vec<i64> {
+    let finished = wait_finished(job, Duration::from_secs(120));
+    assert!(
+        finished.is_some(),
+        "{tag} job did not finish in time\n{}",
+        diagnostics()
+    );
+    let result = job
+        .take_result()
+        .expect("finished job must expose a result");
+    let segments = segment_count(out_dir);
+    assert!(
+        result.is_ok(),
+        "{tag} job failed: {:?}\nsegments={segments} playlist_bytes={}\n{}",
+        result.err(),
+        playlist_len(out_dir),
+        diagnostics()
+    );
+    assert!(
+        playlist_len(out_dir) > 0,
+        "{tag} produced no playlist\n{}",
+        diagnostics()
+    );
+    assert!(
+        segments >= min_segments,
+        "{tag} produced only {segments} segments (expected >= {min_segments})\n{}",
+        diagnostics()
+    );
+    let durations = job.segment_durations();
+    assert!(
+        !durations.is_empty(),
+        "{tag} playlist has no #EXTINF durations\n{}",
+        diagnostics()
+    );
+    let encoder = job.encoder_info();
+    assert!(
+        encoder.video.is_none(),
+        "{tag}: an audio-only source must not report a video encoder: {encoder:?}"
+    );
+    durations
+}
+
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_AUDIO + linked FFmpeg 7.1"]
+fn audio_only_source_remuxes_to_audio_only_playlist() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_AUDIO") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_AUDIO not set");
+        return;
+    };
+    let url = media.to_string_lossy().into_owned();
+    let probed = wdmm_ffmpeg::probe(&url).expect("probe audio-only source");
+    assert!(
+        probed.video.is_empty(),
+        "audio-only fixture must report no video streams: {:?}",
+        probed.video
+    );
+    assert!(
+        !probed.audio.is_empty(),
+        "audio-only fixture must report an audio stream"
+    );
+
+    let out_dir = temp_dir("audio-remux");
+    // dlna-compat asks for video, but the source has none: the remux stage must
+    // still copy the MPEG-TS-copyable AAC audio instead of re-encoding it.
+    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    preset.hls_segment_secs = 4;
+    let opts = wdmm_ffmpeg::JobOpts {
+        input_url: url,
+        preset,
+        out_dir: Some(out_dir.clone()),
+        ..wdmm_ffmpeg::JobOpts::default()
+    };
+    let mut job = wdmm_ffmpeg::open_job(opts).expect("open_job");
+    let durations = assert_audio_only_output(&mut job, &out_dir, "audio-only remux", 2);
+    let encoder = job.encoder_info();
+    assert_eq!(
+        encoder.mode, "remux",
+        "AAC in an M4A is MPEG-TS copyable, so the audio must be copied"
+    );
+    assert_eq!(encoder.audio.as_deref(), Some("copy"));
+    let total: i64 = durations.iter().sum();
+    assert!(
+        total > 5_000,
+        "audio-only playlist covers only {total} ms of media: {durations:?}"
+    );
+    eprintln!(
+        "audio-only remux: durations={durations:?} total_ms={total} encoder={encoder:?}\n{}",
+        diagnostics()
+    );
+    drop(job);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID + linked FFmpeg 7.1"]
+fn audio_only_source_reencodes_unmuxable_audio() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID not set");
+        return;
+    };
+    let out_dir = temp_dir("audio-hybrid");
+    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    preset.hls_segment_secs = 4;
+    let opts = wdmm_ffmpeg::JobOpts {
+        input_url: media.to_string_lossy().into_owned(),
+        preset,
+        out_dir: Some(out_dir.clone()),
+        ..wdmm_ffmpeg::JobOpts::default()
+    };
+    let mut job = wdmm_ffmpeg::open_job(opts).expect("open_job");
+    let durations = assert_audio_only_output(&mut job, &out_dir, "audio-only hybrid", 2);
+    let encoder = job.encoder_info();
+    assert_eq!(
+        encoder.mode, "hybrid",
+        "FLAC cannot be muxed into MPEG-TS, so only the audio is re-encoded"
+    );
+    assert_eq!(encoder.audio.as_deref(), Some("aac"));
+    let log = diagnostics();
+    assert!(
+        log.contains("remux hybrid: audio-only"),
+        "diag must state that the hybrid run is audio-only:\n{log}"
+    );
+    eprintln!("audio-only hybrid: durations={durations:?} encoder={encoder:?}\n{log}");
+    drop(job);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_AUDIO + linked FFmpeg 7.1"]
+fn audio_only_source_survives_the_transcode_path() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_AUDIO") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_AUDIO not set");
+        return;
+    };
+    let out_dir = temp_dir("audio-transcode");
+    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    preset.remux_first = false; // force the transcode path
+    preset.hls_segment_secs = 4;
+    let opts = wdmm_ffmpeg::JobOpts {
+        input_url: media.to_string_lossy().into_owned(),
+        preset,
+        out_dir: Some(out_dir.clone()),
+        ..wdmm_ffmpeg::JobOpts::default()
+    };
+    let mut job = wdmm_ffmpeg::open_job(opts).expect("open_job");
+    let durations = assert_audio_only_output(&mut job, &out_dir, "audio-only transcode", 2);
+    let encoder = job.encoder_info();
+    let log = diagnostics();
+    assert!(
+        log.contains("source has no decodable video stream → audio-only output"),
+        "diag must explain the audio-only degradation:\n{log}"
+    );
+    assert!(
+        !encoder.hw_requested,
+        "no video stream means nothing to encode with hardware"
+    );
+    eprintln!("audio-only transcode: durations={durations:?} encoder={encoder:?}\n{log}");
+    drop(job);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_SUBTITLES + linked FFmpeg 7.1"]
+fn embedded_subtitle_tracks_expose_language_and_title() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_SUBTITLES") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_SUBTITLES not set");
+        return;
+    };
+    let url = media.to_string_lossy().into_owned();
+    let tracks = wdmm_ffmpeg::embedded_subtitle_tracks(&url).expect("embedded subtitle tracks");
+    assert_eq!(
+        tracks.len(),
+        2,
+        "fixture carries two subtitle tracks, got {tracks:?}\n{}",
+        diagnostics()
+    );
+    let full = tracks
+        .iter()
+        .find(|track| track.title.as_deref() == Some("Full subtitles"))
+        .unwrap_or_else(|| panic!("track title from container metadata missing: {tracks:?}"));
+    assert_eq!(full.language.as_deref(), Some("jpn"));
+    assert_eq!(full.index, 2, "probe must preserve the real stream index");
+    let signs = tracks
+        .iter()
+        .find(|track| track.title.as_deref() == Some("Signs only"))
+        .unwrap_or_else(|| panic!("second track title missing: {tracks:?}"));
+    assert_eq!(signs.language.as_deref(), Some("eng"));
+    assert_eq!(signs.index, 3);
+
+    // The full probe and the thin track-list API must agree (one scan shape).
+    let probed = wdmm_ffmpeg::probe(&url).expect("probe subtitles fixture");
+    assert_eq!(probed.subtitles.len(), tracks.len());
+    assert!(!probed.format_name.is_empty());
+    eprintln!("embedded subtitles: {tracks:?}");
 }

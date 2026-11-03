@@ -59,6 +59,9 @@ pub const AVSEEK_FLAG_ANY: c_int = 4;
 /// `AV_OPT_SEARCH_CHILDREN` — search sub-objects when setting options.
 pub const AV_OPT_SEARCH_CHILDREN: c_int = 1;
 
+/// `AV_DICT_IGNORE_SUFFIX` — `av_dict_get` returns only exact key matches.
+pub const AV_DICT_IGNORE_SUFFIX: c_int = 2;
+
 // Well-known codec IDs.
 pub const AV_CODEC_ID_H264: AVCodecID = 27;
 pub const AV_CODEC_ID_AAC: AVCodecID = 86018;
@@ -221,6 +224,12 @@ pub struct AVCodec {
 #[repr(C)]
 pub struct AVDictionary {
     _p: [u8; 0],
+}
+/// One `AVDictionary` entry (sizeof=16, LP64): `char *key @0`, `char *value @8`.
+#[repr(C)]
+pub struct AVDictionaryEntry {
+    pub key: *mut c_char,
+    pub value: *mut c_char,
 }
 #[repr(C)]
 pub struct SwsContext {
@@ -424,6 +433,13 @@ pub unsafe fn stream_r_frame_rate(s: *const AVStream) -> AVRational {
     (*s).r_frame_rate
 }
 
+/// `metadata` (`AVDictionary *` @ +80). The dictionary is owned by the stream;
+/// callers must only read it (use `av_dict_get`) and never free it.
+#[inline]
+pub unsafe fn stream_metadata(s: *const AVStream) -> *mut AVDictionary {
+    *(s as *const u8).add(80).cast()
+}
+
 // AVSubtitle (sizeof=32): format u16 @0, start_display_time u32 @4,
 // end_display_time u32 @8, num_rects u32 @12, rects ** @16, pts i64 @24.
 #[inline]
@@ -586,6 +602,12 @@ extern "C" {
         flags: c_int,
     ) -> c_int;
     pub fn av_dict_free(m: *mut *mut AVDictionary);
+    pub fn av_dict_get(
+        m: *const AVDictionary,
+        key: *const c_char,
+        prev: *const AVDictionaryEntry,
+        flags: c_int,
+    ) -> *const AVDictionaryEntry;
     pub fn av_opt_set(
         obj: *mut c_void,
         name: *const c_char,
