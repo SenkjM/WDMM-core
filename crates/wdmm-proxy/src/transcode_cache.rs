@@ -265,6 +265,32 @@ impl TranscodeCache {
         removed
     }
 
+    /// Delete every HLS segment in `dir`, keeping `plan.json` and the samples
+    /// directory.
+    ///
+    /// Used when a session is re-planned: the previous grid may put its segment
+    /// boundaries anywhere, so a segment that survives would be served as the
+    /// content of a *different* stretch of media. `plan.json` is rewritten right
+    /// after, and the cache index is refreshed by [`Self::touch`].
+    pub fn purge_media(dir: &Path) -> usize {
+        let Ok(read) = fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_segment = name.starts_with("seg") && name.ends_with(".ts");
+            if !is_segment && name != "index.m3u8" {
+                continue;
+            }
+            if fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Record that `key` was just used and refresh its byte count.
     pub fn touch(&self, key: &CacheKey, dir: &Path) {
         let bytes = dir_bytes(dir);
@@ -641,6 +667,37 @@ seg900.ts
         assert!(TranscodeCache::segment_path(&dir, 900).exists());
         assert!(!TranscodeCache::segment_path(&dir, 901).exists());
         assert!(TranscodeCache::segment_path(&dir, 2).exists());
+        fs::remove_dir_all(cache.root()).ok();
+    }
+
+    #[test]
+    fn purge_media_clears_segments_but_keeps_the_plan_and_samples() {
+        // Re-planning can move every boundary, so no segment may survive it.
+        let root = temp_root("purge-media");
+        let cache = TranscodeCache::new(root, 1_000);
+        let key = make_key("etag");
+        let dir = cache.prepare(&key).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 0), vec![0u8; 100]).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 41), vec![0u8; 100]).unwrap();
+        fs::write(dir.join("index.m3u8"), "#EXTM3U\n").unwrap();
+        fs::write(dir.join("plan.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("samples")).unwrap();
+        fs::write(dir.join("samples").join("ext.srt"), "1\n").unwrap();
+        assert_eq!(
+            TranscodeCache::purge_media(&dir),
+            3,
+            "two segments + playlist"
+        );
+        assert_eq!(
+            TranscodeCache::segment_ready(&dir, 0),
+            SegmentLookup::Missing
+        );
+        assert!(!dir.join("index.m3u8").exists());
+        assert!(dir.join("plan.json").exists(), "the plan is rewritten next");
+        assert!(
+            dir.join("samples").join("ext.srt").exists(),
+            "extracted subtitles outlive the grid"
+        );
         fs::remove_dir_all(cache.root()).ok();
     }
 

@@ -1107,6 +1107,17 @@ impl ProxyHandle {
             self.cache.note_hit();
         } else {
             self.cache.note_miss();
+            // A plan we could not reuse may describe a different grid than the
+            // segments still sitting in this directory (it was written by older
+            // code, or a previous first cast died mid-grid). Opening the session
+            // on top of them would serve old boundaries as the new plan's
+            // content, so the media goes; the plan is rewritten below.
+            let dropped = TranscodeCache::purge_media(&cache_dir);
+            if dropped > 0 {
+                wdmm_ffmpeg::diag::log(format!(
+                    "[proxy] hls cache reset: dropped {dropped} file(s) planned by another grid"
+                ));
+            }
             // 2. No usable cached plan: ask libav once which grid this cast will
             //    really produce. Copying the video keeps the source keyframes as
             //    segment boundaries (cheap, and exact because the muxer cuts on
@@ -1167,7 +1178,7 @@ impl ProxyHandle {
             return Err(if wdmm_ffmpeg::is_available() {
                 ProxyError::Cache(message)
             } else {
-                // Without the fmpeg feature there is nothing to plan with; keep
+                // Without the ffmpeg feature there is nothing to plan with; keep
                 // the typed error the FFI layer turns into a user-facing message.
                 ProxyError::Ffmpeg(message)
             });
