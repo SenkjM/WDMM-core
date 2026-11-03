@@ -31,6 +31,15 @@ Callers compose `http://{host}:{port}{path_template}` from the registration plus
 ### `pub async fn register_file(&self, path: impl Into<PathBuf>, name: Option<String>, ttl_secs: Option<u64>, allowed_peers: Option<Vec<IpAddr>>) -> ProxyResult<Registration>`
 `name` only feeds Content-Type guessing; TTL and peer whitelist are optional.
 ### `pub async fn register_driver<F>(&self, size: u64, name: Option<String>, ttl_secs: Option<u64>, allowed_peers: Option<Vec<IpAddr>>, ranges_fn: F) -> ProxyResult<Registration>`
+
+### `pub async fn register_driver_named<F>(&self, size: u64, name: Option<String>, url_name: Option<String>, ttl_secs: Option<u64>, allowed_peers: Option<Vec<IpAddr>>, ranges_fn: F) -> ProxyResult<Registration>`
+
+Same source as `register_driver`, but `url_name` names the resource in the path:
+`/s/<token>/<url_name>` instead of `/s/<token>` (route `/s/:token/:name`). The
+token stays the lookup key; the name is decoration for renderers that derive a
+subtitle's language and label from the URL filename (Kodi's
+`CUtil::GetExternalStreamDetailsFromFilename`). Characters outside
+`A-Za-z0-9._-` become `_`, the name is capped at 120 bytes.
 `start`/`end` are inclusive byte offsets; `end = -1` means read to EOF;
 `size = 0` means unknown. `F: Fn(i64, i64) -> BoxStream + Send + Sync + 'static`.
 ### `pub fn renew_callback<F>(&self, token: &str, ranges_fn: F)`
