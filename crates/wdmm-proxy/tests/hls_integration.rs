@@ -33,6 +33,12 @@ async fn create_test_video() -> PathBuf {
             "libx264",
             "-preset",
             "ultrafast",
+            // Video HLS segments now cut on keyframes only (the muxer's
+            // `hls_flags=split_by_time` is deliberately not set for video
+            // copies), so the fixture needs a short GOP to produce more than
+            // one segment with the preset's 4 s target.
+            "-g",
+            "30",
             "-c:a",
             "aac",
             "-y",

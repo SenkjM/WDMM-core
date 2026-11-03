@@ -17,7 +17,7 @@
 //! Every piece of bookkeeping here is pure host logic — no libav, no async —
 //! so it is unit-tested on a host build without the `ffmpeg` feature.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -210,11 +210,23 @@ impl TranscodeCache {
         dir.join(format!("seg{k}.ts"))
     }
 
-    /// Whether segment `k` is already on disk (and non-empty).
+    /// Whether segment `k` is finished on disk.
+    ///
+    /// A non-empty file is not enough: the muxer writes `segK.ts` incrementally,
+    /// so a segment that is still being produced looks identical to a finished
+    /// one. Serving it truncates the MPEG-TS mid-packet, and the renderer keeps
+    /// the audio going while the picture freezes on the last decoded frame. The
+    /// muxer only appends a segment to its own playlist (`index.m3u8`) once the
+    /// file is closed, so that playlist is the completion marker.
     pub fn segment_ready(dir: &Path, k: u64) -> SegmentLookup {
         match fs::metadata(Self::segment_path(dir, k)) {
-            Ok(meta) if meta.len() > 0 => SegmentLookup::Ready,
-            _ => SegmentLookup::Missing,
+            Ok(meta) if meta.len() > 0 => {}
+            _ => return SegmentLookup::Missing,
+        }
+        if muxer_playlist_lists(dir, k) {
+            SegmentLookup::Ready
+        } else {
+            SegmentLookup::Missing
         }
     }
 
@@ -423,6 +435,32 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// Whether the muxer's own playlist already lists `seg{k}.ts`.
+///
+/// The HLS muxer appends the `segK.ts` URI line only after the segment file is
+/// closed, which is what [`TranscodeCache::segment_ready`] needs to distinguish
+/// a finished segment from one that is still being written.
+fn muxer_playlist_lists(dir: &Path, k: u64) -> bool {
+    muxer_playlist_segments(dir).contains(&k)
+}
+
+/// Segment indices the muxer has already closed, per its own playlist.
+///
+/// Empty when the muxer has not written `index.m3u8` yet (no segment is closed
+/// in that case either).
+pub fn muxer_playlist_segments(dir: &Path) -> HashSet<u64> {
+    let Ok(text) = fs::read_to_string(dir.join("index.m3u8")) else {
+        return HashSet::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let stem = line.strip_prefix("seg")?.strip_suffix(".ts")?;
+            stem.parse::<u64>().ok()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +503,46 @@ mod tests {
     }
 
     #[test]
+    fn segment_ready_requires_the_muxer_to_have_closed_the_segment() {
+        let root = temp_root("ready");
+        let cache = TranscodeCache::new(root, 1_000);
+        let key = make_key("etag");
+        let dir = cache.prepare(&key).unwrap();
+        // seg0 is closed (the muxer listed it), seg1 is still being written.
+        fs::write(TranscodeCache::segment_path(&dir, 0), vec![0u8; 100]).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 1), vec![0u8; 50]).unwrap();
+        fs::write(
+            dir.join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nseg0.ts\n",
+        )
+        .unwrap();
+        assert_eq!(
+            TranscodeCache::segment_ready(&dir, 0),
+            SegmentLookup::Ready
+        );
+        assert_eq!(
+            TranscodeCache::segment_ready(&dir, 1),
+            SegmentLookup::Missing,
+            "a half-written segment must not be served"
+        );
+        assert_eq!(
+            TranscodeCache::segment_ready(&dir, 7),
+            SegmentLookup::Missing
+        );
+        fs::write(
+            dir.join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nseg0.ts\n#EXTINF:0.500,\nseg1.ts\n",
+        )
+        .unwrap();
+        assert_eq!(
+            TranscodeCache::segment_ready(&dir, 1),
+            SegmentLookup::Ready,
+            "closing the segment makes it servable"
+        );
+        fs::remove_dir_all(cache.root()).ok();
+    }
+
+    #[test]
     fn records_bytes_and_reports_stats() {
         let root = temp_root("stats");
         let cache = TranscodeCache::new(root, 1_000);
@@ -482,7 +560,6 @@ mod tests {
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
         assert!(!stats.over_budget);
-        assert_eq!(TranscodeCache::segment_ready(&dir, 1), SegmentLookup::Ready);
         assert_eq!(
             TranscodeCache::segment_ready(&dir, 7),
             SegmentLookup::Missing

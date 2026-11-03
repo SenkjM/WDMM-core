@@ -27,13 +27,25 @@ impl PlaylistSegment {
 }
 
 /// `#EXT-X-TARGETDURATION`: rounded up whole seconds, never zero.
+///
+/// The grid is predicted from the container index, but a segment written by the
+/// muxer can outrun its planned duration by a frame or two (frame cadence,
+/// encoder IDR placement). HLS requires every `EXTINF` to be at or below
+/// `TARGETDURATION`, so a plan sitting just under a whole second gets one second
+/// of slack instead of being rounded to a value the real segment can exceed.
 pub fn target_duration_secs(segments: &[PlaylistSegment]) -> u64 {
-    segments
+    let max_ms = segments
         .iter()
-        .map(|segment| (segment.duration_ms.max(1) as f64 / 1000.0).ceil() as u64)
+        .map(|segment| segment.duration_ms.max(1) as u64)
         .max()
         .unwrap_or(1)
-        .max(1)
+        .max(1);
+    let secs = max_ms.div_ceil(1000);
+    if max_ms % 1000 >= 900 {
+        secs + 1
+    } else {
+        secs
+    }
 }
 
 /// Render a complete, finite VOD playlist.
@@ -95,6 +107,15 @@ mod tests {
         assert_eq!(target_duration_secs(&[PlaylistSegment::new(0, 1_400)]), 2);
         assert_eq!(target_duration_secs(&plan()), 6);
         assert_eq!(target_duration_secs(&[]), 1);
+    }
+
+    #[test]
+    fn target_duration_leaves_slack_near_a_second_boundary() {
+        // 1979 ms rounds up to 2 s, but the muxer can write 2001 ms for that
+        // segment when the encoder places IDRs on its own cadence.
+        assert_eq!(target_duration_secs(&[PlaylistSegment::new(0, 1_979)]), 3);
+        assert_eq!(target_duration_secs(&[PlaylistSegment::new(0, 9_086)]), 10);
+        assert_eq!(target_duration_secs(&[PlaylistSegment::new(0, 1_800)]), 2);
     }
 
     #[test]

@@ -58,8 +58,9 @@ pub use gate::{
 };
 pub use scheduler::{Action, RunState, SchedulePolicy, LOOKAHEAD_SECS, RESUME_MARGIN_SEGMENTS};
 pub use transcode_cache::{
-    CacheKey, SegmentLookup, TranscodeCache, TranscodeCacheStats, CACHE_PURGE_AFTER_SECS,
-    DEFAULT_CACHE_BUDGET_BYTES, DEFAULT_CACHE_SUBDIR, GUARD_BACK_SEGMENTS,
+    muxer_playlist_segments, CacheKey, SegmentLookup, TranscodeCache, TranscodeCacheStats,
+    CACHE_PURGE_AFTER_SECS, DEFAULT_CACHE_BUDGET_BYTES, DEFAULT_CACHE_SUBDIR,
+    GUARD_BACK_SEGMENTS,
 };
 pub use vod::{render_playlist, PlaylistSegment, PLAYLIST_CONTENT_TYPE, SEGMENT_CONTENT_TYPE};
 pub use wdmm_ffmpeg::vod::{PlanAlignment, SegmentPlan};
@@ -414,6 +415,7 @@ fn derive_hls_progress(session: &HlsSession) -> HlsProgress {
 pub fn alignment_label(alignment: PlanAlignment) -> &'static str {
     match alignment {
         PlanAlignment::Exact => "exact",
+        PlanAlignment::Keyframe => "keyframe",
         PlanAlignment::Calibrated => "calibrated",
         PlanAlignment::Approx => "approx",
     }
@@ -428,7 +430,12 @@ fn playlist_segments(plan: &SegmentPlan) -> Vec<PlaylistSegment> {
 }
 
 /// `(highest complete index, number of complete files)` in a segment directory.
+///
+/// "Complete" means the muxer closed the file and listed it in its own playlist:
+/// a segment that is still being written has a file but is not listed yet, and
+/// counting it would let telemetry (and the `ended` flag) run ahead of reality.
 fn scan_segments(dir: &Path) -> (Option<u64>, u32) {
+    let closed = muxer_playlist_segments(dir);
     let Ok(read) = std::fs::read_dir(dir) else {
         return (None, 0);
     };
@@ -446,6 +453,9 @@ fn scan_segments(dir: &Path) -> (Option<u64>, u32) {
         let Ok(k) = digits.parse::<u64>() else {
             continue;
         };
+        if !closed.contains(&k) {
+            continue;
+        }
         let non_empty = entry.metadata().map(|meta| meta.len() > 0).unwrap_or(false);
         if !non_empty {
             continue;
@@ -519,7 +529,10 @@ fn probe_duration_ms(input_url: &str) -> Result<i64, String> {
 /// are rejected instead of trusted: `version` has **no** serde default, so a
 /// `plan.json` written by an older build fails to deserialize and that cache
 /// entry is dropped (see `TranscodeCache::load_plan`).
-const PLAN_FORMAT_VERSION: u32 = 2;
+///
+/// v3: the plan may now be the source's keyframe grid (`alignment: "keyframe"`),
+/// decided before any segment is written.
+const PLAN_FORMAT_VERSION: u32 = 3;
 
 /// Plan record persisted as `<cache_dir>/plan.json`.
 ///
@@ -566,6 +579,7 @@ impl StoredPlan {
         debug_assert_eq!(self.version, PLAN_FORMAT_VERSION);
         let alignment = match self.alignment.as_str() {
             "exact" => PlanAlignment::Exact,
+            "keyframe" => PlanAlignment::Keyframe,
             "calibrated" => PlanAlignment::Calibrated,
             _ => PlanAlignment::Approx,
         };
@@ -595,6 +609,14 @@ fn aligned_hls_time_ms(seg_secs: f64, gop_ms: i64) -> Option<u32> {
     let multiple = ((wanted + gop_ms - 1) / gop_ms).max(1);
     u32::try_from(multiple * gop_ms).ok()
 }
+
+/// `hls_time` (ms) that makes the HLS muxer cut on every video keyframe.
+///
+/// `hlsenc` cuts when `pkt_pts - run_start >= number * hls_time`. A 1 ms
+/// threshold is satisfied by every keyframe after the segment's first packet, so
+/// the cuts become exactly the keyframe sequence and no longer depend on where a
+/// run was started — which is what makes keyframe/transcode plans restart-safe.
+const KEYFRAME_CUT_HLS_TIME_MS: u32 = 1;
 
 /// Whether the segments the warm-up run already wrote match `plan`'s grid.
 ///
@@ -762,12 +784,29 @@ async fn spawn_run_shared(
             .get(token)
             .ok_or_else(|| ProxyError::Cache("HLS session vanished".to_string()))?;
         let start_ms = if planned {
-            session
+            let plan = session
                 .plan
                 .as_ref()
-                .ok_or_else(|| ProxyError::Cache("segment plan not ready".to_string()))?
-                .start_ms(first_k)
-                .unwrap_or(0)
+                .ok_or_else(|| ProxyError::Cache("segment plan not ready".to_string()))?;
+            let start = plan.start_ms(first_k).unwrap_or(0);
+            if first_k > 0 && plan.alignment == wdmm_ffmpeg::PlanAlignment::Keyframe {
+                // A keyframe plan's starts come from the container index, whose
+                // timestamps can lag the packet PTS (MP4 indexes store DTS), so
+                // seeking exactly to one can land on the previous keyframe. A
+                // nudge inside the interval still lands on the intended
+                // keyframe, and the muxer cuts on every keyframe, so where the
+                // run is anchored no longer changes the produced segment grid.
+                //
+                // The nudge must stay well inside *this* interval: a segment can
+                // be much shorter than the median GOP, and overshooting its end
+                // would anchor the run on a later keyframe than segment
+                // `first_k` names.
+                let gap = plan.duration_of(first_k).unwrap_or(0).max(0);
+                let half_gop = plan.gop_ms.unwrap_or(0).max(0) / 2;
+                start + (gap / 2).min(half_gop)
+            } else {
+                start
+            }
         } else {
             0
         };
@@ -1204,7 +1243,7 @@ impl ProxyHandle {
         let seg_secs = preset.hls_segment_secs.max(1) as f64;
 
         // 1. A plan persisted by an earlier session is reused as-is.
-        let plan = self
+        let mut plan = self
             .cache
             .load_plan::<StoredPlan>(&cache_key, &cache_dir)
             .map(StoredPlan::into_plan);
@@ -1212,20 +1251,40 @@ impl ProxyHandle {
             self.cache.note_hit();
         } else {
             self.cache.note_miss();
+            // 2. No cached plan: ask libav for the source's own keyframe grid in
+            //    a single container open. The playlist must match the muxer's
+            //    real cut points, otherwise a seek lands on the wrong content.
+            //    `None` (no usable index / no duration / audio-only) simply keeps
+            //    the warm-up calibration in charge, and a failure is not fatal.
+            match wdmm_ffmpeg::source_plan(&input_url, &preset) {
+                Ok(Some(source)) => {
+                    info!(
+                        "source plan: alignment={} segments={} keyframes={} video_copied={} gop_ms={:?}",
+                        alignment_label(source.plan.alignment),
+                        source.plan.segment_count(),
+                        source.keyframe_count,
+                        source.video_copied,
+                        source.plan.gop_ms,
+                    );
+                    plan = Some(source.plan);
+                }
+                Ok(None) => {
+                    info!("source plan unavailable; calibrating the muxer output");
+                }
+                Err(error) => {
+                    warn!("source plan failed ({error}); calibrating the muxer output");
+                }
+            }
         }
 
-        // 2. The media duration is needed by every plan builder.
+        // 3. The media duration is needed by every remaining plan builder.
         let duration_ms = match plan.as_ref() {
             Some(plan) => plan.duration_ms,
             None => probe_duration_ms(&input_url).map_err(ProxyError::Ffmpeg)?,
         };
 
-        // 3. Without a cached plan the warm-up run measures the real output and
-        //    `finalize_plan` builds a calibrated (or approximate) grid. There is
-        //    deliberately no container-keyframe shortcut: a sparse/absent index
-        //    (Matroska `cues`) produced a one-segment playlist for a 24-minute
-        //    file, which ended the cast after the first segment and broke
-        //    seeking. Calibration measures what the muxer actually wrote.
+        // Persist the plan that was just reused or decided from the source.
+        // Warm-up plans are persisted by `finalize_plan` once measured.
         if let Some(plan) = plan.as_ref() {
             self.cache
                 .save_plan(&cache_key, &cache_dir, &StoredPlan::from_plan(plan))?;
@@ -1234,6 +1293,20 @@ impl ProxyHandle {
         let token = new_token();
         let playlist_template = format!("/h/{token}/index.m3u8");
         let needs_warmup = plan.is_none();
+        // A calibrated plan carries the GOP it was built from, so a reused plan
+        // must keep the muxer cut interval its grid was measured with. Keyframe
+        // and transcode plans instead ask the muxer to cut on *every* keyframe
+        // (a 1 ms threshold), so the cut sequence is independent of the anchor a
+        // run was started at: restarts from any planned boundary reproduce the
+        // plan exactly. The transcode encoder is forced to emit one IDR per
+        // `segment_gop_size` frames, so that plan's grid is the same.
+        let hls_time_override_ms = plan.as_ref().and_then(|plan| match plan.alignment {
+            PlanAlignment::Calibrated => plan
+                .gop_ms
+                .and_then(|gop| aligned_hls_time_ms(seg_secs, gop)),
+            PlanAlignment::Keyframe | PlanAlignment::Exact => Some(KEYFRAME_CUT_HLS_TIME_MS),
+            PlanAlignment::Approx => None,
+        });
         {
             let mut g = self.shared.lock().unwrap();
             g.hls_sessions.insert(
@@ -1253,7 +1326,7 @@ impl ProxyHandle {
                     last_reopen: None,
                     ended: false,
                     duration_ms,
-                    hls_time_override_ms: None,
+                    hls_time_override_ms,
                     warming_started: needs_warmup.then(Instant::now),
                 },
             );
@@ -2248,6 +2321,14 @@ mod tests {
         std::fs::write(dir.join("seg0.ts"), b"x").unwrap();
         std::fs::write(dir.join("seg1.ts"), b"x").unwrap();
         std::fs::write(dir.join("seg2.ts.part"), b"x").unwrap();
+        // seg2 has a file but the muxer has not closed it yet, so it must not
+        // count towards the ready front.
+        std::fs::write(dir.join("seg2.ts"), b"x").unwrap();
+        std::fs::write(
+            dir.join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nseg0.ts\n#EXTINF:4.000,\nseg1.ts\n",
+        )
+        .unwrap();
 
         let mut session = test_session(dir.clone());
         session.plan = Some(test_plan(4.0, 10, 40_000));
@@ -2541,9 +2622,12 @@ mod tests {
             "plan must be split into segments, got {}",
             progress.segment_count
         );
+        // A source with a usable keyframe index is planned up front from the
+        // container (`keyframe`); only an unusable index falls back to measured
+        // warm-up (`calibrated`/`approx`). All three must cover the whole file.
         let alignment = progress.alignment.unwrap_or("none");
         assert!(
-            alignment == "calibrated" || alignment == "approx",
+            alignment == "keyframe" || alignment == "calibrated" || alignment == "approx",
             "unexpected alignment {alignment}"
         );
 
