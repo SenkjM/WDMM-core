@@ -57,8 +57,7 @@ pub use gate::{
 };
 pub use transcode_cache::{
     muxer_playlist_segments, CacheKey, SegmentLookup, TranscodeCache, TranscodeCacheStats,
-    CACHE_PURGE_AFTER_SECS, DEFAULT_CACHE_BUDGET_BYTES, DEFAULT_CACHE_SUBDIR,
-    GUARD_BACK_SEGMENTS,
+    CACHE_PURGE_AFTER_SECS, DEFAULT_CACHE_BUDGET_BYTES, DEFAULT_CACHE_SUBDIR, GUARD_BACK_SEGMENTS,
 };
 pub use vod::{render_playlist, PlaylistSegment, PLAYLIST_CONTENT_TYPE, SEGMENT_CONTENT_TYPE};
 pub use wdmm_ffmpeg::vod::{PlanAlignment, SegmentPlan};
@@ -581,6 +580,7 @@ async fn spawn_run_shared(
     token: &str,
     first_k: u64,
 ) -> ProxyResult<()> {
+    wdmm_ffmpeg::diag::log(format!("[proxy] hls run start at segment {first_k}"));
     let gate = { Arc::clone(&shared.lock().unwrap().gate) };
     // A previous job may have finished while its session is still alive.
     release_finished_permits(shared);
@@ -1067,10 +1067,10 @@ impl ProxyHandle {
         // A cast without a grid cannot seek, so it is refused instead of served
         // with a nominal playlist that the muxer will not follow.
         let Some(plan) = plan else {
-            let detail = plan_error.unwrap_or_else(|| {
-                "the source reports no usable duration/frame rate".to_string()
-            });
+            let detail = plan_error
+                .unwrap_or_else(|| "the source reports no usable duration/frame rate".to_string());
             let message = format!("cannot plan HLS segments for {input_url}: {detail}");
+            wdmm_ffmpeg::diag::log(format!("[proxy] hls plan refused: {message}"));
             return Err(if wdmm_ffmpeg::is_available() {
                 ProxyError::Cache(message)
             } else {
@@ -1084,6 +1084,17 @@ impl ProxyHandle {
         // a keyframe grid only holds while the video is copied, an exact grid only
         // while it is re-encoded.
         preset.remux_first = plan.alignment == PlanAlignment::Keyframe;
+        wdmm_ffmpeg::diag::log(format!(
+            "[proxy] hls plan: alignment={} segments={} seg_secs={:.2} duration_ms={} \
+             gop_ms={:?} remux_first={} cache={}",
+            alignment_label(plan.alignment),
+            plan.segment_count(),
+            plan.seg_secs,
+            plan.duration_ms,
+            plan.gop_ms,
+            preset.remux_first,
+            cache_dir.display(),
+        ));
         self.cache
             .save_plan(&cache_key, &cache_dir, &StoredPlan::from_plan(&plan))?;
 

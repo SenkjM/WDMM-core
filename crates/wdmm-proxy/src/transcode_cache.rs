@@ -516,10 +516,7 @@ mod tests {
             "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nseg0.ts\n",
         )
         .unwrap();
-        assert_eq!(
-            TranscodeCache::segment_ready(&dir, 0),
-            SegmentLookup::Ready
-        );
+        assert_eq!(TranscodeCache::segment_ready(&dir, 0), SegmentLookup::Ready);
         assert_eq!(
             TranscodeCache::segment_ready(&dir, 1),
             SegmentLookup::Missing,
