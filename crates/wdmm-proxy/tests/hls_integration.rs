@@ -1,10 +1,15 @@
-// Integration test: Real FFmpeg HLS session
+// Integration test: real libav HLS job writing into a caller-owned segment directory.
+//
+// This exercises the pull-based VOD model: the job writes `seg<k>.ts` numbered from
+// `start_number`, into a persistent `out_dir` that survives `JobHandle::drop` (the
+// transcode cache owns its lifetime). The playlist is NOT read from the muxer — the
+// proxy synthesizes it — so only segment production is asserted here.
 
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
-use wdmm_ffmpeg::{open_job, JobOpts};
 use wdmm_ffmpeg::preset;
+use wdmm_ffmpeg::{open_job, JobOpts};
 
 /// Generate a short test video using ffmpeg. Returns path to the video file.
 async fn create_test_video() -> PathBuf {
@@ -16,13 +21,20 @@ async fn create_test_video() -> PathBuf {
     // Generate a 5-second test video with color bars and tone
     let output = tokio::process::Command::new("ffmpeg")
         .args([
-            "-f", "lavfi",
-            "-i", "testsrc=duration=5:size=640x480:rate=30",
-            "-f", "lavfi",
-            "-i", "sine=frequency=1000:duration=5",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-c:a", "aac",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=5:size=640x480:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:duration=5",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
             "-y",
         ])
         .arg(&path)
@@ -30,13 +42,27 @@ async fn create_test_video() -> PathBuf {
         .await
         .expect("failed to spawn ffmpeg");
 
-    assert!(output.status.success(), "ffmpeg test video generation failed");
+    assert!(
+        output.status.success(),
+        "ffmpeg test video generation failed"
+    );
     assert!(path.exists(), "test video not created");
     path
 }
 
+fn unique_out_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "wdmm-hls-job-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
 #[tokio::test]
-async fn hls_job_produces_segments() {
+async fn hls_job_produces_numbered_segments_in_out_dir() {
     if !wdmm_ffmpeg::is_available() {
         // Nothing to transcode with: a build without the `ffmpeg` feature can
         // never open a job, so this is a skip, not a failure.
@@ -50,42 +76,56 @@ async fn hls_job_produces_segments() {
         _ => create_test_video().await,
     };
 
+    let out_dir = unique_out_dir();
     let handle = open_job(JobOpts {
         input_url: video.to_string_lossy().into_owned(),
-        preset: preset::preset_passthrough(),
+        preset: preset::preset_balanced(),
         start_offset_secs: 0.0,
-        segment_dir: PathBuf::new(), // empty → open_job auto-creates a temp dir
+        segment_dir: PathBuf::new(),
+        start_number: 0,
+        out_dir: Some(out_dir.clone()),
+        hls_time_override_ms: None,
     })
     .expect("failed to open job");
 
-    let segment_dir = handle.segment_dir().to_path_buf();
-    let playlist = segment_dir.join("index.m3u8");
-
-    // Wait for FFmpeg to write at least the playlist
-    for _ in 0..30 {
-        if playlist.exists() {
+    // The pull-based model restarts jobs at arbitrary `k`, so segment numbering
+    // must come from `start_number` and the first segments must appear promptly.
+    let mut produced = 0usize;
+    for _ in 0..300 {
+        produced = handle.ready_segments();
+        if produced >= 2 {
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
 
-    assert!(playlist.exists(), "playlist was not created");
+    assert!(
+        produced >= 2,
+        "expected at least two segments in {}, got {produced}",
+        out_dir.display()
+    );
+    assert!(
+        out_dir.join("seg0.ts").is_file(),
+        "first segment must be numbered seg0.ts"
+    );
+    assert!(
+        out_dir.join("seg1.ts").is_file(),
+        "second segment must be numbered seg1.ts"
+    );
+    let durations = handle.segment_durations();
+    assert!(
+        durations.len() >= 2 && durations.iter().all(|d| *d > 0),
+        "segment durations must be reported for calibration, got {durations:?}"
+    );
 
-    // Wait a bit longer for at least one segment
-    for _ in 0..30 {
-        let segments: Vec<_> = std::fs::read_dir(&segment_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ts"))
-            .collect();
-        if !segments.is_empty() {
-            // Success
-            drop(handle);
-            assert!(!segment_dir.exists(), "segment dir should be cleaned up on drop");
-            return;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    panic!("no segments were produced after 3 seconds");
+    drop(handle);
+    assert!(
+        out_dir.exists(),
+        "out_dir belongs to the transcode cache and must survive JobHandle::drop"
+    );
+    assert!(
+        out_dir.join("seg0.ts").is_file(),
+        "segments must survive JobHandle::drop"
+    );
+    let _ = std::fs::remove_dir_all(&out_dir);
 }

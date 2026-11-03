@@ -1,183 +1,226 @@
 # wdmm-proxy — Public API
 
-Unified local HTTP range proxy. Serves registered streams over HTTP with
-`Range` support, addressed by an unguessable token. Two back-source modes
-(local file and driver Range callback), aligned with the Dart
-`LocalStreamBridge` (`lib/services/cloud_drivers/stream_bridge.dart`).
+Unified local HTTP server with two back-source modes: token-only byte-range
+proxying (`/s/<token>`) and pull-driven HLS VOD transcode casting
+(`/h/<token>/index.m3u8`). The proxy never builds a full URL — callers compose
+`http://{host}:{port}{path_template}` from the registration plus `addr()`.
 
-## Design rules (brief §3)
+## Design rules
 
-- **Token-only register API**: `register_*` returns `Registration { token,
-  path_template }`. Callers compose `http://{bind_host}:{port}{path_template}`
-  themselves. The proxy **never** returns a full URL with scheme/host/port.
-- **No OpenAPI coupling**: the proxy knows nothing about OpenAPI. OpenAPI
-  (when enabled) may call the proxy to obtain a token for `mode=proxy`, or
-  return a signed direct upstream URL for `mode=direct`.
-- **HTTPS / custom certs**: out of scope.
-- **Idle TTL**: default 10 min; every request resets the timer; the server
-  auto-restarts on the next `register_*`.
-- **Bind**: loopback default; DLNA passes a LAN address.
-
----
+- One `ProxyHandle` per process; the server starts lazily on the first
+  `register_*` and stops after the idle timeout (default 10 minutes) or on drop.
+- Byte-range sources are either a local file or a driver callback.
+- HLS is **pull-driven VOD**: the proxy synthesises the playlist from a segment
+  plan and transcodes segments on demand into a persistent cache. There is no
+  live/push playlist and no seek call; a seek is a request for another segment
+  index, and a cached one is served immediately.
+- Doing so keeps one concurrent transcode job per process (`JobGate`), and a run
+  parks itself once it is ~60 s ahead of the newest request.
 
 ## Error types
 
-### `enum ProxyError`
-`Io(#[from] std::io::Error)`.
+### `pub enum ProxyError {`
 
-### `type ProxyResult<T> = std::result::Result<T, ProxyError>`
+- `Io(#[from] std::io::Error)`
+- `Ffmpeg(String)`
+- `Cache(String)`
+- `Busy(String)` — `"transcoding busy"` when the gate times out.
 
----
+### `pub type ProxyResult<T> = std::result::Result<T, ProxyError>;`
 
-## Types
+## Bind mode and handle
 
-### `type BoxStream`
-`Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>` — the byte stream
-returned by a driver Range callback.
+### `pub enum BindMode {`
 
-### `struct Registration`
-Result of `register_*`. Callers build the URL as
-`http://{bind_host}:{port}{path_template}`.
-Fields:
-- `token: String` — 32-hex, 128-bit random token.
-- `path_template: String` — URL path, e.g. `"/s/3f7a…"`.
+- `Loopback` — `127.0.0.1`; `LanAny` — `0.0.0.0`; `LanIf(String)` — one LAN
+  address; `Explicit(SocketAddr)` — a fixed address.
 
----
+### `pub fn to_bind_addr(&self, port: u16) -> String`
 
-## Proxy handle (`wdmm_proxy::ProxyHandle`)
+### `pub struct ProxyHandle {`
 
-Owns a lazily-started axum server. Starts on the first `register_*`; shuts down
-after the idle timeout of inactivity; restarts on the next `register_*`.
-Dropping the handle stops the server.
+- `pub fn new(bind_mode: BindMode, port: u16) -> Self` — `port = 0` lets the OS choose.
+- `pub fn with_idle_timeout(bind_mode: BindMode, port: u16, idle_timeout: Duration) -> Self`
+- `pub fn addr(&self) -> Option<SocketAddr>` — `None` until the server starts.
+- `pub fn transcode_cache(&self) -> Arc<TranscodeCache>`
+- `pub fn job_gate(&self) -> Arc<JobGate>`
+- `pub fn stop(&self)` — drops the listener; dropping the handle does the same.
 
-### `fn ProxyHandle::new(bind: SocketAddr) -> Self`
-Create a handle bound to `bind` with the default 10-minute idle timeout.
-The server is **not** started yet.
+## Byte-range registration
 
-### `fn ProxyHandle::with_idle_timeout(bind: SocketAddr, idle_timeout: Duration) -> Self`
-Create a handle with a custom idle timeout.
+### `pub type BoxStream = std::pin::Pin<Box<dyn futures_core::Stream<Item = std::io::Result<Bytes>> + Send>>;`
 
-### `fn ProxyHandle::addr(&self) -> Option<SocketAddr>`
-The bound address, or `None` when the server is not running. Use this to read
-the OS-assigned port when `bind` used port 0.
+### `pub struct Registration {`
 
-### `async fn ProxyHandle::register_file(&self, path: impl Into<PathBuf>, name: Option<String>) -> ProxyResult<Registration>`
-Register a local file. `name` is used only for Content-Type guessing
-(e.g. `"song.mp3"`); it is decorative and carries no auth. Returns a
-`Registration`; the caller composes the URL.
+- `token: String` (32-hex), `path_template: String` (e.g. `"/s/3f7a…"`).
 
-### `async fn ProxyHandle::register_driver<F>(&self, size: u64, name: Option<String>, ranges_fn: F) -> ProxyResult<Registration>`
-where `F: Fn(i64, i64) -> BoxStream + Send + Sync + 'static`.
+### `pub async fn register_file(&self, path: impl Into<PathBuf>, name: Option<String>, ttl_secs: Option<u64>, allowed_peers: Option<Vec<IpAddr>>) -> ProxyResult<Registration>`
 
-Register a driver Range callback back-source.
-- `size` — known file size in bytes; pass `0` if unknown (streamed to EOF).
-- `ranges_fn(start, end)` — `start` and `end` are **inclusive** byte offsets.
-  `end = -1` means read to EOF (size unknown).
+`name` only feeds Content-Type guessing; `ttl_secs`/`allowed_peers` are optional.
 
-### `fn ProxyHandle::unregister(&self, token: &str)`
-Revoke a token immediately.
+### `pub async fn register_driver<F>(&self, size: u64, name: Option<String>, ttl_secs: Option<u64>, allowed_peers: Option<Vec<IpAddr>>, ranges_fn: F) -> ProxyResult<Registration>`
 
-### `fn ProxyHandle::renew_callback<F>(&self, token: &str, ranges_fn: F)`
-where `F: Fn(i64, i64) -> BoxStream + Send + Sync + 'static`.
+`where F: Fn(i64, i64) -> BoxStream + Send + Sync + 'static`
 
-Replace the driver callback for an existing token (e.g. after re-auth).
-No-op if the token is unknown or its source is a local file.
+`start`/`end` are inclusive byte offsets; `end = -1` means read to EOF.
+`size = 0` when unknown.
 
-### `fn ProxyHandle::stop(&self)`
-Gracefully stop the server. The handle is still usable; the server restarts
-on the next `register_*`. Also triggered on `Drop`.
+### `pub fn renew_callback<F>(&self, token: &str, ranges_fn: F)`
 
----
+Replaces the callback for an existing token (e.g. after re-auth); no-op for an
+unknown token or a local file.
 
-## Free functions
+### `pub fn unregister(&self, token: &str)`
 
-### `fn resolve_range(header: &str, size: u64) -> Option<(u64, u64)>`
-Parse a single-range `Range` header against `size` bytes. Returns `None` when
-unsatisfiable (→ 416). Supports `a-b`, `a-` (open-ended), `-n` (suffix).
-Multi-range → unsatisfiable.
+### `pub fn revoke_token(&self, token: &str)`
 
-### `fn content_type_for(name: Option<&str>) -> &'static str`
-Guess a MIME type from a filename extension. Table matches Dart
-`LocalStreamBridge._contentTypeFor` (mp4/mkv/webm/avi/mov/ts/mp3/flac/m4a/aac/
-wav/ogg/opus; fallback `application/octet-stream`).
+Alias with security-oriented naming; in-flight requests fail on their next hit.
 
----
+### `pub fn resolve_range(header: &str, size: u64) -> Option<(u64, u64)>`
 
-## HLS session API
+Single `bytes=` range only; `None` → respond `416`.
 
-### `async fn ProxyHandle::register_hls(&self, input: impl Into<PathBuf>, mode: wdmm_ffmpeg::HlsMode) -> ProxyResult<HlsRegistration>`
-Register an HLS session for `input`.
+### `pub fn content_type_for(name: Option<&str>) -> &'static str`
 
-Calls `wdmm_ffmpeg::open_job` to create the segment directory (and, once
-vendored binaries are wired, spawn the transcode process). Use
-`HlsMode::DirectCopy` (default) for codec-compatible media and
-`HlsMode::Compat` for transcoding.
+Extension table shared with the Dart `LocalStreamBridge._contentTypeFor` table
+(includes `srt`/`ass`/`ssa`/`vtt`/`sub` as text/plain).
 
-For the 「单文件直通」 compat option, use `register_file` with byte Range instead.
+## HLS VOD sessions
 
-Returns `HlsRegistration`; callers compose:
+### `pub struct HlsSessionOpts {`
+
+- `device_id`, `input_url`, `preset: TranscodePreset`, `ttl_secs`,
+  `allowed_peers`, `cache: HlsCacheOptions`
+
+One session per `(device_id, input_url)`; a new registration replaces the old.
+
+### `pub struct HlsCacheOptions {`
+
+- `root: Option<PathBuf>` (default `<temp_dir>/wdmm-transcode`),
+  `budget_bytes: Option<u64>` (default 2 GiB),
+  `account_id`, `remote_path`, `preset_id`, `size: u64`,
+  `ident: String` (etag/mtime; empty = ephemeral, rewritten per session).
+
+### `pub fn cache_key(&self) -> CacheKey`
+
+### `pub struct HlsRegistration {`
+
+- `token`, `playlist_template` (e.g. `"/h/3f7a…/index.m3u8"`).
+
+### `pub async fn register_hls(&self, opts: HlsSessionOpts) -> ProxyResult<HlsRegistration>`
+
+Waits until the plan exists (container keyframe index, or up to 20 s of warm-up
+calibration). If calibration cannot finish in time the session starts on an
+approximate grid (alignment `approx`, `drift_ms` reported) rather than failing
+the cast. `input_url` is a local path or a loopback `http://127.0.0.1:{port}/…`
+proxy URL for encrypted sources.
+
+### `pub async fn register_hls_nowait(&self, opts: HlsSessionOpts) -> ProxyResult<HlsRegistration>`
+
+Returns immediately in a warming state; poll `hls_progress().playlist_ready`
+before pointing the renderer at the playlist.
+
+### `pub fn hls_progress(&self, token: &str) -> Option<HlsProgress>`
+
+### `pub fn unregister_hls(&self, token: &str)`
+
+Cancels the job and removes the session; the cached segments stay on disk.
+
+Segment requests wait up to 20 s for the running job (`504` on timeout, `500` on
+job error, `404` past the end). Paths are flat: `seg<k>.ts` only.
+
+## Progress and runtime state
+
+### `pub struct HlsProgress {`
+
+- Plan: `playlist_ready`, `alignment: Option<&'static str>`,
+  `plan_duration_ms: Option<i64>`, `seg_secs: f64`, `segment_count: usize`,
+  `ready_k`, `max_requested_k: Option<u64>`, `drift_ms: Option<i64>`.
+- Run: `run_state: &'static str` (`active` | `idle` | `error`), `ended`,
+  `error`, `segments: u32`, `content_ms`, `wall_ms`, `speed`, `encoder`,
+  `warnings`.
+- Cache: `cache_hits: u64`, `cache_bytes: u64`, `over_budget: bool`.
+
+`drift_ms` is only meaningful for `alignment == "approx"`; the other alignments
+do not drift. A run parks after ~60 s of lookahead (`run_state = "idle"`) and a
+segment request resumes it from the requested index.
+
+## Transcode cache
+
+`<root>/<dir_name>/plan.json` + `seg<k>.ts`, where `dir_name` is a 16-hex
+SHA-256 of the cache key.
+
+### `pub struct CacheKey {`
+
+- `account_id`, `remote_path`, `preset_id`, `size: u64`, `ident: String`.
+
+### `pub const DEFAULT_CACHE_SUBDIR: &str = "wdmm-transcode";`
+
+### `pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;`
+
+### `pub const CACHE_PURGE_AFTER_SECS: u64 = 24 * 3600;`
+
+### `pub const GUARD_BACK_SEGMENTS: u64 = 30;`
+
+### `pub struct TranscodeCache {`
+
+- `pub fn stats(&self) -> TranscodeCacheStats` (`bytes`, `budget_bytes`,
+  `entries`, `hits`, `misses`, `over_budget`)
+- `pub fn evict(&self, protect: Option<&CacheKey>)` — LRU down to 90 % of the
+  budget; the playing session is never evicted, so the cache may stay over
+  budget rather than stall the renderer.
+- `pub fn purge_stale(&self)` — drops entries untouched for 24 h.
+- `pub fn clear(&self) -> ProxyResult<()>`, `pub fn invalidate(&self, key: &CacheKey) -> ProxyResult<()>`
+- `pub fn save_plan<P: Serialize>(&self, key: &CacheKey, dir: &Path, plan: &P) -> ProxyResult<()>`
+- `pub fn load_plan<P: DeserializeOwned>(&self, key: &CacheKey, dir: &Path) -> Option<P>`
+
+## Scheduling and admission
+
+### `pub const LOOKAHEAD_SECS: f64 = 60.0;`
+
+### `pub const RESUME_MARGIN_SEGMENTS: u64 = 3;`
+
+### `pub struct SchedulePolicy {`
+
+- `new(plan_len, seg_secs)`, `lookahead()`, `decide(run, running, k) -> Action`
+  (`Serve`/`Wait`/`Start{from_k}`/`Ended`), `should_stop`, `resume_from`,
+  `within_resume_margin`.
+- `pub fn lookahead_segments(seg_secs: f64) -> u64` — `ceil(60 / seg_secs)`, min 1.
+
+### `pub const MAX_CONCURRENT_HLS_JOBS: usize = 1;`
+
+### `pub const JOB_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);`
+
+### `pub const BUSY_ERROR: &str = "transcoding busy";`
+
+### `pub struct JobGate {`
+
+- `new(max_concurrent)`, `global()`, `capacity()`, `in_use()`, `waiters()`,
+  `acquire(timeout)`, `acquire_async(timeout)`; a `JobPermit` releases on drop.
+- Busy after 15 s → `ProxyError::Busy("transcoding busy")`.
+
+## Playlist rendering
+
+### `pub const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";`
+
+### `pub const SEGMENT_CONTENT_TYPE: &str = "video/mp2t";`
+
+### `pub fn render_playlist(segments: &[PlaylistSegment]) -> String`
+
 ```text
-http://{bind_host}:{port}{playlist_template}
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-TARGETDURATION:<max ceil(seconds)>
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:<seconds.3>,
+seg<k>.ts
+...
+#EXT-X-ENDLIST
 ```
 
-### `async fn ProxyHandle::seek_hls(&self, token: &str, offset_secs: f64) -> ProxyResult<()>`
-Seek an active HLS session to `offset_secs`.
+## From Dart
 
-Kills the current transcode job and restarts it (`-ss offset_secs`). The old
-segment directory is removed when the old `JobHandle` drops. No-op if the
-token is unknown.
-
-### `fn ProxyHandle::unregister_hls(&self, token: &str)`
-Revoke an HLS session token. The transcode job is killed and the segment
-directory is cleaned up.
-
----
-
-### `struct HlsRegistration`
-Result of `register_hls`.
-
-Fields:
-- `token: String` — 32-hex, 128-bit random token.
-- `playlist_template: String` — URL path to the master playlist,
-  e.g. `"/h/3f7a…/index.m3u8"`.
-
----
-
-## HLS routes
-
-The proxy adds the following routes automatically when the server starts:
-
-| Method | Route | Description |
-|--------|-------|-------------|
-| GET | `/h/:token/index.m3u8` | Master HLS playlist (served from segment dir) |
-| GET | `/h/:token/:seg.ts` | HLS segment file |
-
-Content-Type mapping:
-- `*.m3u8` → `application/vnd.apple.mpegurl`
-- `*.ts` → `video/mp2t`
-
-Path traversal (`..`, `/` in segment name) → `400 Bad Request`.
-Unknown token → `404 Not Found`.
-
----
-
-## URL composition
-
-Callers (DLNA, OpenAPI `mode=proxy`, platform players) compose the URL
-themselves:
-
-```rust
-let reg = proxy.register_file(&path, Some("track.mp3".into())).await?;
-let addr = proxy.addr().unwrap(); // port was 0
-let url = format!("http://{addr}{}", reg.path_template);
-// → http://127.0.0.1:43221/s/3f7a…
-```
-
-For DLNA (LAN bind), use the LAN-facing host:
-
-```rust
-let url = format!("http://192.168.1.10:{}{}", addr.port(), reg.path_template);
-```
-
-The token is the only access control on a LAN bind; there is no separate auth
-layer (matching the constraint that proxy and OpenAPI are independent).
+`wdmm-ffi` exposes the process-wide handle; the Dart side composes URLs from
+`{host, port, path_template}` and drives HLS warm-up by polling
+`wdmm_dlna_session_state` for `playlist_ready`.

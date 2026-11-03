@@ -34,7 +34,8 @@ pub mod diag; // always compiled — diagnostics must work without libav
 pub mod plan; // always compiled — pure remux/hybrid decision rules, host-testable
 pub mod preset;
 pub mod subtitle; // always compiled — pure text/timing → WebVTT conversion, host-testable
-mod sys; // always compiled — preset.rs uses its pub const values (AV_CODEC_ID_*)
+mod sys;
+pub mod vod; // always compiled — pure VOD segment planning, host-testable
 
 #[cfg(feature = "ffmpeg")]
 mod transcoder;
@@ -53,6 +54,10 @@ pub use plan::{
     hybrid_audio_codec_id, remux_dropped_streams, remux_plan, remux_stream_selection, RemuxPlan,
 };
 pub use subtitle::{classify_codec, Cue, TrackKind};
+pub use vod::{
+    approximate_plan, calibration_plan, exact_plan, keyframe_index, keyframe_plan,
+    measure_gop_from_durations, KeyframeInfo, PlanAlignment, SegEntry, SegmentPlan,
+};
 pub use wdmm_core::models::TranscodePreset;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -254,6 +259,61 @@ pub fn extract_subtitle_track(_url: &str, _stream_index: u32) -> FfmpegResult<St
     ))
 }
 
+// ── Measured segment durations / segment counts ──────────────────────────────
+
+/// Read the measured segment durations (milliseconds) from a muxer-written
+/// `index.m3u8`, in playlist order.
+///
+/// This is the calibration input (§3.1): the HLS muxer records the real segment
+/// lengths as `#EXTINF` lines, which [`measure_gop_from_durations`] then turns
+/// into a GOP estimate. Returns an empty vector when the playlist does not exist
+/// yet or has no `#EXTINF` lines.
+pub fn measure_segment_durations(dir: &Path) -> Vec<i64> {
+    match std::fs::read_to_string(dir.join("index.m3u8")) {
+        Ok(playlist) => parse_extinf_durations(&playlist),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parse `#EXTINF:<secs>,` lines into milliseconds (rounded).
+fn parse_extinf_durations(playlist: &str) -> Vec<i64> {
+    let mut durations = Vec::new();
+    for line in playlist.lines() {
+        let Some(rest) = line.trim().strip_prefix("#EXTINF:") else {
+            continue;
+        };
+        let secs = rest.split(',').next().unwrap_or("").trim();
+        if let Ok(secs) = secs.parse::<f64>() {
+            if secs.is_finite() && secs >= 0.0 {
+                durations.push((secs * 1000.0).round() as i64);
+            }
+        }
+    }
+    durations
+}
+
+/// Count finished `seg<digits>.ts` files in `dir`.
+fn count_ready_segments(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| is_segment_name(&entry.file_name().to_string_lossy()))
+        .count()
+}
+
+/// Whether `name` is a finished HLS segment written by the muxer.
+fn is_segment_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("seg")
+        .and_then(|rest| rest.strip_suffix(".ts"))
+    else {
+        return false;
+    };
+    !stem.is_empty() && stem.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 // ── HLS job ───────────────────────────────────────────────────────────────────
 
 /// Options for opening a new HLS transcode/remux job.
@@ -267,7 +327,24 @@ pub struct JobOpts {
     pub start_offset_secs: f64,
     /// Caller-provided directory to write `index.m3u8` + segments into.
     /// Must exist; the job does not create it.
+    ///
+    /// Ignored when [`out_dir`](JobOpts::out_dir) is set.
     pub segment_dir: PathBuf,
+    /// Segment number of the first segment (`hlsenc start_number`). The muxer
+    /// then writes `seg<start_number>.ts`, `seg<start_number + 1>.ts`, … which
+    /// lets a pull-based job restart mid-film and cover the requested `k`.
+    pub start_number: u64,
+    /// Persistent job directory (VOD segment cache).
+    ///
+    /// When `Some`, the job writes here, creates the directory if needed, and
+    /// [`JobHandle`]'s `Drop` **does not** delete it (the cache outlives the
+    /// job). When `None`, the legacy behaviour applies: a temporary/caller
+    /// directory whose contents are removed on drop.
+    pub out_dir: Option<PathBuf>,
+    /// Override for the HLS muxer `hls_time` (seconds, decimals allowed),
+    /// expressed in milliseconds. Used after calibration to align `hls_time` to
+    /// a multiple of the measured GOP so segment cuts stop drifting.
+    pub hls_time_override_ms: Option<u32>,
 }
 
 impl Default for JobOpts {
@@ -277,6 +354,9 @@ impl Default for JobOpts {
             preset: preset::preset_passthrough(),
             start_offset_secs: 0.0,
             segment_dir: PathBuf::new(),
+            start_number: 0,
+            out_dir: None,
+            hls_time_override_ms: None,
         }
     }
 }
@@ -285,7 +365,8 @@ impl Default for JobOpts {
 ///
 /// The job writes `index.m3u8` + numbered `.ts` segments into
 /// [`segment_dir`](JobHandle::segment_dir). The proxy reads from that
-/// directory. On drop the job is cancelled and the segment directory removed.
+/// directory. On drop the job is cancelled; the directory itself is removed only
+/// for legacy jobs that own it (`JobOpts::out_dir == None`).
 #[cfg(feature = "ffmpeg")]
 #[derive(Debug)]
 pub struct JobHandle {
@@ -294,6 +375,9 @@ pub struct JobHandle {
     thread: Option<std::thread::JoinHandle<FfmpegResult<()>>>,
     /// Live progress + encoder info shared with the job thread.
     telemetry: Arc<ProgressState>,
+    /// Whether `Drop` owns (and may delete) [`segment_dir`](JobHandle::segment_dir).
+    /// False for persistent VOD cache directories (`JobOpts::out_dir`).
+    owns_dir: bool,
 }
 
 /// Stub handle used when the `ffmpeg` feature is off. `open_job` always
@@ -311,6 +395,29 @@ impl JobHandle {
     /// Directory where the job writes `index.m3u8` + segments.
     pub fn segment_dir(&self) -> &Path {
         &self.segment_dir
+    }
+
+    /// Directory the job writes into (the `JobOpts::out_dir` form).
+    ///
+    /// Identical to [`segment_dir`](JobHandle::segment_dir); both names exist
+    /// because the VOD cache side speaks in "out dirs" while the legacy proxy
+    /// path speaks in "segment dirs".
+    pub fn out_dir(&self) -> &Path {
+        &self.segment_dir
+    }
+
+    /// Number of finished `seg<k>.ts` files currently on disk.
+    ///
+    /// A non-blocking directory snapshot: the muxer may be mid-write, so this is
+    /// a lower/upper bound by at most one segment.
+    pub fn ready_segments(&self) -> usize {
+        count_ready_segments(&self.segment_dir)
+    }
+
+    /// Measured segment durations (milliseconds) from the muxer-written
+    /// `index.m3u8`, in playlist order. Empty until the first `#EXTINF` lands.
+    pub fn segment_durations(&self) -> Vec<i64> {
+        measure_segment_durations(&self.segment_dir)
     }
 
     /// Request cancellation. The background thread stops after its next loop
@@ -373,8 +480,10 @@ impl Drop for JobHandle {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        // Best-effort cleanup of the segment directory.
-        if self.segment_dir.exists() {
+        // Legacy jobs own their segment directory and clean it up. Persistent
+        // VOD cache dirs (`JobOpts::out_dir`) must survive the job: dropping a
+        // handle only cancels, it never evicts cached segments.
+        if self.owns_dir && self.segment_dir.exists() {
             let _ = std::fs::remove_dir_all(&self.segment_dir);
         }
     }
@@ -384,6 +493,15 @@ impl Drop for JobHandle {
 impl JobHandle {
     pub fn segment_dir(&self) -> &Path {
         &self.segment_dir
+    }
+    pub fn out_dir(&self) -> &Path {
+        &self.segment_dir
+    }
+    pub fn ready_segments(&self) -> usize {
+        0
+    }
+    pub fn segment_durations(&self) -> Vec<i64> {
+        Vec::new()
     }
     pub fn cancel(&self) {}
     pub fn is_running(&self) -> bool {
@@ -420,7 +538,14 @@ impl Drop for JobHandle {
 pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
     // Generate a session id for tracing; the directory is caller-provided.
     let id = format!("{:016x}", rand::random::<u64>());
-    let segment_dir = if opts.segment_dir.as_os_str().is_empty() {
+    // A persistent `out_dir` (VOD cache) is owned by the caller and survives
+    // the job; a legacy `segment_dir`/temp dir is owned (and cleaned) by the
+    // handle.
+    let owns_dir = opts.out_dir.is_none();
+    let segment_dir = if let Some(dir) = opts.out_dir.clone() {
+        std::fs::create_dir_all(&dir)?;
+        dir
+    } else if opts.segment_dir.as_os_str().is_empty() {
         let d = std::env::temp_dir().join(format!("wdmm-hls-{}", id));
         std::fs::create_dir_all(&d)?;
         d
@@ -436,6 +561,8 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
     let preset = opts.preset.clone();
     let preset_id = preset.id.clone();
     let start_offset = opts.start_offset_secs;
+    let start_number = opts.start_number;
+    let hls_time_override_ms = opts.hls_time_override_ms;
     let dir = segment_dir.clone();
 
     let thread = std::thread::Builder::new()
@@ -449,13 +576,18 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
                 cancel_t,
                 &telemetry_t,
                 &id,
+                start_number,
+                hls_time_override_ms,
             )
         })?;
 
     tracing::debug!(
-        "wdmm-ffmpeg: open_job preset={} seg_dir={}",
+        "wdmm-ffmpeg: open_job preset={} seg_dir={} start_number={} hls_time_override_ms={:?} owns_dir={}",
         preset_id,
-        segment_dir.display()
+        segment_dir.display(),
+        start_number,
+        hls_time_override_ms,
+        owns_dir
     );
 
     Ok(JobHandle {
@@ -463,6 +595,7 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
         cancel,
         thread: Some(thread),
         telemetry,
+        owns_dir,
     })
 }
 

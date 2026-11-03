@@ -2147,10 +2147,11 @@ pub extern "C" fn wdmm_proxy_unregister(token: *const std::os::raw::c_char) -> F
 
 // ── Proxy HLS FFI ─────────────────────────────────────────────────────────────
 //
-// Thin wrappers around `ProxyHandle::register_hls`, `seek_hls`, and
-// `unregister_hls`. The proxy singleton must already be started via
-// `wdmm_proxy_start`. DLNA cast takes the URL from the caller — the proxy only
-// supplies the token path; the caller composes the full URL.
+// Thin wrappers around `ProxyHandle::register_hls` and `unregister_hls`, plus
+// the transcode-cache management calls (contract §3.5, §4). The proxy singleton
+// must already be started via `wdmm_proxy_start`. DLNA cast takes the URL from
+// the caller — the proxy only supplies the token path; the caller composes the
+// full URL.
 
 // ── Transcode preset CRUD ─────────────────────────────────────────────────────
 
@@ -2261,7 +2262,25 @@ pub extern "C" fn wdmm_proxy_register_hls(
         Some(h) => h,
         None => return FfiString::from("error:proxy not started — call wdmm_proxy_start first"),
     };
-    let reg = rt().block_on(handle.register_hls(device_str, url_str, preset, None, None));
+    // Legacy binding (Dart owns the token): no cache identity is known here, so
+    // the segments stay session-local (contract §3.5, empty `ident`).
+    let opts = wdmm_proxy::HlsSessionOpts {
+        device_id: device_str.to_string(),
+        input_url: url_str.to_string(),
+        preset,
+        ttl_secs: None,
+        allowed_peers: None,
+        cache: wdmm_proxy::HlsCacheOptions {
+            root: None,
+            budget_bytes: None,
+            account_id: String::new(),
+            remote_path: url_str.to_string(),
+            preset_id: pid.to_string(),
+            size: 0,
+            ident: String::new(),
+        },
+    };
+    let reg = rt().block_on(handle.register_hls(opts));
     match reg {
         Ok(r) => {
             let addr = handle.addr();
@@ -2283,34 +2302,6 @@ pub extern "C" fn wdmm_proxy_register_hls(
     }
 }
 
-/// Seek an active HLS session to a new position.
-///
-/// Kills the current transcode job for `token` and restarts it from
-/// `offset_secs` seconds.  Returns `"ok"` or `"error:<message>"`.
-/// Caller must free the result.
-///
-/// # Safety
-/// `token` must be a valid null-terminated UTF-8 C string.
-#[no_mangle]
-pub extern "C" fn wdmm_proxy_hls_seek(
-    token: *const c_char,
-    offset_secs: f64,
-) -> FfiString {
-    let tok = match ptr_to_str(token) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid token"),
-    };
-    let guard = proxy_cell().lock().unwrap();
-    let handle = match guard.as_ref() {
-        Some(h) => h,
-        None => return FfiString::from("error:proxy not started"),
-    };
-    match rt().block_on(handle.seek_hls(tok, offset_secs)) {
-        Ok(()) => FfiString::ok(),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
-
 /// Unregister an HLS session. The transcode job is killed and the segment
 /// directory is removed. Returns `"ok"`.
 ///
@@ -2326,6 +2317,56 @@ pub extern "C" fn wdmm_proxy_unregister_hls(token: *const c_char) -> FfiString {
         h.unregister_hls(tok);
     }
     FfiString::ok()
+}
+
+/// Report the transcode cache state (contract §3.5, §4).
+///
+/// Returns JSON: `{"ok":true,"bytes":N,"budget":N,"entries":N,"hits":N,
+/// "misses":N,"over_budget":bool}` or `{"ok":false,"error":"…"}` when the
+/// proxy has not been started yet. Caller must free the result via
+/// [`wdmm_ffi_free_string`].
+#[no_mangle]
+pub extern "C" fn wdmm_transcode_cache_stats_json() -> FfiString {
+    let guard = proxy_cell().lock().unwrap();
+    let Some(handle) = guard.as_ref() else {
+        return FfiString::from(
+            serde_json::json!({"ok": false, "error": "proxy not started"}).to_string(),
+        );
+    };
+    let stats = handle.transcode_cache().stats();
+    FfiString::from(
+        serde_json::json!({
+            "ok": true,
+            "bytes": stats.bytes,
+            "budget": stats.budget_bytes,
+            "entries": stats.entries,
+            "hits": stats.hits,
+            "misses": stats.misses,
+            "over_budget": stats.over_budget,
+        })
+        .to_string(),
+    )
+}
+
+/// Delete every cached transcode segment (contract §3.5, §4).
+///
+/// Returns `{"ok":true}` on success or `{"ok":false,"error":"…"}` (including
+/// when the proxy has not been started). Caller must free the result via
+/// [`wdmm_ffi_free_string`].
+#[no_mangle]
+pub extern "C" fn wdmm_transcode_cache_clear() -> FfiString {
+    let guard = proxy_cell().lock().unwrap();
+    let Some(handle) = guard.as_ref() else {
+        return FfiString::from(
+            serde_json::json!({"ok": false, "error": "proxy not started"}).to_string(),
+        );
+    };
+    match handle.transcode_cache().clear() {
+        Ok(()) => FfiString::from(serde_json::json!({"ok": true}).to_string()),
+        Err(e) => {
+            FfiString::from(serde_json::json!({"ok": false, "error": e.to_string()}).to_string())
+        }
+    }
 }
 
 // ── Proxy stream FFI ──────────────────────────────────────────────────────────

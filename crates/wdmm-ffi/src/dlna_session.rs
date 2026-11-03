@@ -37,7 +37,9 @@ use wdmm_dlna::{
 };
 use wdmm_drivers::WdmmVfs;
 use wdmm_ffmpeg::subtitle::{classify_codec, TrackKind};
-use wdmm_proxy::{BindMode, BoxStream, HlsProgress, ProxyHandle};
+use wdmm_proxy::{
+    BindMode, BoxStream, HlsCacheOptions, HlsProgress, HlsSessionOpts, JobGate, ProxyHandle,
+};
 
 use crate::{
     create_account_driver, driver_range_stream, global_library_db, proxy_cell, ptr_to_str, rt,
@@ -80,6 +82,61 @@ const EMBEDDED_MARKER: &str = "#embedded:";
 /// Discovery timeout accepted by the extended discover call.
 const DISCOVER_MIN_MS: u64 = 200;
 const DISCOVER_MAX_MS: u64 = 10_000;
+
+/// How long a background libav job (embedded subtitle probe / track extraction)
+/// waits for the proxy's shared transcode gate (contract §3.6).
+const JOB_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Default transcode-cache budget when `cache_budget_mb` is absent (contract §3.5).
+const DEFAULT_CACHE_BUDGET_MB: u64 = 2048;
+
+/// Transcode-cache knobs carried by `config_json` (contract §3.5).
+///
+/// The cache key also feeds the account/path/preset/size of the cast; those come
+/// from the media itself and are filled in by [`prepare_media`].
+#[derive(Debug, Clone)]
+struct CacheConfig {
+    /// `cache_dir`; `None` lets the proxy pick `<temp_dir>/wdmm-transcode`.
+    root: Option<std::path::PathBuf>,
+    /// `cache_budget_mb` converted to bytes; `2048 MiB` when absent.
+    budget_bytes: u64,
+    /// `cache_ident` (etag or mtime). An empty string marks the entry
+    /// *ephemeral*: the proxy may cache segments but never reuses them across
+    /// sessions (contract §3.5).
+    ident: String,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            root: None,
+            budget_bytes: DEFAULT_CACHE_BUDGET_MB * 1024 * 1024,
+            ident: String::new(),
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Read the optional cache keys from a session `config_json`.
+    fn from_json(cfg: &Value) -> Self {
+        let root = opt_string(cfg, "cache_dir")
+            .filter(|dir| !dir.trim().is_empty())
+            .map(std::path::PathBuf::from);
+        let budget_bytes = cfg
+            .get("cache_budget_mb")
+            .and_then(Value::as_u64)
+            .filter(|mb| *mb > 0)
+            .unwrap_or(DEFAULT_CACHE_BUDGET_MB)
+            * 1024
+            * 1024;
+        let ident = opt_string(cfg, "cache_ident").unwrap_or_default();
+        Self {
+            root,
+            budget_bytes,
+            ident,
+        }
+    }
+}
 
 // ── Session registry ─────────────────────────────────────────────────────────
 
@@ -128,13 +185,35 @@ fn update_session(handle: u32, update: impl FnOnce(&mut SessionEntry)) -> bool {
 /// original source (through the loopback proxy stream) and advertises every
 /// text track as a `webvtt` candidate; bitmap tracks are listed as
 /// `bitmap-unsupported` (never silent — contract §5).
-fn spawn_embedded_probe(handle: u32, loopback_url: String, remote_path: String) {
+///
+/// The probe is a full-stream libav decode, so it must hold the proxy's shared
+/// job gate (contract §3.6): a transcode job in flight wins, and a probe that
+/// cannot get the gate within [`JOB_ACQUIRE_TIMEOUT`] is skipped with an
+/// explanation instead of running a second decode in parallel.
+fn spawn_embedded_probe(
+    handle: u32,
+    loopback_url: String,
+    remote_path: String,
+    gate: Arc<JobGate>,
+) {
     let built = std::thread::Builder::new()
         .name(format!("wdmm-subtitle-probe-{handle}"))
         .spawn(move || {
+            let permit = match gate.acquire(JOB_ACQUIRE_TIMEOUT) {
+                Ok(permit) => permit,
+                Err(e) => {
+                    let message = format!("embedded subtitle probe skipped: {e}");
+                    wdmm_ffmpeg::diag::log(format!("[subtitle] {message}"));
+                    update_session(handle, |entry| {
+                        entry.subtitle_status.message = Some(message);
+                    });
+                    return;
+                }
+            };
             let probe = match wdmm_ffmpeg::probe(&loopback_url) {
                 Ok(probe) => probe,
                 Err(e) => {
+                    drop(permit);
                     let message = format!("embedded subtitle probe failed: {e}");
                     wdmm_ffmpeg::diag::log(format!("[subtitle] {message}"));
                     update_session(handle, |entry| {
@@ -143,6 +222,7 @@ fn spawn_embedded_probe(handle: u32, loopback_url: String, remote_path: String) 
                     return;
                 }
             };
+            drop(permit);
             let tracks: Vec<SubtitleCandidate> = probe
                 .subtitles
                 .iter()
@@ -206,8 +286,9 @@ struct SubtitleCandidate {
     track: Option<u32>,
     /// libav codec name for embedded tracks; `None` for sidecars.
     codec: Option<String>,
-    /// `"external"` (sidecar), `"webvtt"` (embedded text) or
-    /// `"bitmap-unsupported"` (embedded bitmap — listed, never selectable).
+    /// `"external"` (sidecar), `"webvtt"` (embedded text),
+    /// `"bitmap-unsupported"` (embedded bitmap — listed, never selectable) or
+    /// `"error"` (the shared libav job gate was busy, contract §3.6).
     support: &'static str,
 }
 
@@ -415,6 +496,8 @@ struct SessionEntry {
     phase: SessionPhase,
     /// DIDL document handed to the renderer (re-sent by `cast`).
     didl: String,
+    /// Transcode-cache knobs for the current media (contract §3.5).
+    cache: CacheConfig,
     /// Failure reason for `phase == Failed`.
     last_error: Option<String>,
 }
@@ -912,6 +995,7 @@ async fn prepare_media(
     lan_ip: IpAddr,
     renderer: &DlnaRenderer,
     driver: Arc<dyn WdmmVfs>,
+    account_id: &str,
     remote_path: &str,
     name: &str,
     size: u64,
@@ -919,6 +1003,7 @@ async fn prepare_media(
     force_direct: bool,
     warmup: bool,
     ui_lang: &str,
+    cache: &CacheConfig,
 ) -> Result<PreparedMedia, String> {
     let size = resolve_size(Arc::clone(&driver), remote_path, size).await;
     let port = handle
@@ -965,28 +1050,28 @@ async fn prepare_media(
                     return Err(format!("transcode preset: {e}"));
                 }
             };
-            // §3: warm-up returns as soon as the job thread exists; the
+            // §3: warm-up returns as soon as the job is registered; the
             // renderer is only pointed at the playlist after `cast`.
+            let opts = HlsSessionOpts {
+                device_id: renderer.usn.clone(),
+                input_url: loopback_url.clone(),
+                preset,
+                ttl_secs: None,
+                allowed_peers: None,
+                cache: HlsCacheOptions {
+                    root: cache.root.clone(),
+                    budget_bytes: Some(cache.budget_bytes),
+                    account_id: account_id.to_string(),
+                    remote_path: remote_path.to_string(),
+                    preset_id: preset_id.to_string(),
+                    size,
+                    ident: cache.ident.clone(),
+                },
+            };
             let registered = if warmup {
-                handle
-                    .register_hls_nowait(
-                        renderer.usn.clone(),
-                        loopback_url.clone(),
-                        preset,
-                        None,
-                        None,
-                    )
-                    .await
+                handle.register_hls_nowait(opts).await
             } else {
-                handle
-                    .register_hls(
-                        renderer.usn.clone(),
-                        loopback_url.clone(),
-                        preset,
-                        None,
-                        None,
-                    )
-                    .await
+                handle.register_hls(opts).await
             };
             match registered {
                 Ok(hls) => (
@@ -1135,6 +1220,8 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
     // §3: warm-up is the default for HLS casts; `warmup:false` keeps the old
     // (blocking, up to 20 s) behaviour as an emergency switch.
     let warmup = cfg.get("warmup").and_then(Value::as_bool).unwrap_or(true);
+    // §3.5: transcode-cache location/budget/identity (all optional).
+    let cache = CacheConfig::from_json(cfg);
 
     let renderer = DlnaRenderer {
         usn: renderer_usn,
@@ -1161,6 +1248,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         lan_ip,
         &renderer,
         Arc::clone(&driver),
+        &account_id,
         &remote_path,
         &name,
         size,
@@ -1168,6 +1256,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         force_direct,
         warmup,
         &ui_lang,
+        &cache,
     )
     .await?;
 
@@ -1201,6 +1290,8 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
     };
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    // The embedded-subtitle probe shares the proxy's single-libav-job gate.
+    let probe_gate = proxy.job_gate();
     let subtitle_status = prepared.subtitle_status;
     let subtitle_status_json = subtitle_status.to_json();
     let loopback_url = prepared.loopback_url;
@@ -1232,6 +1323,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         subtitle_status,
         phase,
         didl: prepared.didl,
+        cache,
         last_error: None,
     };
     put_session(entry);
@@ -1239,7 +1331,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
     // cast, but during HLS it only gets the transcoded TS — so embedded text
     // tracks are discovered from the source in the background (contract §3).
     if prepared.provider == "hls" {
-        spawn_embedded_probe(handle, loopback_url, remote_path.clone());
+        spawn_embedded_probe(handle, loopback_url, remote_path.clone(), probe_gate);
     }
 
     Ok(json!({
@@ -1361,6 +1453,14 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
     let proxy = entry.proxy.clone();
     let driver = Arc::clone(&entry.driver);
     let lan_ip = entry.lan_ip;
+    // §3.5: the cache identity belongs to one file. Switching to another file
+    // without an explicit `cache_ident` makes the segments session-local.
+    let mut cache = entry.cache.clone();
+    if remote_path != entry.remote_path {
+        cache.ident = opt_string(cmd, "cache_ident").unwrap_or_default();
+    } else if let Some(ident) = opt_string(cmd, "cache_ident") {
+        cache.ident = ident;
+    }
 
     let wants_hls = !(force_direct || matches!(preset_id.as_deref(), Some("passthrough")));
     if wants_hls {
@@ -1375,6 +1475,7 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
         lan_ip,
         &entry.renderer,
         Arc::clone(&driver),
+        &entry.account_id,
         &remote_path,
         &name,
         size,
@@ -1382,6 +1483,7 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
         force_direct,
         false,
         &entry.ui_lang,
+        &cache,
     )
     .await?;
 
@@ -1423,13 +1525,16 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
     entry.subtitle_status = prepared.subtitle_status;
     entry.embedded_cache.clear();
     entry.didl = prepared.didl;
+    entry.cache = cache;
     entry.phase = SessionPhase::Playing;
     entry.last_error = None;
     if entry.provider == "hls" {
+        let gate = entry.proxy.job_gate();
         spawn_embedded_probe(
             entry.handle,
             entry.loopback_url.clone(),
             entry.remote_path.clone(),
+            gate,
         );
     }
     Ok(())
@@ -1579,11 +1684,19 @@ async fn select_embedded_subtitle(
         None => {
             // The background probe may still be running (or the app kept a
             // stale list): probe the source now so the track is classified.
+            // A probe is a full-stream libav decode and shares the proxy's
+            // single-job gate with transcoding (contract §3.6).
+            let gate = entry.proxy.job_gate();
             let loopback = entry.loopback_url.clone();
-            let probe = tokio::task::spawn_blocking(move || wdmm_ffmpeg::probe(&loopback))
-                .await
-                .map_err(|e| CmdError::plain(format!("subtitle probe failed: {e}")))?
-                .map_err(|e| CmdError::plain(format!("subtitle probe failed: {e}")))?;
+            let probe = tokio::task::spawn_blocking(move || {
+                let _permit = gate
+                    .acquire(JOB_ACQUIRE_TIMEOUT)
+                    .map_err(|e| format!("transcoding busy: {e}"))?;
+                wdmm_ffmpeg::probe(&loopback).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| CmdError::plain(format!("subtitle probe failed: {e}")))?
+            .map_err(|e| CmdError::plain(format!("subtitle probe failed: {e}")))?;
             let stream = probe
                 .subtitles
                 .iter()
@@ -1615,13 +1728,35 @@ async fn select_embedded_subtitle(
     let data = match entry.embedded_cache.get(&track) {
         Some(cached) => Arc::clone(cached),
         None => {
+            // Extraction decodes the whole source stream: hold the shared gate
+            // for the duration (contract §3.6).
+            let gate = entry.proxy.job_gate();
             let loopback = entry.loopback_url.clone();
-            let vtt = tokio::task::spawn_blocking(move || {
-                wdmm_ffmpeg::extract_subtitle_track(&loopback, track)
+            let extracted = tokio::task::spawn_blocking(move || {
+                let _permit = gate
+                    .acquire(JOB_ACQUIRE_TIMEOUT)
+                    .map_err(|e| format!("transcoding busy: {e}"))?;
+                wdmm_ffmpeg::extract_subtitle_track(&loopback, track).map_err(|e| e.to_string())
             })
             .await
-            .map_err(|e| CmdError::plain(format!("subtitle extraction failed: {e}")))?
             .map_err(|e| CmdError::plain(format!("subtitle extraction failed: {e}")))?;
+            let vtt = match extracted {
+                Ok(vtt) => vtt,
+                Err(e) => {
+                    // Busy/timed-out extraction is reported against this track
+                    // (`support:"error"`), never by silently running a second
+                    // libav job in parallel.
+                    wdmm_ffmpeg::diag::log(format!("[subtitle] extraction failed: {e}"));
+                    if let Some(stale) = entry
+                        .subtitle_candidates
+                        .iter_mut()
+                        .find(|candidate| candidate.track == Some(track))
+                    {
+                        stale.support = "error";
+                    }
+                    return Err(CmdError::plain(format!("subtitle extraction failed: {e}")));
+                }
+            };
             let data = Arc::new(vtt.into_bytes());
             entry.embedded_cache.insert(track, Arc::clone(&data));
             data
@@ -1710,12 +1845,13 @@ fn state_json(
     // Only meaningful once the job has produced at least 3 s of media.
     let estimated_realtime = estimate_realtime(content_ms, speed);
     let warnings = progress.map(|p| p.warnings.clone()).unwrap_or_default();
-    json!({
+    let duration_ms = vod_duration_ms(entry.provider, progress, tick.duration_ms);
+    let mut doc = json!({
         "ok": true,
         "state": if tick.ended { "ended" } else { "casting" },
         "transport": tick.transport,
         "position_ms": tick.position_ms,
-        "duration_ms": tick.duration_ms,
+        "duration_ms": duration_ms,
         "current_path": entry.remote_path,
         "current_name": entry.name,
         "provider": entry.provider,
@@ -1744,6 +1880,62 @@ fn state_json(
         "audio_encoder": encoder.audio,
         "encode_warnings": warnings,
         "diagnostics": wdmm_ffmpeg::diag::tail(40),
+    });
+    // ── contract §3.3–§3.6 VOD scheduler + cache telemetry ──────────────────
+    if let (Value::Object(doc), Value::Object(vod)) = (&mut doc, vod_telemetry(progress)) {
+        doc.extend(vod);
+    }
+    doc
+}
+
+/// `duration_ms` for one state tick (contract §4).
+///
+/// An HLS cast owns its duration from the segment plan — the renderer's
+/// `CurrentTrackDuration` is 0 while the playlist is still warming. A direct
+/// cast keeps the renderer's value verbatim.
+fn vod_duration_ms(provider: &str, progress: Option<&HlsProgress>, tick_ms: i64) -> i64 {
+    if provider == "hls" {
+        progress.and_then(|p| p.plan_duration_ms).unwrap_or(tick_ms)
+    } else {
+        tick_ms
+    }
+}
+
+/// VOD scheduler + transcode-cache telemetry (contract §3.3–§3.6, §4).
+///
+/// A direct cast has no transcode job, so every counter falls back to a neutral
+/// value there (`run_state:"idle"`, `alignment:null`, zeros).
+fn vod_telemetry(progress: Option<&HlsProgress>) -> Value {
+    let run_state = progress.map_or("idle", |p| p.run_state);
+    let alignment = progress
+        .and_then(|p| p.alignment)
+        .map_or(Value::Null, Value::from);
+    let drift_ms = progress
+        .and_then(|p| p.drift_ms)
+        .map_or(Value::Null, Value::from);
+    let ready_segments = progress.map_or(0, |p| p.segments as u64);
+    let seg_count = progress.map_or(0, |p| p.segment_count as u64);
+    let seg_secs = progress.map_or(0.0, |p| p.seg_secs);
+    let lookahead_segments = if seg_secs > 0.0 {
+        // LOOKAHEAD_SEGMENTS = ceil(60 s / seg_secs) (contract §3.4).
+        (60.0_f64 / seg_secs).ceil() as u64
+    } else {
+        0
+    };
+    let cache_hits = progress.map_or(0, |p| p.cache_hits);
+    let cache_bytes = progress.map_or(0, |p| p.cache_bytes);
+    let cache_over_budget = progress.is_some_and(|p| p.over_budget);
+    json!({
+        "run_state": run_state,
+        "alignment": alignment,
+        "drift_ms": drift_ms,
+        "ready_segments": ready_segments,
+        "seg_count": seg_count,
+        "seg_secs": seg_secs,
+        "lookahead_segments": lookahead_segments,
+        "cache_hits": cache_hits,
+        "cache_bytes": cache_bytes,
+        "cache_over_budget": cache_over_budget,
     })
 }
 
@@ -1755,14 +1947,20 @@ fn state_json(
 /// ```json
 /// {"renderer_location":"http://…/desc.xml","renderer_usn":"uuid:…",
 ///  "account_id":"…","remote_path":"/dir/movie.mkv","name":"movie.mkv",
-///  "size":123,"preset_id":null,"force_direct":true,"warmup":true,"ui_lang":"zh"}
+///  "size":123,"preset_id":null,"force_direct":true,"warmup":true,"ui_lang":"zh",
+///  "cache_dir":null,"cache_budget_mb":2048,"cache_ident":"<etag|mtime>"}
 /// ```
+///
+/// The optional transcode-cache keys (contract §3.5) map to
+/// `HlsCacheOptions`: `cache_dir` (default `<temp>/wdmm-transcode`),
+/// `cache_budget_mb` (default 2048 MiB) and `cache_ident` (etag or mtime; an
+/// absent value keeps the segments session-local, never reused across casts).
 ///
 /// `warmup` defaults to `true`: an HLS cast then starts the transcode and
 /// returns immediately with `"phase":"warming"`; the caller polls
 /// [`wdmm_dlna_session_state`] and sends `{"cmd":"cast"}` once
-/// `playlist_ready` is true. `"warmup":false` restores the old behaviour of
-/// blocking up to 20 s for the playlist. Direct casts ignore `warmup` and
+/// `playlist_ready` is true. `"warmup":false` blocks until the proxy has the
+/// playlist (bounded by the proxy's own wait). Direct casts ignore `warmup` and
 /// always return `"phase":"playing"`.
 ///
 /// Returns `{"ok":true,"handle":N,"url":"…","provider":"direct"|"hls",
@@ -1805,11 +2003,19 @@ pub extern "C" fn wdmm_dlna_session_start(config_json: *const c_char) -> FfiStri
 ///
 /// Every subtitle candidate also carries `embedded` (bool), `track`
 /// (AV stream index or null), `codec` (libav codec name or null) and
-/// `support` (`"external"`, `"webvtt"` or `"bitmap-unsupported"`).
+/// `support` (`"external"`, `"webvtt"`, `"bitmap-unsupported"` or `"error"`).
 /// `subtitle_status` is `{text_tracks, bitmap_tracks, bitmap_note, message}`:
 /// `bitmap_note` is non-null only for an HLS cast with bitmap tracks (they are
 /// dropped — text subtitles only), and `message` explains a failed/timed-out
-/// sidecar scan. All keys are additive.
+/// sidecar scan or a skipped embedded probe. All keys are additive.
+///
+/// The VOD scheduler / cache telemetry from contract §3.3–§3.6 is additive
+/// too: `run_state` (`"active"`/`"idle"`/`"error"`), `alignment`
+/// (`"exact"`/`"keyframe"`/`"calibrated"`/`"approx"` or null), `drift_ms`
+/// (int or null), `ready_segments`, `seg_count`, `seg_secs`,
+/// `lookahead_segments`, `cache_hits`, `cache_bytes` and `cache_over_budget`.
+/// For an HLS cast `duration_ms` comes from the segment plan (a warming
+/// renderer reports 0); a direct cast keeps the renderer's value.
 /// Returns `{"ok":false,"error":"…"}` for an unknown handle / renderer failure.
 #[no_mangle]
 pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString {
@@ -2392,6 +2598,125 @@ mod tests {
         assert_eq!(estimate_realtime(2_999, 2.0), None);
         assert_eq!(estimate_realtime(3_000, 1.0), Some(true));
         assert_eq!(estimate_realtime(3_000, 0.99), Some(false));
+    }
+
+    // ── contract §3.3–§3.6: VOD telemetry + transcode cache ──────────────────
+
+    fn sample_progress() -> HlsProgress {
+        HlsProgress {
+            playlist_ready: true,
+            segments: 9,
+            content_ms: 54_000,
+            wall_ms: 60_000,
+            speed: 0.9,
+            ended: false,
+            error: None,
+            encoder: Default::default(),
+            warnings: Vec::new(),
+            run_state: "active",
+            alignment: Some("calibrated"),
+            ready_k: Some(8),
+            max_requested_k: Some(6),
+            plan_duration_ms: Some(7_200_000),
+            // floor would give 5, ceil gives 4 — pins the LOOKAHEAD rule.
+            seg_secs: 13.6,
+            segment_count: 530,
+            drift_ms: Some(-250),
+            cache_hits: 12,
+            cache_bytes: 34_000_000,
+            over_budget: true,
+        }
+    }
+
+    #[test]
+    fn vod_telemetry_is_neutral_without_a_transcode_job() {
+        let value = vod_telemetry(None);
+        assert_eq!(value["run_state"], "idle");
+        assert!(value["alignment"].is_null());
+        assert!(value["drift_ms"].is_null());
+        assert_eq!(value["ready_segments"], 0);
+        assert_eq!(value["seg_count"], 0);
+        assert_eq!(value["seg_secs"], 0.0);
+        assert_eq!(value["lookahead_segments"], 0);
+        assert_eq!(value["cache_hits"], 0);
+        assert_eq!(value["cache_bytes"], 0);
+        assert_eq!(value["cache_over_budget"], false);
+    }
+
+    #[test]
+    fn vod_telemetry_mirrors_the_proxy_progress() {
+        let value = vod_telemetry(Some(&sample_progress()));
+        assert_eq!(value["run_state"], "active");
+        assert_eq!(value["alignment"], "calibrated");
+        assert_eq!(value["drift_ms"], -250);
+        assert_eq!(value["ready_segments"], 9);
+        assert_eq!(value["seg_count"], 530);
+        assert_eq!(value["seg_secs"], 13.6);
+        // ceil(60 / 13.6) = 5
+        assert_eq!(value["lookahead_segments"], 5);
+        assert_eq!(value["cache_hits"], 12);
+        assert_eq!(value["cache_bytes"], 34_000_000);
+        assert_eq!(value["cache_over_budget"], true);
+    }
+
+    #[test]
+    fn vod_duration_comes_from_the_plan_only_for_hls() {
+        let progress = sample_progress();
+        assert_eq!(
+            vod_duration_ms("hls", Some(&progress), 0),
+            7_200_000,
+            "HLS takes the plan duration, not the renderer's 0"
+        );
+        assert_eq!(vod_duration_ms("hls", None, 12_345), 12_345);
+        assert_eq!(
+            vod_duration_ms("direct", Some(&progress), 12_345),
+            12_345,
+            "direct keeps the renderer value"
+        );
+    }
+
+    #[test]
+    fn cache_config_uses_contract_defaults() {
+        let defaults = CacheConfig::from_json(&json!({}));
+        assert!(defaults.root.is_none());
+        assert_eq!(defaults.budget_bytes, 2048 * 1024 * 1024);
+        assert!(defaults.ident.is_empty(), "no ident => ephemeral segments");
+
+        let configured = CacheConfig::from_json(&json!({
+            "cache_dir": "E:\\cache\\wdmm",
+            "cache_budget_mb": 512,
+            "cache_ident": "etag-1234",
+        }));
+        assert_eq!(
+            configured.root.as_deref(),
+            Some(std::path::Path::new("E:\\cache\\wdmm"))
+        );
+        assert_eq!(configured.budget_bytes, 512 * 1024 * 1024);
+        assert_eq!(configured.ident, "etag-1234");
+
+        // A blank directory / zero budget fall back to the defaults.
+        let blanks = CacheConfig::from_json(&json!({"cache_dir": "  ", "cache_budget_mb": 0}));
+        assert!(blanks.root.is_none());
+        assert_eq!(blanks.budget_bytes, 2048 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cache_ffi_reports_not_started_as_json() {
+        // Both cache APIs are session-style JSON even though they are not
+        // `wdmm_dlna_session_*` (contract §4); never the `error:` prefix.
+        // Another test may have the process-wide proxy running in parallel —
+        // only the not-started path is asserted here.
+        if proxy_cell().lock().unwrap().is_some() {
+            return;
+        }
+        let stats = json_of(crate::wdmm_transcode_cache_stats_json());
+        assert_eq!(stats["ok"], false);
+        assert_eq!(stats["error"], "proxy not started");
+        assert!(stats.get("bytes").is_none());
+
+        let cleared = json_of(crate::wdmm_transcode_cache_clear());
+        assert_eq!(cleared["ok"], false);
+        assert_eq!(cleared["error"], "proxy not started");
     }
 
     #[test]

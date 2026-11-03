@@ -28,7 +28,7 @@
 
 use axum::{
     body::Body,
-    extract::{Path, State, ConnectInfo},
+    extract::{ConnectInfo, Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::get,
@@ -36,17 +36,33 @@ use axum::{
 };
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::net::{SocketAddr, IpAddr};
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::io::ReaderStream;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+mod gate;
+mod scheduler;
+mod transcode_cache;
+mod vod;
+
+pub use gate::{JobGate, JobPermit, BUSY_ERROR, JOB_ACQUIRE_TIMEOUT, MAX_CONCURRENT_HLS_JOBS};
+pub use scheduler::{Action, RunState, SchedulePolicy, LOOKAHEAD_SECS, RESUME_MARGIN_SEGMENTS};
+pub use transcode_cache::{
+    CacheKey, SegmentLookup, TranscodeCache, TranscodeCacheStats, CACHE_PURGE_AFTER_SECS,
+    DEFAULT_CACHE_BUDGET_BYTES, DEFAULT_CACHE_SUBDIR, GUARD_BACK_SEGMENTS,
+};
+pub use vod::{render_playlist, PlaylistSegment, PLAYLIST_CONTENT_TYPE, SEGMENT_CONTENT_TYPE};
+pub use wdmm_ffmpeg::vod::{PlanAlignment, SegmentPlan};
+
+/// Preset type re-exported for callers that build [`HlsSessionOpts`].
+pub use wdmm_ffmpeg::TranscodePreset;
 /// Progress telemetry re-exported from [`wdmm_ffmpeg`] so callers (FFI) only
 /// depend on this crate for cast progress.
 pub use wdmm_ffmpeg::{EncoderInfo, ProgressSnapshot};
@@ -59,6 +75,10 @@ pub enum ProxyError {
     Io(#[from] std::io::Error),
     #[error("ffmpeg error: {0}")]
     Ffmpeg(String),
+    #[error("transcode cache error: {0}")]
+    Cache(String),
+    #[error("{0}")]
+    Busy(String),
 }
 
 pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
@@ -130,27 +150,90 @@ struct TokenMeta {
 
 // ── HLS session ───────────────────────────────────────────────────────────────
 
-/// An active HLS transcode session keyed by a proxy-assigned token.
-///
-/// Dropped (killing the underlying process and removing the segment directory)
-/// when `unregister_hls` is called or when replaced by a seek restart.
-struct HlsSession {
-    /// Directory where the transcode job writes `index.m3u8` + numbered segments.
-    segment_dir: std::path::PathBuf,
-    /// Active transcode job. Replaced atomically on seek.
-    job: wdmm_ffmpeg::JobHandle,
-    /// Original input URL (file path or http loopback URL) — for seek restarts.
-    input_url: String,
-    /// Transcode preset — preserved for seek restarts.
-    preset: wdmm_ffmpeg::TranscodePreset,
-    /// Set once the transcode thread has finished and its result was taken.
-    job_ended: bool,
-    /// The job's error text (only when it ended with an error). Cached because
-    /// `JobHandle::take_result` consumes the join handle.
-    job_error: Option<String>,
+/// Cache configuration for one HLS session (contract §3.5).
+#[derive(Debug, Clone, Default)]
+pub struct HlsCacheOptions {
+    /// Cache root; `None` → `<temp_dir>/wdmm-transcode`.
+    pub root: Option<PathBuf>,
+    /// Budget in bytes; `None` → 2 GiB.
+    pub budget_bytes: Option<u64>,
+    pub account_id: String,
+    pub remote_path: String,
+    pub preset_id: String,
+    pub size: u64,
+    /// Stable file identity (etag, or an mtime string). Empty = ephemeral key.
+    pub ident: String,
 }
 
-/// Result of a successful `register_hls` call.
+impl HlsCacheOptions {
+    /// Identity this session's segments are cached under.
+    pub fn cache_key(&self) -> CacheKey {
+        CacheKey::new(
+            &self.account_id,
+            &self.remote_path,
+            &self.preset_id,
+            self.size,
+            &self.ident,
+        )
+    }
+}
+
+/// Everything needed to register one HLS cast session.
+#[derive(Debug, Clone)]
+pub struct HlsSessionOpts {
+    pub device_id: String,
+    pub input_url: String,
+    pub preset: TranscodePreset,
+    pub ttl_secs: Option<u64>,
+    pub allowed_peers: Option<Vec<IpAddr>>,
+    pub cache: HlsCacheOptions,
+}
+
+/// One running transcode job plus its bookkeeping.
+struct HlsRun {
+    job: wdmm_ffmpeg::JobHandle,
+    /// First segment index this job was asked to produce.
+    first_k: u64,
+    /// Highest segment index known to be complete.
+    ready_k: u64,
+    /// The job reached the end of the media.
+    ended: bool,
+    /// Global-job-gate permit; released when the run is dropped.
+    _permit: JobPermit,
+}
+
+/// An active HLS VOD session keyed by a proxy token.
+///
+/// The transcode job no longer owns the playlist: the playlist is synthesized
+/// from [`SegmentPlan`] and segments are produced on demand. Dropping the
+/// session kills the job but leaves its cached segments on disk (contract §3.5).
+struct HlsSession {
+    /// Segment plan; `None` while the calibration warm-up is still running.
+    plan: Option<Arc<SegmentPlan>>,
+    cache: Arc<TranscodeCache>,
+    cache_key: CacheKey,
+    cache_dir: PathBuf,
+    preset: TranscodePreset,
+    input_url: String,
+    seg_secs: f64,
+    run: Option<HlsRun>,
+    /// Error text of the last failed run.
+    job_error: Option<String>,
+    /// Newest segment index the renderer asked for.
+    max_requested_k: u64,
+    /// Cache hits served for this session.
+    hits: u64,
+    /// Last job (re)start; at most one reopen per [`HLS_REOPEN_INTERVAL`].
+    last_reopen: Option<Instant>,
+    /// The plan has been fully produced.
+    ended: bool,
+    /// Probed media duration, needed while building the plan.
+    duration_ms: i64,
+    /// `hls_time` override (ms) once calibration aligned the grid to the GOP.
+    hls_time_override_ms: Option<u32>,
+}
+
+/// Result of a successful [`ProxyHandle::register_hls`] call.
 ///
 /// Callers compose the playlist URL as:
 /// ```text
@@ -165,60 +248,96 @@ pub struct HlsRegistration {
     pub playlist_template: String,
 }
 
-/// Live progress of one HLS transcode session (§2 / §7.3).
+/// Live progress of one HLS session.
 #[derive(Debug, Clone)]
 pub struct HlsProgress {
-    /// `index.m3u8` exists and is non-empty.
+    /// The segment plan exists, so the playlist can be served.
     pub playlist_ready: bool,
-    /// Number of `seg*.ts` files already on disk.
+    /// Number of `seg*.ts` files already on disk for this session.
     pub segments: u32,
-    /// Media time written so far (monotonic).
+    /// Media time produced so far (monotonic).
     pub content_ms: i64,
     /// Wall-clock time since the job thread started.
     pub wall_ms: u64,
     /// `content_ms / wall_ms`; `0.0` before the wall clock starts.
     pub speed: f64,
-    /// The transcode thread has finished.
+    /// The plan has been fully produced.
     pub ended: bool,
-    /// Error text when the thread ended with an error.
+    /// Error text when the job failed.
     pub error: Option<String>,
     /// Encoder selection actually used (§7.3).
     pub encoder: EncoderInfo,
     /// Deduplicated encoder warnings, capped at 8 (§7.3).
     pub warnings: Vec<String>,
+    /// `"active"` (job running) / `"idle"` (parked, runway sufficient) / `"error"`.
+    pub run_state: &'static str,
+    /// Plan alignment strategy, when the plan exists.
+    pub alignment: Option<&'static str>,
+    /// Highest segment index known complete.
+    pub ready_k: Option<u64>,
+    /// Newest segment index the renderer asked for.
+    pub max_requested_k: Option<u64>,
+    /// Media duration from the plan (FFI `duration_ms` source).
+    pub plan_duration_ms: Option<i64>,
+    /// Nominal segment length.
+    pub seg_secs: f64,
+    /// Number of segments in the plan.
+    pub segment_count: usize,
+    /// `(actual produced media ms) - (planned ms)` at the ready front.
+    pub drift_ms: Option<i64>,
+    /// Cache hits served for this session.
+    pub cache_hits: u64,
+    /// Bytes attributed to this session's cache directory.
+    pub cache_bytes: u64,
+    /// Cache accounting is over budget because the play guard band is kept.
+    pub over_budget: bool,
 }
 
-/// Derive [`HlsProgress`] from a segment directory + job telemetry.
+/// Derive [`HlsProgress`] from a live session.
 ///
-/// Reads the filesystem directly (no per-segment synchronization state): the
-/// job thread is the only writer, so a directory listing is enough.
-fn derive_hls_progress(
-    segment_dir: &std::path::Path,
-    snapshot: ProgressSnapshot,
-    ended: bool,
-    error: Option<String>,
-    encoder: EncoderInfo,
-    warnings: Vec<String>,
-) -> HlsProgress {
-    let playlist_ready = std::fs::metadata(segment_dir.join("index.m3u8"))
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+/// Reads the cache directory directly: the job thread is the only writer, so a
+/// directory listing is enough to know which segments are complete.
+fn derive_hls_progress(session: &HlsSession) -> HlsProgress {
+    let (ready_k, ready_count) = scan_segments(&session.cache_dir);
+    let plan = session.plan.as_deref();
+    let plan_len = plan.map(|p| p.segment_count() as u64).unwrap_or(0);
 
-    let mut segments = 0u32;
-    if let Ok(entries) = std::fs::read_dir(segment_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("seg") && name.ends_with(".ts") {
-                segments += 1;
-            }
+    let (content_ms, wall_ms, encoder, warnings, running) = match session.run.as_ref() {
+        Some(run) => {
+            let snapshot = run.job.progress();
+            (
+                snapshot.content_ms,
+                snapshot.wall_ms,
+                run.job.encoder_info(),
+                run.job.warnings(),
+                run.job.is_running(),
+            )
         }
-    }
+        None => (0, 0, EncoderInfo::default(), Vec::new(), false),
+    };
 
-    let speed = if snapshot.wall_ms == 0 {
+    // Planned media time up to and including the ready front.
+    let planned_ms = plan
+        .map(|p| {
+            let last = ready_k
+                .unwrap_or(0)
+                .min(p.segment_count().saturating_sub(1) as u64);
+            p.entries
+                .iter()
+                .take(last as usize + 1)
+                .map(|entry| entry.duration_ms)
+                .sum::<i64>()
+        })
+        .unwrap_or(0);
+    let content_ms = if planned_ms > 0 {
+        planned_ms
+    } else {
+        content_ms
+    };
+    let speed = if wall_ms == 0 {
         0.0
     } else {
-        snapshot.content_ms as f64 / snapshot.wall_ms as f64
+        content_ms as f64 / wall_ms as f64
     };
 
     // Deduplicate while preserving order, keep at most 8.
@@ -235,68 +354,437 @@ fn derive_hls_progress(
         })
         .collect();
 
+    let run_state = if session.job_error.is_some() {
+        "error"
+    } else if running {
+        "active"
+    } else {
+        "idle"
+    };
+
+    let cache_stats = session.cache.stats();
+    let drift_ms = session.run.as_ref().and_then(|run| {
+        plan.map(|plan| {
+            let planned_start = plan.start_ms(run.ready_k).unwrap_or(0);
+            let snapshot = run.job.progress();
+            snapshot.content_ms - planned_start
+        })
+    });
+
     HlsProgress {
-        playlist_ready,
-        segments,
-        content_ms: snapshot.content_ms,
-        wall_ms: snapshot.wall_ms,
+        playlist_ready: session.plan.is_some(),
+        segments: ready_count,
+        content_ms,
+        wall_ms,
         speed,
-        ended,
-        error,
+        ended: session.ended
+            || (plan.is_some() && plan_len > 0 && ready_k.unwrap_or(0) + 1 >= plan_len),
+        error: session.job_error.clone(),
         encoder,
         warnings,
+        run_state,
+        alignment: plan.map(|plan| alignment_label(plan.alignment)),
+        ready_k,
+        max_requested_k: Some(session.max_requested_k),
+        plan_duration_ms: plan.map(|plan| plan.duration_ms),
+        seg_secs: session.seg_secs,
+        segment_count: plan_len as usize,
+        drift_ms,
+        cache_hits: session.hits,
+        cache_bytes: session.cache.bytes_of(&session.cache_key),
+        over_budget: cache_stats.over_budget,
     }
 }
 
-/// How long [`ProxyHandle::register_hls`] waits for the transcode job to write
-/// its first `index.m3u8`.
+/// Human/FFI label of a plan alignment.
+pub fn alignment_label(alignment: PlanAlignment) -> &'static str {
+    match alignment {
+        PlanAlignment::Exact => "exact",
+        PlanAlignment::Keyframe => "keyframe",
+        PlanAlignment::Calibrated => "calibrated",
+        PlanAlignment::Approx => "approx",
+    }
+}
+
+/// Playlist lines for a plan.
+fn playlist_segments(plan: &SegmentPlan) -> Vec<PlaylistSegment> {
+    plan.entries
+        .iter()
+        .map(|entry| PlaylistSegment::new(entry.start_ms, entry.duration_ms))
+        .collect()
+}
+
+/// `(highest complete index, number of complete files)` in a segment directory.
+fn scan_segments(dir: &Path) -> (Option<u64>, u32) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return (None, 0);
+    };
+    let mut ready_k: Option<u64> = None;
+    let mut count = 0u32;
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix("seg") else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(".ts") else {
+            continue;
+        };
+        let Ok(k) = digits.parse::<u64>() else {
+            continue;
+        };
+        let non_empty = entry.metadata().map(|meta| meta.len() > 0).unwrap_or(false);
+        if !non_empty {
+            continue;
+        }
+        count = count.saturating_add(1);
+        ready_k = Some(ready_k.map_or(k, |current| current.max(k)));
+    }
+    (ready_k, count)
+}
+
+/// How long [`ProxyHandle::register_hls`] waits for the pull scheduler to have a
+/// playable plan (keyframe index, or the calibration warm-up segments).
 ///
 /// Renderers fetch the playlist the moment `SetAVTransportURI` returns (Kodi
-/// does it in ~50 ms), so returning before the muxer has created the file makes
-/// the renderer see `404` and abort playback.
-const HLS_PLAYLIST_TIMEOUT: Duration = Duration::from_secs(20);
+/// does it in ~50 ms), so returning before the plan exists makes the renderer
+/// see `404` and abort playback.
+const HLS_PLAN_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long [`serve_hls`] waits for a file that is not on disk yet before
-/// answering `404`. A running transcode keeps appending segments, so a fetch
-/// can legitimately arrive a few hundred ms before the file exists.
-const HLS_SEGMENT_WAIT: Duration = Duration::from_secs(5);
+/// How long [`serve_hls`] waits for a segment the running job is about to
+/// produce before answering `504`.
+///
+/// A 504 with an explicit error is far better than 404: the renderer retries a
+/// 5xx, while a 404 makes it drop the session. The window must cover one job
+/// restart plus one segment: a restart re-opens the input (~2.5 s on a remote
+/// WebDAV source) and the first segment then needs `seg_secs` of *content*
+/// time, which on a software encoder can take several seconds of wall time.
+/// Renderers hold the connection open for this long, so err generous.
+const HLS_SEGMENT_WAIT: Duration = Duration::from_secs(20);
 
-/// Poll interval used by both HLS waits.
+/// Poll interval used by the HLS waits.
 const HLS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Block until `dir/index.m3u8` exists and is non-empty.
+/// Warm-up segments produced before the GOP interval can be measured.
 ///
-/// Fails fast when the transcode thread exits first (unsupported input, missing
-/// codec) rather than burning the full timeout, and reports the job's own error
-/// text so callers can surface it to the user.
-async fn wait_for_playlist(
-    dir: &std::path::Path,
-    job: &mut wdmm_ffmpeg::JobHandle,
-) -> Result<(), String> {
-    let playlist = dir.join("index.m3u8");
-    let deadline = tokio::time::Instant::now() + HLS_PLAYLIST_TIMEOUT;
-    loop {
-        if let Ok(meta) = tokio::fs::metadata(&playlist).await {
-            if meta.len() > 0 {
-                return Ok(());
-            }
+/// Two durations are enough to reveal the grid (`measure_gop_from_durations`
+/// needs ≥ 2); the third gives the measurement a chance to reject unstable
+/// output. Every extra segment costs a full `seg_secs` of *content* time before
+/// the playlist exists, so this stays as small as the maths allows.
+const CALIBRATION_SEGMENTS: u64 = 3;
+
+/// Minimum interval between two transcode job (re)starts of one session.
+const HLS_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Total media duration the plan is sized for, from a probe result.
+fn probe_duration_ms(input_url: &str) -> Result<i64, String> {
+    let probe = wdmm_ffmpeg::probe(input_url).map_err(|e| e.to_string())?;
+    if probe.duration_secs <= 0.0 {
+        return Err("probe returned no duration".to_string());
+    }
+    Ok((probe.duration_secs * 1000.0).round() as i64)
+}
+
+/// Plan record persisted as `<cache_dir>/plan.json`.
+///
+/// `SegmentPlan` itself lives in `wdmm-ffmpeg` and is not `serde`-derived, so
+/// the proxy owns the stable on-disk shape.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredPlan {
+    duration_ms: i64,
+    seg_secs: f64,
+    alignment: String,
+    gop_ms: Option<i64>,
+    entries: Vec<StoredSeg>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredSeg {
+    start_ms: i64,
+    duration_ms: i64,
+}
+
+impl StoredPlan {
+    fn from_plan(plan: &SegmentPlan) -> Self {
+        Self {
+            duration_ms: plan.duration_ms,
+            seg_secs: plan.seg_secs,
+            alignment: alignment_label(plan.alignment).to_string(),
+            gop_ms: plan.gop_ms,
+            entries: plan
+                .entries
+                .iter()
+                .map(|entry| StoredSeg {
+                    start_ms: entry.start_ms,
+                    duration_ms: entry.duration_ms,
+                })
+                .collect(),
         }
-        if !job.is_running() {
-            return Err(match job.take_result() {
-                Some(Err(e)) => {
-                    format!("transcode job failed before writing the HLS playlist: {e}")
+    }
+
+    fn into_plan(self) -> SegmentPlan {
+        let alignment = match self.alignment.as_str() {
+            "exact" => PlanAlignment::Exact,
+            "keyframe" => PlanAlignment::Keyframe,
+            "calibrated" => PlanAlignment::Calibrated,
+            _ => PlanAlignment::Approx,
+        };
+        SegmentPlan {
+            duration_ms: self.duration_ms,
+            seg_secs: self.seg_secs,
+            alignment,
+            gop_ms: self.gop_ms,
+            entries: self
+                .entries
+                .into_iter()
+                .map(|entry| wdmm_ffmpeg::vod::SegEntry {
+                    start_ms: entry.start_ms,
+                    duration_ms: entry.duration_ms,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `hls_time` (ms) aligned to a whole number of GOPs, never below `seg_secs`.
+fn aligned_hls_time_ms(seg_secs: f64, gop_ms: i64) -> Option<u32> {
+    if gop_ms <= 0 {
+        return None;
+    }
+    let wanted = (seg_secs * 1000.0).round() as i64;
+    let multiple = ((wanted + gop_ms - 1) / gop_ms).max(1);
+    u32::try_from(multiple * gop_ms).ok()
+}
+
+/// Build the segment plan from the warm-up run once enough segments exist.
+///
+/// Returns whether the session has a plan afterwards.
+fn finalize_plan(session: &mut HlsSession) -> bool {
+    if session.plan.is_some() {
+        return true;
+    }
+    let Some(run) = session.run.as_ref() else {
+        return false;
+    };
+    let durations = run.job.segment_durations();
+    if durations.len() < CALIBRATION_SEGMENTS as usize && run.job.is_running() {
+        return false;
+    }
+    let plan = match wdmm_ffmpeg::vod::measure_gop_from_durations(&durations) {
+        Some(gop) if gop > 0 => {
+            session.hls_time_override_ms = aligned_hls_time_ms(session.seg_secs, gop);
+            wdmm_ffmpeg::vod::calibration_plan(session.duration_ms, session.seg_secs, gop)
+        }
+        _ => wdmm_ffmpeg::vod::approximate_plan(session.duration_ms, session.seg_secs),
+    };
+    if let Err(e) = session.cache.save_plan(
+        &session.cache_key,
+        &session.cache_dir,
+        &StoredPlan::from_plan(&plan),
+    ) {
+        error!("failed to persist HLS segment plan: {e}");
+    }
+    session.plan = Some(Arc::new(plan));
+    true
+}
+
+/// Last-resort plan when warm-up cannot deliver enough segments in time.
+///
+/// A VOD playlist cannot change its segment grid once the renderer has read it,
+/// so an already started session never upgrades to a better alignment. Failing
+/// the whole cast is worse than an approximate grid: playback starts, and
+/// `alignment: "approx"` plus `drift_ms` tell the UI the seek accuracy is
+/// limited (contract §3.1).
+fn fallback_to_approximate_plan(session: &mut HlsSession) -> bool {
+    if session.plan.is_some() {
+        return true;
+    }
+    let plan = wdmm_ffmpeg::vod::approximate_plan(session.duration_ms, session.seg_secs);
+    if let Err(e) = session.cache.save_plan(
+        &session.cache_key,
+        &session.cache_dir,
+        &StoredPlan::from_plan(&plan),
+    ) {
+        error!("failed to persist approximate HLS segment plan: {e}");
+    }
+    warn!(
+        "calibration did not finish within {}s; using the approximate segment grid",
+        HLS_PLAN_TIMEOUT.as_secs()
+    );
+    session.plan = Some(Arc::new(plan));
+    true
+}
+
+/// Start (or restart) a session's transcode run. See
+/// [`ProxyHandle::spawn_run`].
+async fn spawn_run_shared(
+    shared: &Arc<Mutex<Shared>>,
+    token: &str,
+    first_k: u64,
+    planned: bool,
+) -> ProxyResult<()> {
+    let gate = { Arc::clone(&shared.lock().unwrap().gate) };
+    let permit = gate
+        .acquire_async(JOB_ACQUIRE_TIMEOUT)
+        .await
+        .map_err(|error| {
+            if let Ok(mut g) = shared.lock() {
+                if let Some(session) = g.hls_sessions.get_mut(token) {
+                    session.job_error = Some(error.clone());
                 }
-                _ => "transcode job exited before writing the HLS playlist".to_string(),
-            });
+            }
+            ProxyError::Busy(error)
+        })?;
+
+    let (input_url, preset, cache_dir, start_ms, hls_time_override_ms) = {
+        let g = shared.lock().unwrap();
+        let session = g
+            .hls_sessions
+            .get(token)
+            .ok_or_else(|| ProxyError::Cache("HLS session vanished".to_string()))?;
+        let start_ms = if planned {
+            session
+                .plan
+                .as_ref()
+                .ok_or_else(|| ProxyError::Cache("segment plan not ready".to_string()))?
+                .start_ms(first_k)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        (
+            session.input_url.clone(),
+            session.preset.clone(),
+            session.cache_dir.clone(),
+            start_ms,
+            session.hls_time_override_ms,
+        )
+    };
+
+    let job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+        input_url,
+        preset,
+        start_offset_secs: start_ms as f64 / 1000.0,
+        segment_dir: cache_dir.clone(),
+        start_number: first_k,
+        out_dir: Some(cache_dir),
+        hls_time_override_ms,
+    })
+    .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
+
+    let mut g = shared.lock().unwrap();
+    if let Some(session) = g.hls_sessions.get_mut(token) {
+        session.run = Some(HlsRun {
+            job,
+            first_k,
+            ready_k: first_k,
+            ended: false,
+            _permit: permit,
+        });
+        session.last_reopen = Some(Instant::now());
+        if session.job_error.as_deref() == Some(BUSY_ERROR) {
+            session.job_error = None;
+        }
+    }
+    Ok(())
+}
+
+/// Park a run that is far enough ahead of the newest request (contract §3.4).
+fn park_run_shared(shared: &Arc<Mutex<Shared>>, token: &str, requested_k: u64) {
+    let mut g = shared.lock().unwrap();
+    let Some(session) = g.hls_sessions.get_mut(token) else {
+        return;
+    };
+    let Some(plan) = session.plan.clone() else {
+        return;
+    };
+    let Some(run) = session.run.as_ref() else {
+        return;
+    };
+    let front = scan_segments(&session.cache_dir).0.unwrap_or(run.first_k);
+    let policy = SchedulePolicy::new(plan.segment_count() as u64, session.seg_secs);
+    let state = RunState {
+        first_k: run.first_k,
+        ready_k: front,
+        ended: run.ended,
+    };
+    if policy.should_stop(state, requested_k) {
+        info!("HLS run parked at segment {front} (requested {requested_k})");
+        session.run = None;
+    }
+}
+
+/// Wait until a session's segment plan exists (calibration done / index read).
+async fn wait_for_plan_shared(
+    shared: &Arc<Mutex<Shared>>,
+    token: &str,
+) -> Result<Arc<SegmentPlan>, (StatusCode, String)> {
+    let deadline = tokio::time::Instant::now() + HLS_PLAN_TIMEOUT;
+    loop {
+        let action = {
+            let mut g = shared.lock().unwrap();
+            let Some(session) = g.hls_sessions.get_mut(token) else {
+                return Err((StatusCode::NOT_FOUND, "unknown HLS session".to_string()));
+            };
+            if let Some(plan) = session.plan.clone() {
+                Ok(plan)
+            } else if let Some(err) = session.job_error.clone() {
+                Err((StatusCode::INTERNAL_SERVER_ERROR, err))
+            } else if finalize_plan(session) {
+                Ok(session.plan.clone().expect("plan just finalized"))
+            } else if session.run.is_none() {
+                Err((StatusCode::SERVICE_UNAVAILABLE, String::new()))
+            } else if session
+                .run
+                .as_ref()
+                .map(|run| !run.job.is_running())
+                .unwrap_or(false)
+            {
+                let error = session
+                    .run
+                    .as_mut()
+                    .and_then(|run| match run.job.take_result() {
+                        Some(Err(e)) => Some(e.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "transcode job exited before calibration".to_string());
+                session.job_error = Some(error.clone());
+                Err((StatusCode::INTERNAL_SERVER_ERROR, error))
+            } else {
+                Err((StatusCode::SERVICE_UNAVAILABLE, String::new()))
+            }
+        };
+        match action {
+            Ok(plan) => return Ok(plan),
+            Err((status, message))
+                if message.is_empty() && status == StatusCode::SERVICE_UNAVAILABLE =>
+            {
+                // Warm-up not started yet → kick it.
+                if let Err(e) = spawn_run_shared(shared, token, 0, false).await {
+                    return Err((StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+                }
+            }
+            Err((status, message)) => return Err((status, message)),
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "timed out after {}s waiting for the HLS playlist",
-                HLS_PLAYLIST_TIMEOUT.as_secs()
-            ));
+            // Warm-up too slow: start the session on the approximate grid
+            // instead of failing the whole cast.
+            let mut g = shared.lock().unwrap();
+            let Some(session) = g.hls_sessions.get_mut(token) else {
+                return Err((StatusCode::NOT_FOUND, "unknown HLS session".to_string()));
+            };
+            fallback_to_approximate_plan(session);
+            return Ok(session.plan.clone().expect("plan just finalized"));
         }
         tokio::time::sleep(HLS_POLL_INTERVAL).await;
     }
+}
+
+/// Parse `seg<k>.ts` into `k`.
+fn parse_segment_index(seg: &str) -> Option<u64> {
+    seg.strip_prefix("seg")
+        .and_then(|rest| rest.strip_suffix(".ts"))
+        .and_then(|digits| digits.parse::<u64>().ok())
 }
 
 // ── Shared server state ───────────────────────────────────────────────────────
@@ -316,6 +804,8 @@ struct Shared {
     /// Drop the old sender to cancel the previous idle task; assign new one.
     idle_cancel_tx: Option<oneshot::Sender<()>>,
     idle_timeout: Duration,
+    /// Global transcode admission gate (also reached from the router).
+    gate: Arc<JobGate>,
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -349,6 +839,10 @@ pub struct ProxyHandle {
     #[allow(dead_code)]
     idle_timeout: Duration,
     shared: Arc<Mutex<Shared>>,
+    /// Segment cache shared by every HLS session of this process.
+    cache: Arc<TranscodeCache>,
+    /// Global transcode admission gate (also used by FFI subtitle extraction).
+    gate: Arc<JobGate>,
 }
 
 impl ProxyHandle {
@@ -361,6 +855,8 @@ impl ProxyHandle {
 
     /// Create a handle with a custom idle timeout.
     pub fn with_idle_timeout(bind_mode: BindMode, port: u16, idle_timeout: Duration) -> Self {
+        let cache = Arc::new(TranscodeCache::default());
+        let gate = JobGate::global();
         let shared = Arc::new(Mutex::new(Shared {
             entries: HashMap::new(),
             token_meta: HashMap::new(),
@@ -370,8 +866,26 @@ impl ProxyHandle {
             shutdown_tx: None,
             idle_cancel_tx: None,
             idle_timeout,
+            gate: Arc::clone(&gate),
         }));
-        Self { bind_mode, port, idle_timeout, shared }
+        Self {
+            bind_mode,
+            port,
+            idle_timeout,
+            shared,
+            cache,
+            gate,
+        }
+    }
+
+    /// Segment cache backing every HLS session of this handle.
+    pub fn transcode_cache(&self) -> Arc<TranscodeCache> {
+        Arc::clone(&self.cache)
+    }
+
+    /// Global transcode admission gate (shared with FFI subtitle extraction).
+    pub fn job_gate(&self) -> Arc<JobGate> {
+        Arc::clone(&self.gate)
     }
 
     /// Return the bound `SocketAddr`, or `None` when the server is not running.
@@ -396,7 +910,10 @@ impl ProxyHandle {
         allowed_peers: Option<Vec<IpAddr>>,
     ) -> ProxyResult<Registration> {
         let path = path.into();
-        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         self.insert_entry(
             Entry {
                 name,
@@ -490,80 +1007,89 @@ impl ProxyHandle {
     /// `allowed_peers` — optional IP whitelist; `None` = any peer allowed.
     ///
     /// Returns an [`HlsRegistration`] with a `playlist_template` ready to serve.
-    pub async fn register_hls(
-        &self,
-        device_id: impl Into<String>,
-        input_url: impl Into<String>,
-        preset: wdmm_ffmpeg::TranscodePreset,
-        ttl_secs: Option<u64>,
-        allowed_peers: Option<Vec<IpAddr>>,
-    ) -> ProxyResult<HlsRegistration> {
-        self.start_hls_session(device_id, input_url, preset, ttl_secs, allowed_peers, true)
-            .await
+    pub async fn register_hls(&self, opts: HlsSessionOpts) -> ProxyResult<HlsRegistration> {
+        self.start_hls_session(opts, true).await
     }
 
-    /// Start an HLS transcode session **without** waiting for the playlist.
+    /// Start an HLS VOD session **without** waiting for the plan.
     ///
-    /// This is the warm-up path of contract §3: the FFI returns a `warming`
+    /// This is the warm-up path of contract §3.4: the FFI returns a `warming`
     /// phase to the UI and only points the renderer at `index.m3u8` once
-    /// [`hls_progress`](Self::hls_progress) reports `playlist_ready` (the
-    /// `cast` command). [`register_hls`](Self::register_hls) keeps blocking
-    /// until the playlist exists for callers that need the old guarantee.
-    pub async fn register_hls_nowait(
-        &self,
-        device_id: impl Into<String>,
-        input_url: impl Into<String>,
-        preset: wdmm_ffmpeg::TranscodePreset,
-        ttl_secs: Option<u64>,
-        allowed_peers: Option<Vec<IpAddr>>,
-    ) -> ProxyResult<HlsRegistration> {
-        self.start_hls_session(device_id, input_url, preset, ttl_secs, allowed_peers, false)
-            .await
+    /// [`hls_progress`](Self::hls_progress) reports `playlist_ready`.
+    /// [`register_hls`](Self::register_hls) keeps blocking until the plan (and
+    /// thus the playlist) can be served.
+    pub async fn register_hls_nowait(&self, opts: HlsSessionOpts) -> ProxyResult<HlsRegistration> {
+        self.start_hls_session(opts, false).await
     }
 
     /// Shared implementation of [`register_hls`](Self::register_hls) and
     /// [`register_hls_nowait`](Self::register_hls_nowait).
     async fn start_hls_session(
         &self,
-        device_id: impl Into<String>,
-        input_url: impl Into<String>,
-        preset: wdmm_ffmpeg::TranscodePreset,
-        ttl_secs: Option<u64>,
-        allowed_peers: Option<Vec<IpAddr>>,
-        wait_for_playlist_file: bool,
+        opts: HlsSessionOpts,
+        wait_plan: bool,
     ) -> ProxyResult<HlsRegistration> {
         self.ensure_server().await?;
-        let device_id = device_id.into();
-        let input_url = input_url.into();
+        let HlsSessionOpts {
+            device_id,
+            input_url,
+            preset,
+            ttl_secs,
+            allowed_peers,
+            cache,
+        } = opts;
+        self.cache.configure(cache.root.clone(), cache.budget_bytes);
+        let mut cache_key = cache.cache_key();
+        if cache_key.is_ephemeral() {
+            // No etag/mtime identity ⇒ never reuse another session's segments.
+            cache_key.ident = new_token();
+        }
 
-        // Check if there's already a transcode for this device+media pair
+        // One session per device+media pair (the old run is replaced).
         let old_token = {
             let g = self.shared.lock().unwrap();
-            g.device_media_map.get(&(device_id.clone(), input_url.clone())).cloned()
+            g.device_media_map
+                .get(&(device_id.clone(), input_url.clone()))
+                .cloned()
         };
-
-        // Kill the old session if it exists
         if let Some(token) = old_token {
             info!("replacing existing HLS session for device={device_id}, input={input_url}");
             self.unregister_hls(&token);
         }
 
-        let mut job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
-            input_url: input_url.clone(),
-            preset: preset.clone(),
-            start_offset_secs: 0.0,
-            segment_dir: PathBuf::new(),
-        })
-        .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
-        let segment_dir = job.segment_dir.clone();
-        // The renderer fetches the playlist as soon as we hand it the URL, so
-        // the file must exist before this call returns — unless the caller is
-        // the §3 warm-up path, which waits for `playlist_ready` in the UI.
-        if wait_for_playlist_file {
-            wait_for_playlist(&segment_dir, &mut job)
-                .await
-                .map_err(ProxyError::Ffmpeg)?;
+        let cache_dir = self.cache.prepare(&cache_key)?;
+        let seg_secs = preset.hls_segment_secs.max(1) as f64;
+
+        // 1. A plan persisted by an earlier session is reused as-is.
+        let mut plan = self
+            .cache
+            .load_plan::<StoredPlan>(&cache_key, &cache_dir)
+            .map(StoredPlan::into_plan);
+        if plan.is_some() {
+            self.cache.note_hit();
+        } else {
+            self.cache.note_miss();
         }
+
+        // 2. The media duration is needed by every plan builder.
+        let duration_ms = match plan.as_ref() {
+            Some(plan) => plan.duration_ms,
+            None => probe_duration_ms(&input_url).map_err(ProxyError::Ffmpeg)?,
+        };
+
+        // 3. copy/hybrid sources with a container index get a drift-free grid.
+        if plan.is_none() && wdmm_ffmpeg::vod::keyframe_index_available() {
+            if let Ok(index) = wdmm_ffmpeg::vod::keyframe_index(&input_url) {
+                if !index.is_empty() {
+                    plan = Some(wdmm_ffmpeg::keyframe_plan(duration_ms, seg_secs, &index));
+                }
+            }
+        }
+        if let Some(plan) = plan.as_ref() {
+            self.cache
+                .save_plan(&cache_key, &cache_dir, &StoredPlan::from_plan(plan))?;
+        }
+
         let token = new_token();
         let playlist_template = format!("/h/{token}/index.m3u8");
         {
@@ -571,71 +1097,131 @@ impl ProxyHandle {
             g.hls_sessions.insert(
                 token.clone(),
                 HlsSession {
-                    segment_dir,
-                    job,
-                    input_url: input_url.clone(),
+                    plan: plan.map(Arc::new),
+                    cache: Arc::clone(&self.cache),
+                    cache_key,
+                    cache_dir,
                     preset,
-                    job_ended: false,
+                    input_url: input_url.clone(),
+                    seg_secs,
+                    run: None,
                     job_error: None,
+                    max_requested_k: 0,
+                    hits: 0,
+                    last_reopen: None,
+                    ended: false,
+                    duration_ms,
+                    hls_time_override_ms: None,
                 },
             );
-            g.device_media_map.insert((device_id, input_url), token.clone());
+            g.device_media_map
+                .insert((device_id, input_url), token.clone());
             let now = SystemTime::now();
-            let expires_at = ttl_secs.map(|t| now + Duration::from_secs(t));
-            g.token_meta.insert(token.clone(), TokenMeta {
-                created_at: now,
-                expires_at,
-                allowed_peers,
-            });
+            let expires_at = ttl_secs.map(|ttl| now + Duration::from_secs(ttl));
+            g.token_meta.insert(
+                token.clone(),
+                TokenMeta {
+                    created_at: now,
+                    expires_at,
+                    allowed_peers,
+                },
+            );
             arm_idle_timer(&mut g, Arc::clone(&self.shared));
         }
-        Ok(HlsRegistration { token, playlist_template })
-    }
 
-    /// Seek an active HLS session to `offset_secs`.
-    ///
-    /// Kills the current transcode job and restarts it with `-ss offset_secs`.
-    /// The old segment directory is removed when the old [`JobHandle`] drops.
-    /// No-op if the token is unknown.
-    pub async fn seek_hls(&self, token: &str, offset_secs: f64) -> ProxyResult<()> {
-        // Extract input_url + preset without holding the lock across an await point.
-        let (input_url, preset) = {
-            let g = self.shared.lock().unwrap();
-            match g.hls_sessions.get(token) {
-                None => return Ok(()),
-                Some(s) => (s.input_url.clone(), s.preset.clone()),
-            }
-        };
-        let mut new_job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
-            input_url: input_url.clone(),
-            preset: preset.clone(),
-            start_offset_secs: offset_secs,
-            segment_dir: PathBuf::new(),
-        })
-        .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
-        let new_segment_dir = new_job.segment_dir.clone();
-        // Same rule as `register_hls`: the renderer refetches `index.m3u8`
-        // immediately after the seek, so the new playlist must already exist.
-        // On failure the old session (and its playlist) stays untouched.
-        wait_for_playlist(&new_segment_dir, &mut new_job)
-            .await
-            .map_err(ProxyError::Ffmpeg)?;
-        // Atomically replace the session — old job drops here, killing the old process.
-        let mut g = self.shared.lock().unwrap();
-        if let Some(session) = g.hls_sessions.get_mut(token) {
-            session.segment_dir = new_segment_dir;
-            session.job = new_job;
-            session.job_ended = false;
-            session.job_error = None;
+        if wait_plan {
+            self.wait_for_plan(&token).await?;
         }
-        Ok(())
+        Ok(HlsRegistration {
+            token,
+            playlist_template,
+        })
     }
 
-    /// Revoke an HLS session token. The transcode job is killed and the
-    /// segment directory is removed (on [`JobHandle`] drop).
+    /// Drive the calibration warm-up until a plan exists (or the timeout hits).
+    async fn wait_for_plan(&self, token: &str) -> ProxyResult<()> {
+        enum Step {
+            Ready,
+            Failed(String),
+            NeedRun,
+            Wait,
+        }
+        let deadline = tokio::time::Instant::now() + HLS_PLAN_TIMEOUT;
+        loop {
+            // Decide under the lock, act after dropping it: no guard is held
+            // across `spawn_run().await`.
+            let step = {
+                let mut g = self.shared.lock().unwrap();
+                let Some(session) = g.hls_sessions.get_mut(token) else {
+                    return Err(ProxyError::Cache("HLS session vanished".to_string()));
+                };
+                if session.plan.is_some() {
+                    Step::Ready
+                } else if let Some(err) = session.job_error.clone() {
+                    Step::Failed(err)
+                } else if finalize_plan(session) {
+                    Step::Ready
+                } else {
+                    let run_done = session
+                        .run
+                        .as_ref()
+                        .map(|run| !run.job.is_running())
+                        .unwrap_or(false);
+                    if run_done {
+                        let error = session
+                            .run
+                            .as_mut()
+                            .and_then(|run| match run.job.take_result() {
+                                Some(Err(e)) => Some(e.to_string()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| {
+                                "transcode job exited before calibration".to_string()
+                            });
+                        session.job_error = Some(error.clone());
+                        Step::Failed(error)
+                    } else if session.run.is_none() {
+                        Step::NeedRun
+                    } else {
+                        Step::Wait
+                    }
+                }
+            };
+            match step {
+                Step::Ready => return Ok(()),
+                Step::Failed(err) => return Err(ProxyError::Ffmpeg(err)),
+                Step::NeedRun => self.spawn_run(token, 0, false).await?,
+                Step::Wait => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Warm-up too slow: start on the approximate grid rather than
+                // failing the cast (see `fallback_to_approximate_plan`).
+                let mut g = self.shared.lock().unwrap();
+                let Some(session) = g.hls_sessions.get_mut(token) else {
+                    return Err(ProxyError::Cache("HLS session vanished".to_string()));
+                };
+                fallback_to_approximate_plan(session);
+                return Ok(());
+            }
+            tokio::time::sleep(HLS_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Start (or restart) the session's transcode run so it produces from
+    /// `first_k` on.
+    ///
+    /// `planned` = the plan exists and `first_k`'s planned start offset is used;
+    /// otherwise the run is a calibration warm-up starting at the media head.
+    async fn spawn_run(&self, token: &str, first_k: u64, planned: bool) -> ProxyResult<()> {
+        spawn_run_shared(&self.shared, token, first_k, planned).await
+    }
+
+    /// Revoke an HLS session token across the registry.
+    ///
+    /// The transcode job is cancelled; the cached segments stay on disk
+    /// (contract §3.5: `unregister_hls` does not touch the cache).
     pub fn unregister_hls(&self, token: &str) {
         let mut g = self.shared.lock().unwrap();
-        // Remove from device_media_map by scanning for the token
         g.device_media_map.retain(|_, t| t != token);
         g.hls_sessions.remove(token);
         g.token_meta.remove(token);
@@ -644,30 +1230,24 @@ impl ProxyHandle {
     /// Live progress of an HLS session (§2 / §7.3), or `None` for unknown
     /// tokens.
     ///
-    /// Sync: reads the segment directory + the job's shared telemetry, and
-    /// caches the job result once the thread has finished (calling
-    /// `take_result` twice would lose the error text).
+    /// Sync: reads the cache directory + the job's shared telemetry, and caches
+    /// the job result once the thread has finished (calling `take_result` twice
+    /// would lose the error text).
     pub fn hls_progress(&self, token: &str) -> Option<HlsProgress> {
         let mut g = self.shared.lock().unwrap();
         let session = g.hls_sessions.get_mut(token)?;
-        if !session.job_ended && !session.job.is_running() {
-            session.job_ended = true;
-            session.job_error = match session.job.take_result() {
-                Some(Err(e)) => Some(e.to_string()),
-                _ => None,
-            };
+        // A warm-up run finishes calibration on its own; pick that up here so a
+        // poller sees `playlist_ready` without waiting for a segment request.
+        finalize_plan(session);
+        if let Some(run) = session.run.as_mut() {
+            if !run.job.is_running() {
+                run.ended = true;
+                if let Some(Err(e)) = run.job.take_result() {
+                    session.job_error = Some(e.to_string());
+                }
+            }
         }
-        let snapshot = session.job.progress();
-        let encoder = session.job.encoder_info();
-        let warnings = session.job.warnings();
-        Some(derive_hls_progress(
-            &session.segment_dir,
-            snapshot,
-            session.job_ended,
-            session.job_error.clone(),
-            encoder,
-            warnings,
-        ))
+        Some(derive_hls_progress(session))
     }
 
     /// Gracefully stop the proxy. The handle is still usable; the server will
@@ -699,14 +1279,20 @@ impl ProxyHandle {
             g.entries.insert(token.clone(), entry);
             let now = SystemTime::now();
             let expires_at = ttl_secs.map(|t| now + Duration::from_secs(t));
-            g.token_meta.insert(token.clone(), TokenMeta {
-                created_at: now,
-                expires_at,
-                allowed_peers,
-            });
+            g.token_meta.insert(
+                token.clone(),
+                TokenMeta {
+                    created_at: now,
+                    expires_at,
+                    allowed_peers,
+                },
+            );
             arm_idle_timer(&mut g, Arc::clone(&self.shared));
         }
-        Ok(Registration { token, path_template })
+        Ok(Registration {
+            token,
+            path_template,
+        })
     }
 
     async fn ensure_server(&self) -> ProxyResult<()> {
@@ -727,9 +1313,14 @@ impl ProxyHandle {
 
         let shared_for_cleanup = Arc::clone(&self.shared);
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
-                .await
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
             {
                 error!("wdmm-proxy: server error: {e}");
             }
@@ -795,26 +1386,26 @@ pub fn content_type_for(name: Option<&str>) -> &'static str {
         .and_then(|n| n.rfind('.').map(|i| &n[i + 1..]))
         .unwrap_or("");
     match ext.to_ascii_lowercase().as_str() {
-        "mp4" | "m4v"  => "video/mp4",
-        "mkv"          => "video/x-matroska",
-        "webm"         => "video/webm",
-        "avi"          => "video/x-msvideo",
-        "mov"          => "video/quicktime",
-        "ts"           => "video/mp2t",
-        "mp3"          => "audio/mpeg",
-        "flac"         => "audio/flac",
-        "m4a"          => "audio/mp4",
-        "aac"          => "audio/aac",
-        "wav"          => "audio/wav",
+        "mp4" | "m4v" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+        "ts" => "video/mp2t",
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
         "ogg" | "opus" => "audio/ogg",
         // Subtitle sidecars and generated WebVTT, served to the DLNA renderer.
         // Kodi matches the MIME *subtype* against its subtitle formats.
-        "srt"          => "text/srt",
-        "ass"          => "text/ass",
-        "ssa"          => "text/ssa",
-        "vtt"          => "text/vtt",
-        "sub"          => "text/sub",
-        _              => "application/octet-stream",
+        "srt" => "text/srt",
+        "ass" => "text/ass",
+        "ssa" => "text/ssa",
+        "vtt" => "text/vtt",
+        "sub" => "text/sub",
+        _ => "application/octet-stream",
     }
 }
 
@@ -853,7 +1444,7 @@ pub fn resolve_range(header: &str, size: u64) -> Option<(u64, u64)> {
 async fn serve(
     State(shared): State<Arc<Mutex<Shared>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path(token): Path<String>,
+    AxumPath(token): AxumPath<String>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     // Extract what we need and reset the idle timer — all under one lock.
@@ -883,7 +1474,7 @@ async fn serve(
 
         let entry = g.entries.get(&token).ok_or(StatusCode::NOT_FOUND)?;
         let src = match &entry.source {
-            BackSource::LocalFile(p)      => Src::File(p.clone()),
+            BackSource::LocalFile(p) => Src::File(p.clone()),
             BackSource::DriverCallback(f) => Src::Cb(Arc::clone(f)),
         };
         let ct = content_type_for(entry.name.as_deref());
@@ -903,7 +1494,7 @@ async fn serve(
 
     match src {
         Src::File(path) => serve_file(builder, path, size, range_hdr.as_deref()).await,
-        Src::Cb(cb)     => serve_callback(builder, cb, size, range_hdr.as_deref()),
+        Src::Cb(cb) => serve_callback(builder, cb, size, range_hdr.as_deref()),
     }
 }
 
@@ -920,7 +1511,11 @@ async fn serve_file(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .len();
-    let size = if registered_size > 0 { registered_size } else { file_size };
+    let size = if registered_size > 0 {
+        registered_size
+    } else {
+        file_size
+    };
 
     match range_hdr.map(|h| resolve_range(h, size)) {
         None => builder
@@ -992,78 +1587,190 @@ fn serve_callback(
 async fn serve_hls(
     State(shared): State<Arc<Mutex<Shared>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path((token, seg)): Path<(String, String)>,
-) -> Result<Response, StatusCode> {
+    AxumPath((token, seg)): AxumPath<(String, String)>,
+) -> Result<Response, (StatusCode, String)> {
     // Reject path traversal attempts — HLS segment names are always flat.
     if seg.contains('/') || seg.contains("..") {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((StatusCode::BAD_REQUEST, "invalid HLS path".to_string()));
     }
 
-    let (segment_dir, content_type) = {
+    {
         let mut g = shared.lock().unwrap();
-
-        // Validate token expiration
+        if !g.hls_sessions.contains_key(&token) {
+            return Err((StatusCode::NOT_FOUND, "unknown HLS session".to_string()));
+        }
         if let Some(meta) = g.token_meta.get(&token) {
             if let Some(expires_at) = meta.expires_at {
                 if SystemTime::now() > expires_at {
-                    // Token expired — cleanup and return 401
                     g.hls_sessions.remove(&token);
                     g.token_meta.remove(&token);
-                    return Err(StatusCode::UNAUTHORIZED);
+                    return Err((StatusCode::UNAUTHORIZED, "HLS token expired".to_string()));
                 }
             }
             if let Some(ref whitelist) = meta.allowed_peers {
                 if !whitelist.contains(&peer.ip()) {
-                    return Err(StatusCode::FORBIDDEN);
+                    return Err((StatusCode::FORBIDDEN, "peer not allowed".to_string()));
                 }
             }
         }
-
-        let session = g.hls_sessions.get(&token).ok_or(StatusCode::NOT_FOUND)?;
-        let segment_dir = session.segment_dir.clone();
-        let ct: &'static str = if seg.ends_with(".m3u8") {
-            "application/vnd.apple.mpegurl"
-        } else {
-            "video/mp2t"
-        };
         arm_idle_timer(&mut g, Arc::clone(&shared));
-        (segment_dir, ct)
-    };
-
-    let file_path = segment_dir.join(&seg);
-    // A running transcode appends segments as it goes, so a request can arrive
-    // slightly before the file is flushed. Wait briefly instead of 404-ing: a
-    // single early 404 makes the renderer drop the whole session.
-    let wants_playlist = seg.ends_with(".m3u8");
-    let deadline = tokio::time::Instant::now() + HLS_SEGMENT_WAIT;
-    loop {
-        let ready = match tokio::fs::metadata(&file_path).await {
-            Ok(meta) => !wants_playlist || meta.len() > 0,
-            Err(_) => false,
-        };
-        if ready {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(StatusCode::NOT_FOUND);
-        }
-        tokio::time::sleep(HLS_POLL_INTERVAL).await;
     }
 
-    let file = tokio::fs::File::open(&file_path)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    let file_len = tokio::fs::metadata(&file_path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .len();
+    // The playlist is synthesized from the segment plan — never read from disk
+    // (contract §3.3: exactly one implementation).
+    if seg.ends_with(".m3u8") {
+        let plan = wait_for_plan_shared(&shared, &token).await?;
+        let playlist = render_playlist(&playlist_segments(&plan));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)
+            .header(header::CONTENT_LENGTH, playlist.len())
+            .body(Body::from(playlist))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
 
+    let Some(k) = parse_segment_index(&seg) else {
+        return Err((StatusCode::NOT_FOUND, format!("unknown HLS path {seg}")));
+    };
+
+    let path = ensure_segment(&shared, &token, k).await?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("segment read failed: {e}")))?;
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, file_len)
-        .body(Body::from_stream(ReaderStream::new(file)))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .header(header::CONTENT_TYPE, SEGMENT_CONTENT_TYPE)
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Wait for (or trigger) segment `k`, returning its path once it is on disk.
+async fn ensure_segment(
+    shared: &Arc<Mutex<Shared>>,
+    token: &str,
+    k: u64,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let deadline = tokio::time::Instant::now() + HLS_SEGMENT_WAIT;
+    loop {
+        enum Step {
+            Serve(PathBuf),
+            Wait,
+            Start(u64),
+            Sleep(Duration),
+            Ended,
+        }
+
+        let step = {
+            let mut g = shared.lock().unwrap();
+            let Some(session) = g.hls_sessions.get_mut(token) else {
+                return Err((StatusCode::NOT_FOUND, "unknown HLS session".to_string()));
+            };
+            session.max_requested_k = session.max_requested_k.max(k);
+            if session.plan.is_none() {
+                Step::Wait
+            } else {
+                let plan_len = session
+                    .plan
+                    .as_ref()
+                    .map(|plan| plan.segment_count() as u64)
+                    .unwrap_or(0);
+                let path = TranscodeCache::segment_path(&session.cache_dir, k);
+                match TranscodeCache::segment_ready(&session.cache_dir, k) {
+                    SegmentLookup::Ready => {
+                        session.hits = session.hits.saturating_add(1);
+                        Step::Serve(path)
+                    }
+                    _ if k >= plan_len => Step::Ended,
+                    _ => {
+                        let covered = session
+                            .run
+                            .as_ref()
+                            .map(|run| run.job.is_running() && k >= run.first_k)
+                            .unwrap_or(false);
+                        if covered {
+                            Step::Wait
+                        } else if session.ended {
+                            Step::Ended
+                        } else {
+                            match session.last_reopen {
+                                Some(last) if last.elapsed() < HLS_REOPEN_INTERVAL => {
+                                    Step::Sleep(HLS_REOPEN_INTERVAL - last.elapsed())
+                                }
+                                _ => Step::Start(k),
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        match step {
+            Step::Serve(path) => {
+                park_run_shared(shared, token, k);
+                return Ok(path);
+            }
+            Step::Wait => {
+                if tokio::time::Instant::now() >= deadline {
+                    let (state, error) = {
+                        let g = shared.lock().unwrap();
+                        match g.hls_sessions.get(token) {
+                            Some(session) => (
+                                if session.job_error.is_some() {
+                                    "error"
+                                } else {
+                                    "active"
+                                },
+                                session
+                                    .job_error
+                                    .clone()
+                                    .unwrap_or_else(|| "segment not ready".to_string()),
+                            ),
+                            None => ("error", "session vanished".to_string()),
+                        }
+                    };
+                    let status = if state == "error" {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::GATEWAY_TIMEOUT
+                    };
+                    return Err((
+                        status,
+                        format!(
+                            "segment {k} not ready after {}s: {error}",
+                            HLS_SEGMENT_WAIT.as_secs()
+                        ),
+                    ));
+                }
+                tokio::time::sleep(HLS_POLL_INTERVAL).await;
+            }
+            Step::Start(from_k) => {
+                // Near-neighbour merge: one reopen covers `from_k..=from_k+2`.
+                let from_k = *merge_range_start(from_k).start();
+                spawn_run_shared(shared, token, from_k, true)
+                    .await
+                    .map_err(|error| match error {
+                        ProxyError::Busy(message) => (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            format!("segment {k} not ready: {message}"),
+                        ),
+                        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+                    })?;
+            }
+            Step::Sleep(wait) => tokio::time::sleep(wait).await,
+            Step::Ended => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("segment {k} is past the end of the media"),
+                ));
+            }
+        }
+    }
+}
+
+/// First index of the merged reopen range (k..=k+2), from the pure scheduler module.
+fn merge_range_start(k: u64) -> std::ops::RangeInclusive<u64> {
+    scheduler::merge_range(k)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1134,7 +1841,10 @@ mod tests {
     }
     #[test]
     fn content_type_fallback() {
-        assert_eq!(content_type_for(Some("data.bin")), "application/octet-stream");
+        assert_eq!(
+            content_type_for(Some("data.bin")),
+            "application/octet-stream"
+        );
         assert_eq!(content_type_for(None), "application/octet-stream");
     }
 
@@ -1142,13 +1852,15 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_file_full_and_range() {
-        let path =
-            std::env::temp_dir().join(format!("wdmm-proxy-test-{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("wdmm-proxy-test-{}.bin", std::process::id()));
         let data: Vec<u8> = (0..=255u8).collect();
         std::fs::write(&path, &data).unwrap();
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
-        let reg = proxy.register_file(&path, Some("test.bin".into()), None, None).await.unwrap();
+        let reg = proxy
+            .register_file(&path, Some("test.bin".into()), None, None)
+            .await
+            .unwrap();
         let addr = proxy.addr().unwrap();
         let url = format!("http://{addr}{}", reg.path_template);
         let client = reqwest::Client::new();
@@ -1159,13 +1871,23 @@ mod tests {
         assert_eq!(r.bytes().await.unwrap().as_ref(), data.as_slice());
 
         // Range GET
-        let r = client.get(&url).header("Range", "bytes=10-19").send().await.unwrap();
+        let r = client
+            .get(&url)
+            .header("Range", "bytes=10-19")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 206);
         assert_eq!(r.headers()["content-range"], "bytes 10-19/256");
         assert_eq!(r.bytes().await.unwrap().as_ref(), &data[10..20]);
 
         // Unsatisfiable range → 416
-        let r = client.get(&url).header("Range", "bytes=300-").send().await.unwrap();
+        let r = client
+            .get(&url)
+            .header("Range", "bytes=300-")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 416);
 
         // Unknown token → 404
@@ -1196,18 +1918,25 @@ mod tests {
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let d = Arc::clone(&data);
         let reg = proxy
-            .register_driver(256, Some("audio.mp3".into()), None, None, move |start, end| {
-                let chunk = if end < 0 {
-                    d[start as usize..].to_vec()
-                } else {
-                    d[start as usize..=(end as usize).min(d.len() - 1)].to_vec()
-                };
-                // Build a single-item stream: emit the chunk then end.
-                let stream = futures::stream::once(async move {
-                    Ok::<Bytes, io::Error>(Bytes::from(chunk))
-                });
-                Box::pin(stream) as BoxStream
-            })
+            .register_driver(
+                256,
+                Some("audio.mp3".into()),
+                None,
+                None,
+                move |start, end| {
+                    let chunk = if end < 0 {
+                        d[start as usize..].to_vec()
+                    } else {
+                        d[start as usize..=(end as usize).min(d.len() - 1)].to_vec()
+                    };
+                    // Build a single-item stream: emit the chunk then end.
+                    let stream =
+                        futures::stream::once(
+                            async move { Ok::<Bytes, io::Error>(Bytes::from(chunk)) },
+                        );
+                    Box::pin(stream) as BoxStream
+                },
+            )
             .await
             .unwrap();
 
@@ -1221,7 +1950,12 @@ mod tests {
         assert_eq!(r.bytes().await.unwrap().as_ref(), data.as_slice());
 
         // Range
-        let r = client.get(&url).header("Range", "bytes=0-3").send().await.unwrap();
+        let r = client
+            .get(&url)
+            .header("Range", "bytes=0-3")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 206);
         assert_eq!(r.bytes().await.unwrap().as_ref(), &[0u8, 1, 2, 3]);
 
@@ -1233,13 +1967,18 @@ mod tests {
     #[tokio::test]
     async fn registration_path_only_no_url() {
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
-        let path =
-            std::env::temp_dir().join(format!("wdmm-path-test-{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("wdmm-path-test-{}.bin", std::process::id()));
         std::fs::write(&path, b"hello").unwrap();
         let reg = proxy.register_file(&path, None, None, None).await.unwrap();
         // path_template must start with "/" and not contain "http"
-        assert!(reg.path_template.starts_with('/'), "path_template must start with /");
-        assert!(!reg.path_template.contains("http"), "path_template must not embed scheme");
+        assert!(
+            reg.path_template.starts_with('/'),
+            "path_template must start with /"
+        );
+        assert!(
+            !reg.path_template.contains("http"),
+            "path_template must not embed scheme"
+        );
         proxy.stop();
         let _ = std::fs::remove_file(&path);
     }
@@ -1274,86 +2013,144 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
+    // ── HLS progress derivation (§3.5/§4) ────────────────────────────────────
+    //
+    // Pure struct + filesystem state: no media and no libav needed, so these run
+    // on every host (including Windows).
+
+    /// A calibrated plan of `count` segments of `seg_secs` seconds each.
+    fn test_plan(seg_secs: f64, count: usize, duration_ms: i64) -> Arc<SegmentPlan> {
+        let seg_ms = (seg_secs * 1000.0) as i64;
+        let entries = (0..count)
+            .map(|i| wdmm_ffmpeg::SegEntry {
+                start_ms: i as i64 * seg_ms,
+                duration_ms: seg_ms,
+            })
+            .collect();
+        Arc::new(SegmentPlan {
+            duration_ms,
+            seg_secs,
+            alignment: PlanAlignment::Calibrated,
+            gop_ms: Some(2_000),
+            entries,
+        })
+    }
+
+    fn test_session(dir: PathBuf) -> HlsSession {
+        HlsSession {
+            plan: None,
+            cache: Arc::new(TranscodeCache::new(std::env::temp_dir(), 1 << 30)),
+            cache_key: CacheKey::new("account", "/remote/movie.mkv", "balanced", 10, "etag-1"),
+            cache_dir: dir,
+            preset: wdmm_ffmpeg::preset::preset_balanced(),
+            input_url: "/nonexistent/movie.mkv".to_string(),
+            seg_secs: 4.0,
+            run: None,
+            job_error: None,
+            max_requested_k: 0,
+            hits: 0,
+            last_reopen: None,
+            ended: false,
+            duration_ms: 40_000,
+            hls_time_override_ms: None,
+        }
+    }
 
     #[test]
-    fn hls_progress_derives_not_ready_state() {
-        let dir = unique_seg_dir("not-ready");
-        let progress = derive_hls_progress(
-            &dir,
-            ProgressSnapshot::default(),
-            false,
-            None,
-            EncoderInfo::default(),
-            Vec::new(),
-        );
-        assert!(!progress.playlist_ready);
+    fn hls_progress_without_plan_is_idle() {
+        let dir = unique_seg_dir("no-plan");
+        let progress = derive_hls_progress(&test_session(dir.clone()));
+        assert!(!progress.playlist_ready, "no plan yet ⇒ playlist not ready");
         assert_eq!(progress.segments, 0);
-        assert_eq!(progress.content_ms, 0);
-        assert_eq!(progress.wall_ms, 0);
-        assert_eq!(progress.speed, 0.0, "no wall clock ⇒ speed 0.0");
+        assert_eq!(progress.segment_count, 0);
+        assert_eq!(progress.ready_k, None);
+        assert_eq!(progress.run_state, "idle");
+        assert_eq!(progress.alignment, None);
+        assert_eq!(progress.plan_duration_ms, None);
         assert!(!progress.ended);
-        assert!(progress.error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn hls_progress_derives_ready_state_with_speed() {
-        let dir = unique_seg_dir("ready");
-        std::fs::write(dir.join("index.m3u8"), b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n").unwrap();
+    fn hls_progress_reports_plan_and_ready_front() {
+        let dir = unique_seg_dir("with-plan");
         std::fs::write(dir.join("seg0.ts"), b"x").unwrap();
         std::fs::write(dir.join("seg1.ts"), b"x").unwrap();
-        std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
-        let progress = derive_hls_progress(
-            &dir,
-            ProgressSnapshot { content_ms: 8_000, wall_ms: 4_000, packets: 42 },
-            false,
-            None,
-            EncoderInfo {
-                mode: "transcode".into(),
-                video: Some("libx264".into()),
-                audio: Some("aac".into()),
-                hw_requested: true,
-                hw_available: false,
-            },
-            vec!["w".into()],
+        std::fs::write(dir.join("seg2.ts.part"), b"x").unwrap();
+
+        let mut session = test_session(dir.clone());
+        session.plan = Some(test_plan(4.0, 10, 40_000));
+        session.hits = 3;
+        session.max_requested_k = 1;
+
+        let progress = derive_hls_progress(&session);
+        assert!(progress.playlist_ready);
+        assert_eq!(progress.segments, 2, "only non-empty seg<k>.ts count");
+        assert_eq!(progress.ready_k, Some(1));
+        assert_eq!(progress.segment_count, 10);
+        assert_eq!(progress.seg_secs, 4.0);
+        assert_eq!(progress.plan_duration_ms, Some(40_000));
+        assert_eq!(progress.alignment, Some("calibrated"));
+        assert_eq!(progress.max_requested_k, Some(1));
+        assert_eq!(progress.cache_hits, 3);
+        assert_eq!(
+            progress.content_ms, 8_000,
+            "planned media time to the front"
         );
-        assert!(progress.playlist_ready, "non-empty index.m3u8 ⇒ ready");
-        assert_eq!(progress.segments, 2, "only seg*.ts files count");
-        assert_eq!(progress.content_ms, 8_000);
-        assert_eq!(progress.wall_ms, 4_000);
-        assert!((progress.speed - 2.0).abs() < f64::EPSILON);
+        assert_eq!(progress.run_state, "idle");
         assert!(!progress.ended);
-        assert!(progress.error.is_none());
-        assert_eq!(progress.encoder.mode, "transcode");
-        assert_eq!(progress.encoder.video.as_deref(), Some("libx264"));
-        assert_eq!(progress.encoder.audio.as_deref(), Some("aac"));
-        assert!(!progress.encoder.hw_available);
-        assert_eq!(progress.warnings, vec!["w".to_string()]);
+        assert!(
+            progress.drift_ms.is_none(),
+            "no running job ⇒ no drift measurement"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn hls_progress_reports_ended_error_and_dedupes_warnings() {
-        let dir = unique_seg_dir("ended");
-        let progress = derive_hls_progress(
-            &dir,
-            ProgressSnapshot { content_ms: 1_000, wall_ms: 2_000, packets: 3 },
-            true,
-            Some("avcodec_open2(video encoder libx264) failed: boom (rc=-1)".into()),
-            EncoderInfo::default(),
-            vec!["dup".into(), "dup".into(), "b".into()],
-        );
+    fn hls_progress_reports_error_and_ended() {
+        let dir = unique_seg_dir("error");
+        let mut session = test_session(dir.clone());
+        session.plan = Some(test_plan(4.0, 2, 8_000));
+        session.job_error = Some("avcodec_open2(video encoder libx264) failed".to_string());
+        session.ended = true;
+
+        let progress = derive_hls_progress(&session);
+        assert_eq!(progress.run_state, "error");
         assert!(progress.ended);
-        assert!(progress.error.as_deref().unwrap_or("").contains("avcodec_open2"));
-        assert!(progress.speed < 1.0);
-        assert_eq!(progress.warnings, vec!["dup".to_string(), "b".to_string()]);
+        assert_eq!(
+            progress.error.as_deref(),
+            Some("avcodec_open2(video encoder libx264) failed")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn hls_progress_unknown_token_is_none() {
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
-        assert!(proxy.hls_progress("deadbeef00deadbeef00deadbeef00aa").is_none());
+        assert!(proxy
+            .hls_progress("deadbeef00deadbeef00deadbeef00aa")
+            .is_none());
+    }
+
+    // ── HLS session integration (real libav) ─────────────────────────────────
+
+    fn hls_test_opts(path: &Path, device_id: &str) -> HlsSessionOpts {
+        HlsSessionOpts {
+            device_id: device_id.to_string(),
+            input_url: path.to_string_lossy().into_owned(),
+            preset: wdmm_ffmpeg::preset::preset_balanced(),
+            ttl_secs: None,
+            allowed_peers: None,
+            cache: HlsCacheOptions {
+                root: Some(unique_seg_dir("cache")),
+                budget_bytes: Some(256 * 1024 * 1024),
+                account_id: "test-account".to_string(),
+                remote_path: path.to_string_lossy().into_owned(),
+                preset_id: "balanced".to_string(),
+                size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                ident: format!("test-{}", std::process::id()),
+            },
+        }
     }
 
     #[tokio::test]
@@ -1365,13 +2162,10 @@ mod tests {
         }
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let err = proxy
-            .register_hls(
+            .register_hls(hls_test_opts(
+                Path::new("/nonexistent/media.mp4"),
                 "device-1",
-                "/nonexistent/media.mp4",
-                wdmm_ffmpeg::preset::preset_passthrough(),
-                None,
-                None,
-            )
+            ))
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::Ffmpeg(_)), "got {err:?}");
@@ -1379,45 +2173,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_hls_register_serve_unregister() {
+    async fn proxy_hls_register_serves_vod_playlist_and_segment() {
         let Some(path) = hls_test_media() else { return };
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
-            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
+            .register_hls(hls_test_opts(&path, "device-1"))
             .await
             .unwrap();
-
         assert!(!reg.token.is_empty());
         assert!(reg.playlist_template.starts_with("/h/"));
         assert!(reg.playlist_template.ends_with("/index.m3u8"));
 
-        // `register_hls` returns only once the muxer wrote the playlist, so the
-        // renderer's immediate fetch must succeed (this is what Kodi broke on).
+        // `register_hls` returns only once a playable plan exists, so the
+        // renderer's immediate playlist fetch must succeed (this is what Kodi broke on).
         let addr = proxy.addr().unwrap();
+        let client = reqwest::Client::new();
         let url = format!("http://{addr}{}", reg.playlist_template);
-        let r = reqwest::Client::new().get(&url).send().await.unwrap();
+        let r = client.get(&url).send().await.unwrap();
         assert_eq!(r.status(), 200, "playlist must be servable at once");
-        assert!(r.text().await.unwrap().contains("#EXTM3U"));
+        assert_eq!(
+            r.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(PLAYLIST_CONTENT_TYPE)
+        );
+        let playlist = r.text().await.unwrap();
+        assert!(playlist.starts_with("#EXTM3U"));
+        assert!(playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:"));
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+        assert!(playlist.contains("seg0.ts"));
+        assert!(playlist.trim_end().ends_with("#EXT-X-ENDLIST"));
+
+        // Pulling the first segment must produce it on demand.
+        let seg_url = url.replace("index.m3u8", "seg0.ts");
+        let seg = client.get(&seg_url).send().await.unwrap();
+        assert_eq!(seg.status(), 200, "seg0.ts must be produced on demand");
+        assert_eq!(
+            seg.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(SEGMENT_CONTENT_TYPE)
+        );
+        assert!(!seg.bytes().await.unwrap().is_empty());
 
         proxy.unregister_hls(&reg.token);
+        let gone = client.get(&url).send().await.unwrap();
+        assert_eq!(gone.status(), 404, "unregistered token must 404");
         proxy.stop();
     }
 
     #[tokio::test]
-    async fn proxy_hls_seek_ok() {
+    async fn proxy_hls_pull_reopens_for_later_segments() {
         let Some(path) = hls_test_media() else { return };
 
         let proxy = ProxyHandle::new(BindMode::Loopback, 0);
         let reg = proxy
-            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
+            .register_hls(hls_test_opts(&path, "device-1"))
             .await
             .unwrap();
+        let addr = proxy.addr().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}{}", reg.playlist_template);
+        let playlist = client.get(&url).send().await.unwrap().text().await.unwrap();
+        let segments: Vec<&str> = playlist
+            .lines()
+            .filter(|line| line.ends_with(".ts"))
+            .collect();
+        assert!(
+            segments.len() > 3,
+            "test media must yield several segments, got {segments:?}"
+        );
 
-        // Seek to 30 s — creates a new job+segment_dir; the new playlist must
-        // be ready before `seek_hls` returns.
-        proxy.seek_hls(&reg.token, 30.0).await.unwrap();
+        // Walking forward forces the scheduler to keep the job running and, once
+        // the front is outrun, to reopen at the requested index.
+        let target = segments[3];
+        let seg_url = format!("http://{addr}/h/{}/{target}", reg.token);
+        let seg = client.get(&seg_url).send().await.unwrap();
+        assert_eq!(seg.status(), 200, "{target} must be produced on demand");
+        assert!(!seg.bytes().await.unwrap().is_empty());
 
+        let progress = proxy.hls_progress(&reg.token).unwrap();
+        assert!(
+            progress.ready_k.unwrap_or(0) >= 3,
+            "front must have reached segment 3, got {:?}",
+            progress.ready_k
+        );
         proxy.unregister_hls(&reg.token);
         proxy.stop();
     }
@@ -1430,14 +2272,14 @@ mod tests {
 
         // First registration
         let reg1 = proxy
-            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
+            .register_hls(hls_test_opts(&path, "device-1"))
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 1);
 
         // Second registration for same device+media kills the first
         let reg2 = proxy
-            .register_hls("device-1", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
+            .register_hls(hls_test_opts(&path, "device-1"))
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 1);
@@ -1445,7 +2287,7 @@ mod tests {
 
         // Different device can transcode the same file
         let _reg3 = proxy
-            .register_hls("device-2", path.to_string_lossy().as_ref(), wdmm_ffmpeg::preset::preset_passthrough(), None, None)
+            .register_hls(hls_test_opts(&path, "device-2"))
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 2);

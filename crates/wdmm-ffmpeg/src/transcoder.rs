@@ -47,6 +47,7 @@ use crate::plan::{
     choose_video_encoder, encoder_frame_rate, fallback_warning, hw_gop_size, hw_video_encoder_name,
     hybrid_audio_codec_id, remux_dropped_streams, remux_plan, RemuxPlan,
 };
+use crate::vod::KeyframeInfo;
 
 /// Options for opening the loopback HTTP input: bound every blocking read so a
 /// stalled upstream fails with a real error instead of hanging the job forever.
@@ -80,6 +81,97 @@ unsafe fn stream_codec_id(streams_ptr: *const *mut AVStream, idx: i32) -> Option
         return None;
     }
     Some((*cp).codec_id)
+}
+
+/// HLS `hls_time` in seconds, honouring a millisecond override.
+///
+/// `hlsenc` parses `hls_time` as a decimal float, so sub-second overrides are
+/// passed with up to three decimals. This is what lets the proxy align the
+/// muxer grid with a calibrated (non-integer) segment plan.
+fn hls_time_seconds(preset_secs: u32, override_ms: Option<u32>) -> String {
+    let ms = match override_ms {
+        Some(ms) if ms > 0 => ms,
+        _ => preset_secs.saturating_mul(1000),
+    };
+    if ms % 1000 == 0 {
+        (ms / 1000).to_string()
+    } else {
+        format!("{:.3}", ms as f64 / 1000.0)
+    }
+}
+
+/// Read all video keyframe timestamps (ms) from the container's index
+/// (mp4 `stss`, matroska cues, …).
+///
+/// Cost: O(index entries) — no media bytes are read; a tail-`moov` MP4 works
+/// because `avformat_find_stream_info` already fetches the index over Range.
+/// Containers without an index (e.g. some MPEG-TS) simply yield `Ok(vec![])`,
+/// which the caller maps to a Calibrated/Approximate plan. Never panics.
+pub fn keyframe_index(url: &str) -> FfmpegResult<Vec<KeyframeInfo>> {
+    let url_c = CString::new(url).map_err(|e| FfmpegError::Probe(e.to_string()))?;
+    unsafe {
+        let mut in_opts = input_open_options();
+        let mut in_ctx: *mut AVFormatContext = std::ptr::null_mut();
+        let ret = avformat_open_input(&mut in_ctx, url_c.as_ptr(), std::ptr::null(), &mut in_opts);
+        av_dict_free(&mut in_opts);
+        if ret < 0 {
+            return Err(ffmpeg_err("avformat_open_input (keyframe_index)", ret));
+        }
+        let ret = avformat_find_stream_info(in_ctx, std::ptr::null_mut());
+        if ret < 0 {
+            avformat_close_input(&mut in_ctx);
+            return Err(ffmpeg_err(
+                "avformat_find_stream_info (keyframe_index)",
+                ret,
+            ));
+        }
+
+        let v_idx =
+            av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, std::ptr::null_mut(), 0);
+        if v_idx < 0 {
+            diag::log(format!(
+                "keyframe_index: url={} has no video stream, falling back to calibration",
+                sanitize_url(url)
+            ));
+            avformat_close_input(&mut in_ctx);
+            return Ok(Vec::new());
+        }
+
+        let streams = fmtctx_streams(in_ctx);
+        let stream = *streams.add(v_idx as usize);
+        if stream.is_null() {
+            avformat_close_input(&mut in_ctx);
+            return Ok(Vec::new());
+        }
+        let entries = avformat_index_get_entries_count(stream).max(0);
+        let time_base = (*stream).time_base;
+        let mut keyframes = Vec::new();
+        for idx in 0..entries {
+            let entry = avformat_index_get_entry(stream, idx);
+            if entry.is_null() {
+                continue;
+            }
+            if !(*entry).is_keyframe() {
+                continue;
+            }
+            let timestamp = (*entry).timestamp;
+            if timestamp == AV_NOPTS_VALUE {
+                continue;
+            }
+            keyframes.push(KeyframeInfo {
+                pts_ms: av_rescale_q(timestamp, time_base, MS_TB),
+            });
+        }
+        keyframes.sort_by_key(|keyframe| keyframe.pts_ms);
+        keyframes.dedup_by_key(|keyframe| keyframe.pts_ms);
+        diag::log(format!(
+            "keyframe_index: url={} index_entries={entries} keyframes={}",
+            sanitize_url(url),
+            keyframes.len()
+        ));
+        avformat_close_input(&mut in_ctx);
+        Ok(keyframes)
+    }
 }
 
 // ── Probe ─────────────────────────────────────────────────────────────────────
@@ -701,11 +793,13 @@ pub fn run_hls_job(
     cancel: Arc<AtomicBool>,
     telemetry: &ProgressState,
     job_id: &str,
+    start_number: u64,
+    hls_time_override_ms: Option<u32>,
 ) -> FfmpegResult<()> {
     telemetry.start();
     let tag = job_tag(job_id);
     diag::log(format!(
-        "{tag} job start preset={} container={} remux_first={} video_codec={:?} audio_codec={} start_offset={start_offset_secs:.2} seg_dir={} input={}",
+        "{tag} job start preset={} container={} remux_first={} video_codec={:?} audio_codec={} start_offset={start_offset_secs:.2} start_number={start_number} hls_time_override_ms={hls_time_override_ms:?} seg_dir={} input={}",
         preset.id,
         preset.container,
         preset.remux_first,
@@ -734,6 +828,8 @@ pub fn run_hls_job(
             cancel.clone(),
             telemetry,
             &tag,
+            start_number,
+            hls_time_override_ms,
         ) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -751,6 +847,8 @@ pub fn run_hls_job(
                         cancel,
                         telemetry,
                         &tag,
+                        start_number,
+                        hls_time_override_ms,
                     )
                 }
             }
@@ -764,6 +862,8 @@ pub fn run_hls_job(
             cancel,
             telemetry,
             &tag,
+            start_number,
+            hls_time_override_ms,
         )
     };
 
@@ -1176,6 +1276,8 @@ fn run_remux(
     cancel: Arc<AtomicBool>,
     telemetry: &ProgressState,
     tag: &str,
+    start_number: u64,
+    hls_time_override_ms: Option<u32>,
 ) -> FfmpegResult<()> {
     let url_c = CString::new(input_url).unwrap();
     let playlist = segment_dir.join("index.m3u8");
@@ -1413,21 +1515,19 @@ fn run_remux(
         // playlist itself from the output context's URL, so no `avio_open` and
         // no manual `AVFormatContext.pb` assignment is needed here.
         let mut dict: *mut AVDictionary = std::ptr::null_mut();
-        let seg_secs = preset.hls_segment_secs.to_string();
-        let seg_secs_c = CString::new(seg_secs.as_str()).unwrap();
-        // Cut the first segment early (>=1 s, <=2 s) so the playlist exists
-        // sooner; this is what lets the renderer start before a long segment
-        // has been fully written.
-        let init_secs = preset.hls_segment_secs.min(2).to_string();
-        let init_secs_c = CString::new(init_secs.as_str()).unwrap();
-        av_dict_set(&mut dict, c"hls_time".as_ptr(), seg_secs_c.as_ptr(), 0);
+        let hls_time = hls_time_seconds(preset.hls_segment_secs, hls_time_override_ms);
+        let hls_time_c = CString::new(hls_time.as_str()).unwrap();
+        let start_number_c = CString::new(start_number.to_string()).unwrap();
+        // No `hls_init_time`: the VOD playlist's `EXTINF` values must match the
+        // real cuts, and a shorter first segment would contradict the plan.
+        av_dict_set(&mut dict, c"hls_time".as_ptr(), hls_time_c.as_ptr(), 0);
+        av_dict_set(&mut dict, c"hls_list_size".as_ptr(), c"0".as_ptr(), 0);
         av_dict_set(
             &mut dict,
-            c"hls_init_time".as_ptr(),
-            init_secs_c.as_ptr(),
+            c"start_number".as_ptr(),
+            start_number_c.as_ptr(),
             0,
         );
-        av_dict_set(&mut dict, c"hls_list_size".as_ptr(), c"0".as_ptr(), 0);
         if plan == RemuxPlan::Remux {
             av_dict_set(
                 &mut dict,
@@ -1601,6 +1701,8 @@ fn run_transcode(
     cancel: Arc<AtomicBool>,
     telemetry: &ProgressState,
     tag: &str,
+    start_number: u64,
+    hls_time_override_ms: Option<u32>,
 ) -> FfmpegResult<()> {
     let url_c = CString::new(input_url).unwrap();
     let playlist = segment_dir.join("index.m3u8");
@@ -1883,6 +1985,14 @@ fn run_transcode(
                 codctx_set_time_base(v_enc_ctx, AVRational::new(1, 90000));
                 codctx_set_gop_size(v_enc_ctx, 12);
                 codctx_set_max_b_frames(v_enc_ctx, 2);
+                codctx_set_framerate(v_enc_ctx, framerate);
+                // mpegtsenc only inserts h264_mp4toannexb when the stream
+                // carries AVCC extradata, which libx264 emits for global header
+                // mode. Without this the muxer has no SPS/PPS to start from.
+                codctx_set_flags(
+                    v_enc_ctx,
+                    codctx_flags(v_enc_ctx) | AV_CODEC_FLAG_GLOBAL_HEADER,
+                );
                 if let Some(br) = preset.video_max_bitrate {
                     codctx_set_bit_rate(v_enc_ctx, br as i64);
                 }
@@ -2021,19 +2131,19 @@ fn run_transcode(
         // playlist itself from the output context's URL, so no `avio_open` and
         // no manual `AVFormatContext.pb` assignment is needed here.
         let mut dict: *mut AVDictionary = std::ptr::null_mut();
-        let seg_secs = preset.hls_segment_secs.to_string();
-        let seg_secs_c = CString::new(seg_secs.as_str()).unwrap();
-        // Same early first-segment cut as the remux path.
-        let init_secs = preset.hls_segment_secs.min(2).to_string();
-        let init_secs_c = CString::new(init_secs.as_str()).unwrap();
-        av_dict_set(&mut dict, c"hls_time".as_ptr(), seg_secs_c.as_ptr(), 0);
+        let hls_time = hls_time_seconds(preset.hls_segment_secs, hls_time_override_ms);
+        let hls_time_c = CString::new(hls_time.as_str()).unwrap();
+        let start_number_c = CString::new(start_number.to_string()).unwrap();
+        // No `hls_init_time`: the VOD playlist's `EXTINF` values must match the
+        // real cuts, and a shorter first segment would contradict the plan.
+        av_dict_set(&mut dict, c"hls_time".as_ptr(), hls_time_c.as_ptr(), 0);
+        av_dict_set(&mut dict, c"hls_list_size".as_ptr(), c"0".as_ptr(), 0);
         av_dict_set(
             &mut dict,
-            c"hls_init_time".as_ptr(),
-            init_secs_c.as_ptr(),
+            c"start_number".as_ptr(),
+            start_number_c.as_ptr(),
             0,
         );
-        av_dict_set(&mut dict, c"hls_list_size".as_ptr(), c"0".as_ptr(), 0);
         av_dict_set(
             &mut dict,
             c"hls_segment_filename".as_ptr(),
@@ -2073,8 +2183,14 @@ fn run_transcode(
         let mut audio = AudioPipeline::new(audio_sample_rate, u32::from(preset.audio_channels));
         let mut enc_vframe: *mut AVFrame = std::ptr::null_mut();
         let mut video_out_dims = (0i32, 0i32);
+        // Decoded video frames carry pts in the **input stream** time_base.
+        // libav does not set `AVCodecContext.time_base` for video decoders (it
+        // stays 0/1), so reading it silently scales every frame to pts 0; that
+        // was the mpegts "non monotonically increasing dts" EINVAL.
+        let mut video_dec_tb = AVRational::new(0, 1);
         if !v_enc_ctx.is_null() {
             let in_st = *streams_ptr.add(v_idx as usize);
+            video_dec_tb = (*in_st).time_base;
             let cp = (*in_st).codecpar;
             video_out_dims = fit_dimensions(
                 (*cp).width,
@@ -2234,7 +2350,7 @@ fn run_transcode(
                             enc_vframe,
                             av_rescale_q(
                                 frame_pts(dec_frame),
-                                codctx_time_base(v_dec_ctx),
+                                video_dec_tb,
                                 codctx_time_base(v_enc_ctx),
                             ),
                         );
@@ -2376,9 +2492,16 @@ unsafe fn encode_and_write(
 
         // Capture before the write consumes the packet.
         let pts = (*out_pkt).pts;
+        let dts = (*out_pkt).dts;
+        let duration = (*out_pkt).duration;
+        let size = (*out_pkt).size;
         let tb = (*out_st).time_base;
         let ret = av_interleaved_write_frame(out_ctx, out_pkt);
         if ret < 0 {
+            diag::log(format!(
+                "{} write FAILED stream={} pts={pts} dts={dts} dur={duration} size={size} tb={}/{} rc={ret}",
+                job.tag, out_stream_idx, tb.num, tb.den
+            ));
             return Err(ffmpeg_err("av_interleaved_write_frame (transcode)", ret));
         }
         job.record(pts, tb);
