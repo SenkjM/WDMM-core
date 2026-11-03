@@ -1261,6 +1261,16 @@ struct AudioPipeline {
     layout: AVChannelLayout,
     frame_size: c_int,
     next_pts: i64,
+    /// Encoder-time-base pts of the first queued sample, seeded from the source
+    /// timeline. Copy runs keep the container timestamps for video, so a run
+    /// that starts mid-file must not restart audio at zero: the rendered file
+    /// would then carry two unrelated clocks (audio near 0, video near the seek
+    /// point) and the player reports the mismatch as drift or resyncs the
+    /// playhead backwards.
+    start_samples: i64,
+    /// Decoder time_base of the audio stream, used to reseat `next_pts` on the
+    /// first decoded frame. Zero means "unknown" and keeps `start_samples`.
+    dec_tb: AVRational,
     /// First decoded frame described the source format; later frames must match.
     source_configured: bool,
 }
@@ -1274,13 +1284,22 @@ impl Default for AudioPipeline {
             layout: AVChannelLayout::stereo(),
             frame_size: 0,
             next_pts: 0,
+            start_samples: 0,
+            dec_tb: AVRational::new(0, 1),
             source_configured: false,
         }
     }
 }
 
 impl AudioPipeline {
-    unsafe fn new(audio_sample_rate: i32, audio_channels: u32) -> Self {
+    /// `start_secs` is the media time this run starts at; it only seeds the
+    /// fallback pts for sources whose first decoded frame carries no timestamp.
+    unsafe fn new(audio_sample_rate: i32, audio_channels: u32, start_secs: f64) -> Self {
+        let start_samples = if audio_sample_rate > 0 && start_secs > 0.0 {
+            (start_secs * f64::from(audio_sample_rate)).round() as i64
+        } else {
+            0
+        };
         Self {
             sample_rate: audio_sample_rate,
             layout: if audio_channels == 1 {
@@ -1288,8 +1307,15 @@ impl AudioPipeline {
             } else {
                 AVChannelLayout::stereo()
             },
+            next_pts: start_samples,
+            start_samples,
             ..Self::default()
         }
+    }
+
+    /// Tell the pipeline which clock the decoded frames use.
+    unsafe fn set_source_time_base(&mut self, tb: AVRational) {
+        self.dec_tb = tb;
     }
 
     /// Lazily configure swresample/FIFO from the first decoded frame.
@@ -1334,6 +1360,15 @@ impl AudioPipeline {
             return Err(FfmpegError::Probe(
                 "av_audio_fifo_alloc returned null".into(),
             ));
+        }
+        // Align the audio clock with the container timeline: the first frame
+        // after a mid-file seek carries the source pts, and everything after it
+        // is `frame_size` samples apart, so the whole run stays in step with the
+        // copied video packets.
+        let first_pts = frame_pts(dec_frame);
+        if first_pts != AV_NOPTS_VALUE && self.dec_tb.den > 0 && self.sample_rate > 0 {
+            self.next_pts =
+                av_rescale_q(first_pts, self.dec_tb, AVRational::new(1, self.sample_rate));
         }
         self.source_configured = true;
         Ok(())
@@ -1871,7 +1906,14 @@ fn run_remux(
         let mut job = JobCtx::new(tag, telemetry, segment_dir);
         let mut write_error: Option<FfmpegError> = None;
         let mut decode_errors_logged: u32 = 0;
-        let mut audio = AudioPipeline::new(audio_sample_rate, u32::from(preset.audio_channels));
+        let mut audio = AudioPipeline::new(
+            audio_sample_rate,
+            u32::from(preset.audio_channels),
+            start_offset_secs,
+        );
+        if a_idx >= 0 {
+            audio.set_source_time_base((*(*streams_ptr.add(a_idx as usize))).time_base);
+        }
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -2549,7 +2591,14 @@ fn run_transcode(
         }
 
         let mut sws: *mut SwsContext = std::ptr::null_mut();
-        let mut audio = AudioPipeline::new(audio_sample_rate, u32::from(preset.audio_channels));
+        let mut audio = AudioPipeline::new(
+            audio_sample_rate,
+            u32::from(preset.audio_channels),
+            start_offset_secs,
+        );
+        if a_idx >= 0 {
+            audio.set_source_time_base((*(*streams_ptr.add(a_idx as usize))).time_base);
+        }
         let mut enc_vframe: *mut AVFrame = std::ptr::null_mut();
         let mut video_out_dims = (0i32, 0i32);
         // Decoded video frames carry pts in the **input stream** time_base.
