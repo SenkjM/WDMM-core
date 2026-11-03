@@ -14,10 +14,20 @@
 //! renditions, so Kodi never sees them). The MIME subtype is load-bearing:
 //! Kodi's UPnP renderer matches it against `SupportedSubFormats` and silently
 //! drops anything else — hence `text/<real ext>` for sidecars and `text/vtt`
-//! for generated embedded tracks, never the old `text/plain`. Direct casts use
-//! sidecars only (Kodi demuxes the container itself), HLS casts additionally
-//! advertise the source container's text tracks as synthetic candidates,
-//! extracted to WebVTT on selection.
+//! for generated embedded tracks, never the old `text/plain`.
+//!
+//! Kodi turns *every* subtitle resource in the DIDL into a selectable external
+//! stream (`UPnPInternal.cpp`), so the whole lane is delivered at once and a
+//! subtitle switch never needs a new `SetAVTransportURI`. It also derives the
+//! stream name and language from the resource file name
+//! (`CUtil::GetExternalStreamDetailsFromFilename`), which is why every subtitle
+//! URL ends in `<video stem>[.<language>][.<title>].<ext>`.
+//!
+//! The lane is prepared *before* the transcode warm-up (§C.2): sidecars are
+//! exposed, and (HLS only) the source container's text tracks are probed and
+//! extracted in one libav pass. That keeps the shared transcode gate out of the
+//! playback path — the old on-demand extraction during playback competed with
+//! the cast job and surfaced `transcoding busy`.
 //!
 //! Session errors are JSON (`{"ok":false,"error":"…"}`) rather than the
 //! `"error:…"` string convention used by the older one-shot FFI calls, because
@@ -101,6 +111,10 @@ const JOB_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Default transcode-cache budget when `cache_budget_mb` is absent (contract §3.5).
 const DEFAULT_CACHE_BUDGET_MB: u64 = 2048;
 
+/// Positions past this are restored after a subtitle switch (a re-sent
+/// `SetAVTransportURI` restarts playback; contract §C.4).
+const RESUME_POSITION_MS: i64 = 1_000;
+
 /// Transcode-cache knobs carried by `config_json` (contract §3.5).
 ///
 /// The cache key also feeds the account/path/preset/size of the cast; those come
@@ -171,101 +185,15 @@ fn put_session(entry: SessionEntry) {
     sessions().lock().unwrap().insert(entry.handle, entry);
 }
 
-/// Mutate a session that may be temporarily taken out for an FFI call.
-///
-/// Background work (the embedded-track probe) can land in the window where a
-/// tick/command holds the entry; retry briefly instead of dropping the result.
-fn update_session(handle: u32, update: impl FnOnce(&mut SessionEntry)) -> bool {
-    for _ in 0..50 {
-        {
-            let mut map = sessions().lock().unwrap();
-            if let Some(entry) = map.get_mut(&handle) {
-                update(entry);
-                return true;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    false
-}
-
-/// Background probe of the source container for embedded subtitle tracks.
-///
-/// HLS only: the renderer demuxes the transcoded TS, so the container's own
-/// subtitle tracks are invisible to it after the HLS swap. The probe walks the
-/// original source (through the loopback proxy stream) and advertises every
-/// text track as a `webvtt` candidate; bitmap tracks are listed as
-/// `bitmap-unsupported` (never silent — contract §5).
-///
-/// The probe only opens the container and calls `avformat_find_stream_info` —
-/// it decodes no media — so it deliberately does *not* take the proxy's shared
-/// job gate. Routing it through the gate made the track list depend on the
-/// cast transcode being idle, which is exactly when the user is looking at the
-/// list; a second metadata read costs a few hundred milliseconds and no encoder.
-fn spawn_embedded_probe(handle: u32, loopback_url: String, remote_path: String) {
-    let built = std::thread::Builder::new()
-        .name(format!("wdmm-subtitle-probe-{handle}"))
-        .spawn(move || {
-            let probe = match wdmm_ffmpeg::probe(&loopback_url) {
-                Ok(probe) => probe,
-                Err(e) => {
-                    let message = format!("embedded subtitle probe failed: {e}");
-                    wdmm_ffmpeg::diag::log(format!("[subtitle] {message}"));
-                    update_session(handle, |entry| {
-                        entry.subtitle_status.message = Some(message);
-                    });
-                    return;
-                }
-            };
-            let tracks: Vec<SubtitleCandidate> = probe
-                .subtitles
-                .iter()
-                .map(|track| {
-                    SubtitleCandidate::embedded(
-                        &remote_path,
-                        track.index,
-                        track.codec.clone(),
-                        track.language.as_deref(),
-                        track.title.as_deref(),
-                    )
-                })
-                .collect();
-            let count = probe.subtitles.len();
-            wdmm_ffmpeg::diag::log(format!(
-                "[subtitle] probe found {count} embedded subtitle track(s) in the source"
-            ));
-            if !update_session(handle, |entry| {
-                entry
-                    .subtitle_status
-                    .apply_probe(&probe.subtitles, entry.provider);
-                for candidate in tracks {
-                    if !entry
-                        .subtitle_candidates
-                        .iter()
-                        .any(|existing| existing.path == candidate.path)
-                    {
-                        entry.subtitle_candidates.push(candidate);
-                    }
-                }
-            }) {
-                wdmm_ffmpeg::diag::log("[subtitle] probe finished after the session was closed");
-            }
-        });
-    if let Err(e) = built {
-        wdmm_ffmpeg::diag::log(format!(
-            "[subtitle] could not spawn the embedded probe: {e}"
-        ));
-    }
-}
-
 // ── Session state ────────────────────────────────────────────────────────────
 
 /// One subtitle the cast can hand to the renderer: a sidecar file next to the
 /// video, or (HLS only) a text track embedded in the source container.
 ///
 /// Embedded tracks use a synthetic path
-/// `<media remote_path>#embedded:<stream index>` (contract §4); nothing is
-/// extracted until the user actually selects the track.
+/// `<media remote_path>#embedded:<stream index>` (contract §4). Embedded text
+/// tracks are extracted once, before the transcode warm-up (§C.2); the
+/// candidate itself only carries metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubtitleCandidate {
     name: String,
@@ -291,7 +219,8 @@ struct SubtitleCandidate {
     codec: Option<String>,
     /// `"external"` (sidecar), `"webvtt"` (embedded text),
     /// `"bitmap-unsupported"` (embedded bitmap — listed, never selectable) or
-    /// `"error"` (the shared libav job gate was busy, contract §3.6).
+    /// `"error"` (preparation failed: extraction, size limit or the shared job
+    /// gate; the app shows the track as unavailable).
     support: &'static str,
 }
 
@@ -415,6 +344,20 @@ fn embedded_track_index(path: &str, remote_path: &str) -> Option<u32> {
     suffix.parse().ok()
 }
 
+/// One prepared subtitle the renderer can fetch.
+///
+/// `url` already carries the renderer-visible file name (contract §C.3):
+/// Kodi derives the track's language and label from the URL's last path
+/// segment (`CUtil::GetExternalStreamDetailsFromFilename`), not from the DIDL,
+/// so `url_name` is `<video stem>[.<lang>][.<title>].<ext>`.
+#[derive(Debug, Clone)]
+struct SubtitleResource {
+    candidate: SubtitleCandidate,
+    url: String,
+    protocol: String,
+    token: String,
+}
+
 /// Subtitle delivery status for the state document (contract §6).
 #[derive(Debug, Clone, Default)]
 struct SubtitleStatus {
@@ -519,7 +462,15 @@ struct SessionEntry {
     protocol_info: String,
     subtitle_candidates: Vec<SubtitleCandidate>,
     selected_subtitle: Option<SubtitleCandidate>,
-    subtitle_token: Option<String>,
+    /// Every subtitle resource handed to the renderer, selected track first.
+    ///
+    /// The whole lane is prepared before the transcode warm-up (contract §C.2),
+    /// so selecting a subtitle never extracts or exposes anything during
+    /// playback. The renderer learns language/label from the URL file name.
+    subtitle_resources: Vec<SubtitleResource>,
+    /// Proxy tokens of [`Self::subtitle_resources`], released together when the
+    /// media switches, the session stops or the session closes.
+    subtitle_tokens: Vec<String>,
     /// Per-track generated WebVTT, keyed by AV stream index (HLS only).
     embedded_cache: std::collections::HashMap<u32, Arc<Vec<u8>>>,
     /// Track counts / bitmap note / scan note surfaced to the app (contract §6).
@@ -548,7 +499,12 @@ struct PreparedMedia {
     size: u64,
     subtitle_candidates: Vec<SubtitleCandidate>,
     selected_subtitle: Option<SubtitleCandidate>,
-    subtitle_token: Option<String>,
+    /// Prepared subtitle lane: one resource per deliverable track (contract §C).
+    subtitle_resources: Vec<SubtitleResource>,
+    /// Proxy tokens of [`Self::subtitle_resources`].
+    subtitle_tokens: Vec<String>,
+    /// Generated WebVTT per embedded stream index (HLS only).
+    embedded_cache: std::collections::HashMap<u32, Arc<Vec<u8>>>,
     subtitle_status: SubtitleStatus,
     didl: String,
     /// HLS job started without waiting for the playlist (`register_hls_nowait`).
@@ -947,23 +903,51 @@ fn sink_advertises(sink_protocols: &[String], media_kind: &str) -> bool {
     })
 }
 
-/// Build the DIDL-Lite document (media resource + optional subtitle resource).///
-/// The subtitle resource carries its own `protocolInfo`: Kodi's UPnP renderer
-/// only recognises a subtitle `<res>` whose MIME subtype is the real format
-/// (`text/srt`, `text/vtt`, …), which is why the old shared `text/plain` value
-/// was silently ignored (evidence: Kodi source `UPnPInternal.cpp`
-/// `SupportedSubFormats` + live renderer test).
+/// Build the DIDL-Lite document: the media resource plus one `<res>` per
+/// prepared subtitle (contract §C.1).
+///
+/// Kodi's UPnP renderer turns every subtitle resource whose MIME subtype is a
+/// real format (`text/srt`, `text/vtt`, …) into a selectable external subtitle
+/// stream, so the whole lane is delivered in one document instead of being
+/// re-sent per selection (evidence: Kodi `UPnPInternal.cpp` `SupportedSubFormats`
+/// + live renderer test).
 fn build_didl(
     title: &str,
     media_url: &str,
     protocol_info: &str,
-    subtitle: Option<(&str, &str)>,
+    subtitles: &[(String, String)],
 ) -> String {
     let mut resources = vec![DidlRes::new(media_url, protocol_info)];
-    if let Some((url, subtitle_protocol_info)) = subtitle {
+    for (url, subtitle_protocol_info) in subtitles {
         resources.push(DidlRes::new(url, subtitle_protocol_info));
     }
     build_didl_lite(title, &resources)
+}
+
+/// DIDL for either media kind.
+fn build_media_didl(
+    title: &str,
+    media_kind: &str,
+    media_url: &str,
+    protocol_info: &str,
+    subtitles: &[(String, String)],
+) -> String {
+    if media_kind == "audio" {
+        build_audio_didl(title, media_url, protocol_info, subtitles)
+    } else {
+        build_didl(title, media_url, protocol_info, subtitles)
+    }
+}
+
+/// DIDL for the media a live session currently points at.
+fn build_session_didl(entry: &SessionEntry, subtitles: &[(String, String)]) -> String {
+    build_media_didl(
+        &entry.name,
+        entry.media_kind,
+        &entry.media_url,
+        &entry.protocol_info,
+        subtitles,
+    )
 }
 
 /// Build the DIDL-Lite document for an audio-only item.
@@ -975,7 +959,7 @@ fn build_audio_didl(
     title: &str,
     media_url: &str,
     protocol_info: &str,
-    subtitle: Option<(&str, &str)>,
+    subtitles: &[(String, String)],
 ) -> String {
     let mut document = String::from(
         "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
@@ -990,7 +974,7 @@ fn build_audio_didl(
         xml_escape(protocol_info),
         xml_escape(media_url)
     ));
-    if let Some((url, subtitle_protocol_info)) = subtitle {
+    for (url, subtitle_protocol_info) in subtitles {
         document.push_str(&format!(
             "<res protocolInfo=\"{}\">{}</res>",
             xml_escape(subtitle_protocol_info),
@@ -1084,38 +1068,107 @@ async fn scan_subtitles(
     Ok(candidates)
 }
 
-/// Register `data` as an in-memory proxy stream and return `(token, url)`.
-async fn expose_subtitle_bytes(
+/// Renderer-visible file name for one subtitle resource (contract §C.3).
+///
+/// A renderer derives the external track's language/label from the URL's last
+/// path segment (`CUtil::GetExternalStreamDetailsFromFilename`), so the proxy
+/// URL is registered as `<video stem>[.<lang>][.<title>].<ext>`. Two tracks of
+/// the same format that carry neither a language nor a title fall back to
+/// `<video stem>.<n>.<ext>`.
+fn subtitle_url_name(video_name: &str, candidate: &SubtitleCandidate, index: usize) -> String {
+    let stem = video_stem(video_name);
+    let ext = if candidate.embedded {
+        "vtt".to_string()
+    } else {
+        let ext = extension(&candidate.name);
+        if ext.is_empty() {
+            "srt".to_string()
+        } else {
+            ext
+        }
+    };
+    let mut tokens = vec![stem];
+    if let Some(language) = candidate
+        .language
+        .as_deref()
+        .map(sanitize_url_token)
+        .filter(|token| !token.is_empty())
+    {
+        tokens.push(language);
+    }
+    if let Some(title) = candidate
+        .title
+        .as_deref()
+        .map(sanitize_url_token)
+        .filter(|token| !token.is_empty())
+    {
+        tokens.push(title);
+    }
+    if tokens.len() == 1 {
+        tokens.push((index + 1).to_string());
+    }
+    format!("{}.{}", tokens.join("."), ext)
+}
+
+/// Strip characters that break a URL path or a renderer's file-name parser
+/// (`<>:"/\|?*`, control characters); spaces become dots.
+fn sanitize_url_token(raw: &str) -> String {
+    let mut token = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            continue;
+        }
+        token.push(if ch == ' ' { '.' } else { ch });
+    }
+    token.trim_matches('.').to_string()
+}
+
+/// Register `data` as a named in-memory proxy stream and return the prepared
+/// subtitle resource.
+async fn expose_subtitle_data(
     handle: &ProxyHandle,
     lan_ip: IpAddr,
-    name: String,
+    video_name: &str,
+    candidate: &SubtitleCandidate,
+    index: usize,
     data: Arc<Vec<u8>>,
-) -> Result<(String, String), String> {
+    protocol: String,
+) -> Result<SubtitleResource, String> {
+    let url_name = subtitle_url_name(video_name, candidate, index);
     let size = data.len() as u64;
     let stream_data = Arc::clone(&data);
     let registration = handle
-        .register_driver(size, Some(name), None, None, move |start, end| {
-            mem_range_stream(Arc::clone(&stream_data), start, end)
-        })
+        .register_driver_named(
+            size,
+            Some(candidate.name.clone()),
+            Some(url_name),
+            None,
+            None,
+            move |start, end| mem_range_stream(Arc::clone(&stream_data), start, end),
+        )
         .await
         .map_err(|e| e.to_string())?;
     let port = handle
         .addr()
         .map(|addr| addr.port())
         .ok_or_else(|| "proxy has no bound address".to_string())?;
-    let url = format!("http://{lan_ip}:{port}{}", registration.path_template);
-    Ok((registration.token, url))
+    Ok(SubtitleResource {
+        candidate: candidate.clone(),
+        url: format!("http://{lan_ip}:{port}{}", registration.path_template),
+        protocol,
+        token: registration.token,
+    })
 }
 
 /// Read a sidecar subtitle and expose it through the proxy.
-///
-/// Returns `(token, url)`.
 async fn expose_subtitle(
     handle: &ProxyHandle,
     driver: Arc<dyn WdmmVfs>,
     lan_ip: IpAddr,
+    video_name: &str,
     candidate: &SubtitleCandidate,
-) -> Result<(String, String), String> {
+    index: usize,
+) -> Result<SubtitleResource, String> {
     let raw = match driver.get_content(&candidate.path).await {
         Ok(bytes) => bytes,
         Err(_) => driver
@@ -1129,7 +1182,270 @@ async fn expose_subtitle(
             raw.len()
         ));
     }
-    expose_subtitle_bytes(handle, lan_ip, candidate.name.clone(), Arc::new(raw)).await
+    let protocol = subtitle_didl_protocol(candidate)
+        .ok_or_else(|| "subtitle format is not deliverable".to_string())?;
+    expose_subtitle_data(
+        handle,
+        lan_ip,
+        video_name,
+        candidate,
+        index,
+        Arc::new(raw),
+        protocol,
+    )
+    .await
+}
+
+/// Result of the pre-warm subtitle pass.
+struct PreparedSubtitles {
+    /// Candidate list for the app; bitmap tracks are listed but have no
+    /// resource.
+    candidates: Vec<SubtitleCandidate>,
+    /// Deliverable resources, the auto-selected track first.
+    resources: Vec<SubtitleResource>,
+    /// Auto-picked track for this cast (also the first resource).
+    selected: Option<SubtitleCandidate>,
+    /// Generated WebVTT per embedded stream index (HLS only).
+    embedded_cache: std::collections::HashMap<u32, Arc<Vec<u8>>>,
+}
+
+impl PreparedSubtitles {
+    fn tokens(&self) -> Vec<String> {
+        self.resources
+            .iter()
+            .map(|resource| resource.token.clone())
+            .collect()
+    }
+}
+
+/// Metadata probe of the cast source (opens the container and calls
+/// `avformat_find_stream_info`; decodes nothing).
+///
+/// Runs before the transcode job exists (§C.2), so it never contends with a
+/// cast. The old on-demand probe during playback did, and that is what turned
+/// selecting a subtitle into `transcoding busy`.
+async fn probe_source(loopback_url: &str) -> Result<wdmm_ffmpeg::ProbeResult, String> {
+    let url = loopback_url.to_string();
+    tokio::task::spawn_blocking(move || wdmm_ffmpeg::probe(&url).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("subtitle probe failed: {e}"))?
+}
+
+/// Extract several embedded text tracks in one libav pass.
+///
+/// Extraction decodes the source's subtitle streams, so it holds the shared job
+/// gate (§C.2 + the HLS contract's §3.6). It runs while the HLS job does not
+/// exist yet, which is why the gate is free in the normal path.
+async fn extract_subtitle_tracks(
+    handle: &ProxyHandle,
+    loopback_url: &str,
+    indexes: &[u32],
+) -> std::collections::HashMap<u32, String> {
+    if indexes.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let gate = handle.job_gate();
+    let url = loopback_url.to_string();
+    let indexes = indexes.to_vec();
+    let extracted = tokio::task::spawn_blocking(move || {
+        let _permit = gate.acquire(JOB_ACQUIRE_TIMEOUT)?;
+        wdmm_ffmpeg::extract_subtitle_tracks(&url, &indexes)
+            .map_err(|e| format!("subtitle extraction failed: {e}"))
+    })
+    .await;
+    match extracted {
+        Ok(Ok(tracks)) => tracks,
+        Ok(Err(e)) => {
+            wdmm_ffmpeg::diag::log(format!("[subtitle] {e}"));
+            std::collections::HashMap::new()
+        }
+        Err(e) => {
+            wdmm_ffmpeg::diag::log(format!("[subtitle] extraction task failed: {e}"));
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Prepare the whole subtitle lane before the cast starts (§C.2).
+///
+/// Every auto-matched sidecar is exposed, and (HLS only) every embedded text
+/// track is extracted in one pass and exposed as WebVTT. All of it happens
+/// before `register_hls_nowait`, so a later app-side switch is a pure metadata
+/// re-send. One failing subtitle never fails the cast: sidecar failures are
+/// reported in `subtitle_status.message` and embedded tracks flip to
+/// `support:"error"`.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_subtitles(
+    handle: &ProxyHandle,
+    lan_ip: IpAddr,
+    driver: Arc<dyn WdmmVfs>,
+    provider: &'static str,
+    video_name: &str,
+    remote_path: &str,
+    loopback_url: &str,
+    ui_lang: &str,
+    status: &mut SubtitleStatus,
+) -> PreparedSubtitles {
+    let started = std::time::Instant::now();
+
+    // 1. Sidecars next to the media (bounded: a slow share must not stall the
+    //    cast start forever).
+    let mut candidates = match tokio::time::timeout(
+        SIDECAR_SCAN_TIMEOUT,
+        scan_subtitles(Arc::clone(&driver), remote_path, video_name),
+    )
+    .await
+    {
+        Ok(Ok(candidates)) => candidates,
+        Ok(Err(e)) => {
+            status.message = Some(format!("sidecar subtitle scan failed: {e}"));
+            Vec::new()
+        }
+        Err(_) => {
+            status.message = Some(format!(
+                "sidecar subtitle scan timed out after {}s",
+                SIDECAR_SCAN_TIMEOUT.as_secs()
+            ));
+            Vec::new()
+        }
+    };
+    let sidecar_count = candidates.len();
+
+    // 2. Embedded tracks (HLS only: a direct cast leaves them in the container
+    //    for the renderer to demux itself).
+    let mut embedded_cache: std::collections::HashMap<u32, Arc<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let mut embedded_count = 0usize;
+    if provider == "hls" {
+        match probe_source(loopback_url).await {
+            Ok(probe) => {
+                status.apply_probe(&probe.subtitles, provider);
+                let indexes: Vec<u32> = probe
+                    .subtitles
+                    .iter()
+                    .filter(|track| matches!(classify_codec(&track.codec), TrackKind::Text))
+                    .map(|track| track.index)
+                    .collect();
+                let extracted = extract_subtitle_tracks(handle, loopback_url, &indexes).await;
+                for track in &probe.subtitles {
+                    let mut candidate = SubtitleCandidate::embedded(
+                        remote_path,
+                        track.index,
+                        track.codec.clone(),
+                        track.language.as_deref(),
+                        track.title.as_deref(),
+                    );
+                    if matches!(classify_codec(&track.codec), TrackKind::Text) {
+                        match extracted.get(&track.index) {
+                            Some(vtt) if vtt.len() <= MAX_SUBTITLE_BYTES => {
+                                embedded_cache
+                                    .insert(track.index, Arc::new(vtt.clone().into_bytes()));
+                            }
+                            Some(_) => {
+                                wdmm_ffmpeg::diag::log(format!(
+                                    "[subtitle] embedded track {} is larger than {} bytes",
+                                    track.index, MAX_SUBTITLE_BYTES
+                                ));
+                                candidate.support = "error";
+                            }
+                            None => candidate.support = "error",
+                        }
+                    }
+                    embedded_count += 1;
+                    candidates.push(candidate);
+                }
+            }
+            Err(e) => {
+                let message = format!("embedded subtitle probe failed: {e}");
+                wdmm_ffmpeg::diag::log(format!("[subtitle] {message}"));
+                status.message = Some(message);
+            }
+        }
+    }
+
+    // 3. Expose every deliverable resource.
+    let mut resources: Vec<SubtitleResource> = Vec::new();
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        if candidate.is_bitmap() {
+            continue;
+        }
+        let is_embedded = candidate.embedded;
+        let exposed = if is_embedded {
+            match candidate
+                .track
+                .and_then(|track| embedded_cache.get(&track).cloned())
+            {
+                Some(data) => match subtitle_didl_protocol(candidate) {
+                    Some(protocol) => {
+                        expose_subtitle_data(
+                            handle, lan_ip, video_name, candidate, index, data, protocol,
+                        )
+                        .await
+                    }
+                    None => {
+                        candidate.support = "error";
+                        continue;
+                    }
+                },
+                None => continue,
+            }
+        } else {
+            expose_subtitle(
+                handle,
+                Arc::clone(&driver),
+                lan_ip,
+                video_name,
+                candidate,
+                index,
+            )
+            .await
+        };
+        match exposed {
+            Ok(resource) => resources.push(resource),
+            Err(e) => {
+                if is_embedded {
+                    wdmm_ffmpeg::diag::log(format!(
+                        "[subtitle] embedded track {} unavailable: {e}",
+                        candidate.track.unwrap_or_default()
+                    ));
+                    candidate.support = "error";
+                } else {
+                    status.message = Some(format!("sidecar subtitle unavailable: {e}"));
+                }
+            }
+        }
+    }
+
+    // 4. Auto-pick among what is actually deliverable and put it first, so a
+    //    renderer that plays the first subtitle lands on the UI language.
+    let pickable: Vec<SubtitleCandidate> = resources
+        .iter()
+        .map(|resource| resource.candidate.clone())
+        .collect();
+    let selected = pick_subtitle(&pickable, ui_lang).map(|index| pickable[index].clone());
+    if let Some(selected) = &selected {
+        if let Some(position) = resources
+            .iter()
+            .position(|resource| resource.candidate.path == selected.path)
+        {
+            let first = resources.remove(position);
+            resources.insert(0, first);
+        }
+    }
+
+    wdmm_ffmpeg::diag::log(format!(
+        "[subtitle] prepared {} subtitle resource(s) from {sidecar_count} sidecar candidate(s) and \
+         {embedded_count} embedded track(s) in {} ms, before the transcode warm-up",
+        resources.len(),
+        started.elapsed().as_millis()
+    ));
+
+    PreparedSubtitles {
+        candidates,
+        resources,
+        selected,
+        embedded_cache,
+    }
 }
 
 /// Register the proxy stream(s), negotiate the protocol and build the DIDL.
@@ -1173,66 +1489,7 @@ async fn prepare_media(
     // `force_direct`, or the passthrough preset, means the renderer fetches the
     // original bytes from the proxy; anything else goes through HLS.
     let wants_direct = force_direct || matches!(preset_id, Some("passthrough"));
-    let (provider, media_url, hls_token, warming): (&'static str, String, Option<String>, bool) =
-        if wants_direct {
-            (
-                "direct",
-                format!("http://{lan_ip}:{port}{}", registration.path_template),
-                None,
-                false,
-            )
-        } else {
-            let Some(preset_id) = preset_id else {
-                handle.unregister(&stream_token);
-                return Err("preset_id required for a transcoded cast".to_string());
-            };
-            let preset = match global_library_db().get_transcode_preset(preset_id) {
-                Ok(Some(preset)) => preset,
-                Ok(None) => {
-                    handle.unregister(&stream_token);
-                    return Err(format!("transcode preset not found: {preset_id}"));
-                }
-                Err(e) => {
-                    handle.unregister(&stream_token);
-                    return Err(format!("transcode preset: {e}"));
-                }
-            };
-            // §3: warm-up returns as soon as the job is registered; the
-            // renderer is only pointed at the playlist after `cast`.
-            let opts = HlsSessionOpts {
-                device_id: renderer.usn.clone(),
-                input_url: loopback_url.clone(),
-                preset,
-                ttl_secs: None,
-                allowed_peers: None,
-                cache: HlsCacheOptions {
-                    root: cache.root.clone(),
-                    budget_bytes: Some(cache.budget_bytes),
-                    account_id: account_id.to_string(),
-                    remote_path: remote_path.to_string(),
-                    preset_id: preset_id.to_string(),
-                    size,
-                    ident: cache.ident.clone(),
-                },
-            };
-            let registered = if warmup {
-                handle.register_hls_nowait(opts).await
-            } else {
-                handle.register_hls(opts).await
-            };
-            match registered {
-                Ok(hls) => (
-                    "hls",
-                    format!("http://{lan_ip}:{port}{}", hls.playlist_template),
-                    Some(hls.token),
-                    warmup,
-                ),
-                Err(e) => {
-                    handle.unregister(&stream_token);
-                    return Err(format!("hls registration failed: {e}"));
-                }
-            }
-        };
+    let provider: &'static str = if wants_direct { "direct" } else { "hls" };
 
     // Audio-only sources negotiate and advertise audio classes; the renderer
     // must not be rejected by the video/* gate (task-20).
@@ -1245,6 +1502,25 @@ async fn prepare_media(
         mime_for(name).to_string()
     };
     let mime_ext = extension(name).to_uppercase();
+
+    // Subtitle lane (§C.2): every matched sidecar and (HLS only) every embedded
+    // text track is extracted and exposed *before* the transcode warm-up, so
+    // switching a subtitle never competes for the shared libav gate mid-play.
+    let mut subtitle_status = SubtitleStatus::default();
+    let subtitles = prepare_subtitles(
+        handle,
+        lan_ip,
+        Arc::clone(&driver),
+        provider,
+        name,
+        remote_path,
+        &loopback_url,
+        ui_lang,
+        &mut subtitle_status,
+    )
+    .await;
+    let subtitle_tokens = subtitles.tokens();
+
     let mut sink_protocols: Vec<String> = Vec::new();
     let mut connection_manager = None;
     if let Ok(client) = ConnectionManagerClient::from_renderer(renderer).await {
@@ -1261,7 +1537,7 @@ async fn prepare_media(
         "video/"
     };
     if !sink_protocols.is_empty() && !sink_advertises(&sink_protocols, media_kind) {
-        unregister_media(handle, Some(&stream_token), hls_token.as_deref(), None);
+        unregister_media(handle, Some(&stream_token), None, &subtitle_tokens);
         return Err(format!(
             "renderer does not advertise {wanted_prefix}* in SinkProtocolInfo"
         ));
@@ -1271,60 +1547,72 @@ async fn prepare_media(
         None => format!("http-get:*:{mime}:DLNA.ORG_OP=01"),
     };
 
-    // Best-effort, bounded sidecar scan: a slow share must never delay
-    // `SetAVTransportURI`. A miss is explained in `subtitle_status.message`.
-    let mut subtitle_status = SubtitleStatus::default();
-    let subtitle_candidates = match tokio::time::timeout(
-        SIDECAR_SCAN_TIMEOUT,
-        scan_subtitles(Arc::clone(&driver), remote_path, name),
-    )
-    .await
-    {
-        Ok(Ok(candidates)) => candidates,
-        Ok(Err(e)) => {
-            subtitle_status.message = Some(format!("sidecar subtitle scan failed: {e}"));
-            Vec::new()
-        }
-        Err(_) => {
-            subtitle_status.message = Some(format!(
-                "sidecar subtitle scan timed out after {}s",
-                SIDECAR_SCAN_TIMEOUT.as_secs()
-            ));
-            Vec::new()
-        }
-    };
-    let selected_index = pick_subtitle(&subtitle_candidates, ui_lang);
-    let (selected_subtitle, subtitle_token, subtitle_resource) = match selected_index {
-        Some(idx) => {
-            let candidate = subtitle_candidates[idx].clone();
-            match expose_subtitle(handle, Arc::clone(&driver), lan_ip, &candidate).await {
-                Ok((token, url)) => match subtitle_didl_protocol(&candidate) {
-                    Some(protocol) => (Some(candidate), Some(token), Some((url, protocol))),
-                    None => {
-                        // A bitmap sidecar (e.g. `.sup`) has no Deliverable
-                        // text resource: release the token we just made.
-                        handle.unregister(&token);
-                        (None, None, None)
-                    }
-                },
-                // A missing/oversized subtitle must never fail the cast itself.
-                Err(e) => {
-                    subtitle_status.message = Some(format!("sidecar subtitle unavailable: {e}"));
-                    (None, None, None)
-                }
+    // The transcode warm-up starts last: the renderer is only pointed at the
+    // playlist once the whole subtitle lane is on the proxy (§C.2).
+    let (media_url, hls_token, warming): (String, Option<String>, bool) = if wants_direct {
+        (
+            format!("http://{lan_ip}:{port}{}", registration.path_template),
+            None,
+            false,
+        )
+    } else {
+        let Some(preset_id) = preset_id else {
+            unregister_media(handle, Some(&stream_token), None, &subtitle_tokens);
+            return Err("preset_id required for a transcoded cast".to_string());
+        };
+        let preset = match global_library_db().get_transcode_preset(preset_id) {
+            Ok(Some(preset)) => preset,
+            Ok(None) => {
+                unregister_media(handle, Some(&stream_token), None, &subtitle_tokens);
+                return Err(format!("transcode preset not found: {preset_id}"));
+            }
+            Err(e) => {
+                unregister_media(handle, Some(&stream_token), None, &subtitle_tokens);
+                return Err(format!("transcode preset: {e}"));
+            }
+        };
+        // §3: warm-up returns as soon as the job is registered; the renderer
+        // is only pointed at the playlist after `cast`.
+        let opts = HlsSessionOpts {
+            device_id: renderer.usn.clone(),
+            input_url: loopback_url.clone(),
+            preset,
+            ttl_secs: None,
+            allowed_peers: None,
+            cache: HlsCacheOptions {
+                root: cache.root.clone(),
+                budget_bytes: Some(cache.budget_bytes),
+                account_id: account_id.to_string(),
+                remote_path: remote_path.to_string(),
+                preset_id: preset_id.to_string(),
+                size,
+                ident: cache.ident.clone(),
+            },
+        };
+        let registered = if warmup {
+            handle.register_hls_nowait(opts).await
+        } else {
+            handle.register_hls(opts).await
+        };
+        match registered {
+            Ok(hls) => (
+                format!("http://{lan_ip}:{port}{}", hls.playlist_template),
+                Some(hls.token),
+                warmup,
+            ),
+            Err(e) => {
+                unregister_media(handle, Some(&stream_token), None, &subtitle_tokens);
+                return Err(format!("hls registration failed: {e}"));
             }
         }
-        None => (None, None, None),
     };
-    let subtitle_ref = subtitle_resource
-        .as_ref()
-        .map(|(url, protocol)| (url.as_str(), protocol.as_str()));
 
-    let didl = if media_kind == "audio" {
-        build_audio_didl(name, &media_url, &protocol_info, subtitle_ref)
-    } else {
-        build_didl(name, &media_url, &protocol_info, subtitle_ref)
-    };
+    let subtitle_list: Vec<(String, String)> = subtitles
+        .resources
+        .iter()
+        .map(|resource| (resource.url.clone(), resource.protocol.clone()))
+        .collect();
+    let didl = build_media_didl(name, media_kind, &media_url, &protocol_info, &subtitle_list);
 
     Ok(PreparedMedia {
         provider,
@@ -1336,9 +1624,11 @@ async fn prepare_media(
         mime,
         protocol_info,
         size,
-        subtitle_candidates,
-        selected_subtitle,
-        subtitle_token,
+        subtitle_candidates: subtitles.candidates,
+        selected_subtitle: subtitles.selected,
+        subtitle_resources: subtitles.resources,
+        subtitle_tokens,
+        embedded_cache: subtitles.embedded_cache,
         subtitle_status,
         didl,
         warming,
@@ -1350,7 +1640,7 @@ fn unregister_media(
     handle: &ProxyHandle,
     stream_token: Option<&str>,
     hls_token: Option<&str>,
-    subtitle_token: Option<&str>,
+    subtitle_tokens: &[String],
 ) {
     if let Some(token) = stream_token {
         handle.unregister(token);
@@ -1358,7 +1648,7 @@ fn unregister_media(
     if let Some(token) = hls_token {
         handle.unregister_hls(token);
     }
-    if let Some(token) = subtitle_token {
+    for token in subtitle_tokens {
         handle.unregister(token);
     }
 }
@@ -1430,7 +1720,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
                 &proxy,
                 Some(&prepared.stream_token),
                 prepared.hls_token.as_deref(),
-                prepared.subtitle_token.as_deref(),
+                &prepared.subtitle_tokens,
             );
             return Err(format!("open renderer failed: {e}"));
         }
@@ -1445,7 +1735,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
                 &proxy,
                 Some(&prepared.stream_token),
                 prepared.hls_token.as_deref(),
-                prepared.subtitle_token.as_deref(),
+                &prepared.subtitle_tokens,
             );
             return Err(format!("SetAVTransportURI failed: {e}"));
         }
@@ -1480,8 +1770,9 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         protocol_info: prepared.protocol_info.clone(),
         subtitle_candidates: prepared.subtitle_candidates,
         selected_subtitle: prepared.selected_subtitle,
-        subtitle_token: prepared.subtitle_token,
-        embedded_cache: std::collections::HashMap::new(),
+        subtitle_resources: prepared.subtitle_resources,
+        subtitle_tokens: prepared.subtitle_tokens,
+        embedded_cache: prepared.embedded_cache,
         subtitle_status,
         phase,
         didl: prepared.didl,
@@ -1489,12 +1780,6 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         last_error: None,
     };
     put_session(entry);
-    // HLS only: Kodi lists the source container's own tracks during a direct
-    // cast, but during HLS it only gets the transcoded TS — so embedded text
-    // tracks are discovered from the source in the background (contract §3).
-    if prepared.provider == "hls" {
-        spawn_embedded_probe(handle, loopback_url, remote_path.clone());
-    }
 
     Ok(json!({
         "ok": true,
@@ -1510,7 +1795,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
 }
 
 /// Apply one `{"cmd":…}` document to a session.
-async fn apply_cmd(entry: &mut SessionEntry, cmd: &Value) -> Result<(), CmdError> {
+async fn apply_cmd(entry: &mut SessionEntry, cmd: &Value) -> Result<Option<Value>, CmdError> {
     let command = cmd
         .get("cmd")
         .and_then(Value::as_str)
@@ -1521,13 +1806,18 @@ async fn apply_cmd(entry: &mut SessionEntry, cmd: &Value) -> Result<(), CmdError
             .session
             .play()
             .await
+            .map(|()| None)
             .map_err(|e| CmdError::plain(e.to_string())),
         "pause" => entry
             .session
             .pause()
             .await
+            .map(|()| None)
             .map_err(|e| CmdError::plain(e.to_string())),
-        "stop" => stop_session(entry).await.map_err(CmdError::from),
+        "stop" => stop_session(entry)
+            .await
+            .map(|()| None)
+            .map_err(CmdError::from),
         "seek" => {
             let position_ms = cmd
                 .get("position_ms")
@@ -1537,11 +1827,18 @@ async fn apply_cmd(entry: &mut SessionEntry, cmd: &Value) -> Result<(), CmdError
                 .session
                 .seek(position_ms)
                 .await
+                .map(|()| None)
                 .map_err(|e| CmdError::plain(e.to_string()))
         }
-        "select" => select_media(entry, cmd).await.map_err(CmdError::from),
-        "subtitle" => select_subtitle(entry, cmd).await,
-        "cast" => cast_to_renderer(entry).await.map_err(CmdError::from),
+        "select" => select_media(entry, cmd)
+            .await
+            .map(|()| None)
+            .map_err(CmdError::from),
+        "subtitle" => select_subtitle(entry, cmd).await.map(Some),
+        "cast" => cast_to_renderer(entry)
+            .await
+            .map(|()| None)
+            .map_err(CmdError::from),
         other => Err(CmdError::plain(format!("unknown cmd: {other}"))),
     }
 }
@@ -1575,12 +1872,13 @@ async fn stop_session(entry: &mut SessionEntry) -> Result<(), String> {
         // Warming / failed / idle: cancelling the job and releasing the proxy
         // tokens is the whole stop — do not touch the renderer.
         let hls = entry.hls_token.take();
-        let subtitle = entry.subtitle_token.take();
+        let subtitle = std::mem::take(&mut entry.subtitle_tokens);
+        entry.subtitle_resources.clear();
         unregister_media(
             &entry.proxy,
             Some(&entry.stream_token),
             hls.as_deref(),
-            subtitle.as_deref(),
+            &subtitle,
         );
         Ok(())
     };
@@ -1659,7 +1957,7 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
             &proxy,
             Some(&prepared.stream_token),
             prepared.hls_token.as_deref(),
-            prepared.subtitle_token.as_deref(),
+            &prepared.subtitle_tokens,
         );
         return Err(format!("SetAVTransportURI failed: {e}"));
     }
@@ -1668,7 +1966,7 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
         &proxy,
         Some(&entry.stream_token),
         entry.hls_token.as_deref(),
-        entry.subtitle_token.as_deref(),
+        &entry.subtitle_tokens,
     );
     entry.remote_path = remote_path;
     entry.name = name;
@@ -1685,20 +1983,14 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
     entry.protocol_info = prepared.protocol_info;
     entry.subtitle_candidates = prepared.subtitle_candidates;
     entry.selected_subtitle = prepared.selected_subtitle;
-    entry.subtitle_token = prepared.subtitle_token;
+    entry.subtitle_resources = prepared.subtitle_resources;
+    entry.subtitle_tokens = prepared.subtitle_tokens;
+    entry.embedded_cache = prepared.embedded_cache;
     entry.subtitle_status = prepared.subtitle_status;
-    entry.embedded_cache.clear();
     entry.didl = prepared.didl;
     entry.cache = cache;
     entry.phase = SessionPhase::Playing;
     entry.last_error = None;
-    if entry.provider == "hls" {
-        spawn_embedded_probe(
-            entry.handle,
-            entry.loopback_url.clone(),
-            entry.remote_path.clone(),
-        );
-    }
     Ok(())
 }
 
@@ -1759,64 +2051,85 @@ impl From<&str> for CmdError {
 
 /// Turn subtitles off (`path: null`) or switch to a sidecar / embedded track.
 ///
-/// Sidecars keep the existing behaviour (read the file, expose it through the
-/// proxy). Embedded text tracks are extracted on first selection and cached as
-/// WebVTT; embedded bitmap tracks are refused loudly.
-async fn select_subtitle(entry: &mut SessionEntry, cmd: &Value) -> Result<(), CmdError> {
+/// Every deliverable subtitle was prepared and exposed before the transcode
+/// warm-up (§C.2), so a switch normally just re-sends the URI. Only a track
+/// outside the prepared set falls back to preparing it on the spot.
+async fn select_subtitle(entry: &mut SessionEntry, cmd: &Value) -> Result<Value, CmdError> {
     let wanted = opt_string(cmd, "path");
-    let proxy = entry.proxy.clone();
+    // A renderer only accepts a new subtitle through a new SetAVTransportURI,
+    // which restarts playback: remember the position and jump back afterwards.
+    let resume = entry.session.tick().await.ok().map(|tick| tick.position_ms);
 
-    let subtitle_resource: Option<(String, String)> = match wanted {
+    let subtitles: Vec<(String, String)> = match wanted {
         Some(path) => {
-            if let Some(track) = embedded_track_index(&path, &entry.remote_path) {
-                Some(select_embedded_subtitle(entry, track).await?)
-            } else {
-                Some(select_sidecar_subtitle(entry, &path).await?)
-            }
+            let resource = match find_ready_subtitle(entry, &path) {
+                Some(resource) => resource,
+                None => select_unprepared_subtitle(entry, &path).await?,
+            };
+            let pair = (resource.url.clone(), resource.protocol.clone());
+            entry.selected_subtitle = Some(resource.candidate.clone());
+            vec![pair]
         }
         None => {
-            if let Some(old) = entry.subtitle_token.take() {
-                proxy.unregister(&old);
-            }
             entry.selected_subtitle = None;
-            None
+            Vec::new()
         }
     };
 
-    let didl = if entry.media_kind == "audio" {
-        build_audio_didl(
-            &entry.name,
-            &entry.media_url,
-            &entry.protocol_info,
-            subtitle_resource
-                .as_ref()
-                .map(|(url, protocol)| (url.as_str(), protocol.as_str())),
-        )
-    } else {
-        build_didl(
-            &entry.name,
-            &entry.media_url,
-            &entry.protocol_info,
-            subtitle_resource
-                .as_ref()
-                .map(|(url, protocol)| (url.as_str(), protocol.as_str())),
-        )
-    };
+    let didl = build_session_didl(entry, &subtitles);
     entry.didl = didl.clone();
-    // Re-send the URI (with the new metadata) and play: renderers do not pick
-    // up a subtitle-only metadata change any other way.
     entry
         .session
         .start(&entry.media_url, &didl)
         .await
-        .map_err(|e| CmdError::plain(e.to_string()))
+        .map_err(|e| CmdError::plain(e.to_string()))?;
+    if let Some(position) = resume.filter(|position| *position > RESUME_POSITION_MS) {
+        if let Err(e) = entry.session.seek(position).await {
+            wdmm_ffmpeg::diag::log(format!("[subtitle] seek back to {position} ms failed: {e}"));
+        }
+    }
+    Ok(json!({ "ok": true, "resumed_at_ms": resume }))
 }
 
-/// Expose a real sidecar file as the renderer's external subtitle.
+/// The prepared resource for one candidate path, if the pre-warm pass exposed it.
+fn find_ready_subtitle(entry: &SessionEntry, path: &str) -> Option<SubtitleResource> {
+    if let Some(resource) = entry
+        .subtitle_resources
+        .iter()
+        .find(|resource| resource.candidate.path == path)
+    {
+        return Some(resource.clone());
+    }
+    let track = embedded_track_index(path, &entry.remote_path)?;
+    entry
+        .subtitle_resources
+        .iter()
+        .find(|resource| resource.candidate.embedded && resource.candidate.track == Some(track))
+        .cloned()
+}
+
+/// Fallback for a track outside the prepared set (e.g. a sidecar that appeared
+/// after the cast started). This is the only path that can still prepare a
+/// subtitle during playback.
+async fn select_unprepared_subtitle(
+    entry: &mut SessionEntry,
+    path: &str,
+) -> Result<SubtitleResource, CmdError> {
+    let track = embedded_track_index(path, &entry.remote_path);
+    let resource = match track {
+        Some(track) => select_embedded_subtitle(entry, track).await?,
+        None => select_sidecar_subtitle(entry, path).await?,
+    };
+    entry.subtitle_tokens.push(resource.token.clone());
+    entry.subtitle_resources.push(resource.clone());
+    Ok(resource)
+}
+
+/// Expose a real sidecar file as a renderer-selectable external subtitle.
 async fn select_sidecar_subtitle(
     entry: &mut SessionEntry,
     path: &str,
-) -> Result<(String, String), CmdError> {
+) -> Result<SubtitleResource, CmdError> {
     let driver = Arc::clone(&entry.driver);
     let candidate = entry
         .subtitle_candidates
@@ -1837,27 +2150,32 @@ async fn select_sidecar_subtitle(
                 0,
             )
         });
-    let protocol = subtitle_didl_protocol(&candidate).ok_or_else(|| {
-        CmdError::unsupported(
+    if candidate.is_bitmap() {
+        return Err(CmdError::unsupported(
             "bitmap subtitle sidecar cannot be delivered to a DLNA renderer",
             "bitmap-unsupported",
-        )
-    })?;
-    let (token, url) = expose_subtitle(&entry.proxy, driver, entry.lan_ip, &candidate)
-        .await
-        .map_err(|e| CmdError::plain(format!("subtitle failed: {e}")))?;
-    if let Some(old) = entry.subtitle_token.replace(token) {
-        entry.proxy.unregister(&old);
+        ));
     }
+    let index = entry.subtitle_resources.len();
+    let resource = expose_subtitle(
+        &entry.proxy,
+        driver,
+        entry.lan_ip,
+        &entry.name,
+        &candidate,
+        index,
+    )
+    .await
+    .map_err(|e| CmdError::plain(format!("subtitle failed: {e}")))?;
     entry.selected_subtitle = Some(candidate);
-    Ok((url, protocol))
+    Ok(resource)
 }
 
-/// Extract (or reuse) one embedded text track as WebVTT and expose it.
+/// Expose one embedded text track as WebVTT (cached when already extracted).
 async fn select_embedded_subtitle(
     entry: &mut SessionEntry,
     track: u32,
-) -> Result<(String, String), CmdError> {
+) -> Result<SubtitleResource, CmdError> {
     let candidate = match entry
         .subtitle_candidates
         .iter()
@@ -1866,12 +2184,8 @@ async fn select_embedded_subtitle(
     {
         Some(candidate) => candidate,
         None => {
-            // The background probe may still be running (or the app kept a
-            // stale list): probe the source now so the track is classified.
-            // Like the background probe this is a metadata read (one
-            // `avformat_find_stream_info`, no decode), so it must not queue
-            // behind the cast transcode — that is what turned selecting a
-            // subtitle during playback into `transcoding busy`.
+            // The pre-warm pass normally listed every track; a stale app list
+            // (or a direct cast) can still name one we have not probed.
             let loopback = entry.loopback_url.clone();
             let probe = tokio::task::spawn_blocking(move || {
                 wdmm_ffmpeg::probe(&loopback).map_err(|e| e.to_string())
@@ -1919,17 +2233,23 @@ async fn select_embedded_subtitle(
                 let _permit = gate
                     .acquire(JOB_ACQUIRE_TIMEOUT)
                     .map_err(|e| format!("transcoding busy: {e}"))?;
-                wdmm_ffmpeg::extract_subtitle_track(&loopback, track).map_err(|e| e.to_string())
+                let mut tracks = wdmm_ffmpeg::extract_subtitle_tracks(&loopback, &[track])
+                    .map_err(|e| e.to_string())?;
+                Ok::<Option<String>, String>(tracks.remove(&track))
             })
             .await
             .map_err(|e| CmdError::plain(format!("subtitle extraction failed: {e}")))?;
             let vtt = match extracted {
-                Ok(vtt) => vtt,
-                Err(e) => {
+                Ok(Some(vtt)) => vtt,
+                other => {
+                    let reason = match other {
+                        Err(e) => e,
+                        _ => format!("subtitle track {track} produced no cues"),
+                    };
                     // Busy/timed-out extraction is reported against this track
                     // (`support:"error"`), never by silently running a second
                     // libav job in parallel.
-                    wdmm_ffmpeg::diag::log(format!("[subtitle] extraction failed: {e}"));
+                    wdmm_ffmpeg::diag::log(format!("[subtitle] extraction failed: {reason}"));
                     if let Some(stale) = entry
                         .subtitle_candidates
                         .iter_mut()
@@ -1937,7 +2257,9 @@ async fn select_embedded_subtitle(
                     {
                         stale.support = "error";
                     }
-                    return Err(CmdError::plain(format!("subtitle extraction failed: {e}")));
+                    return Err(CmdError::plain(format!(
+                        "subtitle extraction failed: {reason}"
+                    )));
                 }
             };
             let data = Arc::new(vtt.into_bytes());
@@ -1953,15 +2275,20 @@ async fn select_embedded_subtitle(
     }
     let protocol = subtitle_protocol_info("vtt")
         .ok_or_else(|| CmdError::plain("no protocol info for text/vtt"))?;
-    let name = format!("{}.vtt", video_stem(&entry.name));
-    let (token, url) = expose_subtitle_bytes(&entry.proxy, entry.lan_ip, name, data)
-        .await
-        .map_err(|e| CmdError::plain(format!("subtitle failed: {e}")))?;
-    if let Some(old) = entry.subtitle_token.replace(token) {
-        entry.proxy.unregister(&old);
-    }
+    let index = entry.subtitle_resources.len();
+    let resource = expose_subtitle_data(
+        &entry.proxy,
+        entry.lan_ip,
+        &entry.name,
+        &candidate,
+        index,
+        data,
+        protocol,
+    )
+    .await
+    .map_err(|e| CmdError::plain(format!("subtitle failed: {e}")))?;
     entry.selected_subtitle = Some(candidate);
-    Ok((url, protocol))
+    Ok(resource)
 }
 
 /// Recompute the cast phase from the HLS job telemetry + renderer tick.
@@ -2159,6 +2486,13 @@ fn vod_telemetry(progress: Option<&HlsProgress>) -> Value {
 /// `object.item.audioItem.musicTrack` DIDL item, so they are never rejected by
 /// the renderer's `video/*` sink gate.
 ///
+/// The whole subtitle lane is prepared *before* the transcode warm-up (§C.2):
+/// every auto-matched sidecar is exposed and, for HLS, every embedded text
+/// track is extracted in one libav pass. The DIDL therefore carries one `<res>`
+/// per deliverable subtitle from the first second, which is what lets the
+/// renderer offer them as selectable streams without a second
+/// `SetAVTransportURI`.
+///
 /// Returns `{"ok":true,"handle":N,"url":"…","provider":"direct"|"hls",
 /// "media_kind":"video"|"audio","protocol_info":"…","phase":"playing"|"warming",
 /// "compat":{…},"subtitle_status":{…}}` or
@@ -2249,8 +2583,10 @@ pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString {
 /// `playing`. While warming, `stop` cancels the transcode job without touching
 /// the renderer and moves the phase to `idle`.
 ///
-/// Returns `"ok"` on success. A bitmap embedded track is refused loudly with
-/// `{"ok":false,"error":"…","support":"bitmap-unsupported"}`; every other
+/// Returns `"ok"` on success. `subtitle` returns
+/// `{"ok":true,"resumed_at_ms":12345}` (the position it jumped back to, `null`
+/// when playback had barely started). A bitmap embedded track is refused loudly
+/// with `{"ok":false,"error":"…","support":"bitmap-unsupported"}`; every other
 /// failure returns `{"ok":false,"error":"…"}`.
 #[no_mangle]
 pub extern "C" fn wdmm_dlna_session_cmd(handle: u32, cmd_json: *const c_char) -> FfiString {
@@ -2268,7 +2604,8 @@ pub extern "C" fn wdmm_dlna_session_cmd(handle: u32, cmd_json: *const c_char) ->
     let result = rt().block_on(apply_cmd(&mut entry, &cmd));
     put_session(entry);
     match result {
-        Ok(()) => FfiString::from("ok"),
+        Ok(Some(doc)) => FfiString::from(doc.to_string()),
+        Ok(None) => FfiString::from("ok"),
         Err(e) => FfiString::from(e.json().to_string()),
     }
 }
@@ -2282,11 +2619,12 @@ pub extern "C" fn wdmm_dlna_session_close(handle: u32) -> FfiString {
         return err_json("unknown session handle");
     };
     let _ = rt().block_on(entry.session.stop());
+    let subtitle = std::mem::take(&mut entry.subtitle_tokens);
     unregister_media(
         &entry.proxy,
         Some(&entry.stream_token),
         entry.hls_token.as_deref(),
-        entry.subtitle_token.as_deref(),
+        &subtitle,
     );
     FfiString::from("ok")
 }
@@ -2575,23 +2913,65 @@ mod tests {
     }
 
     #[test]
-    fn didl_has_subtitle_resource_only_when_requested() {
-        let plain = build_didl("t", "http://h/a.mkv", "proto", None);
+    fn didl_lists_every_prepared_subtitle() {
+        let plain = build_didl("t", "http://h/a.mkv", "proto", &[]);
         assert_eq!(plain.matches("<res ").count(), 1);
-        let with_sub = build_didl(
-            "t",
-            "http://h/a.mkv",
-            "proto",
-            Some((
-                "http://h/a.srt",
-                subtitle_protocol_info("srt").unwrap().as_str(),
-            )),
-        );
-        assert_eq!(with_sub.matches("<res ").count(), 2);
+        let srt = subtitle_protocol_info("srt").unwrap();
+        let vtt = subtitle_protocol_info("vtt").unwrap();
+        let subtitles = vec![
+            ("http://h/a.zh.srt".to_string(), srt.clone()),
+            ("http://h/a.vtt".to_string(), vtt.clone()),
+        ];
+        let with_subs = build_didl("t", "http://h/a.mkv", "proto", &subtitles);
+        assert_eq!(with_subs.matches("<res ").count(), 3);
+        // Order is preserved: the renderer numbers the streams in document order.
+        let first = with_subs.find("a.zh.srt").unwrap();
+        let second = with_subs.find("a.vtt").unwrap();
+        assert!(first < second);
         // Channel (b) evidence: the MIME subtype must be the real format, or
         // Kodi's UPnP renderer silently ignores the resource.
-        assert!(with_sub.contains("http-get:*:text/srt:*"));
-        assert!(!with_sub.contains("text/plain"));
+        assert!(with_subs.contains("http-get:*:text/srt:*"));
+        assert!(with_subs.contains("http-get:*:text/vtt:*"));
+        assert!(!with_subs.contains("text/plain"));
+    }
+
+    #[test]
+    fn subtitle_url_name_follows_the_video_name() {
+        // `.zh.chi.Signs.ass` -> stem + language + title + real format, which is
+        // what Kodi's filename-based stream list parses.
+        let mut candidate = SubtitleCandidate::sidecar(
+            "a.zh.chi.Signs.ass".to_string(),
+            "/v/a.zh.chi.Signs.ass".to_string(),
+            "zh".to_string(),
+            Some("chi".to_string()),
+            false,
+            0,
+        );
+        candidate.title = Some("Signs".to_string());
+        assert_eq!(subtitle_url_name("a.mkv", &candidate, 0), "a.chi.Signs.ass");
+        // No language, no title: a stable ordinal keeps the names unique.
+        let plain = SubtitleCandidate::sidecar(
+            "a.srt".to_string(),
+            "/v/a.srt".to_string(),
+            String::new(),
+            None,
+            false,
+            0,
+        );
+        assert_eq!(subtitle_url_name("a.mkv", &plain, 2), "a.3.srt");
+        // Embedded tracks are always WebVTT.
+        let embedded = SubtitleCandidate::embedded("/v/a.mkv", 3, "subrip".to_string(), None, None);
+        assert_eq!(subtitle_url_name("a.mkv", &embedded, 0), "a.1.vtt");
+        // Sanitising keeps the extension intact.
+        let dirty = SubtitleCandidate::sidecar(
+            "a.srt".to_string(),
+            "/v/a.srt".to_string(),
+            String::new(),
+            Some("Bad<>:\"/\\|?*Name".to_string()),
+            false,
+            0,
+        );
+        assert_eq!(subtitle_url_name("a.mkv", &dirty, 0), "a.BadName.srt");
     }
 
     #[test]
@@ -2614,13 +2994,13 @@ mod tests {
 
     #[test]
     fn audio_didl_uses_the_music_track_class() {
-        let didl = build_audio_didl("Song", "http://h/a.mp3", "http-get:*:audio/mpeg:*", None);
+        let didl = build_audio_didl("Song", "http://h/a.mp3", "http-get:*:audio/mpeg:*", &[]);
         assert!(didl.contains("object.item.audioItem.musicTrack"));
         assert!(!didl.contains("videoItem"));
         assert_eq!(didl.matches("<res ").count(), 1);
         assert!(didl.contains("http-get:*:audio/mpeg:*"));
         // Titles are escaped exactly like the video builder.
-        let escaped = build_audio_didl("A & B", "http://h/a.mp3", "proto", None);
+        let escaped = build_audio_didl("A & B", "http://h/a.mp3", "proto", &[]);
         assert!(escaped.contains("A &amp; B"));
     }
 
