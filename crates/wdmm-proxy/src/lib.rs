@@ -700,6 +700,15 @@ fn finalize_plan(session: &mut HlsSession) -> bool {
     // segment request restarts at the plan's own boundaries, now with `hls_time`
     // aligned to the measured GOP. The approximate fallback keeps its segments —
     // it has no grid to match and reports the drift instead.
+    //
+    // Residual race: dropping the handle cancels the job and joins it off the
+    // request path (a blocking join here could stall the caller for a whole
+    // input timeout), so the old muxer may still append one more `index.m3u8`
+    // write while the files are being deleted. Should such a write land after
+    // the delete, a later request for that index could read the old anchor's
+    // content. Closing the window needs a run generation stamped on every
+    // segment; this branch only runs when calibration disagrees with the first
+    // run, and the misalignment it prevents is permanent, so the trade is taken.
     if calibrated && !warm_up_matches_plan(&durations, &plan) {
         session.run = None;
         session.last_reopen = None;
