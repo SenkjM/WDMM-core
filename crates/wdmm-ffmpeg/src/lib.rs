@@ -55,8 +55,8 @@ pub use plan::{
 };
 pub use subtitle::{classify_codec, Cue, TrackKind};
 pub use vod::{
-    approximate_plan, calibration_plan, exact_plan, keyframe_index, keyframe_plan,
-    measure_gop_from_durations, KeyframeInfo, PlanAlignment, SegEntry, SegmentPlan,
+    approximate_plan, calibration_plan, exact_plan, measure_gop_from_durations, PlanAlignment,
+    SegEntry, SegmentPlan,
 };
 pub use wdmm_core::models::TranscodePreset;
 
@@ -477,15 +477,36 @@ impl JobHandle {
 impl Drop for JobHandle {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        // Never wait for the job thread here. The pull scheduler replaces a run
+        // from inside the request path while holding the proxy's shared mutex,
+        // and a cancelled job can take seconds to unwind (a blocked read on the
+        // remote source is only bounded by the open/rw timeouts). Joining inline
+        // would freeze every other request, so the wait happens on a helper
+        // thread.
+        //
+        // Legacy jobs own their segment directory and clean it up after the
+        // thread is gone. Persistent VOD cache dirs (`JobOpts::out_dir`) must
+        // survive the job: dropping a handle only cancels, it never evicts
+        // cached segments.
+        let owned_dir = if self.owns_dir {
+            Some(std::mem::take(&mut self.segment_dir))
+        } else {
+            None
+        };
+        let thread = self.thread.take();
+        if thread.is_none() && owned_dir.is_none() {
+            return;
         }
-        // Legacy jobs own their segment directory and clean it up. Persistent
-        // VOD cache dirs (`JobOpts::out_dir`) must survive the job: dropping a
-        // handle only cancels, it never evicts cached segments.
-        if self.owns_dir && self.segment_dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.segment_dir);
-        }
+        std::thread::spawn(move || {
+            if let Some(t) = thread {
+                let _ = t.join();
+            }
+            if let Some(dir) = owned_dir {
+                if dir.exists() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+        });
     }
 }
 

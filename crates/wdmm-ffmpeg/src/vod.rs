@@ -5,44 +5,33 @@
 //! playlist up front from a [`SegmentPlan`], so the player can seek without
 //! reloading the playlist (`#EXT-X-PLAYLIST-TYPE:VOD` + `ENDLIST`).
 //!
-//! The four alignment strategies model how the segment boundaries relate to the
+//! The three alignment strategies model how the segment boundaries relate to the
 //! media timeline:
 //!
 //! - [`PlanAlignment::Exact`] — transcode grid: strict `k * seg_secs`. The job
 //!   seeks the input and decodes up to the requested frame, so the output can be
 //!   cut on the requested grid regardless of input keyframes.
-//! - [`PlanAlignment::Keyframe`] — copy/hybrid with a container keyframe index
-//!   (mp4 `stss`, mkv `cues`): boundaries come from the real keyframes, using the
-//!   same cut rule as the HLS muxer ("first keyframe at/after `seg_secs` since
-//!   the previous cut"), so the synthesized `EXTINF` matches the output exactly.
-//! - [`PlanAlignment::Calibrated`] — copy/hybrid without a keyframe index: the
-//!   warm-up phase measures real segment durations ([`measure_gop_from_durations`]
-//!   infers `gop_ms`) and the plan steps on that multiple of the GOP. The muxer's
-//!   `hls_time` is aligned to the same step, so errors no longer accumulate.
-//! - [`PlanAlignment::Approx`] — VFR/no-index fallback: nominal grid, drift is
-//!   reported by the caller instead of being modelled.
+//! - [`PlanAlignment::Calibrated`] — copy/hybrid: the warm-up phase measures real
+//!   segment durations ([`measure_gop_from_durations`] infers `gop_ms`) and the
+//!   plan steps on that multiple of the GOP. The muxer's `hls_time` is aligned to
+//!   the same step, so errors no longer accumulate.
+//! - [`PlanAlignment::Approx`] — VFR/no-measurement fallback: nominal grid, drift
+//!   is reported by the caller instead of being modelled.
+//!
+//! There is deliberately **no** keyframe-index alignment: a container index is not
+//! trustworthy enough to plan a playlist from (Matroska `cues` are optional and
+//! frequently sparse — one real file exposed 3 keyframes for a 24-minute 1080p
+//! remux), and a single continuous muxer run cannot honour arbitrary keyframe
+//! boundaries anyway, because the muxer only cuts where its own chained rule says.
+//! Planning off that index produced a one-segment playlist against 11 real
+//! segments, which ended the cast after the first segment and killed seeking.
+//! Measurements from the actual output (calibration) are the only evidence that
+//! holds for every container.
 //!
 //! All logic here is pure and always compiled, so it is unit-testable on a host
-//! without libav. Only [`keyframe_index`] touches libav (and returns an empty
-//! list when the `ffmpeg` feature is off or the container has no index).
-//!
-//! # Cost model for [`keyframe_index`]
-//!
-//! The container index is read through `avformat_index_get_entries_count` /
-//! `avformat_index_get_entry`: O(number of index entries) with no media packet
-//! reads. It relies on the demuxer having populated the index while reading the
-//! container metadata (`moov`/`cues`), which `avformat_open_input` +
-//! `avformat_find_stream_info` already do — including for files whose `moov` sits
-//! at the tail, because HTTP byte-range reads are supported by the proxy source.
-//! When the index is empty (no `stss`/`cues`, or a container without one) the
-//! function returns `Ok(vec![])` and the caller falls back to
-//! [`calibration_plan`]; it never scans the whole file and never panics.
+//! without libav.
 //!
 //! [`SegmentPlan`]: crate::vod::SegmentPlan
-
-use std::sync::OnceLock;
-
-use crate::FfmpegResult;
 
 /// One planned HLS segment: media timeline start and duration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,8 +48,7 @@ pub struct SegEntry {
 pub enum PlanAlignment {
     /// Transcode grid: strict `k * seg_secs`.
     Exact,
-    /// Copy/hybrid with a container keyframe index: real keyframe boundaries.
-    Keyframe,
+
     /// Copy/hybrid without an index: warm-up measured GOP grid.
     Calibrated,
     /// VFR/no-index fallback: nominal grid, drift reported by the caller.
@@ -101,13 +89,6 @@ impl SegmentPlan {
             .get(usize::try_from(k).ok()?)
             .map(|e| e.duration_ms)
     }
-}
-
-/// Keyframe position from a container index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyframeInfo {
-    /// Keyframe presentation timestamp on the media timeline (milliseconds).
-    pub pts_ms: i64,
 }
 
 /// Minimum plausible GOP used when validating measurements (250 ms).
@@ -205,62 +186,6 @@ pub fn calibration_plan(duration_ms: i64, seg_secs: f64, gop_ms: i64) -> Segment
     )
 }
 
-/// Keyframe grid: boundaries come from the real container keyframes, using the
-/// same cut rule as the HLS muxer — a new segment starts at the first keyframe
-/// whose distance from the previous cut is at least `seg_secs`. The first
-/// segment starts at 0 and the last is truncated to `duration_ms`.
-///
-/// Without usable keyframes this degrades to [`approximate_plan`]: a plan built
-/// from a partial/empty keyframe list would be worse than a nominal grid.
-pub fn keyframe_plan(duration_ms: i64, seg_secs: f64, keyframes: &[KeyframeInfo]) -> SegmentPlan {
-    if duration_ms <= 0 {
-        return plan_with(
-            duration_ms,
-            seg_secs,
-            PlanAlignment::Keyframe,
-            None,
-            seg_ms(seg_secs),
-        );
-    }
-    let mut usable: Vec<i64> = keyframes
-        .iter()
-        .map(|k| k.pts_ms)
-        .filter(|t| *t > 0 && *t < duration_ms)
-        .collect();
-    usable.sort_unstable();
-    usable.dedup();
-    if usable.is_empty() {
-        return approximate_plan(duration_ms, seg_secs);
-    }
-
-    let seg = seg_ms(seg_secs);
-    let mut entries = Vec::new();
-    let mut start = 0_i64;
-    for kf in usable {
-        if kf - start >= seg {
-            entries.push(SegEntry {
-                start_ms: start,
-                duration_ms: kf - start,
-            });
-            start = kf;
-        }
-    }
-    if start < duration_ms {
-        entries.push(SegEntry {
-            start_ms: start,
-            duration_ms: duration_ms - start,
-        });
-    }
-
-    SegmentPlan {
-        duration_ms,
-        seg_secs,
-        alignment: PlanAlignment::Keyframe,
-        gop_ms: None,
-        entries,
-    }
-}
-
 /// Infer one GOP unit from measured segment durations.
 ///
 /// The muxer's chained `split_by_time` cuts always land on keyframes, so every
@@ -298,31 +223,6 @@ fn gcd(a: i64, b: i64) -> i64 {
         b = t;
     }
     a
-}
-
-/// Read the video stream's keyframe timestamps from the container index.
-///
-/// Cost: O(index entries), no media packet reads. The index is populated by the
-/// demuxer while reading the container metadata (`moov`/`cues`), including tail
-/// `moov` over HTTP ranges. Returns `Ok(vec![])` when the container exposes no
-/// index (→ [`calibration_plan`] path) and when the `ffmpeg` feature is off;
-/// never panics, never scans the file linearly.
-pub fn keyframe_index(url: &str) -> FfmpegResult<Vec<KeyframeInfo>> {
-    #[cfg(feature = "ffmpeg")]
-    {
-        crate::transcoder::keyframe_index(url)
-    }
-    #[cfg(not(feature = "ffmpeg"))]
-    {
-        let _ = url;
-        Ok(Vec::new())
-    }
-}
-
-/// Whether the crate can read a real keyframe index in this build.
-pub fn keyframe_index_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| cfg!(feature = "ffmpeg"))
 }
 
 #[cfg(test)]
@@ -418,59 +318,6 @@ mod tests {
             );
             assert_eq!(plan.gop_ms, None);
         }
-    }
-
-    #[test]
-    fn keyframe_plan_follows_muxer_cut_rule() {
-        // 2 s GOP, 4 s target: cuts at 4 s, 8 s … zero drift on the real cuts.
-        let kfs: Vec<KeyframeInfo> = (0..=15)
-            .map(|i| KeyframeInfo { pts_ms: i * 2_000 })
-            .collect();
-        let plan = keyframe_plan(10_000, 4.0, &kfs);
-        assert_eq!(plan.alignment, PlanAlignment::Keyframe);
-        assert_eq!(starts(&plan), vec![0, 4_000, 8_000]);
-        assert_eq!(durations(&plan), vec![4_000, 4_000, 2_000]);
-
-        // Uneven GOP: boundaries are real keyframes, not a nominal grid. Cuts
-        // follow the muxer rule (first keyframe at/after 4 s since the last cut).
-        let kfs = vec![
-            KeyframeInfo { pts_ms: 0 },
-            KeyframeInfo { pts_ms: 3_000 },
-            KeyframeInfo { pts_ms: 5_000 },
-            KeyframeInfo { pts_ms: 7_000 },
-            KeyframeInfo { pts_ms: 11_000 },
-        ];
-        let plan = keyframe_plan(13_000, 4.0, &kfs);
-        assert_eq!(starts(&plan), vec![0, 5_000, 11_000]);
-        assert_eq!(durations(&plan), vec![5_000, 6_000, 2_000]);
-    }
-
-    #[test]
-    fn keyframe_plan_handles_unusable_input() {
-        // No keyframes at all → nominal grid (never one giant segment).
-        let plan = keyframe_plan(9_000, 4.0, &[]);
-        assert_eq!(plan.alignment, PlanAlignment::Approx);
-        assert_eq!(durations(&plan), vec![4_000, 4_000, 1_000]);
-
-        // Keyframes outside (0, duration) are ignored.
-        let kfs = vec![
-            KeyframeInfo { pts_ms: -500 },
-            KeyframeInfo { pts_ms: 0 },
-            KeyframeInfo { pts_ms: 20_000 },
-        ];
-        let plan = keyframe_plan(9_000, 4.0, &kfs);
-        assert_eq!(plan.alignment, PlanAlignment::Approx);
-        assert_eq!(durations(&plan), vec![4_000, 4_000, 1_000]);
-
-        // Duplicate keyframes must not create zero-length segments.
-        let kfs = vec![
-            KeyframeInfo { pts_ms: 0 },
-            KeyframeInfo { pts_ms: 4_000 },
-            KeyframeInfo { pts_ms: 4_000 },
-            KeyframeInfo { pts_ms: 8_000 },
-        ];
-        let plan = keyframe_plan(10_000, 4.0, &kfs);
-        assert_eq!(durations(&plan), vec![4_000, 4_000, 2_000]);
     }
 
     #[test]

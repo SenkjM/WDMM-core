@@ -198,8 +198,13 @@ struct HlsRun {
     ready_k: u64,
     /// The job reached the end of the media.
     ended: bool,
-    /// Global-job-gate permit; released when the run is dropped.
-    _permit: JobPermit,
+    /// Global-job-gate permit.
+    ///
+    /// Released as soon as the job thread finishes (a finished job holds no
+    /// encoder), while the run itself stays around to keep reporting telemetry.
+    /// Without this a completed session would keep the single gate slot forever
+    /// and every other cast would fail with `transcoding busy`.
+    permit: Option<JobPermit>,
 }
 
 /// An active HLS VOD session keyed by a proxy token.
@@ -400,7 +405,6 @@ fn derive_hls_progress(session: &HlsSession) -> HlsProgress {
 pub fn alignment_label(alignment: PlanAlignment) -> &'static str {
     match alignment {
         PlanAlignment::Exact => "exact",
-        PlanAlignment::Keyframe => "keyframe",
         PlanAlignment::Calibrated => "calibrated",
         PlanAlignment::Approx => "approx",
     }
@@ -444,12 +448,20 @@ fn scan_segments(dir: &Path) -> (Option<u64>, u32) {
 }
 
 /// How long [`ProxyHandle::register_hls`] waits for the pull scheduler to have a
-/// playable plan (keyframe index, or the calibration warm-up segments).
+/// playable plan (the calibration warm-up must produce `CALIBRATION_SEGMENTS`
+/// finished segments first).
 ///
 /// Renderers fetch the playlist the moment `SetAVTransportURI` returns (Kodi
 /// does it in ~50 ms), so returning before the plan exists makes the renderer
-/// see `404` and abort playback.
-const HLS_PLAN_TIMEOUT: Duration = Duration::from_secs(20);
+/// see `404` and abort playback. Waiting longer is the *correct* trade: the UI
+/// already shows a warm-up panel with the live encode speed, while a premature
+/// playlist bakes in a wrong segment grid, and a VOD grid can never be fixed
+/// afterwards (that is exactly the 「定位无效」regression).
+///
+/// The window covers three segments of *content* time at quarter real time, i.e.
+/// `3 * seg_secs * 4`, so 60 s for the 4 s presets — slow software encodes of
+/// 1080p HEVC included.
+const HLS_PLAN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long [`serve_hls`] waits for a segment the running job is about to
 /// produce before answering `504`.
@@ -473,6 +485,13 @@ const HLS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// the playlist exists, so this stays as small as the maths allows.
 const CALIBRATION_SEGMENTS: u64 = 3;
 
+/// Tolerance when comparing a warm-up segment with the plan grid.
+///
+/// A muxer cut lands on a keyframe, so a warm-up segment is exactly one (or a
+/// multiple of one) GOP long. Anything off by more than a couple of frames means
+/// the warm-up grid is *not* the plan grid.
+const WARM_UP_GRID_TOLERANCE_MS: i64 = 200;
+
 /// Minimum interval between two transcode job (re)starts of one session.
 const HLS_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -485,12 +504,21 @@ fn probe_duration_ms(input_url: &str) -> Result<i64, String> {
     Ok((probe.duration_secs * 1000.0).round() as i64)
 }
 
+/// On-disk shape version of [`StoredPlan`].
+///
+/// Bump whenever the plan semantics change so cached plans from an older build
+/// are rejected instead of trusted: `version` has **no** serde default, so a
+/// `plan.json` written by an older build fails to deserialize and that cache
+/// entry is dropped (see `TranscodeCache::load_plan`).
+const PLAN_FORMAT_VERSION: u32 = 2;
+
 /// Plan record persisted as `<cache_dir>/plan.json`.
 ///
 /// `SegmentPlan` itself lives in `wdmm-ffmpeg` and is not `serde`-derived, so
 /// the proxy owns the stable on-disk shape.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct StoredPlan {
+    version: u32,
     duration_ms: i64,
     seg_secs: f64,
     alignment: String,
@@ -507,6 +535,7 @@ struct StoredSeg {
 impl StoredPlan {
     fn from_plan(plan: &SegmentPlan) -> Self {
         Self {
+            version: PLAN_FORMAT_VERSION,
             duration_ms: plan.duration_ms,
             seg_secs: plan.seg_secs,
             alignment: alignment_label(plan.alignment).to_string(),
@@ -523,9 +552,11 @@ impl StoredPlan {
     }
 
     fn into_plan(self) -> SegmentPlan {
+        // `version` is validated when deserializing: a stale plan is missing the
+        // field and never reaches this point.
+        debug_assert_eq!(self.version, PLAN_FORMAT_VERSION);
         let alignment = match self.alignment.as_str() {
             "exact" => PlanAlignment::Exact,
-            "keyframe" => PlanAlignment::Keyframe,
             "calibrated" => PlanAlignment::Calibrated,
             _ => PlanAlignment::Approx,
         };
@@ -556,6 +587,46 @@ fn aligned_hls_time_ms(seg_secs: f64, gop_ms: i64) -> Option<u32> {
     u32::try_from(multiple * gop_ms).ok()
 }
 
+/// Whether the segments the warm-up run already wrote match `plan`'s grid.
+///
+/// A single finished segment says nothing about the grid (one duration always
+/// matches itself), so at least two are required before the produced media may
+/// be reused.
+fn warm_up_matches_plan(durations: &[i64], plan: &SegmentPlan) -> bool {
+    if durations.len() < 2 {
+        return false;
+    }
+    durations.iter().enumerate().all(|(index, measured)| {
+        let planned = u64::try_from(index)
+            .ok()
+            .and_then(|k| plan.duration_of(k))
+            .unwrap_or(-1);
+        (*measured - planned).abs() <= WARM_UP_GRID_TOLERANCE_MS
+    })
+}
+
+/// Delete the segments a warm-up run wrote at boundaries the plan does not use.
+///
+/// The directory belongs to exactly one cache key, so every `seg*.ts` in it was
+/// produced by this media/preset combination and is now off-grid. The playlist
+/// is always synthesized from the plan and never read back from disk, so the
+/// muxer's own `index.m3u8` goes with them.
+fn discard_segments(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_segment = name.starts_with("seg") && name.ends_with(".ts");
+        if (is_segment || name == "index.m3u8") && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Build the segment plan from the warm-up run once enough segments exist.
 ///
 /// Returns whether the session has a plan afterwards.
@@ -570,12 +641,18 @@ fn finalize_plan(session: &mut HlsSession) -> bool {
     if durations.len() < CALIBRATION_SEGMENTS as usize && run.job.is_running() {
         return false;
     }
-    let plan = match wdmm_ffmpeg::vod::measure_gop_from_durations(&durations) {
+    let (plan, calibrated) = match wdmm_ffmpeg::vod::measure_gop_from_durations(&durations) {
         Some(gop) if gop > 0 => {
             session.hls_time_override_ms = aligned_hls_time_ms(session.seg_secs, gop);
-            wdmm_ffmpeg::vod::calibration_plan(session.duration_ms, session.seg_secs, gop)
+            (
+                wdmm_ffmpeg::vod::calibration_plan(session.duration_ms, session.seg_secs, gop),
+                true,
+            )
         }
-        _ => wdmm_ffmpeg::vod::approximate_plan(session.duration_ms, session.seg_secs),
+        _ => (
+            wdmm_ffmpeg::vod::approximate_plan(session.duration_ms, session.seg_secs),
+            false,
+        ),
     };
     if let Err(e) = session.cache.save_plan(
         &session.cache_key,
@@ -584,11 +661,31 @@ fn finalize_plan(session: &mut HlsSession) -> bool {
     ) {
         error!("failed to persist HLS segment plan: {e}");
     }
+    // The warm-up run cut its segments with the preset's `hls_time`, which is not
+    // necessarily the measured grid (a 3 s GOP turns a 4 s request into 6 s cuts).
+    // The playlist is built from the plan, so off-grid segments must never be
+    // served: they would desync playback and make seeks land on the wrong
+    // content. Drop the run (cancels the job) and discard what it wrote; the next
+    // segment request restarts at the plan's own boundaries, now with `hls_time`
+    // aligned to the measured GOP. The approximate fallback keeps its segments —
+    // it has no grid to match and reports the drift instead.
+    if calibrated && !warm_up_matches_plan(&durations, &plan) {
+        session.run = None;
+        session.last_reopen = None;
+        let removed = discard_segments(&session.cache_dir);
+        info!(
+            "calibration grid differs from the warm-up output; discarded {removed} off-grid segment(s), the plan restarts at its own boundaries"
+        );
+    }
     session.plan = Some(Arc::new(plan));
     true
 }
 
 /// Last-resort plan when warm-up cannot deliver enough segments in time.
+///
+/// This is only reached when the measured rhythm is already known to be
+/// unusable, or warm-up blew the whole [`HLS_PLAN_TIMEOUT`] budget; a normal
+/// session always gets a `calibrated` grid from [`finalize_plan`].
 ///
 /// A VOD playlist cannot change its segment grid once the renderer has read it,
 /// so an already started session never upgrades to a better alignment. Failing
@@ -624,6 +721,8 @@ async fn spawn_run_shared(
     planned: bool,
 ) -> ProxyResult<()> {
     let gate = { Arc::clone(&shared.lock().unwrap().gate) };
+    // A previous job may have finished while its session is still alive.
+    release_finished_permits(shared);
     let permit = gate
         .acquire_async(JOB_ACQUIRE_TIMEOUT)
         .await
@@ -679,7 +778,7 @@ async fn spawn_run_shared(
             first_k,
             ready_k: first_k,
             ended: false,
-            _permit: permit,
+            permit: Some(permit),
         });
         session.last_reopen = Some(Instant::now());
         if session.job_error.as_deref() == Some(BUSY_ERROR) {
@@ -711,6 +810,30 @@ fn park_run_shared(shared: &Arc<Mutex<Shared>>, token: &str, requested_k: u64) {
     if policy.should_stop(state, requested_k) {
         info!("HLS run parked at segment {front} (requested {requested_k})");
         session.run = None;
+    }
+}
+
+/// Release the global gate permit of every job that already finished.
+///
+/// A finished [`HlsRun`] stays in its session so the UI keeps seeing the last
+/// encode telemetry, but it must not keep the single gate slot: the next cast
+/// would otherwise fail with `transcoding busy` even though nothing is encoding.
+fn release_finished_permits(shared: &Arc<Mutex<Shared>>) {
+    let Ok(mut g) = shared.lock() else {
+        return;
+    };
+    for session in g.hls_sessions.values_mut() {
+        let Some(run) = session.run.as_mut() else {
+            continue;
+        };
+        if run.job.is_running() {
+            continue;
+        }
+        run.ended = true;
+        if let Some(Err(e)) = run.job.take_result() {
+            session.job_error = Some(e.to_string());
+        }
+        run.permit = None;
     }
 }
 
@@ -1061,7 +1184,7 @@ impl ProxyHandle {
         let seg_secs = preset.hls_segment_secs.max(1) as f64;
 
         // 1. A plan persisted by an earlier session is reused as-is.
-        let mut plan = self
+        let plan = self
             .cache
             .load_plan::<StoredPlan>(&cache_key, &cache_dir)
             .map(StoredPlan::into_plan);
@@ -1077,14 +1200,12 @@ impl ProxyHandle {
             None => probe_duration_ms(&input_url).map_err(ProxyError::Ffmpeg)?,
         };
 
-        // 3. copy/hybrid sources with a container index get a drift-free grid.
-        if plan.is_none() && wdmm_ffmpeg::vod::keyframe_index_available() {
-            if let Ok(index) = wdmm_ffmpeg::vod::keyframe_index(&input_url) {
-                if !index.is_empty() {
-                    plan = Some(wdmm_ffmpeg::keyframe_plan(duration_ms, seg_secs, &index));
-                }
-            }
-        }
+        // 3. Without a cached plan the warm-up run measures the real output and
+        //    `finalize_plan` builds a calibrated (or approximate) grid. There is
+        //    deliberately no container-keyframe shortcut: a sparse/absent index
+        //    (Matroska `cues`) produced a one-segment playlist for a 24-minute
+        //    file, which ended the cast after the first segment and broke
+        //    seeking. Calibration measures what the muxer actually wrote.
         if let Some(plan) = plan.as_ref() {
             self.cache
                 .save_plan(&cache_key, &cache_dir, &StoredPlan::from_plan(plan))?;
@@ -1242,6 +1363,8 @@ impl ProxyHandle {
         if let Some(run) = session.run.as_mut() {
             if !run.job.is_running() {
                 run.ended = true;
+                // The encoder is gone: free the gate so the next cast can start.
+                run.permit = None;
                 if let Some(Err(e)) = run.job.take_result() {
                     session.job_error = Some(e.to_string());
                 }
@@ -2285,13 +2408,134 @@ mod tests {
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 1);
         assert_ne!(reg1.token, reg2.token, "new token must replace old");
 
-        // Different device can transcode the same file
+        // Different device can transcode the same file. Only one transcode may
+        // run at a time (the global job gate), so the second session is created
+        // with `register_hls_nowait`: session setup must not depend on a free
+        // encoder slot, otherwise a second cast fails with `transcoding busy`
+        // instead of queueing behind the first one.
         let _reg3 = proxy
-            .register_hls(hls_test_opts(&path, "device-2"))
+            .register_hls_nowait(hls_test_opts(&path, "device-2"))
             .await
             .unwrap();
         assert_eq!(proxy.shared.lock().unwrap().hls_sessions.len(), 2);
 
+        proxy.stop();
+    }
+
+    // ── warm-up grid reconciliation (m04973) ─────────────────────────────────
+
+    /// The whole plan is rebuilt from the measured rhythm, so a warm-up run that
+    /// already lands on the planned grid must be kept: restarting would throw
+    /// away segments the renderer can already play.
+    #[test]
+    fn warm_up_matches_plan_accepts_the_same_grid() {
+        let plan = test_plan(4.0, 10, 40_000);
+        assert!(warm_up_matches_plan(&[4_000, 4_000, 4_000], &plan));
+        // Muxer jitter stays inside the tolerance.
+        assert!(warm_up_matches_plan(&[4_050, 3_950, 4_120], &plan));
+    }
+
+    /// A drift-generating source starts its second cut where the first one
+    /// landed, so the produced segments never line up with the declared grid.
+    /// Serving them would play the wrong frames for `seg<k>`, which is exactly
+    /// the 「定位无效」bug — they must be dropped instead.
+    #[test]
+    fn warm_up_matches_plan_rejects_a_drifting_grid() {
+        let plan = test_plan(4.0, 10, 40_000);
+        assert!(!warm_up_matches_plan(&[6_000, 6_000, 6_000], &plan));
+        assert!(!warm_up_matches_plan(&[4_000, 4_000, 4_400], &plan));
+        assert!(
+            !warm_up_matches_plan(&[4_000], &plan),
+            "short input is unusable"
+        );
+    }
+
+    #[test]
+    fn discard_segments_removes_produced_media_only() {
+        let dir = unique_seg_dir("discard");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seg0.ts"), b"zero").unwrap();
+        std::fs::write(dir.join("seg7.ts"), b"seven").unwrap();
+        std::fs::write(dir.join("index.m3u8"), b"#EXTM3U").unwrap();
+        std::fs::write(dir.join("plan.json"), b"{}").unwrap();
+
+        assert_eq!(discard_segments(&dir), 3, "two segments plus index.m3u8");
+        assert!(dir.join("plan.json").is_file(), "the plan must survive");
+        assert!(!dir.join("seg0.ts").exists());
+        assert!(!dir.join("seg7.ts").exists());
+        assert!(!dir.join("index.m3u8").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The user-visible regression: HLS cast, then drag the progress bar to the
+    /// end of the file. Every segment index in the synthesized playlist must be
+    /// fetchable, including ones far past the produced front, and the playlist
+    /// itself must not change afterwards (VOD grids are immutable once read).
+    #[tokio::test]
+    async fn proxy_hls_seek_to_late_segment_is_served() {
+        let Some(path) = hls_test_media() else { return };
+
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
+        let reg = proxy
+            .register_hls(hls_test_opts(&path, "device-1"))
+            .await
+            .unwrap();
+        let addr = proxy.addr().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}{}", reg.playlist_template);
+        let playlist = client.get(&url).send().await.unwrap().text().await.unwrap();
+
+        // 1. The plan covers the whole file instead of collapsing to one entry
+        //    (the keyframe-index bug produced a single 24-minute segment).
+        let progress = proxy.hls_progress(&reg.token).unwrap();
+        assert!(
+            progress.segment_count >= 3,
+            "plan must be split into segments, got {}",
+            progress.segment_count
+        );
+        let alignment = progress.alignment.unwrap_or("none");
+        assert!(
+            alignment == "calibrated" || alignment == "approx",
+            "unexpected alignment {alignment}"
+        );
+
+        // 2. The declared EXTINF total matches the probe'd duration, so the
+        //    renderer's progress bar spans the real length of the file.
+        let total_ms: f64 = playlist
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EXTINF:"))
+            .filter_map(|value| value.trim_end_matches(',').parse::<f64>().ok())
+            .map(|secs| secs * 1000.0)
+            .sum();
+        let plan_duration = progress.plan_duration_ms.unwrap_or(0) as f64;
+        assert!(plan_duration > 0.0, "plan must report a duration");
+        assert!(
+            (total_ms - plan_duration).abs() <= plan_duration * 0.02,
+            "playlist declares {total_ms}ms but the media is {plan_duration}ms"
+        );
+
+        // 3. Seeking to the tail must produce that segment on demand.
+        let indices: Vec<u64> = playlist
+            .lines()
+            .filter_map(|line| line.strip_prefix("seg"))
+            .filter_map(|name| name.strip_suffix(".ts"))
+            .filter_map(|index| index.parse::<u64>().ok())
+            .collect();
+        let last = *indices.last().expect("playlist must list segments");
+        assert!(last >= 2, "expected several segments, got {indices:?}");
+        let seg_url = format!("http://{addr}/h/{}/seg{last}.ts", reg.token);
+        let seg = client.get(&seg_url).send().await.unwrap();
+        assert_eq!(seg.status(), 200, "seg{last}.ts must be produced on demand");
+        assert!(!seg.bytes().await.unwrap().is_empty());
+
+        // 4. Serving a far segment must not rewrite the playlist (no drift).
+        let after = client.get(&url).send().await.unwrap().text().await.unwrap();
+        assert_eq!(
+            playlist, after,
+            "a VOD playlist must not change while playing"
+        );
+
+        proxy.unregister_hls(&reg.token);
         proxy.stop();
     }
 }

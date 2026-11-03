@@ -94,66 +94,6 @@ fn playlist_len(dir: &Path) -> u64 {
 
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
-fn keyframe_index_reads_faststart_mp4() {
-    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
-        eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
-        return;
-    };
-    let started = Instant::now();
-    let keyframes = wdmm_ffmpeg::keyframe_index(media.to_string_lossy().as_ref())
-        .expect("keyframe_index must not fail for a valid mp4");
-    let elapsed = started.elapsed();
-    assert!(
-        keyframes.len() >= 2,
-        "expected a populated container index for {}, got {:?}\n{}",
-        media.display(),
-        keyframes,
-        diagnostics()
-    );
-    let mut previous = keyframes[0].pts_ms;
-    for keyframe in &keyframes[1..] {
-        assert!(
-            keyframe.pts_ms > previous,
-            "keyframe timestamps must be strictly increasing: {previous} → {}",
-            keyframe.pts_ms
-        );
-        previous = keyframe.pts_ms;
-    }
-    let gop = wdmm_ffmpeg::measure_gop_from_durations(
-        &keyframes
-            .windows(2)
-            .map(|pair| pair[1].pts_ms - pair[0].pts_ms)
-            .collect::<Vec<_>>(),
-    );
-    eprintln!(
-        "keyframe_index: {} keyframes in {:?}; inferred gop={:?} ms",
-        keyframes.len(),
-        elapsed,
-        gop
-    );
-}
-
-#[test]
-#[ignore = "needs WDMM_HLS_TEST_MEDIA_TAIL + linked FFmpeg 7.1"]
-fn keyframe_index_reads_tail_moov_mp4() {
-    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_TAIL") else {
-        eprintln!("skip: WDMM_HLS_TEST_MEDIA_TAIL not set");
-        return;
-    };
-    let keyframes = wdmm_ffmpeg::keyframe_index(media.to_string_lossy().as_ref())
-        .expect("keyframe_index must not fail for a valid mp4");
-    assert!(
-        keyframes.len() >= 2,
-        "expected a populated container index (moov at tail) for {}, got {:?}\n{}",
-        media.display(),
-        keyframes,
-        diagnostics()
-    );
-    eprintln!("tail-moov keyframes: {}", keyframes.len());
-}
-
-#[test]
-#[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
 fn vod_job_honours_start_number_out_dir_and_hls_time() {
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");

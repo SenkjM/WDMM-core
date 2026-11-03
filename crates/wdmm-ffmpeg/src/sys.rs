@@ -56,10 +56,6 @@ pub const AVIO_FLAG_WRITE: c_int = 2;
 pub const AVSEEK_FLAG_BACKWARD: c_int = 1;
 pub const AVSEEK_FLAG_ANY: c_int = 4;
 
-/// `AVINDEX_KEYFRAME` — the low `flags` bit of an [`AVIndexEntry`] marks a
-/// keyframe (libavformat/avformat.h:610).
-pub const AVINDEX_KEYFRAME: c_int = 0x0001;
-
 /// `AV_OPT_SEARCH_CHILDREN` — search sub-objects when setting options.
 pub const AV_OPT_SEARCH_CHILDREN: c_int = 1;
 
@@ -199,34 +195,6 @@ pub struct AVPacket {
     _opaque_ref: *mut c_void,  // +88 (8)
     pub time_base: AVRational, // +96 (8)
 } // sizeof=104 ✓
-
-// ── AVIndexEntry (24 bytes, LP64) ─────────────────────────────────────────────
-// pos=0(8), timestamp=8(8), flags:2+size:30 packed at +16(4), min_distance=20(4).
-// Verified with `clang -Xclang -fdump-record-layouts` against FFmpeg n7.1 headers.
-
-#[repr(C)]
-pub struct AVIndexEntry {
-    /// Byte offset of the keyframe/entry (unused here).
-    pub pos: i64, // +0  (8)
-    /// Presentation timestamp in [`AVStream::time_base`] units.
-    pub timestamp: i64, // +8  (8)
-    /// `flags:2` (low two bits) and `size:30` packed into one signed int.
-    pub flags_and_size: c_int, // +16 (4)
-    /// Minimum distance to the previous/next entry (unused here).
-    pub min_distance: c_int, // +20 (4)
-} // sizeof=24 ✓
-
-impl AVIndexEntry {
-    /// The 2-bit `flags` field.
-    pub fn flags(&self) -> c_int {
-        self.flags_and_size & 0b11
-    }
-
-    /// Whether this index entry points at a keyframe.
-    pub fn is_keyframe(&self) -> bool {
-        self.flags() & AVINDEX_KEYFRAME != 0
-    }
-}
 
 // ── Opaque contexts (zero-size markers, always behind pointers) ───────────────
 
@@ -539,12 +507,6 @@ extern "C" {
     ) -> c_int;
     pub fn avformat_close_input(s: *mut *mut AVFormatContext);
     pub fn avformat_free_context(s: *mut AVFormatContext);
-
-    // container index (mp4 stss / mkv cues) — keyframe positions without reads
-    /// Number of index entries for a stream (0 when the container has no index).
-    pub fn avformat_index_get_entries_count(st: *const AVStream) -> c_int;
-    /// Borrowed index entry; `idx` must be `<` the entries count.
-    pub fn avformat_index_get_entry(st: *mut AVStream, idx: c_int) -> *const AVIndexEntry;
 
     // mux / output
     pub fn avformat_alloc_output_context2(

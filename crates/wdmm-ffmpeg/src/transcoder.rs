@@ -47,8 +47,6 @@ use crate::plan::{
     choose_video_encoder, encoder_frame_rate, fallback_warning, hw_gop_size, hw_video_encoder_name,
     hybrid_audio_codec_id, remux_dropped_streams, remux_plan, RemuxPlan,
 };
-use crate::vod::KeyframeInfo;
-
 /// Options for opening the loopback HTTP input: bound every blocking read so a
 /// stalled upstream fails with a real error instead of hanging the job forever.
 const INPUT_TIMEOUT_US: i64 = 15_000_000;
@@ -97,80 +95,6 @@ fn hls_time_seconds(preset_secs: u32, override_ms: Option<u32>) -> String {
         (ms / 1000).to_string()
     } else {
         format!("{:.3}", ms as f64 / 1000.0)
-    }
-}
-
-/// Read all video keyframe timestamps (ms) from the container's index
-/// (mp4 `stss`, matroska cues, …).
-///
-/// Cost: O(index entries) — no media bytes are read; a tail-`moov` MP4 works
-/// because `avformat_find_stream_info` already fetches the index over Range.
-/// Containers without an index (e.g. some MPEG-TS) simply yield `Ok(vec![])`,
-/// which the caller maps to a Calibrated/Approximate plan. Never panics.
-pub fn keyframe_index(url: &str) -> FfmpegResult<Vec<KeyframeInfo>> {
-    let url_c = CString::new(url).map_err(|e| FfmpegError::Probe(e.to_string()))?;
-    unsafe {
-        let mut in_opts = input_open_options();
-        let mut in_ctx: *mut AVFormatContext = std::ptr::null_mut();
-        let ret = avformat_open_input(&mut in_ctx, url_c.as_ptr(), std::ptr::null(), &mut in_opts);
-        av_dict_free(&mut in_opts);
-        if ret < 0 {
-            return Err(ffmpeg_err("avformat_open_input (keyframe_index)", ret));
-        }
-        let ret = avformat_find_stream_info(in_ctx, std::ptr::null_mut());
-        if ret < 0 {
-            avformat_close_input(&mut in_ctx);
-            return Err(ffmpeg_err(
-                "avformat_find_stream_info (keyframe_index)",
-                ret,
-            ));
-        }
-
-        let v_idx =
-            av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, std::ptr::null_mut(), 0);
-        if v_idx < 0 {
-            diag::log(format!(
-                "keyframe_index: url={} has no video stream, falling back to calibration",
-                sanitize_url(url)
-            ));
-            avformat_close_input(&mut in_ctx);
-            return Ok(Vec::new());
-        }
-
-        let streams = fmtctx_streams(in_ctx);
-        let stream = *streams.add(v_idx as usize);
-        if stream.is_null() {
-            avformat_close_input(&mut in_ctx);
-            return Ok(Vec::new());
-        }
-        let entries = avformat_index_get_entries_count(stream).max(0);
-        let time_base = (*stream).time_base;
-        let mut keyframes = Vec::new();
-        for idx in 0..entries {
-            let entry = avformat_index_get_entry(stream, idx);
-            if entry.is_null() {
-                continue;
-            }
-            if !(*entry).is_keyframe() {
-                continue;
-            }
-            let timestamp = (*entry).timestamp;
-            if timestamp == AV_NOPTS_VALUE {
-                continue;
-            }
-            keyframes.push(KeyframeInfo {
-                pts_ms: av_rescale_q(timestamp, time_base, MS_TB),
-            });
-        }
-        keyframes.sort_by_key(|keyframe| keyframe.pts_ms);
-        keyframes.dedup_by_key(|keyframe| keyframe.pts_ms);
-        diag::log(format!(
-            "keyframe_index: url={} index_entries={entries} keyframes={}",
-            sanitize_url(url),
-            keyframes.len()
-        ));
-        avformat_close_input(&mut in_ctx);
-        Ok(keyframes)
     }
 }
 
