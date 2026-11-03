@@ -58,6 +58,17 @@ const VIDEO_EXTS: &[&str] = &[
     "3gp", "rmvb", "rm", "asf", "ogv", "vob", "divx",
 ];
 
+/// Extensions treated as audio-only media (`media_kind:"audio"`).
+///
+/// Classification is deliberately extension-only: a source probe would stall
+/// the very start-up the warm-up path exists to avoid, and libav reports a
+/// cover art attached to an MP3/FLAC as a video stream, so a probe is *less*
+/// accurate than the file name for music files (user report + task-20).
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "flac", "m4a", "aac", "wav", "ape", "ogg", "opus", "wma", "dts", "mka", "aiff", "aif",
+    "alac", "tak", "wv",
+];
+
 /// Containers that many renderers refuse or play badly as-is.
 const PROBLEMATIC_CONTAINERS: &[&str] = &[
     "mkv", "avi", "mov", "ts", "m2ts", "mts", "flv", "rmvb", "rm", "wmv", "asf", "3gp", "webm",
@@ -232,6 +243,7 @@ fn spawn_embedded_probe(
                         track.index,
                         track.codec.clone(),
                         track.language.as_deref(),
+                        track.title.as_deref(),
                     )
                 })
                 .collect();
@@ -277,6 +289,14 @@ struct SubtitleCandidate {
     path: String,
     /// Canonical language key (`"zh"`, `"en"`, …); empty for the default track.
     lang: String,
+    /// Language tag exactly as the source carries it: the raw ISO 639-2 code
+    /// from AVStream metadata for embedded tracks (no normalisation — the app
+    /// maps it to a display name), or the lowercased sidecar file-name suffix
+    /// (`"zh"`, `"chi"`, …) for sidecars. `None` when unknown.
+    language: Option<String>,
+    /// Track title from the source (`SubtitleStream.title`); `None` for
+    /// sidecars and for embedded tracks that carry no title.
+    title: Option<String>,
     /// Whether the file name is exactly `<video stem>.<ext>` (sidecars only).
     exact: bool,
     size: u64,
@@ -293,11 +313,20 @@ struct SubtitleCandidate {
 }
 
 impl SubtitleCandidate {
-    fn sidecar(name: String, path: String, lang: String, exact: bool, size: u64) -> Self {
+    fn sidecar(
+        name: String,
+        path: String,
+        lang: String,
+        language: Option<String>,
+        exact: bool,
+        size: u64,
+    ) -> Self {
         Self {
             name,
             path,
             lang,
+            language,
+            title: None,
             exact,
             size,
             embedded: false,
@@ -308,8 +337,19 @@ impl SubtitleCandidate {
     }
 
     /// Advertise one embedded track of the cast source (HLS mode only).
-    fn embedded(remote_path: &str, track: u32, codec: String, language: Option<&str>) -> Self {
+    fn embedded(
+        remote_path: &str,
+        track: u32,
+        codec: String,
+        language: Option<&str>,
+        title: Option<&str>,
+    ) -> Self {
+        let language = language
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let lang = language
+            .as_deref()
             .map(display_subtitle_language)
             .unwrap_or_default()
             .to_lowercase();
@@ -327,6 +367,11 @@ impl SubtitleCandidate {
             name,
             path: format!("{remote_path}{EMBEDDED_MARKER}{track}"),
             lang,
+            language,
+            title: title
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             exact: false,
             size: 0,
             embedded: true,
@@ -345,6 +390,8 @@ impl SubtitleCandidate {
             "name": self.name,
             "path": self.path,
             "lang": self.lang,
+            "language": self.language,
+            "title": self.title,
             "size": self.size,
             "embedded": self.embedded,
             "track": self.track,
@@ -475,6 +522,8 @@ struct SessionEntry {
     force_direct: bool,
     ui_lang: String,
     provider: &'static str,
+    /// `"video"` or `"audio"` — the DLNA item class the renderer is given.
+    media_kind: &'static str,
     proxy: ProxyHandle,
     lan_ip: IpAddr,
     stream_token: String,
@@ -505,6 +554,8 @@ struct SessionEntry {
 /// Freshly prepared media resources before they are handed to a renderer.
 struct PreparedMedia {
     provider: &'static str,
+    /// `"video"` or `"audio"`.
+    media_kind: &'static str,
     stream_token: String,
     loopback_url: String,
     hls_token: Option<String>,
@@ -593,10 +644,37 @@ fn mime_for(name: &str) -> &'static str {
         "ogv" => "video/ogg",
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
-        "aac" | "m4a" => "audio/mp4",
+        "m4a" | "aac" => "audio/mp4",
         "wav" => "audio/wav",
         "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "ape" => "audio/x-ape",
+        "wv" => "audio/x-wavpack",
+        "dts" => "audio/vnd.dts",
+        "wma" => "audio/x-ms-wma",
+        "mka" => "audio/x-matroska",
+        "aiff" | "aif" => "audio/aiff",
+        "alac" => "audio/mp4",
+        "tak" => "audio/x-tak",
         _ => "video/mp4",
+    }
+}
+
+/// `"audio"` when `name` denotes an audio-only file, `"video"` otherwise.
+///
+/// Extension-only by design (see [`AUDIO_EXTS`]): case-insensitive, and any
+/// `?query` / `#fragment` a caller may have left on the name is ignored.
+fn media_kind(name: &str) -> &'static str {
+    let ext = extension(name);
+    let ext = ext
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    if AUDIO_EXTS.contains(&ext) {
+        "audio"
+    } else {
+        "video"
     }
 }
 
@@ -663,11 +741,20 @@ fn display_subtitle_language(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// One matched sidecar subtitle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtitleMatch {
+    /// Canonical language key used for matching (`"zh"`, `"en"`, …).
+    lang_key: String,
+    /// Raw lowercase language suffix from the file name (`"zh-hans"`,
+    /// `"chi"`); `None` for a bare `<stem>.<ext>` sidecar.
+    language: Option<String>,
+    /// The file name is exactly `<video stem>.<ext>`.
+    exact: bool,
+}
+
 /// Match `subtitle_name` against the video's stem.
-///
-/// Returns `(language_key, exact)` where `language_key` is the canonical key of
-/// the language suffix (empty for a bare `<stem>.<ext>` sidecar).
-fn match_subtitle_name(video_name: &str, subtitle_name: &str) -> Option<(String, bool)> {
+fn match_subtitle_name(video_name: &str, subtitle_name: &str) -> Option<SubtitleMatch> {
     let ext = extension(subtitle_name);
     if !SUBTITLE_EXTS.contains(&ext.as_str()) {
         return None;
@@ -675,14 +762,22 @@ fn match_subtitle_name(video_name: &str, subtitle_name: &str) -> Option<(String,
     let stem = video_stem(video_name).to_lowercase();
     let lower_name = subtitle_name.to_lowercase();
     if lower_name == format!("{stem}.{ext}") {
-        return Some((String::new(), true));
+        return Some(SubtitleMatch {
+            lang_key: String::new(),
+            language: None,
+            exact: true,
+        });
     }
     let rest = lower_name.strip_prefix(&format!("{stem}."))?;
     let middle = rest.strip_suffix(&format!(".{ext}"))?;
     if middle.is_empty() {
         return None;
     }
-    Some((display_subtitle_language(middle).to_lowercase(), false))
+    Some(SubtitleMatch {
+        lang_key: display_subtitle_language(middle).to_lowercase(),
+        language: Some(middle.to_string()),
+        exact: false,
+    })
 }
 
 /// Rank candidates the way the legacy Dart picker did: exact name first, then
@@ -851,8 +946,25 @@ fn compat_json(name: &str, provider: &str) -> Value {
     }
 }
 
-/// Build the DIDL-Lite document (media resource + optional subtitle resource).
+/// Whether the renderer advertises the MIME class of `media_kind`.
 ///
+/// An empty `SinkProtocolInfo` means the renderer did not answer the
+/// ConnectionManager query; that must not reject the cast (task-20).
+fn sink_advertises(sink_protocols: &[String], media_kind: &str) -> bool {
+    let prefix = if media_kind == "audio" {
+        "audio/"
+    } else {
+        "video/"
+    };
+    sink_protocols.iter().any(|info| {
+        info.split(':')
+            .nth(2)
+            // `*/*` is a renderer saying "I take everything".
+            .is_some_and(|m| m.starts_with(prefix) || m == "*/*")
+    })
+}
+
+/// Build the DIDL-Lite document (media resource + optional subtitle resource).///
 /// The subtitle resource carries its own `protocolInfo`: Kodi's UPnP renderer
 /// only recognises a subtitle `<res>` whose MIME subtype is the real format
 /// (`text/srt`, `text/vtt`, …), which is why the old shared `text/plain` value
@@ -869,6 +981,57 @@ fn build_didl(
         resources.push(DidlRes::new(url, subtitle_protocol_info));
     }
     build_didl_lite(title, &resources)
+}
+
+/// Build the DIDL-Lite document for an audio-only item.
+///
+/// `wdmm_dlna::build_didl_lite` hard-codes `object.item.videoItem` and is
+/// outside this crate's write scope, so the audio class is rendered locally
+/// (task-20; fold into `wdmm-dlna` once it grows an audio builder).
+fn build_audio_didl(
+    title: &str,
+    media_url: &str,
+    protocol_info: &str,
+    subtitle: Option<(&str, &str)>,
+) -> String {
+    let mut document = String::from(
+        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+         xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
+         <item id=\"0\" parentID=\"-1\" restricted=\"1\">",
+    );
+    document.push_str(&format!("<dc:title>{}</dc:title>", xml_escape(title)));
+    document.push_str("<upnp:class>object.item.audioItem.musicTrack</upnp:class>");
+    document.push_str(&format!(
+        "<res protocolInfo=\"{}\">{}</res>",
+        xml_escape(protocol_info),
+        xml_escape(media_url)
+    ));
+    if let Some((url, subtitle_protocol_info)) = subtitle {
+        document.push_str(&format!(
+            "<res protocolInfo=\"{}\">{}</res>",
+            xml_escape(subtitle_protocol_info),
+            xml_escape(url)
+        ));
+    }
+    document.push_str("</item></DIDL-Lite>");
+    document
+}
+
+/// Escape XML text/attribute content the way `wdmm-dlna` does.
+fn xml_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Discover a file size through the driver when the caller did not know it.
@@ -917,12 +1080,13 @@ async fn scan_subtitles(
         if item.is_dir {
             continue;
         }
-        if let Some((lang, exact)) = match_subtitle_name(video_name, &item.name) {
+        if let Some(matched) = match_subtitle_name(video_name, &item.name) {
             candidates.push(SubtitleCandidate::sidecar(
                 item.name.clone(),
                 join_path(&parent, &item.name),
-                lang,
-                exact,
+                matched.lang_key,
+                matched.language,
+                matched.exact,
                 item.size,
             ));
         }
@@ -1087,7 +1251,16 @@ async fn prepare_media(
             }
         };
 
-    let mime = mime_for(name).to_string();
+    // Audio-only sources negotiate and advertise audio classes; the renderer
+    // must not be rejected by the video/* gate (task-20).
+    let media_kind = media_kind(name);
+    let mime = if media_kind == "audio" && provider == "hls" {
+        // The transcode output is an MPEG-TS audio stream (AAC), so the
+        // playlist's audio resource is announced as `audio/mpeg`.
+        "audio/mpeg".to_string()
+    } else {
+        mime_for(name).to_string()
+    };
     let mime_ext = extension(name).to_uppercase();
     let mut sink_protocols: Vec<String> = Vec::new();
     let mut connection_manager = None;
@@ -1099,14 +1272,16 @@ async fn prepare_media(
             }
         }
     }
-    let advertises_video = sink_protocols.iter().any(|info| {
-        info.split(':')
-            .nth(2)
-            .is_some_and(|m| m.starts_with("video/"))
-    });
-    if !sink_protocols.is_empty() && !advertises_video {
+    let wanted_prefix = if media_kind == "audio" {
+        "audio/"
+    } else {
+        "video/"
+    };
+    if !sink_protocols.is_empty() && !sink_advertises(&sink_protocols, media_kind) {
         unregister_media(handle, Some(&stream_token), hls_token.as_deref(), None);
-        return Err("renderer does not advertise video/* in SinkProtocolInfo".to_string());
+        return Err(format!(
+            "renderer does not advertise {wanted_prefix}* in SinkProtocolInfo"
+        ));
     }
     let protocol_info = match connection_manager {
         Some(client) => client.negotiate(&mime, &mime_ext, &sink_protocols),
@@ -1162,10 +1337,15 @@ async fn prepare_media(
         .as_ref()
         .map(|(url, protocol)| (url.as_str(), protocol.as_str()));
 
-    let didl = build_didl(name, &media_url, &protocol_info, subtitle_ref);
+    let didl = if media_kind == "audio" {
+        build_audio_didl(name, &media_url, &protocol_info, subtitle_ref)
+    } else {
+        build_didl(name, &media_url, &protocol_info, subtitle_ref)
+    };
 
     Ok(PreparedMedia {
         provider,
+        media_kind,
         stream_token,
         loopback_url,
         hls_token,
@@ -1308,6 +1488,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         force_direct,
         ui_lang,
         provider: prepared.provider,
+        media_kind: prepared.media_kind,
         proxy,
         lan_ip,
         stream_token: prepared.stream_token,
@@ -1339,6 +1520,7 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         "handle": handle,
         "url": prepared.media_url,
         "provider": prepared.provider,
+        "media_kind": prepared.media_kind,
         "protocol_info": prepared.protocol_info,
         "phase": phase.as_str(),
         "compat": compat_json(&name, prepared.provider),
@@ -1513,6 +1695,7 @@ async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Strin
     entry.preset_id = preset_id;
     entry.force_direct = force_direct;
     entry.provider = prepared.provider;
+    entry.media_kind = prepared.media_kind;
     entry.stream_token = prepared.stream_token;
     entry.loopback_url = prepared.loopback_url;
     entry.hls_token = prepared.hls_token;
@@ -1621,14 +1804,25 @@ async fn select_subtitle(entry: &mut SessionEntry, cmd: &Value) -> Result<(), Cm
         }
     };
 
-    let didl = build_didl(
-        &entry.name,
-        &entry.media_url,
-        &entry.protocol_info,
-        subtitle_resource
-            .as_ref()
-            .map(|(url, protocol)| (url.as_str(), protocol.as_str())),
-    );
+    let didl = if entry.media_kind == "audio" {
+        build_audio_didl(
+            &entry.name,
+            &entry.media_url,
+            &entry.protocol_info,
+            subtitle_resource
+                .as_ref()
+                .map(|(url, protocol)| (url.as_str(), protocol.as_str())),
+        )
+    } else {
+        build_didl(
+            &entry.name,
+            &entry.media_url,
+            &entry.protocol_info,
+            subtitle_resource
+                .as_ref()
+                .map(|(url, protocol)| (url.as_str(), protocol.as_str())),
+        )
+    };
     entry.didl = didl.clone();
     // Re-send the URI (with the new metadata) and play: renderers do not pick
     // up a subtitle-only metadata change any other way.
@@ -1651,7 +1845,18 @@ async fn select_sidecar_subtitle(
         .find(|candidate| candidate.path == path)
         .cloned()
         .unwrap_or_else(|| {
-            SubtitleCandidate::sidecar(file_name(path), path.to_string(), String::new(), false, 0)
+            let matched = match_subtitle_name(&entry.name, &file_name(path));
+            SubtitleCandidate::sidecar(
+                file_name(path),
+                path.to_string(),
+                matched
+                    .as_ref()
+                    .map(|m| m.lang_key.clone())
+                    .unwrap_or_default(),
+                matched.and_then(|m| m.language),
+                false,
+                0,
+            )
         });
     let protocol = subtitle_didl_protocol(&candidate).ok_or_else(|| {
         CmdError::unsupported(
@@ -1707,6 +1912,7 @@ async fn select_embedded_subtitle(
                 stream.index,
                 stream.codec.clone(),
                 stream.language.as_deref(),
+                stream.title.as_deref(),
             );
             entry
                 .subtitle_status
@@ -1855,6 +2061,7 @@ fn state_json(
         "current_path": entry.remote_path,
         "current_name": entry.name,
         "provider": entry.provider,
+        "media_kind": entry.media_kind,
         "protocol_info": entry.protocol_info,
         "ended": tick.ended,
         "ended_reason": ended_reason,
@@ -1963,9 +2170,14 @@ fn vod_telemetry(progress: Option<&HlsProgress>) -> Value {
 /// playlist (bounded by the proxy's own wait). Direct casts ignore `warmup` and
 /// always return `"phase":"playing"`.
 ///
+/// `"media_kind"` is derived from the file extension alone (task-20): audio
+/// files are announced with an `audio/*` protocolInfo and an
+/// `object.item.audioItem.musicTrack` DIDL item, so they are never rejected by
+/// the renderer's `video/*` sink gate.
+///
 /// Returns `{"ok":true,"handle":N,"url":"…","provider":"direct"|"hls",
-/// "protocol_info":"…","phase":"playing"|"warming","compat":{…},
-/// "subtitle_status":{…}}` or
+/// "media_kind":"video"|"audio","protocol_info":"…","phase":"playing"|"warming",
+/// "compat":{…},"subtitle_status":{…}}` or
 /// `{"ok":false,"error":"…"}`. Caller must free the result via
 /// [`crate::wdmm_ffi_free_string`].
 ///
@@ -2002,8 +2214,11 @@ pub extern "C" fn wdmm_dlna_session_start(config_json: *const c_char) -> FfiStri
 /// `video_encoder`, `audio_encoder`, `encode_warnings`, `diagnostics`.
 ///
 /// Every subtitle candidate also carries `embedded` (bool), `track`
-/// (AV stream index or null), `codec` (libav codec name or null) and
+/// (AV stream index or null), `codec` (libav codec name or null),
+/// `language` (raw ISO 639-2 tag from the source, or the lowercased sidecar
+/// file-name suffix, or null), `title` (source track title or null) and
 /// `support` (`"external"`, `"webvtt"`, `"bitmap-unsupported"` or `"error"`).
+/// `media_kind` is `"video"` or `"audio"` and is repeated on every tick.
 /// `subtitle_status` is `{text_tracks, bitmap_tracks, bitmap_note, message}`:
 /// `bitmap_note` is non-null only for an HLS cast with bitmap tracks (they are
 /// dropped — text subtitles only), and `message` explains a failed/timed-out
@@ -2267,23 +2482,33 @@ mod tests {
         assert_eq!(display_subtitle_language("ja"), "ja");
     }
 
+    /// `(language key, raw language, exact)` for the assertions below.
+    fn matched(video: &str, subtitle: &str) -> Option<(String, Option<String>, bool)> {
+        match_subtitle_name(video, subtitle)
+            .map(|matched| (matched.lang_key, matched.language, matched.exact))
+    }
+
     #[test]
     fn matches_sidecar_subtitles() {
         assert_eq!(
-            match_subtitle_name("Movie.mkv", "Movie.srt"),
-            Some((String::new(), true))
+            matched("Movie.mkv", "Movie.srt"),
+            Some((String::new(), None, true))
         );
         assert_eq!(
-            match_subtitle_name("Movie.mkv", "Movie.zh.srt"),
-            Some(("zh".to_string(), false))
+            matched("Movie.mkv", "Movie.zh.srt"),
+            Some(("zh".to_string(), Some("zh".to_string()), false))
         );
         assert_eq!(
-            match_subtitle_name("Movie.mkv", "movie.ZH-Hans.ass"),
-            Some(("zh".to_string(), false))
+            matched("Movie.mkv", "movie.ZH-Hans.ass"),
+            Some(("zh".to_string(), Some("zh-hans".to_string()), false))
         );
         assert_eq!(
-            match_subtitle_name("Movie.mkv", "Movie.en-US.vtt"),
-            Some(("en".to_string(), false))
+            matched("Movie.mkv", "Movie.chi.vtt"),
+            Some(("zh".to_string(), Some("chi".to_string()), false))
+        );
+        assert_eq!(
+            matched("Movie.mkv", "Movie.en-US.vtt"),
+            Some(("en".to_string(), Some("en-us".to_string()), false))
         );
         assert_eq!(match_subtitle_name("Movie.mkv", "Other.srt"), None);
         assert_eq!(match_subtitle_name("Movie.mkv", "Movie.idx"), None);
@@ -2296,6 +2521,7 @@ mod tests {
             name.to_string(),
             format!("/v/{name}"),
             lang.to_string(),
+            (!lang.is_empty()).then(|| lang.to_string()),
             exact,
             10,
         )
@@ -2385,6 +2611,56 @@ mod tests {
     }
 
     #[test]
+    fn media_kind_follows_the_extension() {
+        assert_eq!(media_kind("a.mp3"), "audio");
+        assert_eq!(media_kind("song.FLAC"), "audio");
+        assert_eq!(media_kind("track.m4a"), "audio");
+        assert_eq!(media_kind("a.mka"), "audio");
+        assert_eq!(media_kind("a.mkv"), "video");
+        assert_eq!(media_kind("a.MP4"), "video");
+        assert_eq!(media_kind("no-extension"), "video");
+        // A query/fragment left on the name must not change the class.
+        assert_eq!(media_kind("a.mp3?token=1"), "audio");
+        assert_eq!(media_kind("a.flac#frag"), "audio");
+        // Audio extensions get audio MIME types even for exotic formats.
+        assert_eq!(mime_for("a.ape"), "audio/x-ape");
+        assert_eq!(mime_for("a.wv"), "audio/x-wavpack");
+        assert_eq!(mime_for("a.mka"), "audio/x-matroska");
+    }
+
+    #[test]
+    fn audio_didl_uses_the_music_track_class() {
+        let didl = build_audio_didl("Song", "http://h/a.mp3", "http-get:*:audio/mpeg:*", None);
+        assert!(didl.contains("object.item.audioItem.musicTrack"));
+        assert!(!didl.contains("videoItem"));
+        assert_eq!(didl.matches("<res ").count(), 1);
+        assert!(didl.contains("http-get:*:audio/mpeg:*"));
+        // Titles are escaped exactly like the video builder.
+        let escaped = build_audio_didl("A & B", "http://h/a.mp3", "proto", None);
+        assert!(escaped.contains("A &amp; B"));
+    }
+
+    #[test]
+    fn sink_gate_follows_the_media_kind() {
+        let audio_only = vec![
+            "http-get:*:audio/mpeg:*".to_string(),
+            "http-get:*:audio/flac:*".to_string(),
+        ];
+        let video_only = vec![
+            "http-get:*:video/mp4:*".to_string(),
+            "http-get:*:video/x-matroska:*".to_string(),
+        ];
+        // An audio source must pass a renderer that only lists audio types.
+        assert!(sink_advertises(&audio_only, "audio"));
+        assert!(!sink_advertises(&audio_only, "video"));
+        assert!(sink_advertises(&video_only, "video"));
+        assert!(!sink_advertises(&video_only, "audio"));
+        // A renderer that accepts everything (`*/*`) passes for both kinds.
+        assert!(sink_advertises(&["http-get:*:*/*:*".to_string()], "audio"));
+        assert!(sink_advertises(&["http-get:*:*/*:*".to_string()], "video"));
+    }
+
+    #[test]
     fn embedded_marker_only_matches_the_current_media_path() {
         assert_eq!(
             embedded_track_index("/v/a.mkv#embedded:2", "/v/a.mkv"),
@@ -2425,7 +2701,13 @@ mod tests {
             subtitle_didl_protocol(&ass).as_deref(),
             Some("http-get:*:text/ass:*")
         );
-        let embedded = SubtitleCandidate::embedded("/v/a.mkv", 3, "subrip".to_string(), Some("zh"));
+        let embedded = SubtitleCandidate::embedded(
+            "/v/a.mkv",
+            3,
+            "subrip".to_string(),
+            Some("zh-CN"),
+            Some("Forced"),
+        );
         assert_eq!(embedded.support, "webvtt");
         assert_eq!(
             subtitle_didl_protocol(&embedded).as_deref(),
@@ -2433,12 +2715,42 @@ mod tests {
         );
         assert_eq!(embedded.path, "/v/a.mkv#embedded:3");
         assert_eq!(embedded.name, "zh (subrip, embedded)");
+        // `lang` stays the canonical key, `language` is the raw source tag
+        // (`zh-CN`), and `title` comes straight from the container.
+        assert_eq!(embedded.lang, "zh");
+        assert_eq!(embedded.language.as_deref(), Some("zh-CN"));
+        assert_eq!(embedded.title.as_deref(), Some("Forced"));
+        let embedded_json = embedded.to_json();
+        assert_eq!(embedded_json["language"], "zh-CN");
+        assert_eq!(embedded_json["title"], "Forced");
         let bitmap =
-            SubtitleCandidate::embedded("/v/a.mkv", 4, "hdmv_pgs_subtitle".to_string(), None);
+            SubtitleCandidate::embedded("/v/a.mkv", 4, "hdmv_pgs_subtitle".to_string(), None, None);
         assert!(bitmap.is_bitmap());
-        assert_eq!(bitmap.support, "bitmap-unsupported");
+        assert_eq!(bitmap.language, None);
+        assert_eq!(bitmap.title, None);
         assert_eq!(subtitle_didl_protocol(&bitmap), None);
         assert_eq!(bitmap.to_json()["support"], "bitmap-unsupported");
+    }
+
+    #[test]
+    fn sidecar_candidates_expose_their_language_suffix() {
+        let matched = match_subtitle_name("Movie.mkv", "Movie.chi.srt").unwrap();
+        let candidate = SubtitleCandidate::sidecar(
+            "Movie.chi.srt".to_string(),
+            "/v/Movie.chi.srt".to_string(),
+            matched.lang_key,
+            matched.language,
+            matched.exact,
+            42,
+        );
+        let json = candidate.to_json();
+        // `lang` is normalised for matching, `language` keeps the raw suffix.
+        assert_eq!(json["lang"], "zh");
+        assert_eq!(json["language"], "chi");
+        assert_eq!(json["title"], Value::Null);
+        // A bare `<stem>.srt` has no language at all.
+        let plain = match_subtitle_name("Movie.mkv", "Movie.srt").unwrap();
+        assert_eq!(plain.language, None);
     }
 
     #[test]
@@ -2448,11 +2760,13 @@ mod tests {
                 index: 2,
                 codec: "subrip".to_string(),
                 language: Some("zh".to_string()),
+                title: Some("Chinese".to_string()),
             },
             wdmm_ffmpeg::SubtitleStream {
                 index: 3,
                 codec: "hdmv_pgs_subtitle".to_string(),
                 language: None,
+                title: None,
             },
         ];
         let mut hls = SubtitleStatus::default();
