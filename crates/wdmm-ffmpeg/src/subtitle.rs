@@ -170,7 +170,7 @@ pub fn normalize_cues(mut cues: Vec<Cue>) -> Vec<Cue> {
         cue.text = cue.text.trim().to_string();
     }
     cues.retain(|c| !c.text.is_empty());
-    cues.sort_by(|a, b| (a.start_ms, a.end_ms).cmp(&(b.start_ms, b.end_ms)));
+    cues.sort_by_key(|cue| (cue.start_ms, cue.end_ms));
     cues.dedup_by(|a, b| a.start_ms == b.start_ms && a.end_ms == b.end_ms && a.text == b.text);
     cues.truncate(MAX_CUES);
     cues
@@ -189,8 +189,8 @@ pub fn format_timestamp(ms: u64) -> String {
 /// Serialize cues as a WebVTT document (empty tracks still get a valid header).
 pub fn to_webvtt(cues: &[Cue]) -> String {
     let mut out = String::from("WEBVTT\n\n");
-    let mut index = 1usize;
-    for cue in cues {
+    for (offset, cue) in cues.iter().enumerate() {
+        let index = offset + 1;
         // A cue payload must not contain the cue-separator sequence `-->`.
         let text = cue
             .text
@@ -204,7 +204,6 @@ pub fn to_webvtt(cues: &[Cue]) -> String {
             format_timestamp(cue.end_ms),
             text
         ));
-        index += 1;
     }
     out
 }

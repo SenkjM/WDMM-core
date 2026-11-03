@@ -1,0 +1,14 @@
+# Pin the Rust toolchain so that local builds, the Android cross build
+# (`tool/build-rust.ps1`) and CI all compile with the same compiler and lints.
+#
+# Why pinned: `verify.yml` runs `cargo clippy --all-targets -- -D warnings`.
+# While this repo was built locally with 1.93.0 but on CI with the newest
+# stable (1.99.1), clippy grew `unnecessary_sort_by` /
+# `explicit_counter_loop`, so the guard failed on every push while passing
+# locally. Bump `channel` here *and* the `dtolnay/rust-toolchain@<version>`
+# refs in `.github/workflows/*.yml` in the same commit.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy"]
+# Both ABIs that `tool/build-rust.ps1` and the release workflows link against.
+targets = ["aarch64-linux-android", "x86_64-linux-android"]
