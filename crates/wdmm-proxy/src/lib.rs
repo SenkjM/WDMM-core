@@ -52,7 +52,10 @@ mod scheduler;
 mod transcode_cache;
 mod vod;
 
-pub use gate::{JobGate, JobPermit, BUSY_ERROR, JOB_ACQUIRE_TIMEOUT, MAX_CONCURRENT_HLS_JOBS};
+pub use gate::{
+    JobGate, JobPermit, BUSY_ERROR, CAST_PRIORITY_ERROR, JOB_ACQUIRE_TIMEOUT,
+    MAX_CONCURRENT_BACKGROUND_JOBS, MAX_CONCURRENT_HLS_JOBS,
+};
 pub use scheduler::{Action, RunState, SchedulePolicy, LOOKAHEAD_SECS, RESUME_MARGIN_SEGMENTS};
 pub use transcode_cache::{
     CacheKey, SegmentLookup, TranscodeCache, TranscodeCacheStats, CACHE_PURGE_AFTER_SECS,
@@ -236,6 +239,12 @@ struct HlsSession {
     duration_ms: i64,
     /// `hls_time` override (ms) once calibration aligned the grid to the GOP.
     hls_time_override_ms: Option<u32>,
+    /// When the calibration warm-up started, if the plan is still missing.
+    ///
+    /// Nothing but the renderer's own playlist request would ever kick a job in
+    /// this state, so warm-up sessions start their run eagerly and use this stamp
+    /// to fall back to the approximate grid instead of warming forever.
+    warming_started: Option<Instant>,
 }
 
 /// Result of a successful [`ProxyHandle::register_hls`] call.
@@ -678,6 +687,7 @@ fn finalize_plan(session: &mut HlsSession) -> bool {
         );
     }
     session.plan = Some(Arc::new(plan));
+    session.warming_started = None;
     true
 }
 
@@ -709,6 +719,7 @@ fn fallback_to_approximate_plan(session: &mut HlsSession) -> bool {
         HLS_PLAN_TIMEOUT.as_secs()
     );
     session.plan = Some(Arc::new(plan));
+    session.warming_started = None;
     true
 }
 
@@ -734,6 +745,15 @@ async fn spawn_run_shared(
             }
             ProxyError::Busy(error)
         })?;
+    if permit.preempted() {
+        // Contract §3.6: the cast owns the slot; the in-flight background job is
+        // revoked but keeps running until its libav call returns.
+        tracing::info!(
+            token,
+            preemptions = gate.preemptions(),
+            "cast transcode preempted a background subtitle job"
+        );
+    }
 
     let (input_url, preset, cache_dir, start_ms, hls_time_override_ms) = {
         let g = shared.lock().unwrap();
@@ -1213,6 +1233,7 @@ impl ProxyHandle {
 
         let token = new_token();
         let playlist_template = format!("/h/{token}/index.m3u8");
+        let needs_warmup = plan.is_none();
         {
             let mut g = self.shared.lock().unwrap();
             g.hls_sessions.insert(
@@ -1233,6 +1254,7 @@ impl ProxyHandle {
                     ended: false,
                     duration_ms,
                     hls_time_override_ms: None,
+                    warming_started: needs_warmup.then(Instant::now),
                 },
             );
             g.device_media_map
@@ -1250,6 +1272,18 @@ impl ProxyHandle {
             arm_idle_timer(&mut g, Arc::clone(&self.shared));
         }
 
+        // Warm-up sessions never wait for the plan, and no renderer has the
+        // playlist URL yet, so nothing would ever request a segment and start the
+        // measuring run: `playlist_ready` could never become true. Start it here.
+        if !wait_plan && needs_warmup {
+            if let Err(e) = self.spawn_run(&token, 0, false).await {
+                let mut g = self.shared.lock().unwrap();
+                if let Some(session) = g.hls_sessions.get_mut(&token) {
+                    session.job_error = Some(e.to_string());
+                    session.warming_started = None;
+                }
+            }
+        }
         if wait_plan {
             self.wait_for_plan(&token).await?;
         }
@@ -1360,6 +1394,19 @@ impl ProxyHandle {
         // A warm-up run finishes calibration on its own; pick that up here so a
         // poller sees `playlist_ready` without waiting for a segment request.
         finalize_plan(session);
+        // This path has no `wait_for_plan` deadline behind it, so a warm-up that
+        // never accumulates enough segments would leave the UI spinning forever.
+        // Same budget as the blocking path: give up on the exact grid and serve
+        // the approximate one (never neither).
+        if session.plan.is_none() {
+            let elapsed = session
+                .warming_started
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
+            if elapsed >= HLS_PLAN_TIMEOUT {
+                fallback_to_approximate_plan(session);
+            }
+        }
         if let Some(run) = session.run.as_mut() {
             if !run.job.is_running() {
                 run.ended = true;
@@ -2176,6 +2223,7 @@ mod tests {
             ended: false,
             duration_ms: 40_000,
             hls_time_override_ms: None,
+            warming_started: None,
         }
     }
 

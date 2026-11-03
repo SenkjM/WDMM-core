@@ -8,10 +8,10 @@ Callers compose `http://{host}:{port}{path_template}` from the registration plus
 - One `ProxyHandle` per process in the FFI; the server starts lazily on the first `register_*`, stops after the idle timeout (default 10 minutes) or on drop.
 - Byte-range sources are a local file or a driver callback.
 - HLS is **pull-driven VOD**: the proxy synthesises the playlist from a segment plan and transcodes segments on demand into a persistent cache. There is no live/push playlist and no seek call — a seek is a request for another segment index, and a cached one is served immediately.
-- One concurrent transcode job per process (`JobGate`); a run parks itself once it is ~60 s ahead of the newest request and resumes on demand.
+- One concurrent transcode job per process (`JobGate`); a run parks itself once it is ~60 s ahead of the newest request and resumes on demand. The gate is priority-aware: a cast's transcode always wins over a background subtitle probe, so playback warm-up and seek re-opens never queue behind an FFI probe (contract §3.6).
 ## Error types
 ### `pub enum ProxyError {`
-- `Io(#[from] std::io::Error)`, `Ffmpeg(String)`, `Cache(String)`; `Busy(String)` = `"transcoding busy"` when the gate times out.
+- `Io(#[from] std::io::Error)`, `Ffmpeg(String)`, `Cache(String)`; `Busy(String)` = `"transcoding busy"` when the gate times out, or `CAST_PRIORITY_ERROR` (`"transcoding busy: cast transcode has priority"`) when a background job cannot start while a cast holds the gate.
 ### `pub type ProxyResult<T> = std::result::Result<T, ProxyError>;`
 ## Bind mode and handle
 ### `pub enum BindMode {`
@@ -103,12 +103,26 @@ SHA-256 of the cache key. Defaults: `DEFAULT_CACHE_SUBDIR = "wdmm-transcode"`,
   `within_resume_margin`.
 ### `pub fn lookahead_segments(seg_secs: f64) -> u64`
 `ceil(60 / seg_secs)`, minimum 1.
-Limits: `MAX_CONCURRENT_HLS_JOBS = 1`, `JOB_ACQUIRE_TIMEOUT = 15 s`,
-`BUSY_ERROR = "transcoding busy"`.
+Limits: `MAX_CONCURRENT_HLS_JOBS = 1`, `MAX_CONCURRENT_BACKGROUND_JOBS = 1`,
+`JOB_ACQUIRE_TIMEOUT = 15 s`, `BUSY_ERROR = "transcoding busy"`,
+`CAST_PRIORITY_ERROR = "transcoding busy: cast transcode has priority"`.
 ### `pub struct JobGate {`
 - `new(max_concurrent)`, `global()`, `capacity()`, `in_use()`, `waiters()`,
-  `acquire(timeout)`, `acquire_async(timeout)`. A `JobPermit` releases on drop;
-  waiting more than 15 s yields `ProxyError::Busy("transcoding busy")`.
+  `preemptions()`, `background_rejections()`, `acquire(timeout)`,
+  `acquire_async(timeout)`. A `JobPermit` releases on drop; waiting more than 15 s
+  yields `ProxyError::Busy("transcoding busy")`.
+- **Priority classes (contract §3.6).** `acquire_async` is the cast class (HLS
+  transcode: warm-up and renderer re-opens) and is never queued behind background
+  work — if a background job holds the slot it is revoked and the cast takes it at
+  once (`JobPermit::preempted() == true`). `acquire` is the background class (FFI
+  subtitle probe / extractor): it starts only while no cast job is running or
+  waiting, and fails with `CAST_PRIORITY_ERROR` when a cast had priority.
+  `JobPermit::is_revoked()` reports a background permit whose slot the cast took.
+- Preemption revokes the slot, it does not kill the running libav call: a revoked
+  background job keeps executing but still counts against
+  `MAX_CONCURRENT_BACKGROUND_JOBS`, so at most one background decode overlaps the
+  single cast job. Unit tests for the rule live in `src/gate.rs`; the measured
+  contention numbers are in `tests/gate_priority.rs`.
 ## Playlist rendering
 ### `pub const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";`
 ### `pub const SEGMENT_CONTENT_TYPE: &str = "video/mp2t";`
