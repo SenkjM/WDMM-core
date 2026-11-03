@@ -223,11 +223,46 @@ impl TranscodeCache {
             Ok(meta) if meta.len() > 0 => {}
             _ => return SegmentLookup::Missing,
         }
-        if muxer_playlist_lists(dir, k) {
+        if segment_closed(&muxer_playlist_segments(dir), k) {
             SegmentLookup::Ready
         } else {
             SegmentLookup::Missing
         }
+    }
+
+    /// Delete the unfinished tail of a cancelled run.
+    ///
+    /// Cancelling a job mid-segment leaves a truncated `segK.ts`. Nothing appends
+    /// to it any more, and [`segment_closed`] marks anything below the write front
+    /// as closed, so it would be served as if it were complete — the renderer then
+    /// keeps the audio going while the picture freezes. Only `first_k..` is
+    /// touched, so segments cached by earlier runs stay.
+    pub fn purge_partial_segments(dir: &Path, first_k: u64) -> usize {
+        let closed = muxer_playlist_segments(dir);
+        let Ok(read) = fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(rest) = name.strip_prefix("seg") else {
+                continue;
+            };
+            let Some(digits) = rest.strip_suffix(".ts") else {
+                continue;
+            };
+            let Ok(k) = digits.parse::<u64>() else {
+                continue;
+            };
+            if k < first_k || closed.contains(&k) {
+                continue;
+            }
+            if fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     /// Record that `key` was just used and refresh its byte count.
@@ -440,8 +475,15 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// The HLS muxer appends the `segK.ts` URI line only after the segment file is
 /// closed, which is what [`TranscodeCache::segment_ready`] needs to distinguish
 /// a finished segment from one that is still being written.
-fn muxer_playlist_lists(dir: &Path, k: u64) -> bool {
-    muxer_playlist_segments(dir).contains(&k)
+/// Whether the muxer has finished `k`.
+///
+/// A playlist entry is the direct answer, but every reopen rewrites
+/// `index.m3u8` with *only its own* segments, so a segment produced by an earlier
+/// run disappears from it. A later entry proves the muxer moved past `k`, which
+/// means `k` was closed too — without that rule a backward seek would re-transcode
+/// files that are already on disk.
+pub fn segment_closed(closed: &HashSet<u64>, k: u64) -> bool {
+    closed.contains(&k) || closed.iter().any(|listed| *listed > k)
 }
 
 /// Segment indices the muxer has already closed, per its own playlist.
@@ -536,6 +578,69 @@ mod tests {
             SegmentLookup::Ready,
             "closing the segment makes it servable"
         );
+        fs::remove_dir_all(cache.root()).ok();
+    }
+
+    #[test]
+    fn cached_segments_stay_servable_after_a_run_jumps_ahead() {
+        let root = temp_root("ready-after-jump");
+        let cache = TranscodeCache::new(root, 1_000);
+        let key = make_key("etag");
+        let dir = cache.prepare(&key).unwrap();
+        // Segments of an earlier run are still on disk, but the muxer's playlist
+        // was rewritten by a run that jumped ahead to segment 900.
+        fs::write(TranscodeCache::segment_path(&dir, 3), vec![0u8; 100]).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 4), vec![0u8; 100]).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 900), vec![0u8; 100]).unwrap();
+        fs::write(
+            dir.join("index.m3u8"),
+            "#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:900
+#EXTINF:4.000,
+seg900.ts
+",
+        )
+        .unwrap();
+        assert_eq!(
+            TranscodeCache::segment_ready(&dir, 3),
+            SegmentLookup::Ready,
+            "the muxer moved past it, so it is complete"
+        );
+        assert_eq!(TranscodeCache::segment_ready(&dir, 4), SegmentLookup::Ready);
+        assert_eq!(
+            TranscodeCache::segment_ready(&dir, 900),
+            SegmentLookup::Ready
+        );
+        fs::remove_dir_all(cache.root()).ok();
+    }
+
+    #[test]
+    fn purge_removes_only_the_unfinished_tail() {
+        // Own tag: `temp_root` only adds pid + second resolution, so a shared tag
+        // makes two tests fight over the same directory.
+        let root = temp_root("purge-tail");
+        let cache = TranscodeCache::new(root, 1_000);
+        let key = make_key("etag");
+        let dir = cache.prepare(&key).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 2), vec![0u8; 100]).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 900), vec![0u8; 100]).unwrap();
+        fs::write(TranscodeCache::segment_path(&dir, 901), vec![0u8; 42]).unwrap();
+        fs::write(
+            dir.join("index.m3u8"),
+            "#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:900
+#EXTINF:4.000,
+seg900.ts
+",
+        )
+        .unwrap();
+        // Segments before the cancelled run's anchor are cached work: keep them.
+        assert_eq!(TranscodeCache::purge_partial_segments(&dir, 900), 1);
+        assert!(TranscodeCache::segment_path(&dir, 900).exists());
+        assert!(!TranscodeCache::segment_path(&dir, 901).exists());
+        assert!(TranscodeCache::segment_path(&dir, 2).exists());
         fs::remove_dir_all(cache.root()).ok();
     }
 

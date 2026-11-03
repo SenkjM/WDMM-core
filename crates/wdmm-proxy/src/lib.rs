@@ -56,8 +56,9 @@ pub use gate::{
     MAX_CONCURRENT_BACKGROUND_JOBS, MAX_CONCURRENT_HLS_JOBS,
 };
 pub use transcode_cache::{
-    muxer_playlist_segments, CacheKey, SegmentLookup, TranscodeCache, TranscodeCacheStats,
-    CACHE_PURGE_AFTER_SECS, DEFAULT_CACHE_BUDGET_BYTES, DEFAULT_CACHE_SUBDIR, GUARD_BACK_SEGMENTS,
+    muxer_playlist_segments, segment_closed, CacheKey, SegmentLookup, TranscodeCache,
+    TranscodeCacheStats, CACHE_PURGE_AFTER_SECS, DEFAULT_CACHE_BUDGET_BYTES, DEFAULT_CACHE_SUBDIR,
+    GUARD_BACK_SEGMENTS,
 };
 pub use vod::{render_playlist, PlaylistSegment, PLAYLIST_CONTENT_TYPE, SEGMENT_CONTENT_TYPE};
 pub use wdmm_ffmpeg::vod::{PlanAlignment, SegmentPlan};
@@ -464,7 +465,7 @@ fn scan_segments(dir: &Path) -> (Option<u64>, u32) {
         let Ok(k) = digits.parse::<u64>() else {
             continue;
         };
-        if !closed.contains(&k) {
+        if !segment_closed(&closed, k) {
             continue;
         }
         let non_empty = entry.metadata().map(|meta| meta.len() > 0).unwrap_or(false);
@@ -755,9 +756,17 @@ fn drop_previous_run(shared: &Arc<Mutex<Shared>>, token: &str) {
     let Some(session) = g.hls_sessions.get_mut(token) else {
         return;
     };
-    if session.run.take().is_some() {
-        wdmm_ffmpeg::diag::log(format!("[proxy] hls run replaced (session {token})"));
-    }
+    let Some(run) = session.run.take() else {
+        return;
+    };
+    // Cancel first so the muxer stops appending, then drop the unfinished tail it
+    // leaves behind. Run replacement happens on every seek, so a stale truncated
+    // segment would otherwise be served for the rest of the session.
+    drop(run);
+    let purged = TranscodeCache::purge_partial_segments(&session.cache_dir, session.anchor_k);
+    wdmm_ffmpeg::diag::log(format!(
+        "[proxy] hls run replaced (session {token}, dropped {purged} unfinished segment(s))"
+    ));
 }
 
 /// Release the global gate permit of every job that already finished.
