@@ -2003,10 +2003,15 @@ fn refresh_phase(entry: &mut SessionEntry, tick: &wdmm_dlna::TickResult) -> Opti
     progress
 }
 
-/// `null` until the job has produced at least 3 s of media, then whether the
+/// `null` until the job has been running for a stable window, then whether the
 /// encoder keeps up with realtime (§3 `estimated_realtime`).
-fn estimate_realtime(content_ms: i64, speed: f64) -> Option<bool> {
-    (content_ms >= 3_000).then_some(speed >= 1.0)
+///
+/// The window used to be "produced at least 3 s of media", but the proxy now
+/// reports the *absolute* buffered front (`encode_content_ms`), which is minutes
+/// long the moment a seek re-anchors a run. Keying on the wall clock keeps the
+/// panel from flashing "slower than realtime" right after every seek.
+fn estimate_realtime(wall_ms: u64, speed: f64) -> Option<bool> {
+    (wall_ms >= 2_000).then_some(speed >= 1.0)
 }
 
 /// Full state document for one tick.
@@ -2025,8 +2030,8 @@ fn state_json(
     let wall_ms = progress.map_or(0, |p| p.wall_ms);
     let playlist_ready = progress.is_some_and(|p| p.playlist_ready);
     let segments = progress.map_or(0, |p| p.segments);
-    // Only meaningful once the job has produced at least 3 s of media.
-    let estimated_realtime = estimate_realtime(content_ms, speed);
+    // Only meaningful once the job has been running for a stable window.
+    let estimated_realtime = estimate_realtime(wall_ms, speed);
     let warnings = progress.map(|p| p.warnings.clone()).unwrap_or_default();
     let duration_ms = vod_duration_ms(entry.provider, progress, tick.duration_ms);
     let mut doc = json!({
@@ -2886,11 +2891,11 @@ mod tests {
     }
 
     #[test]
-    fn estimated_realtime_needs_three_seconds_of_media() {
+    fn estimated_realtime_needs_a_stable_window() {
         assert_eq!(estimate_realtime(0, 0.0), None);
-        assert_eq!(estimate_realtime(2_999, 2.0), None);
-        assert_eq!(estimate_realtime(3_000, 1.0), Some(true));
-        assert_eq!(estimate_realtime(3_000, 0.99), Some(false));
+        assert_eq!(estimate_realtime(1_999, 2.0), None);
+        assert_eq!(estimate_realtime(2_000, 1.0), Some(true));
+        assert_eq!(estimate_realtime(2_000, 0.99), Some(false));
     }
 
     // ── contract §3.3–§3.6: VOD telemetry + transcode cache ──────────────────

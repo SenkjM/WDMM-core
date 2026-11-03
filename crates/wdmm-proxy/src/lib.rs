@@ -329,7 +329,12 @@ fn derive_hls_progress(session: &HlsSession) -> HlsProgress {
     // "where in the film are we", and after a seek the run is anchored in the
     // middle of the media and starts counting at zero again. `planned_ms` is the
     // end of the ready front measured on the plan grid.
-    let front_k = ready_k.unwrap_or(session.anchor_k);
+    // `scan_segments` reports the highest closed segment in the whole cache
+    // directory, which after a seek can be far *behind* the anchor: the segments
+    // of the previous run are still on disk. Using it verbatim placed the buffer
+    // twenty minutes before the anchor and made `drift_ms` report exactly the
+    // seek position, so clamp the front to the current anchor.
+    let front_k = front_segment(ready_k, session.anchor_k, plan_len);
     let planned_ms = plan
         .entries
         .iter()
@@ -339,10 +344,13 @@ fn derive_hls_progress(session: &HlsSession) -> HlsProgress {
     let content_ms = planned_ms.max(0);
     // Encode speed is a property of the job, so it keeps using the run's own
     // produced duration over its wall clock.
-    let speed = if wall_ms == 0 {
+    let speed = if wall_ms < SPEED_WINDOW_MS {
+        // A job that just started (and any copy-mode job) can hand the muxer a
+        // whole segment within a few milliseconds, so the ratio is not yet
+        // meaningful; report "unknown" instead of a four-digit multiplier.
         0.0
     } else {
-        run_content_ms as f64 / wall_ms as f64
+        (run_content_ms as f64 / wall_ms as f64).clamp(0.0, MAX_REPORTED_SPEED)
     };
 
     // Deduplicate while preserving order, keep at most 8.
@@ -386,7 +394,7 @@ fn derive_hls_progress(session: &HlsSession) -> HlsProgress {
         content_ms,
         wall_ms,
         speed,
-        ended: session.ended || (plan_len > 0 && ready_k.unwrap_or(0) + 1 >= plan_len),
+        ended: session.ended || (plan_len > 0 && front_k + 1 >= plan_len),
         error: session.job_error.clone(),
         encoder,
         warnings,
@@ -402,6 +410,18 @@ fn derive_hls_progress(session: &HlsSession) -> HlsProgress {
         cache_bytes: session.cache.bytes_of(&session.cache_key),
         over_budget: cache_stats.over_budget,
     }
+}
+
+/// Which plan segment the buffered front reaches, never behind `anchor_k`.
+///
+/// `ready_k` comes from a directory scan, so it is a global maximum: after a
+/// seek into the middle of the film the old run's segments are still there and
+/// the scan happily reports segment 20 while the session is anchored at segment
+/// 900. Telemetry must describe the *current* anchor, so anything below it is
+/// ignored, and the index is clamped to the plan length.
+fn front_segment(ready_k: Option<u64>, anchor_k: u64, plan_len: u64) -> u64 {
+    let front = ready_k.unwrap_or(anchor_k).max(anchor_k);
+    front.min(plan_len.saturating_sub(1))
 }
 
 /// Human/FFI label of a plan alignment.
@@ -572,6 +592,17 @@ impl StoredPlan {
 /// the cuts become exactly the keyframe sequence and no longer depend on where a
 /// run was started — which is what makes keyframe/transcode plans restart-safe.
 const KEYFRAME_CUT_HLS_TIME_MS: u32 = 1;
+
+/// Wall-clock window a run must be alive for before `speed` is reported.
+///
+/// Below it the ratio is dominated by start-up: a copy-mode run can write a whole
+/// keyframe segment in the first few milliseconds, and reporting that as "450x"
+/// made the warm-up panel look broken.
+const SPEED_WINDOW_MS: u64 = 2_000;
+
+/// Upper bound for a reported encode speed. Real remux runs reach 20-40x, but
+/// anything above this is still start-up noise rather than a useful measurement.
+const MAX_REPORTED_SPEED: f64 = 100.0;
 
 /// Start (or restart) a session's transcode run. See
 /// [`ProxyHandle::spawn_run`].
@@ -1647,6 +1678,9 @@ async fn ensure_segment(
             Serve(PathBuf),
             Wait,
             Resume,
+            /// The request jumped outside the running job's coverage (a seek):
+            /// cancel that job and transcode from the requested point.
+            Cancel,
             Start(u64),
             Sleep(Duration),
             Ended,
@@ -1695,6 +1729,15 @@ async fn ensure_segment(
                         }
                     } else if session.ended && k >= session.anchor_k && k <= front {
                         Step::Ended
+                    } else if session.run.is_some() {
+                        // A seek landed outside the coverage of the current job.
+                        // Do not park it "for later" and do not keep it paused:
+                        // its decoder, its input and its gate slot are all
+                        // useless now, and the renderer is waiting on the new
+                        // position. Interrupting is also far cheaper than
+                        // waiting for a paused job to be resumed and to reach
+                        // the target segment from the old anchor.
+                        Step::Cancel
                     } else {
                         match session.last_reopen {
                             Some(last) if last.elapsed() < HLS_REOPEN_INTERVAL => {
@@ -1766,6 +1809,18 @@ async fn ensure_segment(
                     run.job.resume();
                     info!("HLS run resumed at segment {k}");
                 }
+            }
+            Step::Cancel => {
+                drop_previous_run(shared, token);
+                info!(
+                    token,
+                    k, "HLS run interrupted by a seek outside its coverage"
+                );
+                wdmm_ffmpeg::diag::log(format!(
+                    "[proxy] hls run interrupted: seek to segment {k} is outside the run"
+                ));
+                // Loop again: the session now has no run, so the next pass either
+                // waits out the reopen throttle or starts a fresh job at `k`.
             }
             Step::Start(from_k) => {
                 // Near-neighbour merge: one reopen covers `from_k..=from_k+2`.
@@ -2081,6 +2136,18 @@ mod tests {
             anchor_k: 0,
             hls_time_override_ms: Some(KEYFRAME_CUT_HLS_TIME_MS),
         }
+    }
+
+    #[test]
+    fn front_segment_never_reports_behind_the_anchor() {
+        // Scan result from an earlier run that is still on disk.
+        assert_eq!(front_segment(Some(20), 900, 1000), 900);
+        // Nothing on disk yet: the anchor is the front.
+        assert_eq!(front_segment(None, 5, 10), 5);
+        // Normal forward progress is reported as-is.
+        assert_eq!(front_segment(Some(9), 0, 10), 9);
+        // Never past the last plan entry.
+        assert_eq!(front_segment(Some(12), 0, 10), 9);
     }
 
     #[test]
