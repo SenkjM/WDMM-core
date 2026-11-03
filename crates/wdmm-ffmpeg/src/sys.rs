@@ -247,8 +247,8 @@ pub struct AVDictionaryEntry {
 /// low two bits (`AVINDEX_KEYFRAME`).
 #[repr(C)]
 pub struct AVIndexEntry {
-    pub pos: i64,           // +0  (8)
-    pub timestamp: i64,     // +8  (8)
+    pub pos: i64,              // +0  (8)
+    pub timestamp: i64,        // +8  (8)
     pub flags_and_size: c_int, // +16 (4)
     pub min_distance: c_int,   // +20 (4)
 } // sizeof=24 ✓

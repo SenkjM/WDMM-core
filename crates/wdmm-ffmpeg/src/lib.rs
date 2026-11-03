@@ -46,8 +46,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "ffmpeg")]
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use plan::{
@@ -55,8 +55,7 @@ pub use plan::{
 };
 pub use subtitle::{classify_codec, Cue, TrackKind};
 pub use vod::{
-    approximate_plan, calibration_plan, exact_plan, keyframe_plan, measure_gop_from_durations,
-    PlanAlignment, SegEntry, SegmentPlan, MIN_KEYFRAMES_FOR_PLAN,
+    exact_plan, keyframe_plan, PlanAlignment, SegEntry, SegmentPlan, MIN_KEYFRAMES_FOR_PLAN,
 };
 pub use wdmm_core::models::TranscodePreset;
 
@@ -84,17 +83,24 @@ pub const fn is_available() -> bool {
 
 // ── Progress telemetry (§1) ───────────────────────────────────────────────────
 
-/// Snapshot of an HLS job's write progress.
+/// Snapshot of an HLS job's progress.
 ///
-/// `content_ms` is monotonic: it only grows as packets are written, and stays
-/// `0` until the muxer has accepted its first packet. `wall_ms` counts from the
-/// moment the job thread actually started working (not from `open_job`).
+/// `content_ms` is monotonic *within one run*: it only grows as packets are
+/// written, and stays `0` until the muxer has accepted its first packet. It is
+/// measured from the run's seek anchor, so the absolute media time of the write
+/// front is `start_ms + content_ms` (the single-session proxy reports exactly
+/// that as `produced_ms`). `wall_ms` counts from the moment the job thread
+/// actually started working (not from `open_job`).
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ProgressSnapshot {
-    /// Media time of the last packet handed to the muxer, in milliseconds.
+pub struct JobProgress {
+    /// Media time of the last packet handed to the muxer, relative to the run's
+    /// seek anchor, in milliseconds.
     pub content_ms: i64,
+    /// Seek anchor of this run: absolute media time the job started from, in
+    /// milliseconds (`JobOpts::start_offset_secs * 1000`).
+    pub start_ms: i64,
     /// Wall-clock milliseconds since the job thread started.
-    pub wall_ms: u64,
+    pub wall_ms: i64,
     /// Packets written (remux) or encoded frames (transcode).
     pub packets: u64,
 }
@@ -125,6 +131,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Debug, Default)]
 pub(crate) struct ProgressState {
     started_epoch_ms: AtomicU64,
+    start_ms: AtomicI64,
     content_ms: AtomicI64,
     packets: AtomicU64,
     encoder: Mutex<EncoderInfo>,
@@ -145,21 +152,27 @@ impl ProgressState {
             .store(Self::now_ms(), Ordering::Relaxed);
     }
 
+    /// Record this run's seek anchor (absolute media milliseconds).
+    pub(crate) fn set_start_ms(&self, start_ms: i64) {
+        self.start_ms.store(start_ms, Ordering::Relaxed);
+    }
+
     /// Record a packet at media time `pts_ms` (monotonic, never decreases).
     pub(crate) fn note_written(&self, pts_ms: i64) {
         self.content_ms.fetch_max(pts_ms.max(0), Ordering::Relaxed);
         self.packets.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn snapshot(&self) -> ProgressSnapshot {
+    pub(crate) fn snapshot(&self) -> JobProgress {
         let started = self.started_epoch_ms.load(Ordering::Relaxed);
         let wall_ms = if started == 0 {
             0
         } else {
-            Self::now_ms().saturating_sub(started)
+            Self::now_ms().saturating_sub(started) as i64
         };
-        ProgressSnapshot {
+        JobProgress {
             content_ms: self.content_ms.load(Ordering::Relaxed),
+            start_ms: self.start_ms.load(Ordering::Relaxed),
             wall_ms,
             packets: self.packets.load(Ordering::Relaxed),
         }
@@ -184,6 +197,68 @@ impl ProgressState {
 
     pub(crate) fn warnings(&self) -> Vec<String> {
         lock(&self.warnings).clone()
+    }
+}
+
+// ── Pause control (§ single-session throttling) ──────────────────────────────
+
+/// Cooperative pause latch shared between [`JobHandle`] and the job thread.
+///
+/// The job loops call [`wait_if_paused`](PauseControl::wait_if_paused) at packet
+/// boundaries; while paused they block on the condvar (no busy wait) and wake
+/// immediately on [`resume`](PauseControl::resume), [`wake`](PauseControl::wake)
+/// or a cancellation request. `pause`/`resume` are idempotent.
+///
+/// The condvar wait is bounded (100 ms) so a cancellation that races with the
+/// pause cannot leave the thread sleeping: the loop re-checks `cancel` on every
+/// wakeup.
+#[derive(Debug, Default)]
+pub(crate) struct PauseControl {
+    paused: std::sync::atomic::AtomicBool,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl PauseControl {
+    /// Ask the job to stop at its next packet boundary. Idempotent.
+    pub(crate) fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Let a paused job continue. Idempotent (also wakes waiters).
+    pub(crate) fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.wake();
+    }
+
+    /// Wake any waiter without changing the pause state (used by `cancel`).
+    pub(crate) fn wake(&self) {
+        let _guard = lock(&self.lock);
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Block while paused. Returns `true` when the caller must stop (cancel was
+    /// requested, either before or during the wait).
+    pub(crate) fn wait_if_paused(&self, cancel: &std::sync::atomic::AtomicBool) -> bool {
+        if !self.paused.load(Ordering::Acquire) {
+            return cancel.load(Ordering::Relaxed);
+        }
+        let mut guard = lock(&self.lock);
+        while self.paused.load(Ordering::Acquire) {
+            if cancel.load(Ordering::Relaxed) {
+                return true;
+            }
+            let (next, _) = self
+                .cv
+                .wait_timeout(guard, Duration::from_millis(100))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next;
+        }
+        cancel.load(Ordering::Relaxed)
     }
 }
 
@@ -337,10 +412,10 @@ pub fn source_plan(_url: &str, _preset: &TranscodePreset) -> FfmpegResult<Option
 /// Read the measured segment durations (milliseconds) from a muxer-written
 /// `index.m3u8`, in playlist order.
 ///
-/// This is the calibration input (§3.1): the HLS muxer records the real segment
-/// lengths as `#EXTINF` lines, which [`measure_gop_from_durations`] then turns
-/// into a GOP estimate. Returns an empty vector when the playlist does not exist
-/// yet or has no `#EXTINF` lines.
+/// Diagnostic helper: the muxer records the real segment lengths as `#EXTINF`
+/// lines. The VOD plan is decided up front (`source_plan`), never calibrated
+/// from these measurements. Returns an empty vector when the playlist does not
+/// exist yet or has no `#EXTINF` lines.
 pub fn measure_segment_durations(dir: &Path) -> Vec<i64> {
     match std::fs::read_to_string(dir.join("index.m3u8")) {
         Ok(playlist) => parse_extinf_durations(&playlist),
@@ -415,8 +490,13 @@ pub struct JobOpts {
     /// directory whose contents are removed on drop.
     pub out_dir: Option<PathBuf>,
     /// Override for the HLS muxer `hls_time` (seconds, decimals allowed),
-    /// expressed in milliseconds. Used after calibration to align `hls_time` to
-    /// a multiple of the measured GOP so segment cuts stop drifting.
+    /// expressed in milliseconds.
+    ///
+    /// The single-session producer sets this to `1` for `Keyframe`/`Exact`
+    /// plans: the muxer then cuts on every video keyframe (copy paths) or every
+    /// encoder IDR (`Exact`), so the real cut grid equals the plan regardless of
+    /// which segment the run was anchored at. Audio-only runs keep the nominal
+    /// segment length and use `hls_flags=split_by_time` instead.
     pub hls_time_override_ms: Option<u32>,
 }
 
@@ -448,6 +528,9 @@ pub struct JobHandle {
     thread: Option<std::thread::JoinHandle<FfmpegResult<()>>>,
     /// Live progress + encoder info shared with the job thread.
     telemetry: Arc<ProgressState>,
+    /// Cooperative pause latch shared with the job thread (single-session
+    /// throttling: the proxy pauses a run that is far ahead of the client).
+    pause: Arc<PauseControl>,
     /// Whether `Drop` owns (and may delete) [`segment_dir`](JobHandle::segment_dir).
     /// False for persistent VOD cache directories (`JobOpts::out_dir`).
     owns_dir: bool,
@@ -494,9 +577,30 @@ impl JobHandle {
     }
 
     /// Request cancellation. The background thread stops after its next loop
-    /// tick (non-blocking — does not wait).
+    /// tick (non-blocking — does not wait). Wakes a paused job so cancellation
+    /// never deadlocks behind the pause latch.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.pause.wake();
+    }
+
+    /// Pause the job at its next packet boundary (single-session throttling).
+    ///
+    /// Idempotent. A paused job still counts as running (`is_running()` stays
+    /// `true`) and never busy-waits: the producer thread blocks on a condvar
+    /// until [`resume`](JobHandle::resume) or cancellation.
+    pub fn pause(&self) {
+        self.pause.pause();
+    }
+
+    /// Resume a paused job. Idempotent.
+    pub fn resume(&self) {
+        self.pause.resume();
+    }
+
+    /// Whether [`pause`](JobHandle::pause) is currently in effect.
+    pub fn is_paused(&self) -> bool {
+        self.pause.is_paused()
     }
 
     /// Non-blocking check: is the transcode thread still running?
@@ -530,8 +634,10 @@ impl JobHandle {
         }
     }
 
-    /// Monotonic write progress (§1). Safe to call while the job runs.
-    pub fn progress(&self) -> ProgressSnapshot {
+    /// Monotonic run progress: `start_ms` + `content_ms` is the absolute media
+    /// time of the write front. Safe to call while the job runs (also while
+    /// paused).
+    pub fn progress(&self) -> JobProgress {
         self.telemetry.snapshot()
     }
 
@@ -550,6 +656,7 @@ impl JobHandle {
 impl Drop for JobHandle {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.pause.wake();
         // Never wait for the job thread here. The pull scheduler replaces a run
         // from inside the request path while holding the proxy's shared mutex,
         // and a cancelled job can take seconds to unwind (a blocked read on the
@@ -598,6 +705,11 @@ impl JobHandle {
         Vec::new()
     }
     pub fn cancel(&self) {}
+    pub fn pause(&self) {}
+    pub fn resume(&self) {}
+    pub fn is_paused(&self) -> bool {
+        false
+    }
     pub fn is_running(&self) -> bool {
         false
     }
@@ -607,8 +719,8 @@ impl JobHandle {
     pub fn join(self) -> FfmpegResult<()> {
         Ok(())
     }
-    pub fn progress(&self) -> ProgressSnapshot {
-        ProgressSnapshot::default()
+    pub fn progress(&self) -> JobProgress {
+        JobProgress::default()
     }
     pub fn encoder_info(&self) -> EncoderInfo {
         EncoderInfo::default()
@@ -651,6 +763,8 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
     let cancel_t = cancel.clone();
     let telemetry = Arc::new(ProgressState::default());
     let telemetry_t = Arc::clone(&telemetry);
+    let pause = Arc::new(PauseControl::default());
+    let pause_t = Arc::clone(&pause);
     let input_url = opts.input_url.clone();
     let preset = opts.preset.clone();
     let preset_id = preset.id.clone();
@@ -669,6 +783,7 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
                 &dir,
                 cancel_t,
                 &telemetry_t,
+                &pause_t,
                 &id,
                 start_number,
                 hls_time_override_ms,
@@ -689,6 +804,7 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
         cancel,
         thread: Some(thread),
         telemetry,
+        pause,
         owns_dir,
     })
 }
@@ -745,6 +861,92 @@ mod tests {
         let (w, h) = transcoder::fit_dimensions(641, 361, None, None);
         assert_eq!(w % 2, 0);
         assert_eq!(h % 2, 0);
+    }
+
+    #[test]
+    fn progress_snapshot_carries_start_anchor() {
+        let state = ProgressState::default();
+        state.set_start_ms(90_000);
+        let snap = state.snapshot();
+        assert_eq!(snap.start_ms, 90_000, "start_ms is the job's seek anchor");
+        assert_eq!(snap.content_ms, 0);
+    }
+
+    // ── Pause control (single-session throttling) ────────────────────────────
+
+    #[test]
+    fn pause_and_resume_are_idempotent() {
+        let gate = PauseControl::default();
+        assert!(!gate.is_paused());
+        gate.pause();
+        gate.pause();
+        assert!(gate.is_paused());
+        gate.resume();
+        gate.resume();
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn pause_gate_blocks_until_resumed() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let gate = Arc::new(PauseControl::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        gate.pause();
+
+        let (tx, rx) = mpsc::channel();
+        let gate_thread = Arc::clone(&gate);
+        let cancel_thread = Arc::clone(&cancel);
+        let waiter = std::thread::spawn(move || {
+            let stopped = gate_thread.wait_if_paused(&cancel_thread);
+            tx.send(stopped).unwrap();
+        });
+
+        // The gate must be blocked while paused (no busy wait, no early return).
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "wait_if_paused must block while paused"
+        );
+
+        gate.resume();
+        let stopped = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resume must wake the pause gate");
+        waiter.join().unwrap();
+        assert!(!stopped, "a resumed run keeps going");
+    }
+
+    #[test]
+    fn pause_gate_stops_when_cancelled_while_paused() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let gate = Arc::new(PauseControl::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        gate.pause();
+
+        let (tx, rx) = mpsc::channel();
+        let gate_thread = Arc::clone(&gate);
+        let cancel_thread = Arc::clone(&cancel);
+        let waiter = std::thread::spawn(move || {
+            let stopped = gate_thread.wait_if_paused(&cancel_thread);
+            tx.send(stopped).unwrap();
+        });
+
+        // Still paused and not cancelled: the waiter must stay blocked.
+        assert!(rx.recv_timeout(Duration::from_millis(120)).is_err());
+
+        // Cancel has to wake the gate even though it is paused.
+        cancel.store(true, AtomicOrdering::SeqCst);
+        gate.wake();
+        let stopped = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancel must wake the pause gate");
+        waiter.join().unwrap();
+        assert!(stopped, "cancel while paused stops the run");
     }
 
     #[test]

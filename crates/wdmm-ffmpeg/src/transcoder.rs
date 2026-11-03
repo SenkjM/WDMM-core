@@ -31,15 +31,15 @@ use std::sync::Arc;
 
 use crate::sys::*;
 use crate::{
-    diag, AudioStream, EncoderInfo, FfmpegError, FfmpegResult, ProbeResult, ProgressState,
-    SourcePlan, SubtitleStream, TranscodePreset, VideoStream,
+    diag, AudioStream, EncoderInfo, FfmpegError, FfmpegResult, PauseControl, ProbeResult,
+    ProgressState, SourcePlan, SubtitleStream, TranscodePreset, VideoStream,
 };
 
 /// Time base used for millisecond content timestamps.
 const MS_TB: AVRational = AVRational::new(1, 1000);
 
 /// How often (~ms of wall time) to emit a progress diagnostic line.
-const PROGRESS_LOG_EVERY_MS: u64 = 2_000;
+const PROGRESS_LOG_EVERY_MS: i64 = 2_000;
 
 // ── Remux decision (pure logic lives in `crate::plan`, host-testable) ──────
 
@@ -84,8 +84,8 @@ unsafe fn stream_codec_id(streams_ptr: *const *mut AVStream, idx: i32) -> Option
 /// HLS `hls_time` in seconds, honouring a millisecond override.
 ///
 /// `hlsenc` parses `hls_time` as a decimal float, so sub-second overrides are
-/// passed with up to three decimals. This is what lets the proxy align the
-/// muxer grid with a calibrated (non-integer) segment plan.
+/// passed with up to three decimals. A 1 ms override makes the muxer cut on
+/// every video keyframe (video-copy paths) or every forced IDR (encode path).
 fn hls_time_seconds(preset_secs: u32, override_ms: Option<u32>) -> String {
     let ms = match override_ms {
         Some(ms) if ms > 0 => ms,
@@ -394,28 +394,18 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
             Some(duration_raw / 1000)
         };
         let Some(duration_ms) = duration_ms else {
-            diag::log(format!("source plan: {url} has no duration, deferring to warm-up"));
+            diag::log(format!(
+                "source plan: {url} has no duration, deferring to warm-up"
+            ));
             avformat_close_input(&mut in_ctx);
             return Ok(None);
         };
 
         let streams_ptr = fmtctx_streams(in_ctx);
-        let v_idx = av_find_best_stream(
-            in_ctx,
-            AVMEDIA_TYPE_VIDEO,
-            -1,
-            -1,
-            std::ptr::null_mut(),
-            0,
-        );
-        let a_idx = av_find_best_stream(
-            in_ctx,
-            AVMEDIA_TYPE_AUDIO,
-            -1,
-            -1,
-            std::ptr::null_mut(),
-            0,
-        );
+        let v_idx =
+            av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, std::ptr::null_mut(), 0);
+        let a_idx =
+            av_find_best_stream(in_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, std::ptr::null_mut(), 0);
         let video_codec = stream_codec_id(streams_ptr, v_idx);
         let audio_codec = stream_codec_id(streams_ptr, a_idx);
         let seg_secs = f64::from(preset.hls_segment_secs);
@@ -424,8 +414,7 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
             // Audio-only HLS cuts on audio packet timing; there is no index that
             // predicts it, so the warm-up calibration stays in charge.
             None
-        } else if preset.remux_first
-            && remux_plan(video_codec, audio_codec) != RemuxPlan::Transcode
+        } else if preset.remux_first && remux_plan(video_codec, audio_codec) != RemuxPlan::Transcode
         {
             let mut keyframes = video_keyframe_index_ms(in_ctx, streams_ptr, v_idx);
             // MP4 indexes store DTS, and the B-frame delay makes the first
@@ -433,9 +422,10 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
             // packet's PTS so both the proxy's seek offset and the muxer's
             // first cut land on the keyframe the plan names. Matroska indexes
             // already use PTS, so the shift is zero there.
-            if let (Some(first_pts), Some(first_kf)) =
-                (first_video_packet_pts_ms(in_ctx, streams_ptr, v_idx), keyframes.first().copied())
-            {
+            if let (Some(first_pts), Some(first_kf)) = (
+                first_video_packet_pts_ms(in_ctx, streams_ptr, v_idx),
+                keyframes.first().copied(),
+            ) {
                 let shift = first_pts.saturating_sub(first_kf);
                 if shift != 0 {
                     for kf in &mut keyframes {
@@ -825,11 +815,7 @@ fn encoder_grid_rate(source: AVRational, configured: AVRational) -> AVRational {
 /// grid the produced `EXTINF` values follow when the source rate does not divide
 /// `seg_secs` evenly (16.1667 fps: 2 s = 32.33 frames, so the encoder can only
 /// cut at 32 frames = 1.979 s).
-fn encode_grid(
-    source_rate: AVRational,
-    configured_rate: AVRational,
-    seg_secs: u32,
-) -> (i32, f64) {
+fn encode_grid(source_rate: AVRational, configured_rate: AVRational, seg_secs: u32) -> (i32, f64) {
     let rate = encoder_grid_rate(source_rate, configured_rate);
     let gop = segment_gop_size(rate.num, rate.den, seg_secs);
     let step_secs = if rate.num > 0 && rate.den > 0 {
@@ -974,7 +960,7 @@ struct JobCtx<'a> {
     segment_dir: &'a Path,
     tracker: ProgressTracker,
     first_segment_logged: bool,
-    last_progress_log_ms: u64,
+    last_progress_log_ms: i64,
 }
 
 impl<'a> JobCtx<'a> {
@@ -1050,11 +1036,13 @@ pub fn run_hls_job(
     segment_dir: &Path,
     cancel: Arc<AtomicBool>,
     telemetry: &ProgressState,
+    pause: &PauseControl,
     job_id: &str,
     start_number: u64,
     hls_time_override_ms: Option<u32>,
 ) -> FfmpegResult<()> {
     telemetry.start();
+    telemetry.set_start_ms((start_offset_secs * 1000.0).round() as i64);
     let tag = job_tag(job_id);
     diag::log(format!(
         "{tag} job start preset={} container={} remux_first={} video_codec={:?} audio_codec={} start_offset={start_offset_secs:.2} start_number={start_number} hls_time_override_ms={hls_time_override_ms:?} seg_dir={} input={}",
@@ -1085,6 +1073,7 @@ pub fn run_hls_job(
             segment_dir,
             cancel.clone(),
             telemetry,
+            pause,
             &tag,
             start_number,
             hls_time_override_ms,
@@ -1104,6 +1093,7 @@ pub fn run_hls_job(
                         segment_dir,
                         cancel,
                         telemetry,
+                        pause,
                         &tag,
                         start_number,
                         hls_time_override_ms,
@@ -1119,6 +1109,7 @@ pub fn run_hls_job(
             segment_dir,
             cancel,
             telemetry,
+            pause,
             &tag,
             start_number,
             hls_time_override_ms,
@@ -1533,6 +1524,7 @@ fn run_remux(
     segment_dir: &Path,
     cancel: Arc<AtomicBool>,
     telemetry: &ProgressState,
+    pause: &PauseControl,
     tag: &str,
     start_number: u64,
     hls_time_override_ms: Option<u32>,
@@ -1810,7 +1802,12 @@ fn run_remux(
         if audio_only {
             // No video stream: the muxer has no keyframes, so cut on the audio
             // packet timestamps instead (`hls_time` above stays the preset value).
-            av_dict_set(&mut dict, c"hls_flags".as_ptr(), c"split_by_time".as_ptr(), 0);
+            av_dict_set(
+                &mut dict,
+                c"hls_flags".as_ptr(),
+                c"split_by_time".as_ptr(),
+                0,
+            );
         }
         // With video both copy paths (pure remux and hybrid audio re-encode) cut
         // on video keyframes only; `split_by_time` is deliberately NOT set there
@@ -1859,6 +1856,11 @@ fn run_remux(
 
         loop {
             if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            // Throttling: block on the packet boundary while the producer is
+            // paused; a cancel that arrives during the wait also stops the run.
+            if pause.wait_if_paused(&cancel) {
                 break;
             }
 
@@ -1980,6 +1982,7 @@ fn run_transcode(
     segment_dir: &Path,
     cancel: Arc<AtomicBool>,
     telemetry: &ProgressState,
+    pause: &PauseControl,
     tag: &str,
     start_number: u64,
     hls_time_override_ms: Option<u32>,
@@ -2195,14 +2198,7 @@ fn run_transcode(
             let mut hw_open_error: Option<String> = None;
             if hw_present {
                 match open_hw_video_encoder(
-                    tag,
-                    hw_name,
-                    hw_codec,
-                    preset,
-                    out_w,
-                    out_h,
-                    framerate,
-                    video_gop,
+                    tag, hw_name, hw_codec, preset, out_w, out_h, framerate, video_gop,
                 ) {
                     Ok((ctx, pix_fmt)) => {
                         v_enc_ctx = ctx;
@@ -2303,7 +2299,9 @@ fn run_transcode(
                 // CLOSED_GOP keeps every segment independently decodable.
                 codctx_set_flags(
                     v_enc_ctx,
-                    codctx_flags(v_enc_ctx) | AV_CODEC_FLAG_GLOBAL_HEADER | AV_CODEC_FLAG_CLOSED_GOP,
+                    codctx_flags(v_enc_ctx)
+                        | AV_CODEC_FLAG_GLOBAL_HEADER
+                        | AV_CODEC_FLAG_CLOSED_GOP,
                 );
                 if let Some(br) = preset.video_max_bitrate {
                     codctx_set_bit_rate(v_enc_ctx, br as i64);
@@ -2489,7 +2487,12 @@ fn run_transcode(
         if audio_only {
             // No video stream: the muxer has no keyframes, so cut on the audio
             // packet timestamps instead (`hls_time` above stays the preset value).
-            av_dict_set(&mut dict, c"hls_flags".as_ptr(), c"split_by_time".as_ptr(), 0);
+            av_dict_set(
+                &mut dict,
+                c"hls_flags".as_ptr(),
+                c"split_by_time".as_ptr(),
+                0,
+            );
         }
         av_dict_set(
             &mut dict,
@@ -2585,6 +2588,11 @@ fn run_transcode(
 
         'decode: loop {
             if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            // Throttling: block on the packet boundary while the producer is
+            // paused; a cancel that arrives during the wait also stops the run.
+            if pause.wait_if_paused(&cancel) {
                 break;
             }
 

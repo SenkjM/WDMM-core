@@ -1,38 +1,30 @@
 //! VOD HLS segment planning (§3.1 of `hls-vod-transcode-cache`).
 //!
-//! The old cast path produced a *live* playlist whose `EXTINF` values were
-//! whatever the muxer happened to cut. The VOD path instead synthesizes the
-//! playlist up front from a [`SegmentPlan`], so the player can seek without
-//! reloading the playlist (`#EXT-X-PLAYLIST-TYPE:VOD` + `ENDLIST`).
+//! The cast path synthesizes the playlist up front from a [`SegmentPlan`], so
+//! the player can seek without reloading it (`#EXT-X-PLAYLIST-TYPE:VOD` +
+//! `ENDLIST`). There are exactly two alignments, both decided once when the
+//! session is created — deliberately no approximate grid:
 //!
-//! The alignment strategies model how the segment boundaries relate to the
-//! media timeline:
+//! - [`PlanAlignment::Keyframe`] — the video stream can be copied into MPEG-TS
+//!   and the container has a usable keyframe index: boundaries are the keyframes
+//!   the HLS muxer actually cuts on, so the synthesized `EXTINF` values match the
+//!   segment files exactly. See [`keyframe_plan`].
+//! - [`PlanAlignment::Exact`] — the video must be re-encoded: the encoder is
+//!   forced to emit an IDR every grid step, so the muxer cuts on the strict
+//!   `k * seg_secs` grid. See [`exact_plan`].
 //!
-//! - [`PlanAlignment::Exact`] — transcode grid: strict `k * seg_secs`. The job
-//!   seeks the input and decodes up to the requested frame, so the output can be
-//!   cut on the requested grid regardless of input keyframes (the encoder is
-//!   forced to emit a keyframe on every grid point).
-//! - [`PlanAlignment::Keyframe`] — copy/hybrid with a usable container keyframe
-//!   index: boundaries are the keyframes the HLS muxer will actually cut on, so
-//!   the synthesized playlist `EXTINF` values match the segment files exactly
-//!   (no warm-up measurement needed). See [`keyframe_plan`].
-//! - [`PlanAlignment::Calibrated`] — copy/hybrid without a keyframe index: the
-//!   warm-up phase measures real segment durations ([`measure_gop_from_durations`]
-//!   infers `gop_ms`) and the plan steps on that multiple of the GOP. The muxer's
-//!   `hls_time` is aligned to the same step, so errors no longer accumulate.
-//! - [`PlanAlignment::Approx`] — VFR/no-measurement fallback: nominal grid, drift
-//!   is reported by the caller instead of being modelled.
+//! A source with an unusable keyframe index is *not* planned approximately: it
+//! falls back to the real encode path (`Exact`). For copy runs the job sets
+//! `hls_time` to a tiny value, so the HLS muxer's cut test (`pkt->pts -
+//! start_pts >= number * hls_time`) is satisfied by every video keyframe: the
+//! muxer cuts on **every keyframe**, which makes the cut sequence independent of
+//! the anchor a run was started at, so a restart from any planned segment
+//! boundary reproduces the plan exactly. [`keyframe_plan`] therefore plans one
+//! segment per keyframe interval; entry starts stay on the media timeline so
+//! restarted runs seek to the exact planned keyframe.
 //!
-//! For copy/hybrid runs the job sets `hls_time` to a tiny value, so the HLS
-//! muxer's cut test (`pkt->pts - start_pts >= number * hls_time`) is satisfied by
-//! every video keyframe: the muxer cuts on **every keyframe**. That makes the cut
-//! sequence independent of the anchor a run was started at, so a restart from any
-//! planned segment boundary reproduces the plan exactly. [`keyframe_plan`]
-//! therefore plans one segment per keyframe interval; entry starts stay on the
-//! media timeline so restarted runs seek to the exact planned keyframe.
-
-//! For encode runs the caller instead keeps `hls_time` tiny while forcing an IDR
-//! every `segment_gop_size` frames, so the cuts land on the uniform grid of
+//! For encode runs the caller keeps `hls_time` tiny while forcing an IDR every
+//! `segment_gop_size` frames, so the cuts land on the uniform grid of
 //! [`exact_plan`].
 //!
 //! All logic here is pure and always compiled, so it is unit-testable on a host
@@ -51,19 +43,18 @@ pub struct SegEntry {
 }
 
 /// How a [`SegmentPlan`]'s boundaries relate to the media timeline (§3.1).
+///
+/// Only these two exist by design: every planned segment boundary is a real cut
+/// point of the job that produces it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlanAlignment {
-    /// Transcode grid: strict `k * seg_secs`.
+    /// Re-encode grid: strict `k * seg_secs` (the encoder emits one IDR per
+    /// step, so the muxer cuts exactly there).
     Exact,
 
     /// Copy/hybrid with a usable container keyframe index: boundaries are the
     /// real keyframes the muxer cuts on.
     Keyframe,
-
-    /// Copy/hybrid without an index: warm-up measured GOP grid.
-    Calibrated,
-    /// VFR/no-index fallback: nominal grid, drift reported by the caller.
-    Approx,
 }
 
 /// The synthesized VOD segment plan for one media item.
@@ -75,7 +66,8 @@ pub struct SegmentPlan {
     pub seg_secs: f64,
     /// Alignment strategy that produced [`entries`](SegmentPlan::entries).
     pub alignment: PlanAlignment,
-    /// Measured keyframe interval for [`PlanAlignment::Calibrated`] plans.
+    /// Median keyframe interval of [`PlanAlignment::Keyframe`] plans (used by
+    /// the caller for seek margins); `None` for [`PlanAlignment::Exact`].
     pub gop_ms: Option<i64>,
     /// Planned segments in playback order.
     pub entries: Vec<SegEntry>,
@@ -101,11 +93,6 @@ impl SegmentPlan {
             .map(|e| e.duration_ms)
     }
 }
-
-/// Minimum plausible GOP used when validating measurements (250 ms).
-const MIN_GOP_MS: i64 = 250;
-/// Maximum plausible GOP used when validating measurements (30 s).
-const MAX_GOP_MS: i64 = 30_000;
 
 /// Nominal segment length in milliseconds (at least 1 ms).
 fn seg_ms(seg_secs: f64) -> i64 {
@@ -152,8 +139,9 @@ fn plan_with(
     }
 }
 
-/// Transcode grid: boundaries are exactly `k * seg_secs`, final segment
-/// truncated. Never drifts because the transcode job seeks per segment.
+/// Re-encode grid: boundaries are exactly `k * seg_secs`, final segment
+/// truncated. The encoder emits one IDR per step, so the muxer's cuts land on
+/// this grid.
 pub fn exact_plan(duration_ms: i64, seg_secs: f64) -> SegmentPlan {
     plan_with(
         duration_ms,
@@ -161,39 +149,6 @@ pub fn exact_plan(duration_ms: i64, seg_secs: f64) -> SegmentPlan {
         PlanAlignment::Exact,
         None,
         seg_ms(seg_secs),
-    )
-}
-
-/// Nominal grid used for VFR/no-index fallback; the caller reports the drift.
-pub fn approximate_plan(duration_ms: i64, seg_secs: f64) -> SegmentPlan {
-    plan_with(
-        duration_ms,
-        seg_secs,
-        PlanAlignment::Approx,
-        None,
-        seg_ms(seg_secs),
-    )
-}
-
-/// Calibrated grid: step is the smallest multiple of the measured GOP that is
-/// at least `seg_secs` (`ceil(seg_secs*1000 / gop_ms) * gop_ms`), final segment
-/// truncated. `hls_time` must be aligned to the same step by the caller.
-///
-/// A non-positive or implausible `gop_ms` degrades to [`approximate_plan`] (the
-/// measurement was not trustworthy, so do not claim to be calibrated).
-pub fn calibration_plan(duration_ms: i64, seg_secs: f64, gop_ms: i64) -> SegmentPlan {
-    if !(MIN_GOP_MS..=MAX_GOP_MS).contains(&gop_ms) {
-        return approximate_plan(duration_ms, seg_secs);
-    }
-    let seg = seg_ms(seg_secs);
-    let steps = (seg + gop_ms - 1) / gop_ms;
-    let step = steps.saturating_mul(gop_ms).max(gop_ms);
-    plan_with(
-        duration_ms,
-        seg_secs,
-        PlanAlignment::Calibrated,
-        Some(gop_ms),
-        step,
     )
 }
 
@@ -217,10 +172,11 @@ pub const MIN_KEYFRAMES_FOR_PLAN: usize = 2;
 /// to. The plan keeps the container `duration_ms`; the entries cover
 /// `duration_ms - first_keyframe`.
 ///
-/// Returns `None` — the caller then falls back to warm-up calibration — when the
-/// index is too short, ends more than two GOPs before the media end (a truncated
-/// Matroska `Cues` block, e.g. a live/no-Cues file after one seek), or the media
-/// duration is unknown.
+/// Returns `None` — the caller then uses the re-encode path
+/// ([`exact_plan`]) — when the index is too short, ends more than two GOPs
+/// before the media end (a truncated Matroska `Cues` block, e.g. a live/no-Cues
+/// file after one seek), or the media duration is unknown. There is
+/// deliberately no approximate/calibrated fallback.
 ///
 /// `keyframes` are media-timeline milliseconds; unsorted, duplicate and negative
 /// entries are tolerated.
@@ -286,45 +242,6 @@ fn median_gap(kfs: &[i64]) -> Option<i64> {
     gaps.get(gaps.len() / 2).copied()
 }
 
-/// Infer one GOP unit from measured segment durations.
-///
-/// The muxer only cuts copy/encode streams on keyframes, so every real segment
-/// duration is an integer multiple of the GOP. The greatest common divisor of
-/// the measured durations is therefore a valid grid unit (usually the GOP
-/// itself, sometimes a multiple when the sample is especially stable).
-///
-/// Returns `None` when the sample is too short, non-positive, or the inferred
-/// unit is implausible (unstable/VFR output) — the caller then uses
-/// [`approximate_plan`] instead of pretending to be calibrated.
-pub fn measure_gop_from_durations(durations_ms: &[i64]) -> Option<i64> {
-    // Two segments is the minimum that can reveal an interval: one duration
-    // alone says nothing about the GOP.
-    if durations_ms.len() < 2 {
-        return None;
-    }
-    let mut g = 0_i64;
-    for d in durations_ms {
-        if *d <= 0 {
-            return None;
-        }
-        g = gcd(g, *d);
-    }
-    if !(MIN_GOP_MS..=MAX_GOP_MS).contains(&g) {
-        return None;
-    }
-    Some(g)
-}
-
-fn gcd(a: i64, b: i64) -> i64 {
-    let (mut a, mut b) = (a.abs(), b.abs());
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
-    }
-    a
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,91 +296,16 @@ mod tests {
     }
 
     #[test]
-    fn approximate_plan_uses_nominal_grid() {
-        let plan = approximate_plan(10_000, 4.0);
-        assert_eq!(plan.alignment, PlanAlignment::Approx);
-        assert_eq!(plan.gop_ms, None);
-        assert_eq!(starts(&plan), vec![0, 4_000, 8_000]);
-        assert_eq!(durations(&plan), vec![4_000, 4_000, 2_000]);
-    }
-
-    #[test]
-    fn calibration_plan_rounds_step_up_to_gop_multiple() {
-        // 4 s requested with a 3 s GOP → 6 s step (2 GOPs), not 3 s.
-        let plan = calibration_plan(20_000, 4.0, 3_000);
-        assert_eq!(plan.alignment, PlanAlignment::Calibrated);
-        assert_eq!(plan.gop_ms, Some(3_000));
-        assert_eq!(starts(&plan), vec![0, 6_000, 12_000, 18_000]);
-        assert_eq!(durations(&plan), vec![6_000, 6_000, 6_000, 2_000]);
-
-        // GOP that divides the requested length keeps it unchanged.
-        let plan = calibration_plan(10_000, 4.0, 2_000);
-        assert_eq!(starts(&plan), vec![0, 4_000, 8_000]);
-        assert_eq!(durations(&plan), vec![4_000, 4_000, 2_000]);
-
-        // Requested 4 s, GOP 10 s → one GOP per segment (10 s).
-        let plan = calibration_plan(25_000, 4.0, 10_000);
-        assert_eq!(starts(&plan), vec![0, 10_000, 20_000]);
-        assert_eq!(durations(&plan), vec![10_000, 10_000, 5_000]);
-    }
-
-    #[test]
-    fn calibration_plan_rejects_implausible_gop() {
-        for gop in [0, -1, 1, 100, MAX_GOP_MS + 1] {
-            let plan = calibration_plan(10_000, 4.0, gop);
-            assert_eq!(
-                plan.alignment,
-                PlanAlignment::Approx,
-                "gop={gop} must not claim to be calibrated"
-            );
-            assert_eq!(plan.gop_ms, None);
-        }
-    }
-
-    #[test]
-    fn measure_gop_uses_the_common_divisor() {
-        assert_eq!(measure_gop_from_durations(&[4_000, 4_000]), Some(4_000));
-        assert_eq!(
-            measure_gop_from_durations(&[4_000, 6_000, 4_000]),
-            Some(2_000)
-        );
-        assert_eq!(measure_gop_from_durations(&[6_000, 9_000]), Some(3_000));
-
-        // Too short / unstable / non-positive samples are rejected.
-        assert_eq!(measure_gop_from_durations(&[]), None);
-        assert_eq!(measure_gop_from_durations(&[4_000]), None);
-        assert_eq!(measure_gop_from_durations(&[4_000, 4_100]), None); // g=100 → implausible
-        assert_eq!(measure_gop_from_durations(&[4_000, -4_000]), None);
-        assert_eq!(measure_gop_from_durations(&[0, 4_000]), None);
-    }
-
-    #[test]
-    fn measured_gop_feeds_calibration_handoff() {
-        let gop = measure_gop_from_durations(&[4_000, 6_000, 4_000]).unwrap();
-        let plan = calibration_plan(14_000, 4.0, gop);
-        assert_eq!(plan.alignment, PlanAlignment::Calibrated);
-        assert_eq!(plan.gop_ms, Some(2_000));
-        assert_eq!(durations(&plan), vec![4_000, 4_000, 4_000, 2_000]);
-        let total: i64 = durations(&plan).iter().sum();
-        assert_eq!(total, 14_000);
-    }
-
-    #[test]
-    fn plans_tile_the_media_without_gaps_or_overlaps() {
+    fn exact_plan_tiles_the_media_without_gaps_or_overlaps() {
         for (duration, seg) in [(0_i64, 4.0_f64), (1, 4.0), (9_500, 4.0), (60_000, 6.0)] {
-            for plan in [
-                exact_plan(duration, seg),
-                approximate_plan(duration, seg),
-                calibration_plan(duration, seg, 2_000),
-            ] {
-                let mut cursor = 0;
-                for entry in &plan.entries {
-                    assert_eq!(entry.start_ms, cursor, "no gap/overlap before {entry:?}");
-                    assert!(entry.duration_ms > 0);
-                    cursor += entry.duration_ms;
-                }
-                assert_eq!(cursor, duration, "plan must cover the full duration");
+            let plan = exact_plan(duration, seg);
+            let mut cursor = 0;
+            for entry in &plan.entries {
+                assert_eq!(entry.start_ms, cursor, "no gap/overlap before {entry:?}");
+                assert!(entry.duration_ms > 0);
+                cursor += entry.duration_ms;
             }
+            assert_eq!(cursor, duration, "plan must cover the full duration");
         }
     }
 
@@ -485,9 +327,7 @@ mod tests {
         assert_eq!(plan.gop_ms, Some(2_000));
         assert_eq!(
             starts(&plan),
-            vec![
-                0, 2_000, 4_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000
-            ]
+            vec![0, 2_000, 4_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000]
         );
         assert_eq!(durations(&plan), vec![2_000; 10]);
     }
@@ -516,10 +356,8 @@ mod tests {
         assert_eq!(plan.gop_ms, Some(3_709), "median keyframe interval");
         let expected: Vec<i64> = REAL_KEYFRAMES_MS.to_vec();
         assert_eq!(starts(&plan), expected);
-        let mut expected_durations: Vec<i64> = REAL_KEYFRAMES_MS
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .collect();
+        let mut expected_durations: Vec<i64> =
+            REAL_KEYFRAMES_MS.windows(2).map(|w| w[1] - w[0]).collect();
         expected_durations.push(110_293 - REAL_KEYFRAMES_MS[REAL_KEYFRAMES_MS.len() - 1]);
         assert_eq!(durations(&plan), expected_durations);
         // Boundaries strictly increase and tile [start, duration].
@@ -595,4 +433,3 @@ mod tests {
         assert_eq!(plan.gop_ms, Some(4_000));
     }
 }
-

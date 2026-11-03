@@ -483,7 +483,12 @@ mod libav_video_key {
         let url = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
         unsafe {
             let mut fmt: *mut c_void = std::ptr::null_mut();
-            if avformat_open_input(&mut fmt, url.as_ptr(), std::ptr::null(), std::ptr::null_mut()) < 0
+            if avformat_open_input(
+                &mut fmt,
+                url.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ) < 0
             {
                 return None;
             }
@@ -697,9 +702,7 @@ fn keyframe_plan_matches_muxer_cuts_for_sampled_segments() {
             "k={k}: seg{k}.ts must start on a video keyframe\n{}",
             diagnostics()
         );
-        eprintln!(
-            "k={k}: planned={planned} ms muxer={measured} ms durations={durations:?}"
-        );
+        eprintln!("k={k}: planned={planned} ms muxer={measured} ms durations={durations:?}");
         drop(job);
         let _ = std::fs::remove_dir_all(&out_dir);
     }
@@ -823,8 +826,9 @@ fn source_plan_refuses_a_truncated_keyframe_index() {
         .expect("source_plan must degrade, not fail")
         .map(|source| source.plan.alignment);
     assert_eq!(
-        plan, None,
-        "a no-Cues MKV has no usable keyframe index and must defer to warm-up\n{}",
+        plan,
+        None,
+        "a no-Cues MKV has no usable keyframe index and must fall back to the re-encode plan\n{}",
         diagnostics()
     );
     assert!(
@@ -832,4 +836,114 @@ fn source_plan_refuses_a_truncated_keyframe_index() {
         "the fallback must be explained in the diagnostics\n{}",
         diagnostics()
     );
+}
+
+/// Encoder preset that runs long enough (hundreds of segments) to observe a
+/// pause; a stream-copy job can finish in a fraction of a second.
+fn long_running_preset() -> wdmm_core::models::TranscodePreset {
+    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    preset.remux_first = false;
+    preset.hls_segment_secs = 2;
+    preset.video_max_w = Some(320);
+    preset.video_max_h = Some(180);
+    preset.video_fps_cap = Some(15);
+    preset.video_hw_preferred = false;
+    preset
+}
+
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
+fn paused_job_holds_progress_and_resume_finishes() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
+        return;
+    };
+    let out_dir = temp_dir("pause-resume");
+    let mut job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+        input_url: media.to_string_lossy().into_owned(),
+        preset: long_running_preset(),
+        out_dir: Some(out_dir.clone()),
+        hls_time_override_ms: Some(1),
+        ..wdmm_ffmpeg::JobOpts::default()
+    })
+    .expect("open_job");
+
+    assert!(
+        wait_until(Duration::from_secs(120), || job.progress().content_ms > 0),
+        "job never produced progress\n{}",
+        diagnostics()
+    );
+    job.pause();
+    assert!(job.is_paused(), "the handle reports the pause");
+    // Give the read loop time to reach a packet boundary and block.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(job.is_running(), "a paused job still counts as running");
+    let frozen = job.progress().content_ms;
+    std::thread::sleep(Duration::from_millis(500));
+    let later = job.progress().content_ms;
+    assert_eq!(
+        frozen,
+        later,
+        "progress must not advance while paused (frozen={frozen}, later={later})\n{}",
+        diagnostics()
+    );
+
+    job.resume();
+    assert!(!job.is_paused(), "the handle reports the resume");
+    assert!(
+        wait_until(Duration::from_secs(300), || !job.is_running()),
+        "resumed job did not finish\n{}",
+        diagnostics()
+    );
+    job.take_result()
+        .expect("job result")
+        .expect("a resumed job must succeed");
+    assert!(
+        segment_count(&out_dir) > 0,
+        "a resumed job keeps writing segments\n{}",
+        diagnostics()
+    );
+    drop(job);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
+fn cancelling_a_paused_job_exits_without_deadlock() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
+        return;
+    };
+    let out_dir = temp_dir("pause-cancel");
+    let mut job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+        input_url: media.to_string_lossy().into_owned(),
+        preset: long_running_preset(),
+        out_dir: Some(out_dir.clone()),
+        hls_time_override_ms: Some(1),
+        ..wdmm_ffmpeg::JobOpts::default()
+    })
+    .expect("open_job");
+
+    assert!(
+        wait_until(Duration::from_secs(120), || job.progress().content_ms > 0),
+        "job never produced progress\n{}",
+        diagnostics()
+    );
+    job.pause();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(job.is_running(), "job is paused, not finished");
+    job.cancel();
+    assert!(
+        wait_until(Duration::from_secs(60), || !job.is_running()),
+        "a cancel must wake a paused job (no deadlock)\n{}",
+        diagnostics()
+    );
+    assert!(job.is_paused(), "cancel leaves the pause latch untouched");
+    match job.take_result() {
+        Some(Err(_)) => {} // cancelled jobs report an error
+        Some(Ok(())) => {} // or the run finished at the boundary
+        None => panic!("job ended without a result\n{}", diagnostics()),
+    }
+    drop(job);
+    let _ = std::fs::remove_dir_all(&out_dir);
 }

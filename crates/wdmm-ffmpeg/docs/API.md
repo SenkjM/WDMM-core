@@ -22,13 +22,17 @@ FFmpeg is LGPL/GPL — see `docs/FFMPEG-ATTRIBUTION.md`. WDMM is AGPL-3.0.
 - `duration_secs: f64`
 - `video: Vec<VideoStream>` (`index`, `codec`, `width`, `height`, `fps`)
 - `audio: Vec<AudioStream>` (`index`, `codec`, `channels`, `sample_rate`, `language`)
-- `subtitles: Vec<SubtitleStream>` (`index`, `codec`, `language`)
+- `subtitles: Vec<SubtitleStream>` (`index`, `codec`, `language`, `title`)
 - `format_name: String`
 ### `pub fn probe(url: &str) -> FfmpegResult<ProbeResult>`
 Accepts a local path or an `http(s)://` URL (the proxy passes its loopback URL
 for encrypted sources).
 
 ## Subtitle extraction
+### `pub fn embedded_subtitle_tracks(url: &str) -> FfmpegResult<Vec<SubtitleStream>>`
+Lists the embedded subtitle tracks of a source (one probe, no second scan),
+including the per-track `language` and `title` metadata the FFI exposes as cast
+subtitle candidates.
 ### `pub fn extract_subtitle_track(url: &str, stream_index: u32) -> FfmpegResult<String>`
 Decodes one text subtitle stream to WebVTT. Bitmap codecs (PGS, DVD, DVB) are
 rejected — classify with `classify_codec` first. Requires the `ffmpeg` feature.
@@ -42,8 +46,10 @@ rejected — classify with `classify_codec` first. Requires the `ffmpeg` feature
   mid-film and cover the requested `k`
 - `out_dir: Option<PathBuf>` — persistent VOD cache; created here and **not**
   deleted on drop. `None` means a temp dir owned (and removed) by the job.
-- `hls_time_override_ms: Option<u32>` — `hls_time` in ms, aligned to the
-  measured GOP after calibration so cuts stop drifting
+- `hls_time_override_ms: Option<u32>` — `hls_time` in ms. `Some(1)` makes the
+  HLS muxer cut on every video keyframe (copy/hybrid) or every forced IDR
+  (encode path), so the plan grid is anchor-independent. Audio-only jobs keep
+  `hls_segment_secs` with `split_by_time`.
 ### `pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle>`
 Starts the job on a background OS thread and returns immediately. Admission is
 the caller's job — `wdmm-proxy` holds the process-wide `JobGate` permit.
@@ -52,49 +58,53 @@ the caller's job — `wdmm-proxy` holds the process-wide `JobGate` permit.
 - `ready_segments()` — non-blocking directory snapshot.
 - `segment_durations()` — `EXTINF` values; empty until the first segment.
 - `cancel()`, `is_running()`, `take_result()` (`None` while running), `join()`.
-- `progress()` (`content_ms`, `wall_ms`, `packets`), `encoder_info()`
-  (`mode` = `remux`/`hybrid`/`hw`/`sw`), `warnings()` (deduplicated fallbacks).
+- `pause()` / `resume()` / `is_paused()` — cooperative throttling: the read loops
+  block at packet boundaries while paused (no busy wait); `cancel()` and `Drop`
+  wake the latch, so a paused job never deadlocks. `is_running()` stays `true`
+  while paused.
+- `progress()` — `JobProgress { content_ms, start_ms, wall_ms, packets }`:
+  `content_ms` is media produced since the run's seek anchor, `start_ms` is that
+  anchor (absolute media ms = `start_offset_secs * 1000`), `wall_ms` the elapsed
+  job time.
+- `encoder_info()` (`mode` = `remux`/`hybrid`/`hw`/`sw`), `warnings()`
+  (deduplicated fallbacks).
 Dropping the handle cancels and joins the job.
 
 ## Segment plan
 The proxy synthesises a VOD playlist from a `SegmentPlan` before playback, so
-the renderer can seek without reloading it:
-- `Exact` — strict `k * seg_secs`; the job seeks and decodes per segment, so
-  cuts land on the grid regardless of keyframes.
-- `Keyframe` — copy/hybrid with a container index (mp4 `stss`, mkv `cues`);
-  `EXTINF` matches the real output exactly.
-- `Calibrated` — copy/hybrid without an index; warm-up measures real segment
-  durations and the plan steps on the measured GOP multiple.
-- `Approx` — VFR/no-index fallback on a nominal grid. Only this alignment
-  implies user-visible drift; the caller reports it (`drift_ms`).
+the renderer can seek without reloading it. There are exactly two alignments —
+by design there is **no approximate/calibrated grid**, because a plan whose
+boundaries are not real cut points makes seeking land on the wrong segment:
+- `Exact` — forced re-encode: strict `k * seg_secs`. The encoder emits one IDR
+  per step (closed GOP) and `hls_time` is tiny, so the muxer cuts on the grid.
+- `Keyframe` — copy/hybrid with a usable container keyframe index (mp4 `stss`,
+  mkv `cues`): one segment per keyframe interval, so the synthesized `EXTINF`
+  values match the segment files exactly. A source without a usable index is
+  not planned approximately: it takes the `Exact` re-encode path instead.
 ### `pub enum PlanAlignment {`
 ### `pub struct SegmentPlan {`
 - `duration_ms: i64`, `seg_secs: f64`, `alignment: PlanAlignment`,
-  `gop_ms: Option<i64>`, `entries: Vec<SegEntry>`
+  `gop_ms: Option<i64>` (median keyframe interval for `Keyframe`, `None` for
+  `Exact`), `entries: Vec<SegEntry>`
 - `segment_count()`, `start_ms(k) -> Option<i64>`, `duration_of(k) -> Option<i64>`
 ### `pub struct SegEntry {`
 - `start_ms: i64`, `duration_ms: i64`
-### `pub struct KeyframeInfo {`
-- `pts_ms: i64`
 ### `pub fn exact_plan(duration_ms: i64, seg_secs: f64) -> SegmentPlan`
-Never drifts because the transcode job seeks per segment.
-### `pub fn approximate_plan(duration_ms: i64, seg_secs: f64) -> SegmentPlan`
-Nominal grid; the caller reports the drift instead of modelling it.
-### `pub fn calibration_plan(duration_ms: i64, seg_secs: f64, gop_ms: i64) -> SegmentPlan`
-Step is `ceil(seg_secs*1000 / gop_ms) * gop_ms`; an implausible GOP
-(< 250 ms or > 30 s) degrades to `approximate_plan`.
-### `pub fn keyframe_plan(duration_ms: i64, seg_secs: f64, keyframes: &[KeyframeInfo]) -> SegmentPlan`
-Uses the HLS muxer cut rule ("first keyframe at/after `seg_secs` since the
-previous cut"); without usable keyframes it degrades to `approximate_plan`.
-### `pub fn measure_gop_from_durations(durations_ms: &[i64]) -> Option<i64>`
-Infers one GOP unit; `None` when the sample is too small or implausible.
-### `pub fn keyframe_index(url: &str) -> FfmpegResult<Vec<KeyframeInfo>>`
-Reads a container index only, never the whole file; empty when the feature is
-off or the container has no index.
-### `pub fn keyframe_index_available() -> bool`
-Whether this build can read a real keyframe index (path: `wdmm_ffmpeg::vod::keyframe_index_available`).
+Uniform grid; never drifts because the encoder controls every cut.
+### `pub fn keyframe_plan(duration_ms: i64, seg_secs: f64, keyframes: &[i64]) -> Option<SegmentPlan>`
+One segment per keyframe interval (the muxer cuts on every keyframe). `None`
+when the index is too short (`MIN_KEYFRAMES_FOR_PLAN`) or truncated (ends more
+than two GOPs before the media end) — the caller then re-encodes.
+### `pub const MIN_KEYFRAMES_FOR_PLAN: usize`
+### `pub struct SourcePlan {`
+- `plan: SegmentPlan`, `video_copied: bool`, `keyframe_count: usize`
+### `pub fn source_plan(url: &str, preset: &TranscodePreset) -> FfmpegResult<Option<SourcePlan>>`
+Opens the source once, decides the alignment up front (video copy ⇒ keyframe
+grid; re-encode or unusable index ⇒ exact grid) and returns `None` when the plan
+cannot be decided (audio-only source, unknown duration).
 ### `pub fn measure_segment_durations(dir: &Path) -> Vec<i64>`
-Parses `EXTINF` values from `<dir>/index.m3u8`.
+Parses `EXTINF` values from `<dir>/index.m3u8` (diagnostics; plans are decided
+up front, never calibrated from measurements).
 
 ## Diagnostics
 ### `pub fn log(msg: impl AsRef<str>)`
