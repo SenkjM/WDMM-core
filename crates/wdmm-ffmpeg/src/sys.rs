@@ -78,6 +78,15 @@ pub const AV_SAMPLE_FMT_S16P: AVSampleFormat = 6;
 /// first packet. Required for MediaCodec encoders so the MPEG-TS muxer can
 /// detect AVCC extradata and insert `h264_mp4toannexb` / `hevc_mp4toannexb`.
 pub const AV_CODEC_FLAG_GLOBAL_HEADER: c_int = 1 << 22;
+/// `AV_CODEC_FLAG_CLOSED_GOP` — every GOP is closed (no B-frames referencing
+/// across the GOP boundary). The HLS muxer cuts copy/encode streams only on
+/// keyframes, so a closed GOP is what makes an encoded segment independently
+/// decodable from its first frame.
+pub const AV_CODEC_FLAG_CLOSED_GOP: c_int = 1 << 1;
+
+/// `AVINDEX_KEYFRAME` — the low bits of `AVIndexEntry::flags_and_size` mark an
+/// index entry as a keyframe.
+pub const AVINDEX_KEYFRAME: c_int = 0x0001;
 
 // AV_ROUND_NEAR_INF (5) | AV_ROUND_PASS_MINMAX (8192 = 1 << 13)
 pub const AV_ROUND_NEAR_INF_PASS: u32 = 5 | (1 << 13);
@@ -231,6 +240,18 @@ pub struct AVDictionaryEntry {
     pub key: *mut c_char,
     pub value: *mut c_char,
 }
+/// One `AVIndexEntry` (sizeof=24, LP64): `int64_t pos @0`, `int64_t timestamp @8`,
+/// `int flags @16` (low 2 bits) + `int size @18`, `int min_distance @20`.
+///
+/// `flags_and_size` packs two 16-bit/mixed fields; the keyframe bit lives in the
+/// low two bits (`AVINDEX_KEYFRAME`).
+#[repr(C)]
+pub struct AVIndexEntry {
+    pub pos: i64,           // +0  (8)
+    pub timestamp: i64,     // +8  (8)
+    pub flags_and_size: c_int, // +16 (4)
+    pub min_distance: c_int,   // +20 (4)
+} // sizeof=24 ✓
 #[repr(C)]
 pub struct SwsContext {
     _p: [u8; 0],
@@ -523,6 +544,12 @@ extern "C" {
     ) -> c_int;
     pub fn avformat_close_input(s: *mut *mut AVFormatContext);
     pub fn avformat_free_context(s: *mut AVFormatContext);
+    /// Number of entries currently in `st->index_entries` (0 when the demuxer
+    /// has not parsed a container index yet).
+    pub fn avformat_index_get_entries_count(st: *const AVStream) -> c_int;
+    /// One entry of `st->index_entries`; the returned pointer is borrowed from
+    /// the stream and lives as long as the input context.
+    pub fn avformat_index_get_entry(st: *mut AVStream, idx: c_int) -> *const AVIndexEntry;
 
     // mux / output
     pub fn avformat_alloc_output_context2(

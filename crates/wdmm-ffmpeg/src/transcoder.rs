@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::sys::*;
 use crate::{
     diag, AudioStream, EncoderInfo, FfmpegError, FfmpegResult, ProbeResult, ProgressState,
-    SubtitleStream, VideoStream,
+    SourcePlan, SubtitleStream, TranscodePreset, VideoStream,
 };
 
 /// Time base used for millisecond content timestamps.
@@ -44,8 +44,8 @@ const PROGRESS_LOG_EVERY_MS: u64 = 2_000;
 // ── Remux decision (pure logic lives in `crate::plan`, host-testable) ──────
 
 use crate::plan::{
-    choose_video_encoder, encoder_frame_rate, fallback_warning, hw_gop_size, hw_video_encoder_name,
-    hybrid_audio_codec_id, remux_dropped_streams, remux_plan, RemuxPlan,
+    choose_video_encoder, encoder_frame_rate, fallback_warning, hw_video_encoder_name,
+    hybrid_audio_codec_id, remux_dropped_streams, remux_plan, segment_gop_size, RemuxPlan,
 };
 /// Options for opening the loopback HTTP input: bound every blocking read so a
 /// stalled upstream fails with a real error instead of hanging the job forever.
@@ -223,6 +223,277 @@ pub fn probe_url(url: &str) -> FfmpegResult<ProbeResult> {
             subtitles: subs,
             format_name: fmt_name,
         })
+    }
+}
+
+// ── Source plan (decided from one container open, before any segment) ────────
+
+/// Collect the video stream's keyframe timestamps (milliseconds) from the
+/// container index built so far in `streams_ptr`.
+///
+/// The timestamps are kept signed on purpose: the MP4 demuxer stores each
+/// sample's DTS in the index, and with B-frames the first keyframe's DTS is
+/// negative (e.g. `-146.556 ms` for a 23.976 fps clip). `source_plan_impl`
+/// shifts the whole list onto the packet-PTS timeline before planning.
+unsafe fn collect_keyframes_ms(streams_ptr: *const *mut AVStream, v_idx: i32) -> Vec<i64> {
+    if v_idx < 0 {
+        return Vec::new();
+    }
+    let st = *streams_ptr.add(v_idx as usize);
+    if st.is_null() {
+        return Vec::new();
+    }
+    let count = avformat_index_get_entries_count(st);
+    if count <= 0 {
+        return Vec::new();
+    }
+    let tb = (*st).time_base;
+    if tb.den <= 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let entry = avformat_index_get_entry(st, i);
+        if entry.is_null() {
+            continue;
+        }
+        if (*entry).flags_and_size & AVINDEX_KEYFRAME == 0 {
+            continue;
+        }
+        let pts = (*entry).timestamp;
+        if pts == AV_NOPTS_VALUE {
+            continue;
+        }
+        let ms = i128::from(pts) * 1000 * i128::from(tb.num) / i128::from(tb.den);
+        out.push(ms.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
+    }
+    out
+}
+
+/// Video keyframe timestamps (ms), asking the demuxer to finish parsing the
+/// container index when it has not done so yet.
+///
+/// MP4 exposes its complete sample index right after
+/// `avformat_find_stream_info`. Matroska defers `Cues` parsing until the first
+/// seek, so one `av_seek_frame(.., 0, AVSEEK_FLAG_BACKWARD)` populates the full
+/// index without demuxing media. A no-`Cues` file only gets the linear-scan
+/// prefix; [`crate::vod::keyframe_plan`] rejects that truncated index.
+/// Entry count below which the index is assumed to be lazily built (MKV cues are
+/// only parsed on the first seek): do one `seek(0)` and re-read.
+const MIN_INDEX_ENTRIES_BEFORE_SEEK: usize = 3;
+
+unsafe fn video_keyframe_index_ms(
+    in_ctx: *mut AVFormatContext,
+    streams_ptr: *const *mut AVStream,
+    v_idx: i32,
+) -> Vec<i64> {
+    let mut keyframes = collect_keyframes_ms(streams_ptr, v_idx);
+    if keyframes.len() < MIN_INDEX_ENTRIES_BEFORE_SEEK {
+        let before = keyframes.len();
+        let ret = av_seek_frame(in_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
+        diag::log(format!(
+            "source plan: keyframe index entries_before={before} seek(0) rc={ret}"
+        ));
+        if ret >= 0 {
+            keyframes = collect_keyframes_ms(streams_ptr, v_idx);
+        }
+    }
+    keyframes.sort_unstable();
+    keyframes.dedup();
+    keyframes
+}
+
+/// PTS (in milliseconds, stream timeline) of the first video packet in the
+/// current read position.
+///
+/// The index timestamps are DTS for MP4 but `av_seek_frame` (and every player)
+/// works on PTS, so the plan needs the packet-PTS origin to shift the index onto
+/// the seekable timeline. The walk stops at the first video packet, so it reads
+/// at most a handful of packets even when audio comes first.
+unsafe fn first_video_packet_pts_ms(
+    in_ctx: *mut AVFormatContext,
+    streams_ptr: *const *mut AVStream,
+    v_idx: i32,
+) -> Option<i64> {
+    if v_idx < 0 {
+        return None;
+    }
+    let st = *streams_ptr.add(v_idx as usize);
+    if st.is_null() {
+        return None;
+    }
+    let tb = (*st).time_base;
+    if tb.den <= 0 {
+        return None;
+    }
+    let mut pkt = av_packet_alloc();
+    if pkt.is_null() {
+        return None;
+    }
+    let mut out = None;
+    // Bound the walk: the first video packet normally arrives immediately, but
+    // a malformed file could pad the front with thousands of other packets.
+    for _ in 0..4096 {
+        let ret = av_read_frame(in_ctx, pkt);
+        if ret < 0 {
+            break;
+        }
+        let is_video = (*pkt).stream_index == v_idx;
+        if is_video {
+            let pts = (*pkt).pts;
+            if pts != AV_NOPTS_VALUE {
+                let ms = i128::from(pts) * 1000 * i128::from(tb.num) / i128::from(tb.den);
+                out = Some(ms.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
+            }
+        }
+        av_packet_unref(pkt);
+        if is_video {
+            break;
+        }
+    }
+    av_packet_free(&mut pkt);
+    out
+}
+
+/// Implementation of [`crate::source_plan`]: one open, decide plan.
+pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Option<SourcePlan>> {
+    if preset.container == "original" {
+        // Pass-through casts have no HLS segmentation at all.
+        return Ok(None);
+    }
+    let url_c = CString::new(url).map_err(|e| FfmpegError::Probe(e.to_string()))?;
+    unsafe {
+        let mut in_ctx: *mut AVFormatContext = std::ptr::null_mut();
+        let mut open_opts = input_open_options();
+        let ret = avformat_open_input(
+            &mut in_ctx,
+            url_c.as_ptr(),
+            std::ptr::null(),
+            &mut open_opts,
+        );
+        av_dict_free(&mut open_opts);
+        if ret < 0 {
+            return Err(FfmpegError::Probe(format!(
+                "source_plan avformat_open_input({url}): {}",
+                av_err2str(ret)
+            )));
+        }
+        let ret = avformat_find_stream_info(in_ctx, std::ptr::null_mut());
+        if ret < 0 {
+            avformat_close_input(&mut in_ctx);
+            return Err(FfmpegError::Probe(format!(
+                "source_plan avformat_find_stream_info: {}",
+                av_err2str(ret)
+            )));
+        }
+
+        let duration_raw = fmtctx_duration(in_ctx);
+        let duration_ms = if duration_raw == AV_NOPTS_VALUE || duration_raw <= 0 {
+            None
+        } else {
+            Some(duration_raw / 1000)
+        };
+        let Some(duration_ms) = duration_ms else {
+            diag::log(format!("source plan: {url} has no duration, deferring to warm-up"));
+            avformat_close_input(&mut in_ctx);
+            return Ok(None);
+        };
+
+        let streams_ptr = fmtctx_streams(in_ctx);
+        let v_idx = av_find_best_stream(
+            in_ctx,
+            AVMEDIA_TYPE_VIDEO,
+            -1,
+            -1,
+            std::ptr::null_mut(),
+            0,
+        );
+        let a_idx = av_find_best_stream(
+            in_ctx,
+            AVMEDIA_TYPE_AUDIO,
+            -1,
+            -1,
+            std::ptr::null_mut(),
+            0,
+        );
+        let video_codec = stream_codec_id(streams_ptr, v_idx);
+        let audio_codec = stream_codec_id(streams_ptr, a_idx);
+        let seg_secs = f64::from(preset.hls_segment_secs);
+
+        let plan = if video_codec.is_none() {
+            // Audio-only HLS cuts on audio packet timing; there is no index that
+            // predicts it, so the warm-up calibration stays in charge.
+            None
+        } else if preset.remux_first
+            && remux_plan(video_codec, audio_codec) != RemuxPlan::Transcode
+        {
+            let mut keyframes = video_keyframe_index_ms(in_ctx, streams_ptr, v_idx);
+            // MP4 indexes store DTS, and the B-frame delay makes the first
+            // keyframe's DTS negative. Anchor the list on the first video
+            // packet's PTS so both the proxy's seek offset and the muxer's
+            // first cut land on the keyframe the plan names. Matroska indexes
+            // already use PTS, so the shift is zero there.
+            if let (Some(first_pts), Some(first_kf)) =
+                (first_video_packet_pts_ms(in_ctx, streams_ptr, v_idx), keyframes.first().copied())
+            {
+                let shift = first_pts.saturating_sub(first_kf);
+                if shift != 0 {
+                    for kf in &mut keyframes {
+                        *kf = kf.saturating_add(shift);
+                    }
+                    diag::log(format!(
+                        "source plan: {url} keyframe timeline shifted by {shift}ms (index timestamps are dts)"
+                    ));
+                }
+            }
+            let count = keyframes.len();
+            match crate::vod::keyframe_plan(duration_ms, seg_secs, &keyframes) {
+                Some(plan) => {
+                    diag::log(format!(
+                        "source plan: {url} keyframe grid segments={} keyframes={count} gop_ms={:?}",
+                        plan.segment_count(),
+                        plan.gop_ms
+                    ));
+                    Some(SourcePlan {
+                        plan,
+                        video_copied: true,
+                        keyframe_count: count,
+                    })
+                }
+                None => {
+                    diag::log(format!(
+                        "source plan: {url} keyframe index unusable (entries={count}), deferring to warm-up"
+                    ));
+                    None
+                }
+            }
+        } else {
+            // Video is re-encoded: the encoder holds one IDR per segment (see
+            // `encode_grid`), so the grid is uniform — but its step is the
+            // encoder's frame-accurate GOP, not the nominal segment length: a
+            // 16.1667 fps source can only cut at 32 frames (1.979 s) for a 2 s
+            // target, and the plan must name what the muxer will really write.
+            let v_st = *streams_ptr.add(v_idx as usize);
+            let src_rate = stream_r_frame_rate(v_st);
+            let (fps_num, fps_den) =
+                encoder_frame_rate(src_rate.num, src_rate.den, preset.video_fps_cap);
+            let configured = AVRational::new(fps_num, fps_den);
+            let (gop, step_secs) = encode_grid(src_rate, configured, preset.hls_segment_secs);
+            let plan = crate::vod::exact_plan(duration_ms, step_secs);
+            diag::log(format!(
+                "source plan: {url} re-encode exact grid segments={} gop={gop} step_ms={:.1}",
+                plan.segment_count(),
+                step_secs * 1000.0
+            ));
+            Some(SourcePlan {
+                plan,
+                video_copied: false,
+                keyframe_count: 0,
+            })
+        };
+
+        avformat_close_input(&mut in_ctx);
+        Ok(plan)
     }
 }
 
@@ -530,6 +801,45 @@ fn pix_fmt_name(fmt: c_int) -> &'static str {
     }
 }
 
+/// Frame rate the encoder actually receives.
+///
+/// Decoded frames are forwarded with their original timestamps (the transcode
+/// path never resamples or drops frames), so the real frame cadence is the
+/// source stream's rate. A preset fps cap only changes the encoder *hint* and
+/// must not be used to size the keyframe interval, or the IDRs land off the
+/// planned grid (e.g. a 16.1667 fps source hinted as 15 fps would produce
+/// 1.855 s segments for a 2 s grid).
+fn encoder_grid_rate(source: AVRational, configured: AVRational) -> AVRational {
+    let fps = f64::from(source.num) / f64::from(source.den.max(1));
+    if source.num > 0 && source.den > 0 && (1.0..=240.0).contains(&fps) {
+        source
+    } else {
+        configured
+    }
+}
+
+/// Encoder GOP in frames plus its real duration in seconds.
+///
+/// The frame count is chosen so that an IDR lands on every `seg_secs` boundary;
+/// the returned `step_secs` is that GOP expressed in media time, which is the
+/// grid the produced `EXTINF` values follow when the source rate does not divide
+/// `seg_secs` evenly (16.1667 fps: 2 s = 32.33 frames, so the encoder can only
+/// cut at 32 frames = 1.979 s).
+fn encode_grid(
+    source_rate: AVRational,
+    configured_rate: AVRational,
+    seg_secs: u32,
+) -> (i32, f64) {
+    let rate = encoder_grid_rate(source_rate, configured_rate);
+    let gop = segment_gop_size(rate.num, rate.den, seg_secs);
+    let step_secs = if rate.num > 0 && rate.den > 0 {
+        f64::from(gop) * f64::from(rate.den) / f64::from(rate.num)
+    } else {
+        f64::from(seg_secs)
+    };
+    (gop, step_secs)
+}
+
 /// Configure and open a MediaCodec hardware video encoder.
 ///
 /// `mediacodecenc.c` accepts software frames via an input ByteBuffer in
@@ -551,8 +861,8 @@ unsafe fn open_hw_video_encoder(
     width: c_int,
     height: c_int,
     framerate: AVRational,
+    gop: c_int,
 ) -> Result<(*mut AVCodecContext, c_int), String> {
-    let gop = hw_gop_size(framerate.num, framerate.den);
     let mut last_err = String::from("unknown error");
     for pix_fmt in [AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P] {
         let mut ctx = avcodec_alloc_context3(codec);
@@ -1472,8 +1782,19 @@ fn run_remux(
         // HLS muxer options. The HLS muxer is AVFMT_NOFILE: libav opens the
         // playlist itself from the output context's URL, so no `avio_open` and
         // no manual `AVFormatContext.pb` assignment is needed here.
+        //
+        // With a video stream the caller passes a tiny `hls_time` (1 ms) so the
+        // muxer cuts on *every* keyframe: that makes the cut sequence independent
+        // of the anchor a run was started at, which is what the keyframe plan
+        // relies on. Without a video stream there are no keyframes to cut on, so
+        // the audio-only path keeps a normal `hls_time` and cuts on time.
+        let audio_only = v_idx < 0;
         let mut dict: *mut AVDictionary = std::ptr::null_mut();
-        let hls_time = hls_time_seconds(preset.hls_segment_secs, hls_time_override_ms);
+        let hls_time = if audio_only {
+            hls_time_seconds(preset.hls_segment_secs, None)
+        } else {
+            hls_time_seconds(preset.hls_segment_secs, hls_time_override_ms)
+        };
         let hls_time_c = CString::new(hls_time.as_str()).unwrap();
         let start_number_c = CString::new(start_number.to_string()).unwrap();
         // No `hls_init_time`: the VOD playlist's `EXTINF` values must match the
@@ -1486,14 +1807,15 @@ fn run_remux(
             start_number_c.as_ptr(),
             0,
         );
-        if plan == RemuxPlan::Remux {
-            av_dict_set(
-                &mut dict,
-                c"hls_flags".as_ptr(),
-                c"split_by_time".as_ptr(),
-                0,
-            );
+        if audio_only {
+            // No video stream: the muxer has no keyframes, so cut on the audio
+            // packet timestamps instead (`hls_time` above stays the preset value).
+            av_dict_set(&mut dict, c"hls_flags".as_ptr(), c"split_by_time".as_ptr(), 0);
         }
+        // With video both copy paths (pure remux and hybrid audio re-encode) cut
+        // on video keyframes only; `split_by_time` is deliberately NOT set there
+        // because it would let the muxer cut mid-GOP, producing segments that
+        // cannot be decoded independently and contradicting the keyframe plan.
         av_dict_set(
             &mut dict,
             c"hls_segment_filename".as_ptr(),
@@ -1859,6 +2181,9 @@ fn run_transcode(
             let (fps_num, fps_den) =
                 encoder_frame_rate(src_rate.num, src_rate.den, preset.video_fps_cap);
             let framerate = AVRational::new(fps_num, fps_den);
+            // GOP frames are sized for the frames the encoder actually sees, not
+            // for the capped hint (see `encoder_grid_rate`).
+            let (video_gop, _) = encode_grid(src_rate, framerate, preset.hls_segment_secs);
             let hw_name = hw_video_encoder_name(preset.video_codec.as_deref());
             let hw_name_c = CString::new(hw_name).unwrap();
             let hw_codec = if preset.video_hw_preferred {
@@ -1869,8 +2194,16 @@ fn run_transcode(
             let hw_present = !hw_codec.is_null();
             let mut hw_open_error: Option<String> = None;
             if hw_present {
-                match open_hw_video_encoder(tag, hw_name, hw_codec, preset, out_w, out_h, framerate)
-                {
+                match open_hw_video_encoder(
+                    tag,
+                    hw_name,
+                    hw_codec,
+                    preset,
+                    out_w,
+                    out_h,
+                    framerate,
+                    video_gop,
+                ) {
                     Ok((ctx, pix_fmt)) => {
                         v_enc_ctx = ctx;
                         v_enc_codec = hw_codec;
@@ -1890,19 +2223,21 @@ fn run_transcode(
                 hw_available,
             );
             diag::log(format!(
-                "{tag} transcode encoder choice: requested_hw={hw_name} present={hw_present} opened={hw_available} fps={}/{} gop={}",
+                "{tag} transcode encoder choice: requested_hw={hw_name} present={hw_present} opened={hw_available} fps={}/{} source_fps={}/{} gop={}",
                 framerate.num,
                 framerate.den,
-                hw_gop_size(framerate.num, framerate.den)
+                src_rate.num,
+                src_rate.den,
+                video_gop
             ));
             if let Some(warning) = fallback_warning(choice, hw_name, hw_open_error.as_deref()) {
                 diag::log(format!("{tag} transcode hardware fallback: {warning}"));
                 telemetry.warn(warning);
             }
             if !hw_available {
-                // Software path: libx264 first, then any H.264 encoder. Pixel
-                // format, GOP and B-frame config stay byte-for-byte identical
-                // to the pre-hardware software behaviour.
+                // Software path: libx264 first, then any H.264 encoder. The key
+                // difference to a generic encode is that the GOP is pinned to
+                // one segment so the exact plan grid is what the muxer cuts on.
                 v_enc_codec = avcodec_find_encoder_by_name(c"libx264".as_ptr());
                 if !v_enc_codec.is_null() {
                     v_enc_name = Some("libx264".into());
@@ -1947,21 +2282,34 @@ fn run_transcode(
                 codctx_set_width(v_enc_ctx, out_w);
                 codctx_set_height(v_enc_ctx, out_h);
                 codctx_set_pix_fmt(v_enc_ctx, v_enc_pix_fmt);
+                let sw_gop = video_gop;
                 codctx_set_time_base(v_enc_ctx, AVRational::new(1, 90000));
-                codctx_set_gop_size(v_enc_ctx, 12);
+                codctx_set_gop_size(v_enc_ctx, sw_gop);
                 codctx_set_max_b_frames(v_enc_ctx, 2);
                 codctx_set_framerate(v_enc_ctx, framerate);
+                // Force an IDR exactly every `sw_gop` frames: `keyint` = one
+                // segment, `min-keyint` blocks early IDRs, `scenecut=0` stops
+                // scene changes from shifting the cut points off the plan grid.
+                let mut enc_opts: *mut AVDictionary = std::ptr::null_mut();
+                if v_enc_name.as_deref() == Some("libx264") {
+                    let params =
+                        CString::new(format!("keyint={sw_gop}:min-keyint={sw_gop}:scenecut=0"))
+                            .unwrap();
+                    av_dict_set(&mut enc_opts, c"x264-params".as_ptr(), params.as_ptr(), 0);
+                }
                 // mpegtsenc only inserts h264_mp4toannexb when the stream
                 // carries AVCC extradata, which libx264 emits for global header
                 // mode. Without this the muxer has no SPS/PPS to start from.
+                // CLOSED_GOP keeps every segment independently decodable.
                 codctx_set_flags(
                     v_enc_ctx,
-                    codctx_flags(v_enc_ctx) | AV_CODEC_FLAG_GLOBAL_HEADER,
+                    codctx_flags(v_enc_ctx) | AV_CODEC_FLAG_GLOBAL_HEADER | AV_CODEC_FLAG_CLOSED_GOP,
                 );
                 if let Some(br) = preset.video_max_bitrate {
                     codctx_set_bit_rate(v_enc_ctx, br as i64);
                 }
-                let ret = avcodec_open2(v_enc_ctx, v_enc_codec, std::ptr::null_mut());
+                let ret = avcodec_open2(v_enc_ctx, v_enc_codec, &mut enc_opts);
+                av_dict_free(&mut enc_opts);
                 diag::log(format!(
                     "{tag} transcode avcodec_open2(video encoder {}) rc={ret}",
                     v_enc_name.as_deref().unwrap_or("?")
@@ -2114,8 +2462,18 @@ fn run_transcode(
         // HLS muxer options. The HLS muxer is AVFMT_NOFILE: libav opens the
         // playlist itself from the output context's URL, so no `avio_open` and
         // no manual `AVFormatContext.pb` assignment is needed here.
+        //
+        // With a video encoder the caller passes a tiny `hls_time` (1 ms) and the
+        // encoder is forced to emit an IDR every `segment_gop_size` frames, so the
+        // muxer cuts exactly on the transcode plan's uniform grid — independent of
+        // the anchor a run was started at. Pure audio keeps a normal `hls_time`.
+        let audio_only = v_enc_ctx.is_null();
         let mut dict: *mut AVDictionary = std::ptr::null_mut();
-        let hls_time = hls_time_seconds(preset.hls_segment_secs, hls_time_override_ms);
+        let hls_time = if audio_only {
+            hls_time_seconds(preset.hls_segment_secs, None)
+        } else {
+            hls_time_seconds(preset.hls_segment_secs, hls_time_override_ms)
+        };
         let hls_time_c = CString::new(hls_time.as_str()).unwrap();
         let start_number_c = CString::new(start_number.to_string()).unwrap();
         // No `hls_init_time`: the VOD playlist's `EXTINF` values must match the
@@ -2128,6 +2486,11 @@ fn run_transcode(
             start_number_c.as_ptr(),
             0,
         );
+        if audio_only {
+            // No video stream: the muxer has no keyframes, so cut on the audio
+            // packet timestamps instead (`hls_time` above stays the preset value).
+            av_dict_set(&mut dict, c"hls_flags".as_ptr(), c"split_by_time".as_ptr(), 0);
+        }
         av_dict_set(
             &mut dict,
             c"hls_segment_filename".as_ptr(),

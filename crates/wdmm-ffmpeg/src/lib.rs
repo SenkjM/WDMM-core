@@ -55,8 +55,8 @@ pub use plan::{
 };
 pub use subtitle::{classify_codec, Cue, TrackKind};
 pub use vod::{
-    approximate_plan, calibration_plan, exact_plan, measure_gop_from_durations, PlanAlignment,
-    SegEntry, SegmentPlan,
+    approximate_plan, calibration_plan, exact_plan, keyframe_plan, measure_gop_from_durations,
+    PlanAlignment, SegEntry, SegmentPlan, MIN_KEYFRAMES_FOR_PLAN,
 };
 pub use wdmm_core::models::TranscodePreset;
 
@@ -281,6 +281,52 @@ pub fn extract_subtitle_track(url: &str, stream_index: u32) -> FfmpegResult<Stri
 /// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
 #[cfg(not(feature = "ffmpeg"))]
 pub fn extract_subtitle_track(_url: &str, _stream_index: u32) -> FfmpegResult<String> {
+    Err(FfmpegError::Unavailable(
+        "FFmpeg not linked (build with --features ffmpeg)".into(),
+    ))
+}
+
+// ── Source plan (decided before any segment is written) ─────────────────────
+
+/// The segment plan for a source, decided from a single container open.
+///
+/// The proxy calls [`source_plan`] before it starts an HLS job so the synthesized
+/// VOD playlist matches what the muxer will actually produce:
+///
+/// - video-copyable source (remux/hybrid) with a usable keyframe index →
+///   [`PlanAlignment::Keyframe`], boundaries are the muxer's real cut points;
+/// - video that must be re-encoded → [`PlanAlignment::Exact`], and the encoder is
+///   forced to emit one keyframe per segment;
+/// - no usable keyframe index (or no known duration) → `None`, the caller keeps
+///   the warm-up/calibration fallback.
+#[derive(Debug, Clone)]
+pub struct SourcePlan {
+    /// The plan the playlist should be synthesized from.
+    pub plan: SegmentPlan,
+    /// Whether the video stream is copied (remux/hybrid) rather than re-encoded.
+    pub video_copied: bool,
+    /// Number of keyframes the plan was built from (0 for exact plans).
+    pub keyframe_count: usize,
+}
+
+/// Decide the segment plan for `url` and `preset` before any segment is written.
+///
+/// Opens the input exactly once: probes streams, picks the copy/encode path with
+/// the same rules the job uses, and (for copy paths) reads the container's
+/// keyframe index — one bounded `av_seek_frame` is performed only when the index
+/// looks unparsed, so no media is demuxed for planning.
+///
+/// Returns `Ok(None)` when the source cannot be planned up front (unknown/short
+/// duration, no video stream, unusable keyframe index); callers must then fall
+/// back to measuring the real output.
+#[cfg(feature = "ffmpeg")]
+pub fn source_plan(url: &str, preset: &TranscodePreset) -> FfmpegResult<Option<SourcePlan>> {
+    transcoder::source_plan_impl(url, preset)
+}
+
+/// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
+#[cfg(not(feature = "ffmpeg"))]
+pub fn source_plan(_url: &str, _preset: &TranscodePreset) -> FfmpegResult<Option<SourcePlan>> {
     Err(FfmpegError::Unavailable(
         "FFmpeg not linked (build with --features ffmpeg)".into(),
     ))

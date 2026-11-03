@@ -17,6 +17,8 @@
 //! $env:WDMM_HLS_TEST_MEDIA_AUDIO='E:\test\video\_env\audio-only.m4a'
 //! $env:WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID='E:\test\video\_env\audio-only.flac'
 //! $env:WDMM_HLS_TEST_MEDIA_SUBTITLES='E:\test\video\_env\subtitles.mkv'
+//! $env:WDMM_HLS_TEST_MEDIA_MKV='E:\test\video\_env\out_copy.mkv'
+//! $env:WDMM_HLS_TEST_MEDIA_NOCUES='E:\test\video\_env\out_nocues.mkv'
 //! cargo test -p wdmm-ffmpeg --features ffmpeg --test hls_vod_host -- --ignored --test-threads=1
 //! ```
 
@@ -425,4 +427,409 @@ fn embedded_subtitle_tracks_expose_language_and_title() {
     assert_eq!(probed.subtitles.len(), tracks.len());
     assert!(!probed.format_name.is_empty());
     eprintln!("embedded subtitles: {tracks:?}");
+}
+
+// ── Source keyframe plan: plan grid == muxer cut grid ────────────────────────
+
+/// Minimal libav access used only to check that a written segment starts on a
+/// keyframe. The crate's own `sys` module is private, so the test declares the
+/// two demux calls and the 7.1 layouts it needs (see `keyframe_index_probe.rs`).
+#[cfg(feature = "ffmpeg")]
+mod libav_video_key {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::path::Path;
+
+    /// `AVPacket` (sizeof 104, LP64): only `stream_index` and `flags` are read.
+    #[repr(C)]
+    struct Packet {
+        buf: *mut c_void,
+        pts: i64,
+        dts: i64,
+        data: *mut u8,
+        size: c_int,
+        stream_index: c_int,
+        flags: c_int,
+        side_data: *mut c_void,
+        side_data_elems: c_int,
+        duration: i64,
+        pos: i64,
+        opaque: *mut c_void,
+        opaque_ref: *mut c_void,
+        time_base: [c_int; 2],
+    }
+
+    #[link(name = "avformat")]
+    extern "C" {
+        fn avformat_open_input(
+            ps: *mut *mut c_void,
+            url: *const c_char,
+            fmt: *const c_void,
+            options: *mut *mut c_void,
+        ) -> c_int;
+        fn avformat_find_stream_info(ic: *mut c_void, opts: *mut *mut c_void) -> c_int;
+        fn av_read_frame(s: *mut c_void, pkt: *mut Packet) -> c_int;
+        fn avformat_close_input(ps: *mut *mut c_void);
+    }
+
+    #[link(name = "avcodec")]
+    extern "C" {
+        fn av_packet_unref(pkt: *mut Packet);
+    }
+
+    /// Whether the first video packet of `path` carries `AV_PKT_FLAG_KEY`.
+    ///
+    /// `None` when the file cannot be opened or carries no video packet.
+    pub fn first_video_packet_is_keyframe(path: &Path) -> Option<bool> {
+        let url = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+        unsafe {
+            let mut fmt: *mut c_void = std::ptr::null_mut();
+            if avformat_open_input(&mut fmt, url.as_ptr(), std::ptr::null(), std::ptr::null_mut()) < 0
+            {
+                return None;
+            }
+            if avformat_find_stream_info(fmt, std::ptr::null_mut()) < 0 {
+                avformat_close_input(&mut fmt);
+                return None;
+            }
+            // AVFormatContext (LP64): nb_streams @44, streams @48 (`AVStream **`).
+            let nb_streams = *(fmt as *const c_int).add(11) as usize;
+            let streams = *(fmt as *const *mut *mut u8).add(6);
+            let mut found = None;
+            let mut pkt: Packet = std::mem::zeroed();
+            loop {
+                if av_read_frame(fmt, &mut pkt) < 0 {
+                    break;
+                }
+                let index = pkt.stream_index.max(0) as usize;
+                if index < nb_streams {
+                    let st = *streams.add(index);
+                    if !st.is_null() {
+                        // AVStream.codecpar @16; AVCodecParameters.codec_type @0.
+                        let cp = *((st as *const u8).add(16) as *const *const u8);
+                        if !cp.is_null() && *(cp as *const c_int) == 0 {
+                            found = Some(pkt.flags & 0x0001 != 0);
+                            av_packet_unref(&mut pkt);
+                            break;
+                        }
+                    }
+                }
+                av_packet_unref(&mut pkt);
+            }
+            avformat_close_input(&mut fmt);
+            found
+        }
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD (MP4) / WDMM_HLS_TEST_MEDIA_MKV (Cues MKV) + linked FFmpeg 7.1"]
+fn source_plan_reports_the_container_keyframe_grid() {
+    let mut checked = 0;
+    for (env, expected_keyframes, label) in [
+        ("WDMM_HLS_TEST_MEDIA_HEAD", 27_usize, "MP4"),
+        ("WDMM_HLS_TEST_MEDIA_MKV", 27_usize, "Cues MKV"),
+    ] {
+        let Some(media) = env_media(env) else {
+            eprintln!("skip: {env} not set");
+            continue;
+        };
+        let url = media.to_string_lossy().into_owned();
+        let preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+        let source = wdmm_ffmpeg::source_plan(&url, &preset)
+            .expect("source_plan must not fail for a normal container")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: a container with a keyframe index must yield a plan\n{}",
+                    diagnostics()
+                )
+            });
+        assert_eq!(
+            source.plan.alignment,
+            wdmm_ffmpeg::PlanAlignment::Keyframe,
+            "{label}: the index-backed path must be marked keyframe"
+        );
+        assert!(
+            source.video_copied,
+            "{label}: H.264/AAC sources are video-copied, so the plan is the index grid"
+        );
+        assert_eq!(
+            source.keyframe_count,
+            expected_keyframes,
+            "{label}: keyframe count must equal the ffprobe ground truth\n{}",
+            diagnostics()
+        );
+        assert_eq!(
+            source.plan.segment_count(),
+            source.plan.entries.len(),
+            "{label}: plan entries drive the playlist"
+        );
+        let first = source.plan.start_ms(0).expect("first segment start");
+        let mut previous = i64::MIN;
+        for (k, entry) in source.plan.entries.iter().enumerate() {
+            assert!(
+                entry.duration_ms > 0,
+                "{label}: segment {k} must have positive duration"
+            );
+            assert!(
+                entry.start_ms > previous,
+                "{label}: boundaries must strictly increase at {k}"
+            );
+            if k > 0 {
+                // One segment per keyframe interval: each entry starts exactly
+                // where the previous one ends (contiguous keyframe cuts).
+                assert_eq!(
+                    entry.start_ms,
+                    previous + source.plan.entries[k - 1].duration_ms,
+                    "{label}: segment {k} must start where segment {} ended",
+                    k - 1
+                );
+            }
+            previous = entry.start_ms;
+        }
+        let total: i64 = source.plan.entries.iter().map(|e| e.duration_ms).sum();
+        assert_eq!(
+            total,
+            source.plan.duration_ms - first,
+            "{label}: the last segment must run to the media end"
+        );
+        eprintln!(
+            "{label}: plan entries={:?}",
+            source
+                .plan
+                .entries
+                .iter()
+                .map(|e| (e.start_ms, e.duration_ms))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            source.plan.gop_ms.unwrap_or(0) > 0,
+            "{label}: a keyframe plan reports its measured GOP"
+        );
+        eprintln!(
+            "{label}: keyframes={} segments={} gop_ms={:?} first={} last_start={}",
+            source.keyframe_count,
+            source.plan.segment_count(),
+            source.plan.gop_ms,
+            first,
+            source
+                .plan
+                .start_ms(source.plan.segment_count() as u64 - 1)
+                .expect("last segment start"),
+        );
+        checked += 1;
+    }
+    if checked == 0 {
+        eprintln!("skip: neither source media env var is set");
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
+fn keyframe_plan_matches_muxer_cuts_for_sampled_segments() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
+        return;
+    };
+    let url = media.to_string_lossy().into_owned();
+    let preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let source = wdmm_ffmpeg::source_plan(&url, &preset)
+        .expect("source_plan")
+        .expect("keyframe plan");
+    let plan = source.plan.clone();
+    let last = plan.segment_count().saturating_sub(1) as u64;
+    let samples = [0_u64, last / 2, last.saturating_sub(2)];
+    let mut seen = std::collections::HashSet::new();
+    for k in samples {
+        if !seen.insert(k) {
+            continue;
+        }
+        let out_dir = temp_dir(&format!("keyframe-plan-k{k}"));
+        let planned = plan.duration_of(k).expect("planned duration for k");
+        // The proxy seeks half a GOP into the interval for keyframe plans
+        // (`spawn_run_shared`: container indexes store DTS on MP4, so an exact
+        // start would land on the previous keyframe). Segment 0 still starts at
+        // the origin, so it is never offset.
+        let seek_ms = if k == 0 {
+            0
+        } else {
+            plan.start_ms(k).expect("segment start for k") + plan.gop_ms.unwrap_or(0) / 2
+        };
+        let opts = wdmm_ffmpeg::JobOpts {
+            input_url: url.clone(),
+            preset: preset.clone(),
+            start_offset_secs: seek_ms as f64 / 1000.0,
+            start_number: k,
+            out_dir: Some(out_dir.clone()),
+            // The proxy passes a 1 ms `hls_time` for keyframe/transcode plans so
+            // the muxer cuts on every keyframe (see `KEYFRAME_CUT_HLS_TIME_MS`).
+            hls_time_override_ms: Some(1),
+            ..wdmm_ffmpeg::JobOpts::default()
+        };
+        let job = wdmm_ffmpeg::open_job(opts).expect("open_job");
+        let segment = out_dir.join(format!("seg{k}.ts"));
+        assert!(
+            wait_until(Duration::from_secs(120), || segment.is_file()),
+            "seg{k}.ts never appeared\n{}",
+            diagnostics()
+        );
+        assert!(
+            wait_until(Duration::from_secs(180), || !job.is_running()),
+            "job for k={k} did not finish\n{}",
+            diagnostics()
+        );
+        let durations = job.segment_durations();
+        assert!(
+            !durations.is_empty(),
+            "no #EXTINF for k={k}\n{}",
+            diagnostics()
+        );
+        let measured = durations[0];
+        assert!(
+            (measured - planned).abs() <= 200,
+            "k={k}: plan says {planned} ms but the muxer cut {measured} ms (durations={durations:?})\n{}",
+            diagnostics()
+        );
+        assert_eq!(
+            libav_video_key::first_video_packet_is_keyframe(&segment),
+            Some(true),
+            "k={k}: seg{k}.ts must start on a video keyframe\n{}",
+            diagnostics()
+        );
+        eprintln!(
+            "k={k}: planned={planned} ms muxer={measured} ms durations={durations:?}"
+        );
+        drop(job);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
+fn encode_path_cuts_on_the_exact_grid() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
+        return;
+    };
+    let url = media.to_string_lossy().into_owned();
+    // Force the real re-encode path at a cheap resolution, with a 2 s grid.
+    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    preset.remux_first = false;
+    preset.hls_segment_secs = 2;
+    preset.video_max_w = Some(320);
+    preset.video_max_h = Some(180);
+    preset.video_fps_cap = Some(15);
+    preset.video_hw_preferred = false;
+
+    let source = wdmm_ffmpeg::source_plan(&url, &preset)
+        .expect("source_plan")
+        .expect("exact plan for the encode path");
+    assert_eq!(
+        source.plan.alignment,
+        wdmm_ffmpeg::PlanAlignment::Exact,
+        "the re-encode path plans the exact uniform grid"
+    );
+    assert!(!source.video_copied);
+    assert_eq!(
+        source.keyframe_count, 0,
+        "no keyframe index is needed when the encoder controls the cuts"
+    );
+    let plan = source.plan.clone();
+    let out_dir = temp_dir("encode-grid");
+    let mut job = wdmm_ffmpeg::open_job(wdmm_ffmpeg::JobOpts {
+        input_url: url.clone(),
+        preset: preset.clone(),
+        start_offset_secs: 0.0,
+        start_number: 0,
+        out_dir: Some(out_dir.clone()),
+        // The proxy passes a 1 ms `hls_time` for exact/keyframe plans; the
+        // encoder's closed GOP pins a keyframe to every grid boundary.
+        hls_time_override_ms: Some(1),
+        ..wdmm_ffmpeg::JobOpts::default()
+    })
+    .expect("open_job");
+    assert!(
+        wait_until(Duration::from_secs(300), || !job.is_running()),
+        "encode job did not finish\n{}",
+        diagnostics()
+    );
+    let result = job.take_result().expect("encode job result");
+    result.expect("encode job must succeed");
+    let durations = job.segment_durations();
+    assert!(
+        durations.len() >= 3,
+        "expected several encoded segments, got {durations:?}\n{}",
+        diagnostics()
+    );
+    let mut cumulative = 0_i64;
+    let last = durations.len().saturating_sub(1);
+    for (k, &measured) in durations.iter().enumerate() {
+        let planned = plan.duration_of(k as u64).expect("planned duration");
+        cumulative += measured;
+        if k == last {
+            // The final EXTINF comes from the muxer trailer (real media tail),
+            // so it is not a full grid step; the sampled-segment contract
+            // covers every other entry.
+            eprintln!(
+                "encode-path last segment: plan={planned} ms muxer={measured} ms (cumulative end {cumulative})"
+            );
+            break;
+        }
+        assert!(
+            (measured - planned).abs() <= 200,
+            "encoded segment {k}: plan says {planned} ms, muxer wrote {measured} ms (durations={durations:?})\n{}",
+            diagnostics()
+        );
+        let start = plan.start_ms(k as u64).expect("planned start");
+        assert!(
+            (cumulative - measured - start).abs() <= 500,
+            "encoded segment {k}: cumulative start {} != planned start {start}",
+            cumulative - measured
+        );
+        if k < 3 {
+            assert_eq!(
+                libav_video_key::first_video_packet_is_keyframe(
+                    &out_dir.join(format!("seg{k}.ts"))
+                ),
+                Some(true),
+                "encoded seg{k}.ts must start on an IDR frame"
+            );
+        }
+    }
+    eprintln!(
+        "encode-path sample: planned={:?} muxer={:?}",
+        (0..durations.len().min(4))
+            .map(|k| plan.duration_of(k as u64).unwrap_or(0))
+            .collect::<Vec<_>>(),
+        &durations[..durations.len().min(4)]
+    );
+    drop(job);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[cfg(feature = "ffmpeg")]
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_NOCUES + linked FFmpeg 7.1"]
+fn source_plan_refuses_a_truncated_keyframe_index() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_NOCUES") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_NOCUES not set");
+        return;
+    };
+    let url = media.to_string_lossy().into_owned();
+    let preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let plan = wdmm_ffmpeg::source_plan(&url, &preset)
+        .expect("source_plan must degrade, not fail")
+        .map(|source| source.plan.alignment);
+    assert_eq!(
+        plan, None,
+        "a no-Cues MKV has no usable keyframe index and must defer to warm-up\n{}",
+        diagnostics()
+    );
+    assert!(
+        diagnostics().contains("source plan:"),
+        "the fallback must be explained in the diagnostics\n{}",
+        diagnostics()
+    );
 }

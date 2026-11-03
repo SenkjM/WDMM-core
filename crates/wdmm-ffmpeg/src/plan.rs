@@ -215,6 +215,26 @@ pub fn hw_gop_size(fps_num: i32, fps_den: i32) -> i32 {
     ((2.0 * fps).round() as i32).max(1)
 }
 
+/// Encoder GOP size (frames) for a segment boundary: `round(seg_secs * fps)`.
+///
+/// The exact transcode grid assumes a keyframe on every `k * seg_secs` boundary,
+/// and the HLS muxer only cuts encoded streams on keyframes. Setting the
+/// encoder's GOP to exactly one segment worth of frames — with B-frames off and
+/// scene-cut keyframes disabled — makes the produced `EXTINF` values match
+/// [`exact_plan`](crate::vod::exact_plan).
+///
+/// Returns at least one frame; a non-positive frame rate falls back to 30 fps and
+/// pathological inputs are capped at one hour of frames (no 32-bit overflow).
+pub fn segment_gop_size(fps_num: i32, fps_den: i32, seg_secs: u32) -> i32 {
+    let fps = if fps_num > 0 && fps_den > 0 {
+        fps_num as f64 / fps_den as f64
+    } else {
+        30.0
+    };
+    let frames = (f64::from(seg_secs.max(1)) * fps).round();
+    (frames as i64).clamp(1, 60 * 60) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +402,18 @@ mod tests {
         assert_eq!(hw_gop_size(60, 1), 120);
         // Degenerate input rate keeps a usable 2 s GOP at 30 fps.
         assert_eq!(hw_gop_size(0, 0), 60);
+    }
+
+    #[test]
+    fn segment_gop_is_one_segment_worth_of_frames() {
+        // 30 fps × 4 s segments → a keyframe every 120 frames.
+        assert_eq!(segment_gop_size(30, 1, 4), 120);
+        // 23.976 fps × 4 s → 96 frames (rounded).
+        assert_eq!(segment_gop_size(24000, 1001, 4), 96);
+        // 25 fps × 2 s → 50 frames.
+        assert_eq!(segment_gop_size(25, 1, 2), 50);
+        // Degenerate input rate defaults to 30 fps; zero seconds means one frame.
+        assert_eq!(segment_gop_size(0, 0, 4), 120);
+        assert_eq!(segment_gop_size(30, 1, 0), 30);
     }
 }
