@@ -462,8 +462,16 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
                     })
                 }
                 None => {
+                    let first = keyframes.first().copied().unwrap_or(-1);
+                    let last = keyframes.last().copied().unwrap_or(-1);
+                    let gop = keyframes
+                        .windows(2)
+                        .map(|w| w[1] - w[0])
+                        .filter(|gap| *gap > 0)
+                        .min()
+                        .unwrap_or(-1);
                     diag::log(format!(
-                        "source plan: {url} keyframe index unusable (entries={count}), deferring to warm-up"
+                        "source plan: {url} keyframe index unusable (entries={count} first_ms={first} last_ms={last} min_gap_ms={gop} duration_ms={duration_ms}), deferring to warm-up"
                     ));
                     None
                 }

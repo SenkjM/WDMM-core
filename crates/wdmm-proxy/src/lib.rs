@@ -508,7 +508,14 @@ const HLS_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// v3: the plan may now be the source's keyframe grid (`alignment: "keyframe"`),
 /// decided before any segment is written.
-const PLAN_FORMAT_VERSION: u32 = 3;
+///
+/// v4: the sparse-keyframe-index test now compares the index against the media
+/// duration instead of a fixed entry count. Plans cached by v3 were produced by
+/// that broken test and are therefore full re-encode grids for sources that do
+/// have a usable index (a 24-minute MKV with 3 lazy `Cues` entries, or a 2.3 h
+/// MKV whose index only looked dense). Bumping the version throws them away once
+/// so the source is planned again; re-planning costs one open + index read.
+const PLAN_FORMAT_VERSION: u32 = 4;
 
 /// Plan record persisted as `<cache_dir>/plan.json`.
 ///
@@ -616,6 +623,16 @@ async fn spawn_run_shared(
     let gate = { Arc::clone(&shared.lock().unwrap().gate) };
     // A previous job may have finished while its session is still alive.
     release_finished_permits(shared);
+    {
+        let g = shared.lock().unwrap();
+        if let Some(session) = g.hls_sessions.get(token) {
+            let reusable = session.anchor_k == first_k
+                && session.run.as_ref().is_some_and(|run| run.job.is_running());
+            if reusable {
+                return Ok(());
+            }
+        }
+    }
     // A *paused* job still reports `is_running()`, so it would keep the single
     // gate slot and the acquire below would time out with `transcoding busy` —
     // this is what made every seek fail. The jump replaces the run anyway, so
@@ -730,9 +747,12 @@ fn park_run_shared(shared: &Arc<Mutex<Shared>>, token: &str, requested_k: u64) {
     let Some(session) = g.hls_sessions.get_mut(token) else {
         return;
     };
-    let front = scan_segments(&session.cache_dir)
-        .0
-        .unwrap_or(session.anchor_k);
+    let plan_len = session.plan.segment_count() as u64;
+    let front = front_segment(
+        scan_segments(&session.cache_dir).0,
+        session.anchor_k,
+        plan_len,
+    );
     let Some(run) = session.run.as_mut() else {
         return;
     };
@@ -1710,9 +1730,18 @@ async fn ensure_segment(
                 }
                 _ if k >= plan_len => Step::Ended,
                 _ => {
-                    let front = scan_segments(&session.cache_dir)
-                        .0
-                        .unwrap_or(session.anchor_k);
+                    // The directory scan covers the whole cache, but the running
+                    // job is anchored at `anchor_k`: the previous run's segments
+                    // are still on disk and sit *behind* it. Clamp the front to
+                    // the anchor (exactly like `derive_hls_progress` does) —
+                    // without this every request for the fresh anchor was judged
+                    // "outside the run" and cancelled the job that had just been
+                    // started for it, so a seek could never produce a segment.
+                    let front = front_segment(
+                        scan_segments(&session.cache_dir).0,
+                        session.anchor_k,
+                        plan_len,
+                    );
                     // The running job covers everything from its anchor up to the
                     // ready front plus the throttle window, so a request in there
                     // must wait for it instead of restarting the job.
@@ -2462,6 +2491,92 @@ mod tests {
         assert_eq!(
             playlist, after,
             "a VOD playlist must not change while playing"
+        );
+
+        proxy.unregister_hls(&reg.token);
+        proxy.stop();
+    }
+
+    /// Regression: dragging the progress bar left the cast stuck on "idle".
+    ///
+    /// The window check compared the request with a directory scan that also
+    /// sees the *previous* run's segments, so right after a seek the ready front
+    /// sat far below the new anchor. Every request then looked "outside the run"
+    /// and cancelled the job that had just been started for it: the on-device
+    /// diag log showed `hls run start at segment N` / `hls run interrupted: seek
+    /// to segment N` repeating once per second, each job dying with `packets=0`,
+    /// until the renderer timed out and dropped the cast. A renderer asks for the
+    /// same segment several times around a seek, so repeated requests must share
+    /// one run instead of restarting it.
+    #[tokio::test]
+    async fn proxy_hls_repeated_seek_request_keeps_the_run() {
+        let Some(path) = hls_test_media() else { return };
+
+        let proxy = ProxyHandle::new(BindMode::Loopback, 0);
+        let reg = proxy
+            .register_hls(hls_test_opts(&path, "device-1"))
+            .await
+            .unwrap();
+        let addr = proxy.addr().unwrap();
+        let client = reqwest::Client::new();
+        let playlist = client
+            .get(format!("http://{addr}{}", reg.playlist_template))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        // Warm the head first: that is what leaves the previous run's segments on
+        // disk, which the old window check then measured the seek against.
+        let head = client
+            .get(format!("http://{addr}/h/{}/seg0.ts", reg.token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), 200, "seg0.ts must be served");
+
+        let last = playlist
+            .lines()
+            .filter_map(|line| line.strip_prefix("seg"))
+            .filter_map(|name| name.strip_suffix(".ts"))
+            .filter_map(|index| index.parse::<u64>().ok())
+            .next_back()
+            .expect("playlist must list segments");
+        let target = last.saturating_sub(1);
+        let seg_url = format!("http://{addr}/h/{}/seg{target}.ts", reg.token);
+
+        // Two requests for the same seek target, exactly like a renderer probing
+        // a new position: neither may cancel the other's run.
+        let (first, second) =
+            tokio::join!(client.get(&seg_url).send(), client.get(&seg_url).send());
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.status(), 200, "first seek request must be served");
+        assert_eq!(
+            second.status(),
+            200,
+            "a repeat request for the same segment must be served"
+        );
+        assert!(!first.bytes().await.unwrap().is_empty());
+        assert!(!second.bytes().await.unwrap().is_empty());
+
+        // The seek must be anchored at the target rather than at the head: the
+        // ready front has to be at least the requested segment. A short tail is
+        // copied fast enough that the run may already be done (that is fine),
+        // so only a *failed* job or an unanchored front is a regression.
+        let progress = proxy.hls_progress(&reg.token).unwrap();
+        assert!(
+            progress.error.is_none(),
+            "the seek run must not fail: {:?}",
+            progress.error
+        );
+        assert!(
+            progress.ready_k.unwrap_or(0) >= target,
+            "the run must report the seek target as produced, got {:?} (state {:?})",
+            progress.ready_k,
+            progress.run_state
         );
 
         proxy.unregister_hls(&reg.token);
