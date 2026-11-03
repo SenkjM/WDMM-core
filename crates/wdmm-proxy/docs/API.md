@@ -8,7 +8,8 @@ Callers compose `http://{host}:{port}{path_template}` from the registration plus
 - One `ProxyHandle` per process in the FFI; the server starts lazily on the first `register_*`, stops after the idle timeout (default 10 minutes) or on drop.
 - Byte-range sources are a local file or a driver callback.
 - HLS is **pull-driven VOD**: the proxy synthesises the playlist from a segment plan and transcodes segments on demand into a persistent cache. There is no live/push playlist and no seek call — a seek is a request for another segment index, and a cached one is served immediately.
-- One concurrent transcode job per process (`JobGate`); a run parks itself once it is ~60 s ahead of the newest request and resumes on demand. The gate is priority-aware: a cast's transcode always wins over a background subtitle probe, so playback warm-up and seek re-opens never queue behind an FFI probe (contract §3.6).
+- One concurrent transcode job per process (`JobGate`). A cast has exactly **one** long-lived job: instead of cancelling and reopening on every jump, the job is *paused* once it is more than `AHEAD_SEGMENTS` ahead of the newest request and resumed when the renderer catches up. Only a jump that leaves the covered window starts a second run. The gate is priority-aware: a cast's transcode always wins over a background subtitle probe, so opening a cast never queues behind an FFI probe (contract §3.6).
+- The segment grid is fixed **before** the session is registered, from the source itself (`wdmm_ffmpeg::source_plan`): the container keyframe index when the video can be copied, an exact encoder grid when it must be re-encoded. A source with no usable grid is refused rather than served on a nominal one.
 ## Error types
 ### `pub enum ProxyError {`
 - `Io(#[from] std::io::Error)`, `Ffmpeg(String)`, `Cache(String)`; `Busy(String)` = `"transcoding busy"` when the gate times out, or `CAST_PRIORITY_ERROR` (`"transcoding busy: cast transcode has priority"`) when a background job cannot start while a cast holds the gate.
@@ -55,13 +56,16 @@ subtitle sidecars (`srt`/`ass`/`ssa`/`vtt`/`sub`) are `text/*`.
 ### `pub struct HlsRegistration {`
 - `token`, `playlist_template` (e.g. `"/h/3f7a…/index.m3u8"`).
 ### `pub async fn register_hls(&self, opts: HlsSessionOpts) -> ProxyResult<HlsRegistration>`
-Waits for the plan (container keyframe index, or up to 20 s of warm-up
-calibration). If calibration cannot finish in time the session starts on an
-approximate grid rather than failing the cast. `input_url` is a local path or a
-loopback proxy URL for encrypted sources.
+Resolves the segment plan (a persisted `plan.json`, else `source_plan` with the
+video copied, else `source_plan` with it re-encoded), persists it, registers the
+session and starts a pre-buffering run at segment 0, so the playlist is servable
+as soon as this returns. `input_url` is a local path or a loopback proxy URL for
+encrypted sources. Fails with `ProxyError::Cache` (`Ffmpeg` when the `ffmpeg`
+feature is off) when no grid can be planned.
 ### `pub async fn register_hls_nowait(&self, opts: HlsSessionOpts) -> ProxyResult<HlsRegistration>`
-Returns immediately in a warming state; poll `hls_progress().playlist_ready`
-before pointing the renderer at the playlist.
+Same work as `register_hls`; kept as a separate entry point so the FFI can keep
+its two-phase (`phase: "warming"` → cast) contract. `playlist_ready` is true as
+soon as the session exists.
 ### `pub fn hls_progress(&self, token: &str) -> Option<HlsProgress>`
 ### `pub fn unregister_hls(&self, token: &str)`
 Cancels the job and removes the session; cached segments stay on disk.
@@ -69,16 +73,19 @@ Segment requests wait up to 20 s (`504` on timeout, `500` on job error, `404`
 past the end). Paths are flat: `seg<k>.ts` only.
 ## Progress and runtime state
 ### `pub struct HlsProgress {`
-- Plan: `playlist_ready`, `alignment: Option<&'static str>` (`exact` | `keyframe` | `calibrated` | `approx`),
+- Plan: `playlist_ready` (always true — the plan precedes the session),
+  `alignment: Option<&'static str>` (`exact` | `keyframe`),
   `plan_duration_ms: Option<i64>`, `seg_secs: f64`, `segment_count: usize`,
   `ready_k`, `max_requested_k: Option<u64>`, `drift_ms: Option<i64>`.
 - Run: `run_state: &'static str` (`active` | `idle` | `error`), `ended`,
   `error`, `segments: u32`, `content_ms`, `wall_ms`, `speed`, `encoder`, `warnings`.
 - Cache: `cache_hits: u64`, `cache_bytes: u64`, `over_budget: bool`.
 
-`drift_ms` is only meaningful for `alignment == "approx"`; the other alignments
-do not drift. A run parks after ~60 s of lookahead (`run_state = "idle"`); a
-segment request resumes it from the requested index.
+`content_ms` and `drift_ms` are absolute media time: `content_ms` is the end of the
+ready front on the plan grid, `drift_ms` is how far the run's own output differs
+from that grid (bounded by one segment). A run that is more than `AHEAD_SEGMENTS`
+ahead of the newest request is paused, not cancelled, so `run_state` stays
+`active` while a job is held.
 ## Transcode cache
 Layout: `<root>/<dir_name>/plan.json` + `seg<k>.ts`, `dir_name` = 16-hex
 SHA-256 of the cache key. Defaults: `DEFAULT_CACHE_SUBDIR = "wdmm-transcode"`,
@@ -95,14 +102,12 @@ SHA-256 of the cache key. Defaults: `DEFAULT_CACHE_SUBDIR = "wdmm-transcode"`,
 - `save_plan(key, dir, plan)`, `load_plan(key, dir)` — a persisted plan is a
   cache hit across sessions.
 ## Scheduling and admission
-### `pub const LOOKAHEAD_SECS: f64 = 60.0;`
-### `pub const RESUME_MARGIN_SEGMENTS: u64 = 3;`
-### `pub struct SchedulePolicy {`
-- `new(plan_len, seg_secs)`, `lookahead()`, `decide(run, running, k) -> Action`
-  (`Serve` / `Wait` / `Start{from_k}` / `Ended`), `should_stop`, `resume_from`,
-  `within_resume_margin`.
-### `pub fn lookahead_segments(seg_secs: f64) -> u64`
-`ceil(60 / seg_secs)`, minimum 1.
+A request for segment `k` is served from disk when the muxer has closed it, waits
+while the running job covers it (`anchor_k <= k <= front + AHEAD_SEGMENTS`), and
+otherwise starts a run at `k` (merged to warm `k+1`/`k+2`), throttled to one
+reopen per second. `AHEAD_SEGMENTS = 12` bounds how far ahead of the newest
+request the single job may run before it is paused; `HLS_SEGMENT_WAIT = 20 s`
+bounds how long a request blocks.
 Limits: `MAX_CONCURRENT_HLS_JOBS = 1`, `MAX_CONCURRENT_BACKGROUND_JOBS = 1`,
 `JOB_ACQUIRE_TIMEOUT = 15 s`, `BUSY_ERROR = "transcoding busy"`,
 `CAST_PRIORITY_ERROR = "transcoding busy: cast transcode has priority"`.

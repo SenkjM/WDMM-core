@@ -75,10 +75,11 @@ Config keys: `renderer_location`, `renderer_usn`, `account_id`, `remote_path`,
 (default 2048) and `cache_ident` (etag/mtime; absent ⇒ session-local).
 Returns `{"ok":true,"handle":N,"url","provider":"direct"|"hls","protocol_info","phase":"playing"|"warming","compat","subtitle_status"}`.
 ### `pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString`
-HLS VOD fields: `run_state` (`"active"`/`"idle"`/`"error"`), `alignment`
-(`"exact"`/`"keyframe"`/`"calibrated"`/`"approx"` or null), `drift_ms` (only
-meaningful for `approx`), `ready_segments`, `seg_count`, `seg_secs`,
-`lookahead_segments` (`ceil(60 / seg_secs)`), `cache_hits`, `cache_bytes`,
+HLS VOD fields: `run_state` (`"active"`/`"idle"`/`"error"`; a throttled job that
+is paused stays `"active"`), `alignment` (`"exact"`/`"keyframe"` or null),
+`drift_ms` (how far the run's output sits from the plan grid, bounded by one
+segment), `ready_segments`, `seg_count`, `seg_secs`, `lookahead_segments`
+(`wdmm_proxy::AHEAD_SEGMENTS`, the pause window), `cache_hits`, `cache_bytes`,
 `cache_over_budget` — plus `phase`, `playlist_ready`, `segments`, `encode_speed`,
 `encode_content_ms`, `encode_wall_ms`, `encode_mode`, `video_encoder`,
 `audio_encoder`, `encode_warnings` and `diagnostics` (`wdmm_ffmpeg::diag::tail(40)`).

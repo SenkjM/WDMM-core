@@ -39,6 +39,7 @@ use wdmm_drivers::WdmmVfs;
 use wdmm_ffmpeg::subtitle::{classify_codec, TrackKind};
 use wdmm_proxy::{
     BindMode, BoxStream, HlsCacheOptions, HlsProgress, HlsSessionOpts, JobGate, ProxyHandle,
+    AHEAD_SEGMENTS,
 };
 
 use crate::{
@@ -2123,9 +2124,11 @@ fn vod_telemetry(progress: Option<&HlsProgress>) -> Value {
     let ready_segments = progress.map_or(0, |p| p.segments as u64);
     let seg_count = progress.map_or(0, |p| p.segment_count as u64);
     let seg_secs = progress.map_or(0.0, |p| p.seg_secs);
-    let lookahead_segments = if seg_secs > 0.0 {
-        // LOOKAHEAD_SEGMENTS = ceil(60 s / seg_secs) (contract §3.4).
-        (60.0_f64 / seg_secs).ceil() as u64
+    // The single session job is paused once it is this far ahead of the newest
+    // request, so this is the real window between the ready front and the
+    // request front.
+    let lookahead_segments = if progress.is_some() {
+        AHEAD_SEGMENTS
     } else {
         0
     };
@@ -2928,7 +2931,7 @@ mod tests {
             encoder: Default::default(),
             warnings: Vec::new(),
             run_state: "active",
-            alignment: Some("calibrated"),
+            alignment: Some("keyframe"),
             ready_k: Some(8),
             max_requested_k: Some(6),
             plan_duration_ms: Some(7_200_000),
@@ -2961,13 +2964,12 @@ mod tests {
     fn vod_telemetry_mirrors_the_proxy_progress() {
         let value = vod_telemetry(Some(&sample_progress()));
         assert_eq!(value["run_state"], "active");
-        assert_eq!(value["alignment"], "calibrated");
+        assert_eq!(value["alignment"], "keyframe");
         assert_eq!(value["drift_ms"], -250);
         assert_eq!(value["ready_segments"], 9);
         assert_eq!(value["seg_count"], 530);
         assert_eq!(value["seg_secs"], 13.6);
-        // ceil(60 / 13.6) = 5
-        assert_eq!(value["lookahead_segments"], 5);
+        assert_eq!(value["lookahead_segments"], AHEAD_SEGMENTS);
         assert_eq!(value["cache_hits"], 12);
         assert_eq!(value["cache_bytes"], 34_000_000);
         assert_eq!(value["cache_over_budget"], true);
