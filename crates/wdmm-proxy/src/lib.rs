@@ -584,6 +584,12 @@ async fn spawn_run_shared(
     let gate = { Arc::clone(&shared.lock().unwrap().gate) };
     // A previous job may have finished while its session is still alive.
     release_finished_permits(shared);
+    // A *paused* job still reports `is_running()`, so it would keep the single
+    // gate slot and the acquire below would time out with `transcoding busy` —
+    // this is what made every seek fail. The jump replaces the run anyway, so
+    // drop it first; `JobHandle::drop` cancels and joins on a helper thread, so
+    // this returns immediately.
+    drop_previous_run(shared, token);
     let permit = gate
         .acquire_async(JOB_ACQUIRE_TIMEOUT)
         .await
@@ -686,13 +692,31 @@ fn park_run_shared(shared: &Arc<Mutex<Shared>>, token: &str, requested_k: u64) {
     let front = scan_segments(&session.cache_dir)
         .0
         .unwrap_or(session.anchor_k);
-    let Some(run) = session.run.as_ref() else {
+    let Some(run) = session.run.as_mut() else {
         return;
     };
     let ahead = front.saturating_sub(requested_k);
     if ahead > AHEAD_SEGMENTS && !run.job.is_paused() {
         info!("HLS run throttled at segment {front} (requested {requested_k}, {ahead} ahead)");
         run.job.pause();
+        // A paused job produces nothing, so it must not keep the single
+        // transcode slot: otherwise the subtitle probe (a background job) is
+        // rejected with `transcoding busy` for as long as the viewer stays
+        // inside the buffered window. The permit is re-acquired on resume.
+        run.permit = None;
+    }
+}
+
+/// Drop a session's run so the next one can take the gate slot.
+fn drop_previous_run(shared: &Arc<Mutex<Shared>>, token: &str) {
+    let Ok(mut g) = shared.lock() else {
+        return;
+    };
+    let Some(session) = g.hls_sessions.get_mut(token) else {
+        return;
+    };
+    if session.run.take().is_some() {
+        wdmm_ffmpeg::diag::log(format!("[proxy] hls run replaced (session {token})"));
     }
 }
 
@@ -1613,6 +1637,7 @@ async fn ensure_segment(
         enum Step {
             Serve(PathBuf),
             Wait,
+            Resume,
             Start(u64),
             Sleep(Duration),
             Ended,
@@ -1643,12 +1668,22 @@ async fn ensure_segment(
                         && k >= session.anchor_k
                         && k <= front.saturating_add(AHEAD_SEGMENTS);
                     if in_window {
-                        if let Some(run) = session.run.as_ref() {
-                            if run.job.is_paused() {
-                                run.job.resume();
+                        let paused_without_slot = session
+                            .run
+                            .as_ref()
+                            .is_some_and(|run| run.job.is_paused() && run.permit.is_none());
+                        if paused_without_slot {
+                            // The throttle gave the slot away (see
+                            // `park_run_shared`); take it back before resuming.
+                            Step::Resume
+                        } else {
+                            if let Some(run) = session.run.as_ref() {
+                                if run.job.is_paused() {
+                                    run.job.resume();
+                                }
                             }
+                            Step::Wait
                         }
-                        Step::Wait
                     } else if session.ended && k >= session.anchor_k && k <= front {
                         Step::Ended
                     } else {
@@ -1701,6 +1736,27 @@ async fn ensure_segment(
                     ));
                 }
                 tokio::time::sleep(HLS_POLL_INTERVAL).await;
+            }
+            Step::Resume => {
+                let gate = { Arc::clone(&shared.lock().unwrap().gate) };
+                let permit = gate
+                    .acquire_async(JOB_ACQUIRE_TIMEOUT)
+                    .await
+                    .map_err(|error| {
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            format!("segment {k} not ready: {error}"),
+                        )
+                    })?;
+                let mut g = shared.lock().unwrap();
+                let Some(session) = g.hls_sessions.get_mut(token) else {
+                    return Err((StatusCode::NOT_FOUND, "unknown HLS session".to_string()));
+                };
+                if let Some(run) = session.run.as_mut() {
+                    run.permit = Some(permit);
+                    run.job.resume();
+                    info!("HLS run resumed at segment {k}");
+                }
             }
             Step::Start(from_k) => {
                 // Near-neighbour merge: one reopen covers `from_k..=from_k+2`.

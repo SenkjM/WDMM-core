@@ -278,21 +278,32 @@ unsafe fn collect_keyframes_ms(streams_ptr: *const *mut AVStream, v_idx: i32) ->
 /// seek, so one `av_seek_frame(.., 0, AVSEEK_FLAG_BACKWARD)` populates the full
 /// index without demuxing media. A no-`Cues` file only gets the linear-scan
 /// prefix; [`crate::vod::keyframe_plan`] rejects that truncated index.
-/// Entry count below which the index is assumed to be lazily built (MKV cues are
-/// only parsed on the first seek): do one `seek(0)` and re-read.
-const MIN_INDEX_ENTRIES_BEFORE_SEEK: usize = 3;
+/// Loosest sane assumption about keyframe density: one keyframe per ten
+/// seconds of media.
+///
+/// An index holding fewer entries than that cannot describe the media, so it is
+/// treated as not-yet-parsed and one `seek(0)` is spent to finish it. Counting
+/// against the duration matters: Matroska parses `Cues` lazily, but the linear
+/// prefix of a long file can still hold a handful of entries, and the previous
+/// "fewer than 3 entries" test waved exactly that through as complete — a
+/// 24-minute MKV with 3 entries looked fine and the plan fell back to a full
+/// re-encode.
+const ASSUMED_MAX_GOP_MS: i64 = 10_000;
 
 unsafe fn video_keyframe_index_ms(
     in_ctx: *mut AVFormatContext,
     streams_ptr: *const *mut AVStream,
     v_idx: i32,
+    duration_ms: i64,
 ) -> Vec<i64> {
     let mut keyframes = collect_keyframes_ms(streams_ptr, v_idx);
-    if keyframes.len() < MIN_INDEX_ENTRIES_BEFORE_SEEK {
+    let sparse = keyframes.len() < 2
+        || (keyframes.len() as i64).saturating_mul(ASSUMED_MAX_GOP_MS) < duration_ms;
+    if sparse {
         let before = keyframes.len();
         let ret = av_seek_frame(in_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
         diag::log(format!(
-            "source plan: keyframe index entries_before={before} seek(0) rc={ret}"
+            "source plan: keyframe index sparse entries_before={before} duration_ms={duration_ms} seek(0) rc={ret}"
         ));
         if ret >= 0 {
             keyframes = collect_keyframes_ms(streams_ptr, v_idx);
@@ -416,7 +427,7 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
             None
         } else if preset.remux_first && remux_plan(video_codec, audio_codec) != RemuxPlan::Transcode
         {
-            let mut keyframes = video_keyframe_index_ms(in_ctx, streams_ptr, v_idx);
+            let mut keyframes = video_keyframe_index_ms(in_ctx, streams_ptr, v_idx, duration_ms);
             // MP4 indexes store DTS, and the B-frame delay makes the first
             // keyframe's DTS negative. Anchor the list on the first video
             // packet's PTS so both the proxy's seek offset and the muxer's
