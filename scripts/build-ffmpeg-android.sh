@@ -162,6 +162,16 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
 # (avc_pix_fmts mediacodecenc.c:96-101, copy_frame_to_buffer:469-494) — no
 # EGL/Surface pipeline is required. libmediandk is a platform library, so this
 # does not affect the --disable-nonfree policy.
+#
+# MediaCodec hardware decoders (transcode-pipeline-optimization): the matching
+# `h264_mediacodec` / `hevc_mediacodec` DECODERS were never enabled, which is
+# why 1080p HEVC 10-bit sources were decoded on the CPU (0.72× on a Snapdragon
+# 888). `crates/wdmm-ffmpeg/src/hwdecode.rs` calls av_hwdevice_ctx_create()
+# against AV_HWDEVICE_TYPE_MEDIACODEC and transfers AV_PIX_FMT_MEDIACODEC
+# frames back to NV12 with av_hwframe_transfer_data(); both require these
+# decoders to exist in the build. The decoders use the same NDK libmediandk
+# path (no JVM/Surface), so no extra flags beyond --enable-jni/--enable-mediacodec
+# are needed.
 
 ./configure \
   --enable-shared \
@@ -179,6 +189,7 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
   --enable-jni \
   --enable-mediacodec \
   --enable-encoder=h264_mediacodec,hevc_mediacodec \
+  --enable-decoder=h264_mediacodec,hevc_mediacodec \
   --enable-decoder=h264 \
   --enable-decoder=hevc \
   --enable-decoder=aac \
