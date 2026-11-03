@@ -265,9 +265,14 @@ pub struct AVAudioFifo {
     _p: [u8; 0],
 }
 /// Opaque marker for libavcodec's `AVSubtitle` (32 bytes, LP64; see accessors).
-#[repr(C)]
+///
+/// The size and alignment matter: this type is instantiated on the stack and
+/// passed to `avcodec_decode_subtitle2`, which writes the decoded subtitle
+/// through the pointer. A zero-sized marker would let libav write 32 bytes past
+/// a zero-length stack slot (stack corruption, `got_sub_ptr` being clobbered).
+#[repr(C, align(8))]
 pub struct AVSubtitle {
-    _p: [u8; 0],
+    _p: [u8; 32],
 }
 /// Opaque marker for libavcodec's `AVSubtitleRect` (96 bytes, LP64; see accessors).
 #[repr(C)]
@@ -746,4 +751,126 @@ pub fn av_err2str(errnum: c_int) -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+// ── Hardware decode / device bindings (MediaCodec) ───────────────────────────
+//
+// Everything below was verified against the FFmpeg n7.1.5 headers with the NDK
+// clang record-layout dump (`-target aarch64-linux-android24 -Xclang
+// -fdump-record-layouts`) and, for the enum values, by compiling a small probe
+// TU that prints `AV_HWDEVICE_TYPE_MEDIACODEC` / `AV_PIX_FMT_*` / the
+// `AV_CODEC_HW_CONFIG_METHOD_*` and `AV_HWFRAME_TRANSFER_DIRECTION_*`
+// constants (LP64 — identical layout on x86_64 and arm64).
+
+/// `AV_PIX_FMT_NONE` — sentinel that terminates a pixel-format list.
+pub const AV_PIX_FMT_NONE: AVPixelFormat = -1;
+/// `AV_PIX_FMT_MEDIACODEC` — opaque hardware surface (`hwcontext_mediacodec.h`:
+/// `AV_PIX_FMT_MEDIACODEC, ///< MediaCodec opaque direct surface`).
+pub const AV_PIX_FMT_MEDIACODEC: AVPixelFormat = 164;
+
+/// `enum AVHWDeviceType` is an `int` (hwcontext.h).
+pub type AVHWDeviceType = c_int;
+/// `AV_HWDEVICE_TYPE_MEDIACODEC` — 11th entry of `AVHWDeviceType` (0-based: 10).
+pub const AV_HWDEVICE_TYPE_MEDIACODEC: AVHWDeviceType = 10;
+
+/// `enum AVHWFrameTransferDirection` is an `int` (hwcontext.h).
+pub type AVHWFrameTransferDirection = c_int;
+/// `AV_HWFRAME_TRANSFER_DIRECTION_FROM` — hardware → system memory.
+pub const AV_HWFRAME_TRANSFER_DIRECTION_FROM: AVHWFrameTransferDirection = 0;
+/// `AV_HWFRAME_TRANSFER_DIRECTION_TO` — system → hardware memory.
+pub const AV_HWFRAME_TRANSFER_DIRECTION_TO: AVHWFrameTransferDirection = 1;
+
+/// `AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX` — the codec uses the device
+/// context attached to `AVCodecContext.hw_device_ctx`.
+pub const AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX: c_int = 1 << 0;
+
+/// `AVBufferRef` (libavutil/buffer.h), sizeof = 24 with LP64:
+/// `AVBuffer *buffer @0`, `uint8_t *data @8`, `int size @16` (+4 tail pad).
+#[repr(C)]
+pub struct AVBufferRef {
+    pub buffer: *mut c_void, // +0
+    pub data: *mut u8,       // +8
+    pub size: c_int,         // +16
+}
+
+/// `AVCodecHWConfig` (libavcodec/codec.h), sizeof = 12:
+/// `enum AVPixelFormat pix_fmt @0`, `int methods @4`,
+/// `enum AVHWDeviceType device_type @8`. FFmpeg 7.1 has **no** `flags` field
+/// here (older 4.x layouts did — do not copy stale offsets from the web).
+#[repr(C)]
+pub struct AVCodecHWConfig {
+    pub pix_fmt: AVPixelFormat,      // +0 (4)
+    pub methods: c_int,              // +4 (4)
+    pub device_type: AVHWDeviceType, // +8 (4)
+}
+
+/// `AVCodecContext.get_format` callback signature
+/// (`enum AVPixelFormat (*get_format)(struct AVCodecContext *s, const enum AVPixelFormat *fmt)`).
+pub type GetFormatFn =
+    unsafe extern "C" fn(s: *mut AVCodecContext, fmt: *const AVPixelFormat) -> AVPixelFormat;
+
+// AVCodecContext (sizeof = 864): codec @16, opaque @48, get_format @192,
+// hw_frames_ctx @552, hw_device_ctx @560.
+/// `const AVCodec *codec` @ +16.
+#[inline]
+pub unsafe fn codctx_codec(c: *const AVCodecContext) -> *const AVCodec {
+    *(c as *const u8).add(16).cast()
+}
+/// `void *opaque` @ +48 — our get_format callback reads its accepted list here.
+#[inline]
+pub unsafe fn codctx_opaque(c: *const AVCodecContext) -> *mut c_void {
+    *(c as *const u8).add(48).cast()
+}
+#[inline]
+pub unsafe fn codctx_set_opaque(c: *mut AVCodecContext, v: *mut c_void) {
+    *(c as *mut u8).add(48).cast() = v;
+}
+/// `get_format` @ +192, null when unset.
+#[inline]
+pub unsafe fn codctx_get_format(c: *const AVCodecContext) -> Option<GetFormatFn> {
+    *(c as *const u8).add(192).cast()
+}
+#[inline]
+pub unsafe fn codctx_set_get_format(c: *mut AVCodecContext, f: Option<GetFormatFn>) {
+    *(c as *mut u8).add(192).cast() = f;
+}
+/// `AVBufferRef *hw_device_ctx` @ +560.
+#[inline]
+pub unsafe fn codctx_hw_device_ctx(c: *const AVCodecContext) -> *mut AVBufferRef {
+    *(c as *const u8).add(560).cast()
+}
+#[inline]
+pub unsafe fn codctx_set_hw_device_ctx(c: *mut AVCodecContext, v: *mut AVBufferRef) {
+    *(c as *mut u8).add(560).cast() = v;
+}
+/// `AVBufferRef *hw_frames_ctx` on AVFrame @ +352 (sizeof(AVFrame) = 440).
+#[inline]
+pub unsafe fn frame_hw_frames_ctx(f: *const AVFrame) -> *mut AVBufferRef {
+    *(f as *const u8).add(352).cast()
+}
+
+#[cfg(feature = "ffmpeg")]
+extern "C" {
+    // hwdevice / hwcontext
+    pub fn av_hwdevice_find_type_by_name(name: *const c_char) -> AVHWDeviceType;
+    pub fn av_hwdevice_ctx_create(
+        device_ctx: *mut *mut AVBufferRef,
+        type_: AVHWDeviceType,
+        device: *const c_char,
+        opts: *mut AVDictionary,
+        flags: c_int,
+    ) -> c_int;
+    pub fn av_buffer_ref(buf: *const AVBufferRef) -> *mut AVBufferRef;
+    pub fn av_buffer_unref(buf: *mut *mut AVBufferRef);
+    pub fn av_free(ptr: *mut c_void);
+    pub fn av_hwframe_transfer_data(dst: *mut AVFrame, src: *const AVFrame, flags: c_int) -> c_int;
+    pub fn av_hwframe_transfer_get_formats(
+        hwframe_ctx: *mut AVBufferRef,
+        dir: AVHWFrameTransferDirection,
+        formats: *mut *mut AVPixelFormat,
+        flags: c_int,
+    ) -> c_int;
+
+    // hw config probing
+    pub fn avcodec_get_hw_config(codec: *const AVCodec, index: c_int) -> *const AVCodecHWConfig;
 }

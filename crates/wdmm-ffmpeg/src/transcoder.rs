@@ -24,6 +24,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +32,7 @@ use std::sync::Arc;
 
 use crate::sys::*;
 use crate::{
-    diag, AudioStream, EncoderInfo, FfmpegError, FfmpegResult, PauseControl, ProbeResult,
+    diag, hwdecode, AudioStream, EncoderInfo, FfmpegError, FfmpegResult, PauseControl, ProbeResult,
     ProgressState, SourcePlan, SubtitleStream, TranscodePreset, VideoStream,
 };
 
@@ -603,12 +604,23 @@ unsafe fn cue_from_avsubtitle(
     })
 }
 
-/// Decode the subtitle stream at `stream_index` of an already-opened input.
-unsafe fn extract_subtitle_inner(
+/// One text subtitle stream decoded by [`extract_subtitle_tracks`].
+struct SubtitleTrack {
+    index: u32,
+    codec: String,
+    time_base: AVRational,
+    decoder: *mut AVCodecContext,
+    cues: Vec<crate::subtitle::Cue>,
+    packets: u64,
+    decode_errors: u32,
+}
+
+/// Validate a subtitle stream and open a text decoder for it.
+unsafe fn open_subtitle_track(
     fmt_ctx: *mut AVFormatContext,
     stream_index: u32,
-) -> FfmpegResult<String> {
-    use crate::subtitle::{self, normalize_cues, to_webvtt, Cue, TrackKind};
+) -> FfmpegResult<SubtitleTrack> {
+    use crate::subtitle::{self, TrackKind};
 
     let nb = fmtctx_nb_streams(fmt_ctx) as usize;
     if stream_index as usize >= nb {
@@ -672,18 +684,64 @@ unsafe fn extract_subtitle_inner(
         return Err(ffmpeg_err(format!("avcodec_open2({codec})"), ret));
     }
 
+    Ok(SubtitleTrack {
+        index: stream_index,
+        codec,
+        time_base: (*st).time_base,
+        decoder: dec_ctx,
+        cues: Vec::new(),
+        packets: 0,
+        decode_errors: 0,
+    })
+}
+
+/// Decode one subtitle packet into `track.cues`.
+unsafe fn decode_subtitle_packet(track: &mut SubtitleTrack, pkt: *mut AVPacket) {
+    track.packets += 1;
+    let fallback_pts_ms = if (*pkt).pts == AV_NOPTS_VALUE {
+        0
+    } else {
+        av_rescale_q((*pkt).pts, track.time_base, MS_TB).max(0)
+    };
+    let mut sub: AVSubtitle = std::mem::zeroed();
+    let mut got: c_int = 0;
+    let ret = avcodec_decode_subtitle2(track.decoder, &mut sub, &mut got, pkt);
+    if ret < 0 {
+        track.decode_errors += 1;
+        if track.decode_errors <= 3 {
+            diag::log(format!(
+                "[subtitle] decode error #{} in '{}' stream {}: {}",
+                track.decode_errors,
+                track.codec,
+                track.index,
+                av_err2str(ret)
+            ));
+        }
+    }
+    if got != 0 {
+        let cue = cue_from_avsubtitle(&sub, fallback_pts_ms, &track.codec);
+        avsubtitle_free(&mut sub);
+        if let Some(cue) = cue {
+            track.cues.push(cue);
+        }
+    }
+}
+
+/// Decode the subtitle stream at `stream_index` of an already-opened input.
+unsafe fn extract_subtitle_inner(
+    fmt_ctx: *mut AVFormatContext,
+    stream_index: u32,
+) -> FfmpegResult<String> {
+    use crate::subtitle::{normalize_cues, to_webvtt};
+
+    let mut track = open_subtitle_track(fmt_ctx, stream_index)?;
     let mut pkt = av_packet_alloc();
     if pkt.is_null() {
-        avcodec_free_context(&mut dec_ctx);
+        avcodec_free_context(&mut track.decoder);
         return Err(FfmpegError::Probe("av_packet_alloc returned NULL".into()));
     }
 
-    let tb = (*st).time_base;
-    let mut cues: Vec<Cue> = Vec::new();
-    let mut packets = 0u64;
-    let mut decode_errors = 0u32;
     let mut read_error: Option<i32> = None;
-
     loop {
         let ret = av_read_frame(fmt_ctx, pkt);
         if ret < 0 {
@@ -693,58 +751,41 @@ unsafe fn extract_subtitle_inner(
             break;
         }
         if (*pkt).stream_index as u32 == stream_index {
-            packets += 1;
-            let fallback_pts_ms = if (*pkt).pts == AV_NOPTS_VALUE {
-                0
-            } else {
-                av_rescale_q((*pkt).pts, tb, MS_TB).max(0)
-            };
-            let mut sub: AVSubtitle = std::mem::zeroed();
-            let mut got: c_int = 0;
-            let ret = avcodec_decode_subtitle2(dec_ctx, &mut sub, &mut got, pkt);
-            if ret < 0 {
-                decode_errors += 1;
-                if decode_errors <= 3 {
-                    diag::log(format!(
-                        "[subtitle] decode error #{decode_errors} in '{codec}' stream {stream_index}: {}",
-                        av_err2str(ret)
-                    ));
-                }
-            }
-            if got != 0 {
-                let cue = cue_from_avsubtitle(&sub, fallback_pts_ms, &codec);
-                avsubtitle_free(&mut sub);
-                if let Some(cue) = cue {
-                    cues.push(cue);
-                }
-            }
+            decode_subtitle_packet(&mut track, pkt);
         }
         av_packet_unref(pkt);
-        if packets >= SUBTITLE_MAX_PACKETS || cues.len() >= subtitle::MAX_CUES {
+        if track.packets >= SUBTITLE_MAX_PACKETS || track.cues.len() >= crate::subtitle::MAX_CUES {
             diag::log(format!(
-                "[subtitle] stopping extraction early after {packets} packets / {} cues",
-                cues.len()
+                "[subtitle] stopping extraction early after {} packets / {} cues",
+                track.packets,
+                track.cues.len()
             ));
             break;
         }
     }
 
     av_packet_free(&mut pkt);
-    avcodec_free_context(&mut dec_ctx);
+    avcodec_free_context(&mut track.decoder);
 
-    let cues = normalize_cues(cues);
+    let cues = normalize_cues(track.cues);
     if cues.is_empty() {
         return Err(FfmpegError::Probe(format!(
-            "no subtitle cues decoded from '{codec}' stream {stream_index} \
-             ({packets} packets, {decode_errors} decode error(s){}",
+            "no subtitle cues decoded from '{}' stream {stream_index} \
+             ({} packets, {} decode error(s){}",
+            track.codec,
+            track.packets,
+            track.decode_errors,
             read_error
                 .map(|code| format!(", read ended with {}", av_err2str(code)))
                 .unwrap_or_default()
         )));
     }
     diag::log(format!(
-        "[subtitle] extracted {} cues from '{codec}' stream {stream_index} ({packets} packets, {decode_errors} decode error(s))",
-        cues.len()
+        "[subtitle] extracted {} cues from '{}' stream {stream_index} ({} packets, {} decode error(s))",
+        cues.len(),
+        track.codec,
+        track.packets,
+        track.decode_errors
     ));
     Ok(to_webvtt(&cues))
 }
@@ -768,6 +809,123 @@ pub fn extract_subtitle_track(url: &str, stream_index: u32) -> FfmpegResult<Stri
         };
         avformat_close_input(&mut fmt_ctx);
         result
+    }
+}
+
+/// Extract several embedded **text** subtitle streams in one demux pass.
+///
+/// Opens the source once, opens one decoder per requested text stream, and
+/// fans the demuxed packets out to the right decoder. Bitmap tracks
+/// (PGS/DVD/DVB) and unsupported codecs are skipped with a diagnostic and are
+/// absent from the returned map, so one bad track never fails the others.
+/// Streams that produce no cues are skipped the same way.
+pub fn extract_subtitle_tracks(
+    url: &str,
+    stream_indexes: &[u32],
+) -> FfmpegResult<HashMap<u32, String>> {
+    use crate::subtitle::{normalize_cues, to_webvtt};
+    use std::time::Instant;
+
+    let mut result = HashMap::new();
+    if stream_indexes.is_empty() {
+        return Ok(result);
+    }
+    let started = Instant::now();
+    let url_c = CString::new(url).map_err(|e| FfmpegError::Probe(e.to_string()))?;
+    unsafe {
+        let mut fmt_ctx: *mut AVFormatContext = std::ptr::null_mut();
+        let mut opts = input_open_options();
+        let ret = avformat_open_input(&mut fmt_ctx, url_c.as_ptr(), std::ptr::null(), &mut opts);
+        av_dict_free(&mut opts);
+        if ret < 0 || fmt_ctx.is_null() {
+            return Err(ffmpeg_err(format!("open subtitle source {url}"), ret));
+        }
+        let ret = avformat_find_stream_info(fmt_ctx, std::ptr::null_mut());
+        if ret < 0 {
+            avformat_close_input(&mut fmt_ctx);
+            return Err(ffmpeg_err("avformat_find_stream_info(subtitle)", ret));
+        }
+
+        let mut tracks: Vec<SubtitleTrack> = Vec::new();
+        let mut seen: Vec<u32> = Vec::new();
+        for &index in stream_indexes {
+            if seen.contains(&index) {
+                continue;
+            }
+            seen.push(index);
+            match open_subtitle_track(fmt_ctx, index) {
+                Ok(track) => tracks.push(track),
+                Err(error) => diag::log(format!("[subtitle] skipping stream {index}: {error}")),
+            }
+        }
+        if tracks.is_empty() {
+            avformat_close_input(&mut fmt_ctx);
+            return Ok(result);
+        }
+
+        let mut pkt = av_packet_alloc();
+        if pkt.is_null() {
+            for track in &mut tracks {
+                avcodec_free_context(&mut track.decoder);
+            }
+            avformat_close_input(&mut fmt_ctx);
+            return Err(FfmpegError::Probe("av_packet_alloc returned NULL".into()));
+        }
+
+        let mut packets_read = 0u64;
+        loop {
+            let ret = av_read_frame(fmt_ctx, pkt);
+            if ret < 0 {
+                break;
+            }
+            packets_read += 1;
+            let index = (*pkt).stream_index as u32;
+            if let Some(track) = tracks.iter_mut().find(|t| t.index == index) {
+                if track.cues.len() < crate::subtitle::MAX_CUES {
+                    decode_subtitle_packet(track, pkt);
+                }
+            }
+            av_packet_unref(pkt);
+            let all_capped = tracks
+                .iter()
+                .all(|t| t.cues.len() >= crate::subtitle::MAX_CUES);
+            if packets_read >= SUBTITLE_MAX_PACKETS || all_capped {
+                diag::log(format!(
+                    "[subtitle] multi-track pass stopped after {packets_read} packets"
+                ));
+                break;
+            }
+        }
+        av_packet_free(&mut pkt);
+
+        for track in &mut tracks {
+            let index = track.index;
+            let codec = track.codec.clone();
+            let packets = track.packets;
+            let errors = track.decode_errors;
+            let cues = normalize_cues(std::mem::take(&mut track.cues));
+            avcodec_free_context(&mut track.decoder);
+            if cues.is_empty() {
+                diag::log(format!(
+                    "[subtitle] stream {index} '{codec}' produced no cues \
+                     ({packets} packets, {errors} decode error(s))"
+                ));
+                continue;
+            }
+            diag::log(format!(
+                "[subtitle] extracted {} cues from '{codec}' stream {index} \
+                 ({packets} packets, {errors} decode error(s))",
+                cues.len()
+            ));
+            result.insert(index, to_webvtt(&cues));
+        }
+        avformat_close_input(&mut fmt_ctx);
+        diag::log(format!(
+            "[subtitle] multi-track extraction: {} track(s) from {packets_read} packets in {} ms",
+            result.len(),
+            started.elapsed().as_millis()
+        ));
+        Ok(result)
     }
 }
 
@@ -2036,6 +2194,97 @@ fn run_remux(
 
 // ── Transcode path ────────────────────────────────────────────────────────────
 
+/// Open one video decoder context for `stream` with `codec`.
+///
+/// Allocates the context, copies the stream parameters, optionally attaches a
+/// MediaCodec hardware device ([`hwdecode::attach`] **must** run before
+/// `avcodec_open2`), and opens the decoder. On failure the context (and any
+/// attached device) is freed before returning the error, so the caller can retry
+/// with the stock decoder.
+unsafe fn open_video_decoder(
+    stream: *mut AVStream,
+    codec: *const AVCodec,
+    codec_id: u32,
+    tag: &str,
+    label: &str,
+    try_hardware: bool,
+) -> FfmpegResult<(*mut AVCodecContext, Option<hwdecode::HwDecode>)> {
+    let mut ctx = avcodec_alloc_context3(codec);
+    if ctx.is_null() {
+        return Err(FfmpegError::Probe(format!(
+            "avcodec_alloc_context3({label}) returned null"
+        )));
+    }
+    let ret = avcodec_parameters_to_context(ctx, (*stream).codecpar);
+    if ret < 0 {
+        avcodec_free_context(&mut ctx);
+        return Err(ffmpeg_err(
+            format!("avcodec_parameters_to_context({label})"),
+            ret,
+        ));
+    }
+    // attach() must run before avcodec_open2: the decoder negotiates the
+    // MediaCodec pixel format during open.
+    let mut hw = if try_hardware {
+        hwdecode::attach(ctx, codec_id as c_int)
+    } else {
+        None
+    };
+    let ret = avcodec_open2(ctx, codec, std::ptr::null_mut());
+    diag::log(format!("{tag} transcode avcodec_open2({label}) rc={ret}"));
+    if ret < 0 {
+        if let Some(hw) = hw.take() {
+            hw.drop();
+        }
+        avcodec_free_context(&mut ctx);
+        return Err(ffmpeg_err(format!("avcodec_open2({label})"), ret));
+    }
+    Ok((ctx, hw))
+}
+
+/// Open the video decoder, preferring a MediaCodec hardware decoder.
+///
+/// The MediaCodec decoder is only used when `avcodec_find_decoder_by_name`
+/// resolves it *and* a device attaches and `avcodec_open2` succeeds. Every
+/// failure (host build without the decoder, Android device without a usable
+/// codec, unsupported profile) logs one diagnostic line and falls back to the
+/// stock software decoder — hardware decode must never fail the cast.
+unsafe fn open_video_decoder_hw_or_sw(
+    stream: *mut AVStream,
+    codec_id: u32,
+    stock_codec: *const AVCodec,
+    tag: &str,
+) -> FfmpegResult<(*mut AVCodecContext, Option<hwdecode::HwDecode>)> {
+    let dec_name = codec_display_name(codec_id);
+    if let Some(hw_name) = hwdecode::mediacodec_decoder_name(codec_id) {
+        let hw_codec = avcodec_find_decoder_by_name(hw_name.as_ptr().cast::<c_char>());
+        if !hw_codec.is_null() {
+            let label = format!("video decoder {dec_name} (mediacodec)");
+            match open_video_decoder(stream, hw_codec, codec_id, tag, &label, true) {
+                Ok((ctx, Some(hw))) => return Ok((ctx, Some(hw))),
+                Ok((ctx, None)) => {
+                    // The decoder is compiled in but no hardware device attached;
+                    // the stock decoder keeps the software path predictable.
+                    let mut ctx = ctx;
+                    avcodec_free_context(&mut ctx);
+                    diag::log(format!(
+                        "{tag} transcode: no MediaCodec device, using software decoder {dec_name}"
+                    ));
+                }
+                Err(error) => {
+                    // The decoder opened with a hardware context but could not
+                    // open (unsupported profile, device busy, …): retry software.
+                    diag::log(format!(
+                        "{tag} transcode: hardware video decode unavailable ({error}); using software decoder"
+                    ));
+                }
+            }
+        }
+    }
+    let label = format!("video decoder {dec_name}");
+    open_video_decoder(stream, stock_codec, codec_id, tag, &label, false)
+}
+
 fn run_transcode(
     input_url: &str,
     preset: &wdmm_core::models::TranscodePreset,
@@ -2116,54 +2365,16 @@ fn run_transcode(
             ));
         }
 
-        // ── Open decoders ─────────────────────────────────────────────────
+        // ── Open the audio decoder ────────────────────────────────────────
+        // The video decoder is opened right before the decode loop (once the
+        // muxer and encoder are fully set up) so a MediaCodec hardware attach can
+        // fail and fall back to software decode without dismantling the output.
         let mut v_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
         let mut a_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
+        // MediaCodec hardware-decode guard; dropped before the decoder context
+        // is freed (see the cleanup section below).
+        let mut hw_decode: Option<hwdecode::HwDecode> = None;
 
-        if decode_video && !v_dec_codec.is_null() {
-            let in_st = *streams_ptr.add(v_idx as usize);
-            let dec_name = codec_display_name((*(*in_st).codecpar).codec_id);
-            v_dec_ctx = avcodec_alloc_context3(v_dec_codec);
-            if v_dec_ctx.is_null() {
-                avformat_close_input(&mut in_ctx);
-                return Err(FfmpegError::Probe(
-                    "avcodec_alloc_context3(video decoder) returned null".into(),
-                ));
-            }
-            let ret = avcodec_parameters_to_context(v_dec_ctx, (*in_st).codecpar);
-            if ret < 0 {
-                cleanup_transcode(
-                    in_ctx,
-                    std::ptr::null_mut(),
-                    v_dec_ctx,
-                    a_dec_ctx,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                return Err(ffmpeg_err(
-                    "avcodec_parameters_to_context(video decoder)",
-                    ret,
-                ));
-            }
-            let ret = avcodec_open2(v_dec_ctx, v_dec_codec, std::ptr::null_mut());
-            diag::log(format!(
-                "{tag} transcode avcodec_open2(video decoder {dec_name}) rc={ret}"
-            ));
-            if ret < 0 {
-                cleanup_transcode(
-                    in_ctx,
-                    std::ptr::null_mut(),
-                    v_dec_ctx,
-                    a_dec_ctx,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                return Err(ffmpeg_err(
-                    format!("avcodec_open2(video decoder {dec_name})"),
-                    ret,
-                ));
-            }
-        }
         if a_idx >= 0 && !a_dec_codec.is_null() {
             match open_audio_decoder(streams_ptr, a_idx, a_dec_codec, tag) {
                 Ok(ctx) => a_dec_ctx = ctx,
@@ -2600,6 +2811,12 @@ fn run_transcode(
             audio.set_source_time_base((*(*streams_ptr.add(a_idx as usize))).time_base);
         }
         let mut enc_vframe: *mut AVFrame = std::ptr::null_mut();
+        // System-memory frame a MediaCodec hardware frame is transferred into
+        // before scaling/encoding; allocated lazily and reused per frame.
+        let mut hw_sw_frame: *mut AVFrame = std::ptr::null_mut();
+        // Format the cached sws context was created for; a mid-job fallback from
+        // hardware frames (NV12/P010) to software frames (YUV420P) changes it.
+        let mut sws_src_fmt: c_int = AV_PIX_FMT_NONE;
         let mut video_out_dims = (0i32, 0i32);
         // Decoded video frames carry pts in the **input stream** time_base.
         // libav does not set `AVCodecContext.time_base` for video decoders (it
@@ -2623,6 +2840,7 @@ fn run_transcode(
                     &mut out_pkt,
                     &mut dec_frame,
                     &mut enc_vframe,
+                    &mut hw_sw_frame,
                     &mut sws,
                     &mut audio,
                 );
@@ -2641,11 +2859,41 @@ fn run_transcode(
                     &mut out_pkt,
                     &mut dec_frame,
                     &mut enc_vframe,
+                    &mut hw_sw_frame,
                     &mut sws,
                     &mut audio,
                 );
                 cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
                 return Err(ffmpeg_err("av_frame_get_buffer(encoder frame)", ret));
+            }
+        }
+
+        // ── Open the video decoder (MediaCodec hardware decode when possible) ─
+        // Everything that can fail before decoding is set up by now, so a failed
+        // hardware attach/open falls back to the stock decoder without touching
+        // the muxer, encoders or output streams of the job.
+        if decode_video && !v_dec_codec.is_null() {
+            let in_st = *streams_ptr.add(v_idx as usize);
+            let codec_id = (*(*in_st).codecpar).codec_id;
+            match open_video_decoder_hw_or_sw(in_st, codec_id, v_dec_codec, tag) {
+                Ok((ctx, hw)) => {
+                    v_dec_ctx = ctx;
+                    hw_decode = hw;
+                }
+                Err(error) => {
+                    diag::log(format!("{tag} transcode: {error}"));
+                    free_loop_state(
+                        &mut in_pkt,
+                        &mut out_pkt,
+                        &mut dec_frame,
+                        &mut enc_vframe,
+                        &mut hw_sw_frame,
+                        &mut sws,
+                        &mut audio,
+                    );
+                    cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
+                    return Err(error);
+                }
             }
         }
 
@@ -2702,15 +2950,76 @@ fn run_transcode(
                         break;
                     }
                     if !enc_vframe.is_null() && !v_enc_ctx.is_null() {
-                        let sw = frame_width(dec_frame);
-                        let sh = frame_height(dec_frame);
+                        // MediaCodec frames carry GPU surfaces; transfer them to
+                        // system memory before sws_scale can read the pixels.
+                        let mut frame = dec_frame;
+                        if hw_decode.is_some() && hwdecode::is_hw_frame(dec_frame) {
+                            if hw_sw_frame.is_null() {
+                                hw_sw_frame = av_frame_alloc();
+                                if hw_sw_frame.is_null() {
+                                    fatal = Some(FfmpegError::Probe(
+                                        "av_frame_alloc(hardware→software frame) returned null"
+                                            .into(),
+                                    ));
+                                    av_frame_unref(dec_frame);
+                                    break 'decode;
+                                }
+                            }
+                            let transferred = match hw_decode.as_ref() {
+                                Some(hw) => hw.to_software(dec_frame, hw_sw_frame),
+                                None => false,
+                            };
+                            if transferred {
+                                frame = hw_sw_frame;
+                            } else {
+                                // A device that refuses a transfer must not kill the
+                                // cast: reopen the stock decoder and keep the job.
+                                diag::log(format!(
+                                    "{tag} transcode: hardware frame transfer failed; switching to software decode"
+                                ));
+                                if let Some(hw) = hw_decode.take() {
+                                    hw.drop();
+                                }
+                                avcodec_free_context(&mut v_dec_ctx);
+                                if !sws.is_null() {
+                                    sws_freeContext(sws);
+                                    sws = std::ptr::null_mut();
+                                }
+                                sws_src_fmt = AV_PIX_FMT_NONE;
+                                let in_st = *streams_ptr.add(v_idx as usize);
+                                let codec_id = (*(*in_st).codecpar).codec_id;
+                                match open_video_decoder(
+                                    in_st,
+                                    v_dec_codec,
+                                    codec_id,
+                                    tag,
+                                    "video decoder (software fallback)",
+                                    false,
+                                ) {
+                                    Ok((ctx, _)) => v_dec_ctx = ctx,
+                                    Err(error) => fatal = Some(error),
+                                }
+                                av_frame_unref(dec_frame);
+                                av_frame_unref(hw_sw_frame);
+                                if fatal.is_some() {
+                                    break 'decode;
+                                }
+                                break;
+                            }
+                        }
+                        let sw = frame_width(frame);
+                        let sh = frame_height(frame);
+                        let src_fmt = frame_format(frame);
                         let dw = video_out_dims.0;
                         let dh = video_out_dims.1;
-                        if sws.is_null() {
+                        if sws.is_null() || src_fmt != sws_src_fmt {
+                            if !sws.is_null() {
+                                sws_freeContext(sws);
+                            }
                             sws = sws_getContext(
                                 sw,
                                 sh,
-                                frame_format(dec_frame),
+                                src_fmt,
                                 dw,
                                 dh,
                                 v_enc_pix_fmt,
@@ -2723,19 +3032,23 @@ fn run_transcode(
                                 fatal =
                                     Some(FfmpegError::Probe("sws_getContext returned null".into()));
                                 av_frame_unref(dec_frame);
+                                if !hw_sw_frame.is_null() {
+                                    av_frame_unref(hw_sw_frame);
+                                }
                                 break 'decode;
                             }
+                            sws_src_fmt = src_fmt;
                         }
                         let src_d = [
-                            frame_data(dec_frame, 0) as *const u8,
-                            frame_data(dec_frame, 1) as *const u8,
-                            frame_data(dec_frame, 2) as *const u8,
+                            frame_data(frame, 0) as *const u8,
+                            frame_data(frame, 1) as *const u8,
+                            frame_data(frame, 2) as *const u8,
                             std::ptr::null(),
                         ];
                         let src_s = [
-                            frame_linesize(dec_frame, 0),
-                            frame_linesize(dec_frame, 1),
-                            frame_linesize(dec_frame, 2),
+                            frame_linesize(frame, 0),
+                            frame_linesize(frame, 1),
+                            frame_linesize(frame, 2),
                             0,
                         ];
                         let dst_d = [
@@ -2767,12 +3080,15 @@ fn run_transcode(
                                 ));
                             }
                             av_frame_unref(dec_frame);
+                            if !hw_sw_frame.is_null() {
+                                av_frame_unref(hw_sw_frame);
+                            }
                             continue;
                         }
                         frame_set_pts(
                             enc_vframe,
                             av_rescale_q(
-                                frame_pts(dec_frame),
+                                frame_pts(frame),
                                 video_dec_tb,
                                 codctx_time_base(v_enc_ctx),
                             ),
@@ -2788,10 +3104,16 @@ fn run_transcode(
                         ) {
                             fatal = Some(e);
                             av_frame_unref(dec_frame);
+                            if !hw_sw_frame.is_null() {
+                                av_frame_unref(hw_sw_frame);
+                            }
                             break 'decode;
                         }
                     }
                     av_frame_unref(dec_frame);
+                    if !hw_sw_frame.is_null() {
+                        av_frame_unref(hw_sw_frame);
+                    }
                 }
             } else if stream_idx == a_idx && !a_dec_ctx.is_null() && !a_enc_ctx.is_null() {
                 if let Err(e) = drain_audio_frames(
@@ -2848,6 +3170,11 @@ fn run_transcode(
         }
 
         // ── Cleanup ───────────────────────────────────────────────────────
+        // Release the hardware decoder binding before the decoder context: the
+        // guard owns the AVBufferRef(hw_device_ctx) it attached to that context.
+        if let Some(hw) = hw_decode.take() {
+            hw.drop();
+        }
         if !sws.is_null() {
             sws_freeContext(sws);
         }
@@ -2856,6 +3183,7 @@ fn run_transcode(
             av_frame_free(&mut enc_vframe);
         }
         av_frame_free(&mut dec_frame);
+        av_frame_free(&mut hw_sw_frame);
         av_packet_free(&mut in_pkt);
         av_packet_free(&mut out_pkt);
 
@@ -2939,6 +3267,7 @@ unsafe fn free_loop_state(
     out_pkt: &mut *mut AVPacket,
     dec_frame: &mut *mut AVFrame,
     enc_vframe: &mut *mut AVFrame,
+    hw_sw_frame: &mut *mut AVFrame,
     sws: &mut *mut SwsContext,
     audio: &mut AudioPipeline,
 ) {
@@ -2953,6 +3282,9 @@ unsafe fn free_loop_state(
     }
     if !enc_vframe.is_null() {
         av_frame_free(enc_vframe);
+    }
+    if !hw_sw_frame.is_null() {
+        av_frame_free(hw_sw_frame);
     }
     if !sws.is_null() {
         sws_freeContext(*sws);

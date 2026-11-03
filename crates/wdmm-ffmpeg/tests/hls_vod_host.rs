@@ -429,6 +429,58 @@ fn embedded_subtitle_tracks_expose_language_and_title() {
     eprintln!("embedded subtitles: {tracks:?}");
 }
 
+#[test]
+#[ignore = "needs WDMM_HLS_TEST_MEDIA_SUBTITLES + linked FFmpeg 7.1"]
+fn extract_subtitle_tracks_decodes_every_text_track_in_one_pass() {
+    let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_SUBTITLES") else {
+        eprintln!("skip: WDMM_HLS_TEST_MEDIA_SUBTITLES not set");
+        return;
+    };
+    let url = media.to_string_lossy().into_owned();
+    let started = std::time::Instant::now();
+    // 0 is the video stream and 99 does not exist: both must be skipped, not
+    // fail the pass. 2/3 are the subrip tracks.
+    let tracks =
+        wdmm_ffmpeg::extract_subtitle_tracks(&url, &[0, 2, 3, 99]).expect("multi-track extraction");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        tracks.len(),
+        2,
+        "expected only the two text tracks, got {:?}\n{}",
+        tracks.keys().collect::<Vec<_>>(),
+        diagnostics()
+    );
+    for index in [2u32, 3] {
+        let text = tracks.get(&index).unwrap_or_else(|| {
+            panic!("stream {index} missing from multi-track result: {tracks:?}")
+        });
+        assert!(
+            text.starts_with("WEBVTT"),
+            "stream {index} is not WebVTT: {text:?}"
+        );
+        assert!(text.contains("-->"), "stream {index} has no cues: {text:?}");
+    }
+    assert!(
+        !tracks.contains_key(&0),
+        "non-subtitle stream was extracted"
+    );
+    assert!(!tracks.contains_key(&99), "unknown stream was extracted");
+    assert_ne!(
+        tracks.get(&2),
+        tracks.get(&3),
+        "the two tracks must decode independently"
+    );
+    // An empty request must not open the media at all.
+    let none = wdmm_ffmpeg::extract_subtitle_tracks(&url, &[]).expect("empty request");
+    assert!(none.is_empty());
+    eprintln!(
+        "multi-track extraction: {} track(s) in {:?}\n{}",
+        tracks.len(),
+        elapsed,
+        diagnostics()
+    );
+}
+
 // ── Source keyframe plan: plan grid == muxer cut grid ────────────────────────
 
 /// Minimal libav access used only to check that a written segment starts on a

@@ -38,7 +38,12 @@ mod sys;
 pub mod vod; // always compiled — pure VOD segment planning, host-testable
 
 #[cfg(feature = "ffmpeg")]
+mod hwdecode; // hardware (MediaCodec) decode helpers for the transcode path
+#[cfg(feature = "ffmpeg")]
 mod transcoder;
+
+#[cfg(feature = "ffmpeg")]
+pub use hwdecode::{attach, is_hw_frame, mediacodec_decoder_name, software_format, HwDecode};
 
 use std::path::{Path, PathBuf};
 #[cfg(feature = "ffmpeg")]
@@ -353,9 +358,34 @@ pub fn extract_subtitle_track(url: &str, stream_index: u32) -> FfmpegResult<Stri
     transcoder::extract_subtitle_track(url, stream_index)
 }
 
+/// Extract several embedded **text** subtitle streams in a single pass.
+///
+/// One `avformat_open_input` + one `avformat_find_stream_info` + one demux loop
+/// feeds every requested stream into its own decoder, so a media file with many
+/// embedded tracks costs one read pass instead of one per track. Each entry of
+/// the returned map is the WebVTT text for that `stream_index`.
+///
+/// Text codecs only: bitmap subtitle tracks (PGS/DVD/DVB) are skipped and never
+/// appear in the result (they need rendering, not text conversion). Unknown
+/// indexes are skipped too; an empty `stream_indexes` returns an empty map
+/// without opening the media at all.
+///
+/// Per-track failures are reported through [`crate::diag`] and simply omit that
+/// track from the map; an unreadable media URL is still the only hard error.
+#[cfg(feature = "ffmpeg")]
+pub fn extract_subtitle_tracks(
+    url: &str,
+    stream_indexes: &[u32],
+) -> FfmpegResult<std::collections::HashMap<u32, String>> {
+    transcoder::extract_subtitle_tracks(url, stream_indexes)
+}
+
 /// Stub: returns [`FfmpegError::Unavailable`] when `ffmpeg` feature is off.
 #[cfg(not(feature = "ffmpeg"))]
-pub fn extract_subtitle_track(_url: &str, _stream_index: u32) -> FfmpegResult<String> {
+pub fn extract_subtitle_tracks(
+    _url: &str,
+    _stream_indexes: &[u32],
+) -> FfmpegResult<std::collections::HashMap<u32, String>> {
     Err(FfmpegError::Unavailable(
         "FFmpeg not linked (build with --features ffmpeg)".into(),
     ))
