@@ -240,6 +240,12 @@ pub struct TranscodePreset {
     /// `true` for the factory presets (`h264`, `hevc`).
     pub is_builtin: bool,
     /// Last edit time, seconds since the Unix epoch.
+    ///
+    /// Assigned by the storage layer on every save, so callers may leave it out
+    /// of the JSON they hand to `wdmm_transcode_preset_save`: a client has no
+    /// business inventing this timestamp, and requiring it made the preset
+    /// editor fail with `error:parse:missing field updated_at`.
+    #[serde(default)]
     pub updated_at: i64,
 }
 
@@ -277,5 +283,79 @@ impl TranscodePreset {
     /// copy is allowed, or a hardware/software encoder is configured.
     pub fn has_usable_video_path(&self) -> bool {
         self.video_copy || !self.hw_video_encoder.is_empty() || !self.sw_video_encoder.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TranscodePreset;
+
+    /// The exact shape the Flutter editor hands to `wdmm_transcode_preset_save`:
+    /// `TranscodePreset.toJson()` in `lib/models/transcode_preset.dart` omits
+    /// every `null` envelope field and never sends `updated_at`. Deserialization
+    /// must accept it — the timestamp is the storage layer's business.
+    #[test]
+    fn preset_json_from_the_editor_parses_without_updated_at() {
+        let json = r#"{
+            "id": "my-h265",
+            "label": "My H.265",
+            "video_copy": false,
+            "audio_copy": false,
+            "hw_video_encoder": "hevc_mediacodec",
+            "hw_video_tier": "fast",
+            "sw_video_encoder": "libx264",
+            "sw_video_tier": "quality",
+            "audio_codec": "aac",
+            "audio_bitrate": 128000,
+            "audio_channels": 2,
+            "hls_segment_secs": 4,
+            "sort_order": 100,
+            "is_builtin": false
+        }"#;
+        let preset: TranscodePreset =
+            serde_json::from_str(json).expect("editor JSON must deserialize");
+        assert_eq!(preset.id, "my-h265");
+        assert_eq!(preset.hw_video_encoder, "hevc_mediacodec");
+        assert_eq!(preset.sw_video_tier, "quality");
+        assert_eq!(preset.video_max_w, None);
+        assert_eq!(preset.audio_sample_rate, None);
+        assert_eq!(preset.updated_at, 0, "omitted timestamps default to zero");
+        preset.validate().expect("editor JSON must pass validation");
+    }
+
+    /// `list`/`get` output is fed straight back into the editor, so the round
+    /// trip has to survive a timestamp that is present.
+    #[test]
+    fn preset_json_with_a_timestamp_round_trips() {
+        let json = r#"{
+            "id": "h264",
+            "label": "H.264",
+            "video_copy": true,
+            "audio_copy": true,
+            "hw_video_encoder": "h264_mediacodec",
+            "hw_video_tier": "balanced",
+            "sw_video_encoder": "libx264",
+            "sw_video_tier": "balanced",
+            "video_max_w": 1920,
+            "video_max_h": 1080,
+            "video_max_bitrate": 4000000,
+            "video_fps_cap": 30,
+            "audio_codec": "aac",
+            "audio_bitrate": 128000,
+            "audio_channels": 2,
+            "audio_sample_rate": 44100,
+            "hls_segment_secs": 4,
+            "sort_order": 10,
+            "is_builtin": true,
+            "updated_at": 1760000000
+        }"#;
+        let preset: TranscodePreset =
+            serde_json::from_str(json).expect("stored JSON must deserialize");
+        assert_eq!(preset.updated_at, 1_760_000_000);
+        assert_eq!(preset.video_max_bitrate, Some(4_000_000));
+        let again: TranscodePreset =
+            serde_json::from_str(&serde_json::to_string(&preset).unwrap()).unwrap();
+        assert_eq!(again.updated_at, preset.updated_at);
+        assert_eq!(again.id, preset.id);
     }
 }

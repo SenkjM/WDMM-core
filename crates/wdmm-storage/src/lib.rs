@@ -7148,6 +7148,27 @@ mod tests {
     }
 
     #[test]
+    fn save_stamps_updated_at_itself() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        // The editor's JSON carries no timestamp (serde defaults it to 0), so the
+        // storage layer has to supply one; otherwise every row would read back as
+        // "last edited at the epoch".
+        let mut preset = db.get_transcode_preset("h264").unwrap().unwrap();
+        preset.id = "user-stamp".into();
+        preset.is_builtin = false;
+        preset.label = "Stamp".into();
+        preset.updated_at = 0;
+        db.save_transcode_preset(&preset).unwrap();
+
+        let stored = db.get_transcode_preset("user-stamp").unwrap().unwrap();
+        assert!(
+            stored.updated_at > 1_700_000_000,
+            "save must stamp updated_at, got {}",
+            stored.updated_at
+        );
+    }
+
+    #[test]
     fn save_rejects_invalid_presets_with_user_facing_messages() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
         let base = db.get_transcode_preset("hevc").unwrap().unwrap();
