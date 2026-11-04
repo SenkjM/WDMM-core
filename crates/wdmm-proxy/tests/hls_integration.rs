@@ -85,12 +85,13 @@ async fn hls_job_produces_numbered_segments_in_out_dir() {
     let out_dir = unique_out_dir();
     let handle = open_job(JobOpts {
         input_url: video.to_string_lossy().into_owned(),
-        preset: preset::preset_balanced(),
+        preset: preset::preset_h264(),
         start_offset_secs: 0.0,
         segment_dir: PathBuf::new(),
         start_number: 0,
         out_dir: Some(out_dir.clone()),
         hls_time_override_ms: None,
+        decision: None,
     })
     .expect("failed to open job");
 

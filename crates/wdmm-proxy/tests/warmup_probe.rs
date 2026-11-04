@@ -41,7 +41,7 @@ async fn warm_up_starts_eagerly_and_reports_ready() {
     let opts = HlsSessionOpts {
         device_id: "probe-device".into(),
         input_url: media.to_string_lossy().into_owned(),
-        preset: preset::preset_balanced(),
+        preset: preset::preset_h264(),
         ttl_secs: None,
         allowed_peers: None,
         cache: HlsCacheOptions {

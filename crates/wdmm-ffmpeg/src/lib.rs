@@ -15,12 +15,11 @@
 //!
 //! ## Preset model
 //!
-//! A [`wdmm_core::models::TranscodePreset`] drives the job:
-//! - `container = "original"` → pass-through (no HLS wrapping).
-//! - `remux_first = true` → try remux (`-c copy` equivalent) first, fall back
-//!   to transcode on codec incompatibility.
-//! - `video_codec = None` → audio-only.
-//! - `audio_codec = "copy"` → copy audio unchanged.
+//! A [`wdmm_core::models::TranscodePreset`] drives the job through a per-stream
+//! decision (see [`SessionDecision`]): each stream is either copied when the
+//! source is already MPEG-TS compatible and the preset allows it, or encoded
+//! with the preset's hardware/software encoder. The output container is always
+//! MPEG-TS (HLS segments); direct playback never reaches this crate.
 //!
 //! ## License
 //! This crate links against FFmpeg shared libraries, licensed under LGPL v2.1+
@@ -56,7 +55,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use plan::{
-    hybrid_audio_codec_id, remux_dropped_streams, remux_plan, remux_stream_selection, RemuxPlan,
+    bitrate_factor_for_tier, decide_audio_action, decide_video_action, default_video_bitrate,
+    encoder_frame_rate, hw_gop_size, remux_dropped_streams, remux_plan, remux_stream_selection,
+    segment_gop_size, sw_fallback_downgrades_hevc, target_video_bitrate_for_tier, video_plan_diag,
+    x264_preset_for_tier, AudioAction, RemuxPlan, StreamAction,
 };
 pub use subtitle::{classify_codec, Cue, TrackKind};
 pub use vod::{
@@ -126,6 +128,137 @@ pub struct EncoderInfo {
     /// A hardware encoder actually opened successfully (presence in libavcodec
     /// alone is not enough — `avcodec_open2` must have succeeded).
     pub hw_available: bool,
+    /// Video stream action as reported to the session status JSON:
+    /// `"copy"` / `"hw"` / `"sw"` / `"none"`.
+    pub video_action: Option<String>,
+    /// Audio stream action: `"copy"` / `"sw"` / `"none"`.
+    pub audio_action: Option<String>,
+}
+
+/// What one stream of a job does (contract §2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StreamMode {
+    /// No such stream in the output (source has none, or it is dropped).
+    #[default]
+    None,
+    /// Packets are copied through unchanged.
+    Copy,
+    /// Encoded with a hardware encoder.
+    Hardware,
+    /// Encoded with a software encoder.
+    Software,
+}
+
+impl StreamMode {
+    /// Stable status-JSON token: `"none"`/`"copy"`/`"hw"`/`"sw"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StreamMode::None => "none",
+            StreamMode::Copy => "copy",
+            StreamMode::Hardware => "hw",
+            StreamMode::Software => "sw",
+        }
+    }
+}
+
+/// Per-stream decision for one HLS job, decided once from the source codecs and
+/// the preset (contract §2).
+///
+/// The decision is deterministic for a given `(preset, source codecs, hardware
+/// availability)` triple, so re-opening the same session (seek / pull-driven
+/// restart) reproduces exactly the same stream layout — the segment grid must
+/// never drift between runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionDecision {
+    /// Video stream action.
+    pub video: StreamMode,
+    /// Video encoder name when [`video`](Self::video) is an `Encode` variant.
+    pub video_encoder: Option<String>,
+    /// Tier (`"fast"`/`"balanced"`/`"quality"`) backing the video encoder knobs.
+    pub video_tier: Option<String>,
+    /// Audio stream action.
+    pub audio: StreamMode,
+    /// Audio encoder name when [`audio`](Self::audio) is [`StreamMode::Software`].
+    pub audio_encoder: Option<String>,
+}
+
+impl SessionDecision {
+    /// Decide both streams for a source whose best video stream is
+    /// `video_codec_id` (0 = no video stream) and best audio stream is
+    /// `audio_codec_id` (0 = no audio stream).
+    ///
+    /// `hw_encoder_available` must mean "found by name *and* `avcodec_open2`
+    /// succeeded" — presence in libavcodec is not proof on device. It is only
+    /// consulted when the video stream must be re-encoded.
+    pub fn decide(
+        preset: &TranscodePreset,
+        video_codec_id: u32,
+        audio_codec_id: u32,
+        hw_encoder_available: bool,
+    ) -> Result<Self, String> {
+        let (video, video_encoder, video_tier) = if video_codec_id == 0 {
+            (StreamMode::None, None, None)
+        } else {
+            match decide_video_action(preset, video_codec_id, hw_encoder_available)? {
+                StreamAction::Copy => (StreamMode::Copy, Some("copy".to_string()), None),
+                StreamAction::Encode {
+                    hardware,
+                    encoder,
+                    tier,
+                } => (
+                    if hardware {
+                        StreamMode::Hardware
+                    } else {
+                        StreamMode::Software
+                    },
+                    Some(encoder.to_string()),
+                    Some(tier.to_string()),
+                ),
+            }
+        };
+        let (audio, audio_encoder) = if audio_codec_id == 0 {
+            (StreamMode::None, None)
+        } else {
+            match decide_audio_action(preset, audio_codec_id) {
+                AudioAction::Copy => (StreamMode::Copy, Some("copy".to_string())),
+                AudioAction::Encode { encoder } => {
+                    (StreamMode::Software, Some(encoder.to_string()))
+                }
+            }
+        };
+        Ok(Self {
+            video,
+            video_encoder,
+            video_tier,
+            audio,
+            audio_encoder,
+        })
+    }
+
+    /// Whether the video stream is copied through unchanged.
+    pub fn video_is_copy(&self) -> bool {
+        self.video == StreamMode::Copy
+    }
+
+    /// Whether the audio stream is copied through unchanged.
+    pub fn audio_is_copy(&self) -> bool {
+        self.audio == StreamMode::Copy
+    }
+
+    /// Whether any stream is present in the output.
+    pub fn has_any_stream(&self) -> bool {
+        self.video != StreamMode::None || self.audio != StreamMode::None
+    }
+
+    /// Status-JSON token for the video stream (`"copy"`/`"hw"`/`"sw"`/`"none"`).
+    pub fn video_action_str(&self) -> &'static str {
+        self.video.as_str()
+    }
+
+    /// Status-JSON token for the audio stream (`"copy"`/`"sw"`/`"none"`).
+    pub fn audio_action_str(&self) -> &'static str {
+        self.audio.as_str()
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -183,8 +316,25 @@ impl ProgressState {
         }
     }
 
-    pub(crate) fn set_encoder(&self, info: EncoderInfo) {
-        *lock(&self.encoder) = info;
+    pub(crate) fn set_encoder(&self, mut info: EncoderInfo) {
+        let mut cur = lock(&self.encoder);
+        // The per-stream action is decided before the job opens any encoder and
+        // is reported alongside the encoder choice, so keep it across updates.
+        if info.video_action.is_none() {
+            info.video_action = cur.video_action.clone();
+        }
+        if info.audio_action.is_none() {
+            info.audio_action = cur.audio_action.clone();
+        }
+        *cur = info;
+    }
+
+    /// Record the per-stream actions reported through the session status JSON
+    /// (contract §11.1): `copy`/`hw`/`sw`/`none`.
+    pub(crate) fn set_actions(&self, video: &str, audio: &str) {
+        let mut enc = lock(&self.encoder);
+        enc.video_action = Some(video.to_string());
+        enc.audio_action = Some(audio.to_string());
     }
 
     pub(crate) fn encoder(&self) -> EncoderInfo {
@@ -412,6 +562,10 @@ pub struct SourcePlan {
     pub video_copied: bool,
     /// Number of keyframes the plan was built from (0 for exact plans).
     pub keyframe_count: usize,
+    /// The per-stream decision this plan was built for. Passing it to every
+    /// [`JobOpts::decision`] of the same session keeps re-opened runs on the
+    /// exact same stream layout (contract §2).
+    pub decision: SessionDecision,
 }
 
 /// Decide the segment plan for `url` and `preset` before any segment is written.
@@ -528,18 +682,26 @@ pub struct JobOpts {
     /// which segment the run was anchored at. Audio-only runs keep the nominal
     /// segment length and use `hls_flags=split_by_time` instead.
     pub hls_time_override_ms: Option<u32>,
+    /// Pre-decided per-stream layout (contract §2).
+    ///
+    /// When `Some`, the job uses it verbatim instead of deciding again — this is
+    /// what keeps a seek / pull-driven restart on the same stream layout as the
+    /// session's first run. When `None`, the job decides from the source codecs
+    /// and the preset.
+    pub decision: Option<SessionDecision>,
 }
 
 impl Default for JobOpts {
     fn default() -> Self {
         Self {
             input_url: String::new(),
-            preset: preset::preset_passthrough(),
+            preset: preset::preset_h264(),
             start_offset_secs: 0.0,
             segment_dir: PathBuf::new(),
             start_number: 0,
             out_dir: None,
             hls_time_override_ms: None,
+            decision: None,
         }
     }
 }
@@ -801,6 +963,7 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
     let start_offset = opts.start_offset_secs;
     let start_number = opts.start_number;
     let hls_time_override_ms = opts.hls_time_override_ms;
+    let decision = opts.decision.clone();
     let dir = segment_dir.clone();
 
     let thread = std::thread::Builder::new()
@@ -817,6 +980,7 @@ pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle> {
                 &id,
                 start_number,
                 hls_time_override_ms,
+                decision,
             )
         })?;
 
@@ -852,19 +1016,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preset_passthrough_is_audio_copy() {
-        let p = preset::preset_passthrough();
-        assert_eq!(p.container, "original");
-        assert_eq!(p.audio_codec, "copy");
-        assert!(!p.remux_first);
+    fn builtin_presets_are_h264_and_hevc() {
+        let all = preset::all_builtin_presets();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "h264");
+        assert_eq!(all[1].id, "hevc");
+        assert!(all.iter().all(|p| p.is_builtin && p.validate().is_ok()));
+    }
+
+    // ── Per-stream decision (contract §2) ────────────────────────────────────
+
+    fn decision_preset() -> TranscodePreset {
+        preset::preset_h264()
     }
 
     #[test]
-    fn all_builtin_presets_have_5() {
-        let all = preset::all_builtin_presets();
-        assert_eq!(all.len(), 5);
-        assert_eq!(all[0].id, "passthrough");
-        assert_eq!(all[4].id, "audio-only");
+    fn decision_copy_copy_when_source_is_mpegts_compatible() {
+        let p = decision_preset();
+        let d = SessionDecision::decide(&p, preset::codec_ids::H264, preset::codec_ids::AAC, false)
+            .expect("decision");
+        assert_eq!(d.video, StreamMode::Copy);
+        assert_eq!(d.audio, StreamMode::Copy);
+        assert_eq!(d.video_action_str(), "copy");
+        assert_eq!(d.audio_action_str(), "copy");
+    }
+
+    #[test]
+    fn decision_encode_copy_uses_the_sw_encoder_and_copies_audio() {
+        let mut p = decision_preset();
+        p.video_copy = false;
+        p.sw_video_tier = "fast".to_string();
+        let d = SessionDecision::decide(&p, preset::codec_ids::HEVC, preset::codec_ids::AAC, false)
+            .expect("decision");
+        assert_eq!(d.video, StreamMode::Software);
+        assert_eq!(d.video_encoder.as_deref(), Some("libx264"));
+        assert_eq!(d.video_tier.as_deref(), Some("fast"));
+        assert_eq!(d.audio, StreamMode::Copy);
+    }
+
+    #[test]
+    fn decision_copy_encode_re_encodes_audio_only() {
+        let mut p = decision_preset();
+        p.audio_codec = "ac3".to_string();
+        let d = SessionDecision::decide(&p, preset::codec_ids::H264, preset::codec_ids::MP2, false)
+            .expect("decision");
+        assert_eq!(d.video, StreamMode::Copy);
+        assert_eq!(d.audio, StreamMode::Software);
+        assert_eq!(d.audio_encoder.as_deref(), Some("ac3"));
+    }
+
+    #[test]
+    fn decision_hardware_when_available() {
+        let mut p = decision_preset();
+        p.video_copy = false;
+        let d = SessionDecision::decide(&p, preset::codec_ids::HEVC, preset::codec_ids::AAC, true)
+            .expect("decision");
+        assert_eq!(d.video, StreamMode::Hardware);
+        assert_eq!(d.video_encoder.as_deref(), Some("h264_mediacodec"));
+    }
+
+    #[test]
+    fn decision_is_deterministic_for_reopened_runs() {
+        let p = decision_preset();
+        let first = SessionDecision::decide(&p, 27, 86018, false).expect("decision");
+        let second = SessionDecision::decide(&p, 27, 86018, false).expect("decision");
+        assert_eq!(first, second, "a reopen must not drift the stream layout");
+    }
+
+    #[test]
+    fn decision_handles_audio_only_and_video_only_sources() {
+        let p = decision_preset();
+        let audio_only =
+            SessionDecision::decide(&p, 0, preset::codec_ids::AAC, false).expect("decision");
+        assert_eq!(audio_only.video, StreamMode::None);
+        assert_eq!(audio_only.video_action_str(), "none");
+        assert!(!audio_only.video_is_copy());
+        assert!(audio_only.has_any_stream());
+
+        let video_only =
+            SessionDecision::decide(&p, preset::codec_ids::H264, 0, false).expect("decision");
+        assert_eq!(video_only.audio, StreamMode::None);
+        assert_eq!(video_only.audio_action_str(), "none");
+        assert!(video_only.has_any_stream());
+    }
+
+    #[test]
+    fn jobopts_default() {
+        let o = JobOpts::default();
+        assert!(o.input_url.is_empty());
+        assert_eq!(o.preset.id, "h264");
+        assert_eq!(o.start_offset_secs, 0.0);
+        assert!(o.decision.is_none());
     }
 
     #[test]
@@ -977,14 +1219,6 @@ mod tests {
             .expect("cancel must wake the pause gate");
         waiter.join().unwrap();
         assert!(stopped, "cancel while paused stops the run");
-    }
-
-    #[test]
-    fn jobopts_default() {
-        let o = JobOpts::default();
-        assert!(o.input_url.is_empty());
-        assert_eq!(o.preset.id, "passthrough");
-        assert_eq!(o.start_offset_secs, 0.0);
     }
 
     // ── Progress telemetry (§1) ───────────────────────────────────────────────

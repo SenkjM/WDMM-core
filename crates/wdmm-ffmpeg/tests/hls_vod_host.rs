@@ -108,7 +108,7 @@ fn vod_job_honours_start_number_out_dir_and_hls_time() {
     let start_number = 7_u64;
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: media.to_string_lossy().into_owned(),
-        preset: wdmm_ffmpeg::preset::preset_dlna_compat(),
+        preset: wdmm_ffmpeg::preset::preset_h264(),
         start_number,
         out_dir: Some(out_dir.clone()),
         hls_time_override_ms: Some(1_600),
@@ -168,7 +168,7 @@ fn transcode_path_produces_a_full_vod_playlist() {
     };
     let out_dir = temp_dir("transcode");
     // dlna-compat tries remux first; a VP9/Opus input can only be transcoded.
-    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let mut preset = wdmm_ffmpeg::preset::preset_h264();
     // The default preset's 4 s segments leave only two segments for this 8 s
     // clip; use 2 s so the assertion actually exercises playlist rotation.
     preset.hls_segment_secs = 2;
@@ -297,7 +297,7 @@ fn audio_only_source_remuxes_to_audio_only_playlist() {
     let out_dir = temp_dir("audio-remux");
     // dlna-compat asks for video, but the source has none: the remux stage must
     // still copy the MPEG-TS-copyable AAC audio instead of re-encoding it.
-    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let mut preset = wdmm_ffmpeg::preset::preset_h264();
     preset.hls_segment_secs = 4;
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: url,
@@ -334,7 +334,7 @@ fn audio_only_source_reencodes_unmuxable_audio() {
         return;
     };
     let out_dir = temp_dir("audio-hybrid");
-    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let mut preset = wdmm_ffmpeg::preset::preset_h264();
     preset.hls_segment_secs = 4;
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: media.to_string_lossy().into_owned(),
@@ -368,8 +368,9 @@ fn audio_only_source_survives_the_transcode_path() {
         return;
     };
     let out_dir = temp_dir("audio-transcode");
-    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
-    preset.remux_first = false; // force the transcode path
+    let mut preset = wdmm_ffmpeg::preset::preset_h264();
+    preset.video_copy = false; // force the transcode path
+    preset.audio_copy = false;
     preset.hls_segment_secs = 4;
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: media.to_string_lossy().into_owned(),
@@ -592,7 +593,7 @@ fn source_plan_reports_the_container_keyframe_grid() {
             continue;
         };
         let url = media.to_string_lossy().into_owned();
-        let preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+        let preset = wdmm_ffmpeg::preset::preset_h264();
         let source = wdmm_ffmpeg::source_plan(&url, &preset)
             .expect("source_plan must not fail for a normal container")
             .unwrap_or_else(|| {
@@ -690,7 +691,7 @@ fn keyframe_plan_matches_muxer_cuts_for_sampled_segments() {
         return;
     };
     let url = media.to_string_lossy().into_owned();
-    let preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let preset = wdmm_ffmpeg::preset::preset_h264();
     let source = wdmm_ffmpeg::source_plan(&url, &preset)
         .expect("source_plan")
         .expect("keyframe plan");
@@ -770,13 +771,15 @@ fn encode_path_cuts_on_the_exact_grid() {
     };
     let url = media.to_string_lossy().into_owned();
     // Force the real re-encode path at a cheap resolution, with a 2 s grid.
-    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
-    preset.remux_first = false;
+    let mut preset = wdmm_ffmpeg::preset::preset_h264();
+    preset.video_copy = false;
+    preset.audio_copy = false;
     preset.hls_segment_secs = 2;
     preset.video_max_w = Some(320);
     preset.video_max_h = Some(180);
     preset.video_fps_cap = Some(15);
-    preset.video_hw_preferred = false;
+    // An empty hardware encoder name forces the software encoder.
+    preset.hw_video_encoder = String::new();
 
     let source = wdmm_ffmpeg::source_plan(&url, &preset)
         .expect("source_plan")
@@ -873,7 +876,7 @@ fn source_plan_refuses_a_truncated_keyframe_index() {
         return;
     };
     let url = media.to_string_lossy().into_owned();
-    let preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let preset = wdmm_ffmpeg::preset::preset_h264();
     let plan = wdmm_ffmpeg::source_plan(&url, &preset)
         .expect("source_plan must degrade, not fail")
         .map(|source| source.plan.alignment);
@@ -893,13 +896,15 @@ fn source_plan_refuses_a_truncated_keyframe_index() {
 /// Encoder preset that runs long enough (hundreds of segments) to observe a
 /// pause; a stream-copy job can finish in a fraction of a second.
 fn long_running_preset() -> wdmm_core::models::TranscodePreset {
-    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
-    preset.remux_first = false;
+    let mut preset = wdmm_ffmpeg::preset::preset_h264();
+    preset.video_copy = false;
+    preset.audio_copy = false;
     preset.hls_segment_secs = 2;
     preset.video_max_w = Some(320);
     preset.video_max_h = Some(180);
     preset.video_fps_cap = Some(15);
-    preset.video_hw_preferred = false;
+    // An empty hardware encoder name forces the software encoder.
+    preset.hw_video_encoder = String::new();
     preset
 }
 

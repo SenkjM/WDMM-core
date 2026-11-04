@@ -156,36 +156,75 @@ pub struct QueueTask {
 }
 
 
-// ── Transcode presets (B3.5) ──────────────────────────────────────────────────
+// ── Transcode presets (B3.5, schema v13) ─────────────────────────────────────
 
-/// A DLNA cast transcode preset. Canonical type shared by wdmm-storage and
-/// wdmm-ffmpeg. See `wdmm-storage` schema v11 for the DB layout.
+/// Hardware (MediaCodec) video encoders a preset may select in
+/// [`TranscodePreset::hw_video_encoder`].
+pub const HW_VIDEO_ENCODERS: [&str; 3] = ["h264_mediacodec", "hevc_mediacodec", "mpeg4_mediacodec"];
+
+/// Software video encoders a preset may select in
+/// [`TranscodePreset::sw_video_encoder`].
 ///
-/// `video_codec = None`      → audio-only (no video stream).
-/// `container  = "original"` → pass-through without re-muxing.
-/// `audio_codec = "copy"`    → copy audio unchanged.
+/// There is deliberately no `libx265`: software HEVC encoding is not shipped.
+pub const SW_VIDEO_ENCODERS: [&str; 3] = ["libx264", "mpeg2video", "mpeg4"];
+
+/// Speed/quality tiers a preset may select in `hw_video_tier`/`sw_video_tier`.
+pub const VIDEO_TIERS: [&str; 3] = ["fast", "balanced", "quality"];
+
+/// Output audio codecs a preset may select in [`TranscodePreset::audio_codec`].
+pub const AUDIO_CODECS: [&str; 4] = ["aac", "ac3", "eac3", "mp2"];
+
+/// A DLNA cast transcode preset. Canonical type shared by wdmm-storage,
+/// wdmm-ffmpeg and the FFI layer. See `wdmm-storage` schema v13 for the DB
+/// layout.
+///
+/// The video side is decided in three layers, in this order:
+///
+/// 1. **copy** — [`video_copy`](Self::video_copy): pass the source stream
+///    through when MPEG-TS can carry it (no re-encode at all);
+/// 2. **hardware encode** — [`hw_video_encoder`](Self::hw_video_encoder)
+///    (empty = disabled) with the [`hw_video_tier`](Self::hw_video_tier) knobs;
+/// 3. **software encode** — [`sw_video_encoder`](Self::sw_video_encoder)
+///    (empty = disabled), the fallback when hardware is missing or fails.
+///
+/// Audio has its own two-state copy/encode switch ([`audio_copy`](Self::audio_copy)).
+/// HLS output is always MPEG-TS fragments — pass-through is a session-level
+/// `forceDirect` decision, not a preset field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscodePreset {
-    /// Stable identifier (e.g. `"dlna-compat"`, `"passthrough"`).
+    /// Stable identifier (e.g. `"h264"`, `"hevc"`).
     pub id: String,
     /// Human-readable label shown in the UI.
     pub label: String,
-    /// Output container: `"mpegts"`, `"mp4"`, or `"original"`.
-    pub container: String,
-    /// Video codec: `"h264"` → tries `h264_mediacodec`, then `libx264`.
-    /// `None` = audio-only.
-    pub video_codec: Option<String>,
-    /// Prefer hardware encoder (`h264_mediacodec`) before `libx264`.
-    pub video_hw_preferred: bool,
+    // ── ① copy layer (highest priority) ─────────────────────────────────────
+    /// Allow the video stream to be copied when the source codec is MPEG-TS
+    /// compatible.
+    pub video_copy: bool,
+    /// Allow the audio stream to be copied when the source codec is MPEG-TS
+    /// compatible.
+    pub audio_copy: bool,
+    // ── ② hardware encoder layer ("" = disabled) ────────────────────────────
+    /// MediaCodec encoder name, one of [`HW_VIDEO_ENCODERS`] or `""`.
+    pub hw_video_encoder: String,
+    /// Speed/quality tier for the hardware encoder, one of [`VIDEO_TIERS`].
+    pub hw_video_tier: String,
+    // ── ③ software encoder fallback ("" = disabled) ─────────────────────────
+    /// Software encoder name, one of [`SW_VIDEO_ENCODERS`] or `""`.
+    pub sw_video_encoder: String,
+    /// Speed/quality tier for the software encoder, one of [`VIDEO_TIERS`].
+    pub sw_video_tier: String,
+    // ── output envelope (independent of the layer) ──────────────────────────
     /// Max output width px (scale-down only). `None` = no limit.
     pub video_max_w: Option<u32>,
     /// Max output height px. `None` = no limit.
     pub video_max_h: Option<u32>,
-    /// Max video bitrate bits/s. `None` = no limit.
+    /// Max video bitrate bits/s. `None` = derive from the envelope.
     pub video_max_bitrate: Option<u32>,
     /// Frame-rate cap (e.g. 30). `None` = no cap.
     pub video_fps_cap: Option<u32>,
-    /// Audio codec: `"aac"`, `"mp3"`, or `"copy"`.
+    // ── audio ───────────────────────────────────────────────────────────────
+    /// Audio codec used when [`audio_copy`](Self::audio_copy) is off: one of
+    /// [`AUDIO_CODECS`].
     pub audio_codec: String,
     /// Audio bitrate bits/s (e.g. `128_000`).
     pub audio_bitrate: u32,
@@ -193,12 +232,50 @@ pub struct TranscodePreset {
     pub audio_channels: u8,
     /// Output sample rate Hz. `None` = keep source.
     pub audio_sample_rate: Option<u32>,
+    // ── session ─────────────────────────────────────────────────────────────
     /// HLS segment duration in seconds.
     pub hls_segment_secs: u32,
-    /// Try remux (copy streams) before falling back to transcode.
-    pub remux_first: bool,
     /// UI sort order (lower = earlier).
-    pub sort_order: u32,
-    /// `true` for the 5 factory presets.
+    pub sort_order: i64,
+    /// `true` for the factory presets (`h264`, `hevc`).
     pub is_builtin: bool,
+    /// Last edit time, seconds since the Unix epoch.
+    pub updated_at: i64,
+}
+
+impl TranscodePreset {
+    /// Check the enum-like string fields against the contract's allowed
+    /// literals and require at least one usable video path unless
+    /// [`video_copy`](Self::video_copy) is enabled.
+    ///
+    /// Returns the user-facing error message (the FFI/storage layers prefix
+    /// it with `error:`), e.g. `unknown encoder: libx265`.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.hw_video_encoder.is_empty()
+            && !HW_VIDEO_ENCODERS.contains(&self.hw_video_encoder.as_str())
+        {
+            return Err(format!("unknown encoder: {}", self.hw_video_encoder));
+        }
+        if !self.sw_video_encoder.is_empty()
+            && !SW_VIDEO_ENCODERS.contains(&self.sw_video_encoder.as_str())
+        {
+            return Err(format!("unknown encoder: {}", self.sw_video_encoder));
+        }
+        if !VIDEO_TIERS.contains(&self.hw_video_tier.as_str()) {
+            return Err(format!("unknown tier: {}", self.hw_video_tier));
+        }
+        if !VIDEO_TIERS.contains(&self.sw_video_tier.as_str()) {
+            return Err(format!("unknown tier: {}", self.sw_video_tier));
+        }
+        if !self.has_usable_video_path() {
+            return Err("no usable video path".to_string());
+        }
+        Ok(())
+    }
+
+    /// `true` when at least one of the three video layers can produce output:
+    /// copy is allowed, or a hardware/software encoder is configured.
+    pub fn has_usable_video_path(&self) -> bool {
+        self.video_copy || !self.hw_video_encoder.is_empty() || !self.sw_video_encoder.is_empty()
+    }
 }

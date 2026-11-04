@@ -2198,8 +2198,9 @@ pub extern "C" fn wdmm_transcode_preset_save(json: *const c_char) -> FfiString {
 /// Delete a transcode preset by ID.
 ///
 /// Built-in presets (`is_builtin = true`) are not deleted; the call returns
-/// `"error:builtin"` in that case.  Returns `"ok"` or `"error:<message>"`.
-/// Caller must free the result.
+/// `"error:builtin"` in that case (the UI hides delete and offers
+/// [`wdmm_transcode_preset_reset`] instead). Returns `"ok"` or
+/// `"error:<message>"`. Caller must free the result.
 ///
 /// # Safety
 /// `id` must be a valid null-terminated UTF-8 C string.
@@ -2211,6 +2212,36 @@ pub extern "C" fn wdmm_transcode_preset_delete(id: *const c_char) -> FfiString {
     };
     let db = global_library_db();
     match db.delete_transcode_preset(s) {
+        Ok(()) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Restore one built-in preset to its factory values.
+///
+/// A built-in preset is editable (unlike user presets, which the user can
+/// simply delete), so the edit UI offers a per-item "restore defaults". This
+/// writes the factory values from `wdmm_ffmpeg::preset::builtin_preset`
+/// directly — it does not read the old row back, because the old row is the
+/// very thing being reset.
+///
+/// `id` must be `"h264"` or `"hevc"`; anything else returns
+/// `"error:unknown builtin preset: <id>"`. Returns `"ok"` on success.
+/// Caller must free the result.
+///
+/// # Safety
+/// `id` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_transcode_preset_reset(id: *const c_char) -> FfiString {
+    let s = match ptr_to_str(id) {
+        Some(s) => s,
+        None => return FfiString::from("error:invalid id pointer"),
+    };
+    let Some(preset) = wdmm_ffmpeg::preset::builtin_preset(s) else {
+        return FfiString::from(format!("error:unknown builtin preset: {s}"));
+    };
+    let db = global_library_db();
+    match db.save_transcode_preset(&preset) {
         Ok(()) => FfiString::ok(),
         Err(e) => FfiString::from(format!("error:{e}")),
     }

@@ -55,6 +55,34 @@ pub fn unsupported_reason(codec: &str) -> Option<&'static str> {
     }
 }
 
+/// Container extensions whose embedded subtitle tracks are probed for a cast.
+///
+/// Probing opens the source file and enumerates its subtitle tracks. That is
+/// cheap enough for MP4-family sources and pays off: an HLS cast cannot carry
+/// the container's tracks, so text tracks are extracted and side-loaded as
+/// WebVTT. Matroska/WebM/AVI/TS sources routinely carry dozens of tracks (30+
+/// language variants are common), enumerating them is the most expensive part
+/// of cast preparation, and those sources are cast direct so the renderer
+/// demuxes its own tracks. They therefore get the external sidecar scan only
+/// (contract `.tmp/contract/preset-encoder-tiers.md` §8).
+pub const MP4_FAMILY_EXTS: &[&str] = &["mp4", "m4v", "mov", "3gp", "3g2", "m4a", "m4b", "mp4a"];
+
+/// Whether `name` is an MP4-family container, i.e. one whose embedded subtitle
+/// tracks may be probed for an HLS cast.
+///
+/// `name` may be a plain file name or a `/`-separated remote path; a trailing
+/// `?query` / `#fragment` (WebDAV/DLNA signed URLs sometimes carry one) is
+/// ignored. Case-insensitive. A name without an extension is not MP4-family.
+pub fn container_supports_embedded_subs(name: &str) -> bool {
+    let name = name.split(['?', '#']).next().unwrap_or(name);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            MP4_FAMILY_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+        }
+        _ => false,
+    }
+}
+
 /// Normalize decoded subtitle text: drop ASS override tags, normalize line
 /// breaks, trim trailing blanks and collapse blank lines.
 ///
@@ -390,5 +418,52 @@ mod tests {
     #[test]
     fn empty_track_is_still_valid_webvtt() {
         assert_eq!(to_webvtt(&[]), "WEBVTT\n\n");
+    }
+
+    #[test]
+    fn only_mp4_family_containers_support_embedded_probing() {
+        for name in [
+            "movie.mp4",
+            "MOVIE.MP4",
+            "clip.m4v",
+            "trailer.mov",
+            "shot.3gp",
+            "old.3g2",
+            "song.m4a",
+            "book.m4b",
+            "audio.mp4a",
+            "/Remote/Downloads/Movie.Mov",
+            "movie.mp4?token=abc123",
+            // A synthetic embedded candidate path must not crash the check.
+            "movie.MP4#embedded:2",
+        ] {
+            assert!(
+                container_supports_embedded_subs(name),
+                "{name} should be MP4-family"
+            );
+        }
+
+        for name in [
+            "movie.mkv",
+            "MOVIE.MKV",
+            "movie.webm",
+            "movie.avi",
+            "movie.ts",
+            "movie.m2ts",
+            "movie.flv",
+            "movie.wmv",
+            "movie.mpg",
+            "movie.mka",
+            "movie.srt",
+            "movie.mp4.srt",
+            "no_extension",
+            "",
+            ".mp4",
+        ] {
+            assert!(
+                !container_supports_embedded_subs(name),
+                "{name} must not be probed for embedded subtitles"
+            );
+        }
     }
 }

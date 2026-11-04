@@ -9,8 +9,9 @@
 //! content type is the real subtitle MIME type. Kodi's UPnP renderer
 //! (`UPnPInternal.cpp` `GetResource` + `SupportedSubFormats`) only accepts a
 //! subtitle resource when the MIME **subtype** is the actual format (`srt`,
-//! `ass`, `ssa`, `vtt`, `sub`) — it logs `adding subtitle: #N, type '<t>'` and
-//! hands the URL to the player. A `text/plain` resource is silently ignored.
+//! `ass`, `ssa`, `vtt`, `sub`, `smi`) — it logs `adding subtitle: #N, type
+//! '<t>'` and hands the URL to the player. A `text/plain` resource is silently
+//! ignored.
 
 /// Content type (`text/<ext>`) Kodi accepts for a sidecar subtitle extension.
 ///
@@ -23,6 +24,8 @@ pub fn subtitle_content_type(ext: &str) -> Option<&'static str> {
         "ssa" => "text/ssa",
         "vtt" => "text/vtt",
         "sub" => "text/sub",
+        // Kodi's `SupportedSubFormats` also accepts `smi` (`<SAMI>` text files).
+        "smi" => "text/smi",
         _ => return None,
     })
 }
@@ -155,6 +158,7 @@ mod tests {
             ("ssa", "text/ssa"),
             ("vtt", "text/vtt"),
             ("sub", "text/sub"),
+            ("SMI", "text/smi"),
         ] {
             assert_eq!(
                 subtitle_protocol_info(ext).as_deref(),

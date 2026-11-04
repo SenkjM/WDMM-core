@@ -1,8 +1,20 @@
-//! Pure remux / hybrid / transcode decision logic.
+//! Pure remux / copy / encode decision logic for the three-layer preset model.
 //!
 //! These helpers involve no libav calls, so they compile (and are unit-tested)
 //! on a host build without the `ffmpeg` feature — the Windows host has no
 //! libav, which is exactly where the decision rules must be provable.
+//!
+//! The model is (see `preset-encoder-tiers` contract §1–§3):
+//!
+//! 1. copy the source stream when MPEG-TS can carry it and the preset allows it;
+//! 2. otherwise encode with the preset's MediaCodec (hardware) encoder;
+//! 3. otherwise encode with the preset's software encoder.
+//!
+//! [`decide_video_action`] / [`decide_audio_action`] implement that order for
+//! one stream. The caller decides each stream once per session and caches the
+//! result — reopen/seek restarts must reuse the same decision.
+
+use wdmm_core::models::TranscodePreset;
 
 /// What the cheap remux stage should do for the selected best streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,124 +72,205 @@ pub fn remux_dropped_streams(best_video: i32, best_audio: i32, nb_streams: usize
         .collect()
 }
 
-/// Audio codec used when the hybrid path has to re-encode the audio track.
-/// The preset's `"copy"` choice is impossible in hybrid mode, so it maps to AAC.
-pub fn hybrid_audio_codec_id(audio_codec: &str) -> u32 {
-    if audio_codec == "mp3" {
-        crate::sys::AV_CODEC_ID_MP3
-    } else {
-        crate::sys::AV_CODEC_ID_AAC
-    }
-}
+// ── Three-layer stream decisions (contract §2) ───────────────────────────────
 
-// ── Video encoder selection (hardware MediaCodec vs. libx264) ────────────────
-
-/// MediaCodec H.264 encoder name.
-pub const HW_H264_ENCODER: &str = "h264_mediacodec";
-/// MediaCodec H.265/HEVC encoder name.
-pub const HW_HEVC_ENCODER: &str = "hevc_mediacodec";
-/// Software H.264 encoder name (the universal fallback).
-pub const SW_H264_ENCODER: &str = "libx264";
-
-/// Hardware encoder to request for the preset's video codec.
-///
-/// Only an explicit HEVC request selects `hevc_mediacodec`; everything else
-/// (including `None`) keeps the H.264 path — the codec is never switched
-/// silently.
-pub fn hw_video_encoder_name(video_codec: Option<&str>) -> &'static str {
-    match video_codec {
-        Some(codec) if codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265") => {
-            HW_HEVC_ENCODER
-        }
-        _ => HW_H264_ENCODER,
-    }
-}
-
-/// Why the transcode path ended up on the software encoder (if it did).
+/// Decision for one video stream, fixed once per session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SoftwareReason {
-    /// The preset did not ask for hardware encoding.
-    NotPreferred,
-    /// The requested MediaCodec encoder is not compiled into libavcodec.
-    HardwareUnavailable,
-    /// The encoder exists but `avcodec_open2` failed (device codec missing or
-    /// configuration rejected).
-    HardwareOpenFailed,
-}
-
-/// Video encoder chosen for the transcode path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoEncoderChoice {
-    /// A MediaCodec encoder that already opened successfully.
-    Hardware { name: &'static str },
-    /// libx264, with the reason hardware was not used.
-    Software {
-        name: &'static str,
-        reason: SoftwareReason,
+pub enum StreamAction<'a> {
+    /// Pass the source bitstream through unchanged (MPEG-TS compatible codec).
+    Copy,
+    /// Re-encode; `encoder` is a name accepted by
+    /// `avcodec_find_encoder_by_name`, `tier` is the preset's
+    /// `fast`/`balanced`/`quality` knob string.
+    Encode {
+        /// `true` for a MediaCodec (hardware) encoder, `false` for software.
+        hardware: bool,
+        /// Encoder name from the preset (`""` never appears here).
+        encoder: &'a str,
+        /// Tier string from the preset.
+        tier: &'a str,
     },
 }
 
-/// Decide which video encoder to use after probing.
-///
-/// `hw_codec_present` is `avcodec_find_encoder_by_name(...) != NULL`;
-/// `hw_open_ok` is a real `avcodec_open2` success. Hardware is only chosen when
-/// both are true — presence alone is not proof that the device codec works.
-pub fn choose_video_encoder(
-    video_codec: Option<&str>,
-    hw_preferred: bool,
-    hw_codec_present: bool,
-    hw_open_ok: bool,
-) -> VideoEncoderChoice {
-    if !hw_preferred {
-        return VideoEncoderChoice::Software {
-            name: SW_H264_ENCODER,
-            reason: SoftwareReason::NotPreferred,
-        };
+impl<'a> StreamAction<'a> {
+    /// `true` for [`StreamAction::Copy`].
+    pub fn is_copy(&self) -> bool {
+        matches!(self, StreamAction::Copy)
     }
-    if !hw_codec_present {
-        return VideoEncoderChoice::Software {
-            name: SW_H264_ENCODER,
-            reason: SoftwareReason::HardwareUnavailable,
-        };
+
+    /// Encoder name when encoding, `None` for copy.
+    pub fn encoder_name(&self) -> Option<&'a str> {
+        match self {
+            StreamAction::Copy => None,
+            StreamAction::Encode { encoder, .. } => Some(encoder),
+        }
     }
-    if !hw_open_ok {
-        return VideoEncoderChoice::Software {
-            name: SW_H264_ENCODER,
-            reason: SoftwareReason::HardwareOpenFailed,
-        };
-    }
-    VideoEncoderChoice::Hardware {
-        name: hw_video_encoder_name(video_codec),
+
+    /// Tier string when encoding, `None` for copy.
+    pub fn tier(&self) -> Option<&'a str> {
+        match self {
+            StreamAction::Copy => None,
+            StreamAction::Encode { tier, .. } => Some(tier),
+        }
     }
 }
 
-/// Never-silent fallback message for `EncoderInfo.warnings` / the diag log.
+/// Decision for one audio stream, fixed once per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioAction<'a> {
+    /// Pass the source audio through unchanged (MPEG-TS compatible codec).
+    Copy,
+    /// Re-encode with the preset's `audio_codec` (`aac`/`ac3`/`eac3`/`mp2`).
+    Encode { encoder: &'a str },
+}
+
+impl<'a> AudioAction<'a> {
+    /// `true` for [`AudioAction::Copy`].
+    pub fn is_copy(&self) -> bool {
+        matches!(self, AudioAction::Copy)
+    }
+
+    /// Encoder name when encoding, `None` for copy.
+    pub fn encoder_name(&self) -> Option<&'a str> {
+        match self {
+            AudioAction::Copy => None,
+            AudioAction::Encode { encoder } => Some(encoder),
+        }
+    }
+}
+
+/// Decide the video action for a source stream (contract §2).
 ///
-/// Returns `None` when no fallback happened (hardware was used, or the preset
-/// never asked for hardware). The fallback reason is always spelled out.
-pub fn fallback_warning(
-    choice: VideoEncoderChoice,
-    requested_hw: &str,
-    open_error: Option<&str>,
-) -> Option<String> {
-    match choice {
-        VideoEncoderChoice::Hardware { .. } => None,
-        VideoEncoderChoice::Software {
-            reason: SoftwareReason::NotPreferred,
-            ..
-        } => None,
-        VideoEncoderChoice::Software {
-            reason: SoftwareReason::HardwareUnavailable,
-            ..
-        } => Some(format!("{requested_hw} 不可用，已回退 {SW_H264_ENCODER}")),
-        VideoEncoderChoice::Software {
-            reason: SoftwareReason::HardwareOpenFailed,
-            ..
+/// Order: copy (when allowed and MPEG-TS compatible) → hardware encode (when
+/// configured *and* the device encoder is available) → software encode →
+/// error. `hw_encoder_available` is the caller's `avcodec_find_encoder_by_name`
+/// probe plus a successful `avcodec_open2` attempt; presence alone is not proof
+/// that the device codec works.
+pub fn decide_video_action<'a>(
+    preset: &'a TranscodePreset,
+    source_codec_id: u32,
+    hw_encoder_available: bool,
+) -> Result<StreamAction<'a>, String> {
+    if preset.video_copy && crate::preset::is_mpegts_video_copy_compatible(source_codec_id) {
+        return Ok(StreamAction::Copy);
+    }
+    if !preset.hw_video_encoder.is_empty() && hw_encoder_available {
+        return Ok(StreamAction::Encode {
+            hardware: true,
+            encoder: &preset.hw_video_encoder,
+            tier: &preset.hw_video_tier,
+        });
+    }
+    if !preset.sw_video_encoder.is_empty() {
+        return Ok(StreamAction::Encode {
+            hardware: false,
+            encoder: &preset.sw_video_encoder,
+            tier: &preset.sw_video_tier,
+        });
+    }
+    Err(format!(
+        "no video encoder available for preset {}",
+        preset.id
+    ))
+}
+
+/// Decide the audio action for a source stream (contract §2).
+///
+/// Audio has no hardware encoder: copy when allowed and MPEG-TS compatible,
+/// otherwise encode with the preset's `audio_codec`. Audio-only sources (no
+/// video stream) still go through this same decision.
+pub fn decide_audio_action<'a>(
+    preset: &'a TranscodePreset,
+    source_codec_id: u32,
+) -> AudioAction<'a> {
+    if preset.audio_copy && crate::preset::is_mpegts_audio_copy_compatible(source_codec_id) {
+        return AudioAction::Copy;
+    }
+    AudioAction::Encode {
+        encoder: &preset.audio_codec,
+    }
+}
+
+/// `true` when a software fallback downgrades the intended HEVC output to
+/// H.264 (software HEVC encoding is not shipped, contract §2).
+///
+/// Callers must log `video: sw fallback downgrades hevc to h264` when this is
+/// true and the software branch actually runs.
+pub fn sw_fallback_downgrades_hevc(preset: &TranscodePreset) -> bool {
+    preset.hw_video_encoder == "hevc_mediacodec" && preset.sw_video_encoder == "libx264"
+}
+
+// ── Tier mapping (contract §3) ───────────────────────────────────────────────
+
+/// `x264` `preset` value for a tier (`fast|balanced|quality`).
+///
+/// Returns `None` for unknown tiers: the caller then keeps libx264's default
+/// rather than guessing.
+pub fn x264_preset_for_tier(tier: &str) -> Option<&'static str> {
+    match tier {
+        "fast" => Some("veryfast"),
+        "balanced" => Some("medium"),
+        "quality" => Some("slow"),
+        _ => None,
+    }
+}
+
+/// Bitrate multiplier for a tier: faster tiers spend less bitrate for the same
+/// quality target. Unknown tiers fall back to `1.0` (no adjustment).
+pub fn bitrate_factor_for_tier(tier: &str) -> f64 {
+    match tier {
+        "fast" => 0.85,
+        "quality" => 1.35,
+        _ => 1.0,
+    }
+}
+
+/// Default video bitrate used when the preset does not set one:
+/// `width * height * fps * 0.10`, floored at 800 kbit/s.
+pub fn default_video_bitrate(width: u32, height: u32, fps: f64) -> u32 {
+    let fps = if fps.is_finite() && fps > 0.0 {
+        fps
+    } else {
+        30.0
+    };
+    let derived = (f64::from(width) * f64::from(height) * fps * 0.10).round();
+    (derived as u64).max(800_000) as u32
+}
+
+/// Effective video bitrate for one tier: `(video_max_bitrate or the envelope
+/// default) * bitrate_factor_for_tier(tier)`.
+pub fn target_video_bitrate_for_tier(
+    preset: &TranscodePreset,
+    width: u32,
+    height: u32,
+    fps: f64,
+    tier: &str,
+) -> u32 {
+    let base = preset
+        .video_max_bitrate
+        .unwrap_or_else(|| default_video_bitrate(width, height, fps));
+    (f64::from(base) * bitrate_factor_for_tier(tier))
+        .round()
+        .max(1.0) as u32
+}
+
+/// One-line diag for the decided video layer (contract §3): emitted once per
+/// session.
+pub fn video_plan_diag(action: StreamAction<'_>, bitrate: u32) -> String {
+    match action {
+        StreamAction::Copy => format!(
+            "video plan: action=copy encoder=none tier=none x264_preset=none bitrate={bitrate}"
+        ),
+        StreamAction::Encode {
+            hardware,
+            encoder,
+            tier,
         } => {
-            let err = open_error.unwrap_or("unknown error");
-            Some(format!(
-                "{requested_hw} 打开失败（{err}），已回退 {SW_H264_ENCODER}"
-            ))
+            let action = if hardware { "hw" } else { "sw" };
+            let x264 = x264_preset_for_tier(tier).unwrap_or("none");
+            format!(
+                "video plan: action={action} encoder={encoder} tier={tier} x264_preset={x264} bitrate={bitrate}"
+            )
         }
     }
 }
@@ -238,51 +331,48 @@ pub fn segment_gop_size(fps_num: i32, fps_den: i32, seg_secs: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Codec ids used by the tests (AVCodecID values). Video ids shift across
-    // libav major versions (FFmpeg 9.0: HEVC 173→172, VP9 167→166,
-    // AV1 226→222); re-verify on every libav bump.
-    const H264: u32 = 27;
-    const VP9: u32 = 166;
-    const HEVC: u32 = 172;
-    const AV1: u32 = 222;
-    const MPEG2: u32 = 2;
-    const MP3: u32 = 86017;
-    const AAC: u32 = 86018;
-    const AC3: u32 = 86019;
-    const EAC3: u32 = 86056;
-    const FLAC: u32 = 86028;
-    const OPUS: u32 = 86076;
+    use crate::preset::{codec_ids, preset_h264, preset_hevc};
 
     #[test]
     fn remux_plan_matrix_matches_stream_compatibility() {
+        use codec_ids::*;
         // Both copyable → pure remux.
         assert_eq!(remux_plan(Some(H264), Some(AAC)), RemuxPlan::Remux);
         assert_eq!(remux_plan(Some(HEVC), Some(AC3)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(Some(MPEG2), Some(EAC3)), RemuxPlan::Remux);
+        assert_eq!(remux_plan(Some(MPEG2VIDEO), Some(EAC3)), RemuxPlan::Remux);
         assert_eq!(remux_plan(Some(H264), Some(MP3)), RemuxPlan::Remux);
-        // Video copyable, audio not → hybrid (the Feibanyama HEVC+Opus case).
-        assert_eq!(remux_plan(Some(H264), Some(OPUS)), RemuxPlan::Hybrid);
-        assert_eq!(remux_plan(Some(HEVC), Some(FLAC)), RemuxPlan::Hybrid);
-        assert_eq!(remux_plan(Some(MPEG2), Some(OPUS)), RemuxPlan::Hybrid);
+        // Video copyable, audio not → hybrid (the HEVC+Opus case).
+        assert_eq!(remux_plan(Some(H264), Some(OPUS_ID)), RemuxPlan::Hybrid);
+        assert_eq!(remux_plan(Some(HEVC), Some(FLAC_ID)), RemuxPlan::Hybrid);
         // Video not copyable → full transcode.
-        assert_eq!(remux_plan(Some(VP9), Some(OPUS)), RemuxPlan::Transcode);
-        assert_eq!(remux_plan(Some(AV1), Some(AAC)), RemuxPlan::Transcode);
+        assert_eq!(
+            remux_plan(Some(VP9_ID), Some(OPUS_ID)),
+            RemuxPlan::Transcode
+        );
+        assert_eq!(remux_plan(Some(AV1_ID), Some(AAC)), RemuxPlan::Transcode);
         // No audio is fine: video-only remux.
         assert_eq!(remux_plan(Some(H264), None), RemuxPlan::Remux);
         assert_eq!(remux_plan(None, None), RemuxPlan::Transcode);
     }
 
+    // Codecs not modelled by the preset layer; values are only used by these
+    // tests (FFmpeg 9.0 numbering, see `preset::codec_ids`).
+    const VP9_ID: u32 = 166;
+    const AV1_ID: u32 = 222;
+    const OPUS_ID: u32 = 86076;
+    const FLAC_ID: u32 = 86028;
+
     #[test]
     fn audio_only_sources_stay_on_the_cheap_path() {
+        use codec_ids::*;
         // Audio-only source (no video stream): copy the audio when MPEG-TS can
         // carry it, otherwise hybrid re-encodes only the audio.
         assert_eq!(remux_plan(None, Some(AAC)), RemuxPlan::Remux);
         assert_eq!(remux_plan(None, Some(MP3)), RemuxPlan::Remux);
         assert_eq!(remux_plan(None, Some(AC3)), RemuxPlan::Remux);
         assert_eq!(remux_plan(None, Some(EAC3)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(None, Some(OPUS)), RemuxPlan::Hybrid);
-        assert_eq!(remux_plan(None, Some(FLAC)), RemuxPlan::Hybrid);
+        assert_eq!(remux_plan(None, Some(OPUS_ID)), RemuxPlan::Hybrid);
+        assert_eq!(remux_plan(None, Some(FLAC_ID)), RemuxPlan::Hybrid);
         // Nothing playable at all still falls back to the transcode path.
         assert_eq!(remux_plan(None, None), RemuxPlan::Transcode);
     }
@@ -305,83 +395,170 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_audio_codec_is_aac_or_mp3() {
-        assert_eq!(hybrid_audio_codec_id("mp3"), MP3);
-        assert_eq!(hybrid_audio_codec_id("aac"), AAC);
-        // Any other preset audio codec falls back to AAC for the hybrid path.
-        assert_eq!(hybrid_audio_codec_id("opus"), AAC);
-        assert_eq!(hybrid_audio_codec_id("copy"), AAC);
-    }
+    fn four_quadrants_are_decidable() {
+        // The built-ins allow copy, so a compatible source copies both streams.
+        let preset = preset_h264();
+        assert_eq!(
+            decide_video_action(&preset, codec_ids::H264, true),
+            Ok(StreamAction::Copy)
+        );
+        assert_eq!(
+            decide_audio_action(&preset, codec_ids::AAC),
+            AudioAction::Copy
+        );
 
-    #[test]
-    fn hardware_encoder_name_follows_the_preset_codec() {
-        assert_eq!(hw_video_encoder_name(Some("h264")), HW_H264_ENCODER);
-        assert_eq!(hw_video_encoder_name(Some("H264")), HW_H264_ENCODER);
-        assert_eq!(hw_video_encoder_name(Some("hevc")), HW_HEVC_ENCODER);
-        assert_eq!(hw_video_encoder_name(Some("h265")), HW_HEVC_ENCODER);
-        // No explicit codec request keeps H.264 — never silently switch codecs.
-        assert_eq!(hw_video_encoder_name(None), HW_H264_ENCODER);
-    }
+        // copy + encode: video copies, Opus audio must be re-encoded.
+        assert_eq!(
+            decide_video_action(&preset, codec_ids::H264, true),
+            Ok(StreamAction::Copy)
+        );
+        assert_eq!(
+            decide_audio_action(&preset, OPUS_ID),
+            AudioAction::Encode { encoder: "aac" }
+        );
 
-    #[test]
-    fn video_encoder_choice_prefers_opened_hardware() {
-        // H.264 preset + hardware preferred + present + opened → hardware.
+        // encode + copy: VP9 video cannot be copied, AAC audio can.
         assert_eq!(
-            choose_video_encoder(Some("h264"), true, true, true),
-            VideoEncoderChoice::Hardware {
-                name: HW_H264_ENCODER
-            }
+            decide_video_action(&preset, VP9_ID, true),
+            Ok(StreamAction::Encode {
+                hardware: true,
+                encoder: "h264_mediacodec",
+                tier: "balanced",
+            })
         );
-        // Explicit HEVC request selects the HEVC encoder.
         assert_eq!(
-            choose_video_encoder(Some("hevc"), true, true, true),
-            VideoEncoderChoice::Hardware {
-                name: HW_HEVC_ENCODER
-            }
+            decide_audio_action(&preset, codec_ids::AAC),
+            AudioAction::Copy
         );
-        // Not preferred → software, and the reason says so.
+
+        // encode + encode: VP9 video + Opus audio both re-encoded.
         assert_eq!(
-            choose_video_encoder(Some("h264"), false, true, true),
-            VideoEncoderChoice::Software {
-                name: SW_H264_ENCODER,
-                reason: SoftwareReason::NotPreferred
-            }
+            decide_video_action(&preset, VP9_ID, false),
+            Ok(StreamAction::Encode {
+                hardware: false,
+                encoder: "libx264",
+                tier: "balanced",
+            })
         );
-        // Missing from libavcodec → software.
         assert_eq!(
-            choose_video_encoder(Some("h264"), true, false, false),
-            VideoEncoderChoice::Software {
-                name: SW_H264_ENCODER,
-                reason: SoftwareReason::HardwareUnavailable
-            }
-        );
-        // Present but the device codec could not be opened → software; presence
-        // alone must never be treated as usable.
-        assert_eq!(
-            choose_video_encoder(Some("hevc"), true, true, false),
-            VideoEncoderChoice::Software {
-                name: SW_H264_ENCODER,
-                reason: SoftwareReason::HardwareOpenFailed
-            }
+            decide_audio_action(&preset, OPUS_ID),
+            AudioAction::Encode { encoder: "aac" }
         );
     }
 
     #[test]
-    fn fallback_warnings_are_never_silent() {
-        let hw = choose_video_encoder(Some("h264"), true, true, true);
-        assert_eq!(fallback_warning(hw, HW_H264_ENCODER, None), None);
-        let not_preferred = choose_video_encoder(Some("h264"), false, true, true);
-        assert_eq!(fallback_warning(not_preferred, HW_H264_ENCODER, None), None);
-        let unavailable = choose_video_encoder(Some("h264"), true, false, false);
-        let msg = fallback_warning(unavailable, HW_H264_ENCODER, None).unwrap();
-        assert!(msg.contains(HW_H264_ENCODER), "{msg}");
-        assert!(msg.contains(SW_H264_ENCODER), "{msg}");
-        assert!(msg.contains("不可用"), "{msg}");
-        let open_failed = choose_video_encoder(Some("hevc"), true, true, false);
-        let msg = fallback_warning(open_failed, HW_HEVC_ENCODER, Some("rc=-38")).unwrap();
-        assert!(msg.contains(HW_HEVC_ENCODER), "{msg}");
-        assert!(msg.contains("rc=-38"), "{msg}");
-        assert!(msg.contains("回退"), "{msg}");
+    fn copy_off_and_hardware_unavailable_fall_through_to_software() {
+        let mut preset = preset_h264();
+        preset.video_copy = false;
+        preset.audio_copy = false;
+        assert_eq!(
+            decide_video_action(&preset, codec_ids::H264, true),
+            Ok(StreamAction::Encode {
+                hardware: true,
+                encoder: "h264_mediacodec",
+                tier: "balanced",
+            })
+        );
+        assert_eq!(
+            decide_video_action(&preset, codec_ids::H264, false),
+            Ok(StreamAction::Encode {
+                hardware: false,
+                encoder: "libx264",
+                tier: "balanced",
+            })
+        );
+        assert_eq!(
+            decide_audio_action(&preset, codec_ids::AAC),
+            AudioAction::Encode { encoder: "aac" }
+        );
+    }
+
+    #[test]
+    fn no_usable_layer_is_a_loud_error() {
+        let mut preset = preset_h264();
+        preset.video_copy = false;
+        preset.hw_video_encoder = String::new();
+        preset.sw_video_encoder = String::new();
+        let err = decide_video_action(&preset, VP9_ID, true).unwrap_err();
+        assert_eq!(err, "no video encoder available for preset h264");
+    }
+
+    #[test]
+    fn sw_fallback_downgrades_hevc_only_for_the_hevc_builtin() {
+        assert!(sw_fallback_downgrades_hevc(&preset_hevc()));
+        assert!(!sw_fallback_downgrades_hevc(&preset_h264()));
+    }
+
+    #[test]
+    fn tier_maps_to_x264_preset_and_bitrate_factor() {
+        assert_eq!(x264_preset_for_tier("fast"), Some("veryfast"));
+        assert_eq!(x264_preset_for_tier("balanced"), Some("medium"));
+        assert_eq!(x264_preset_for_tier("quality"), Some("slow"));
+        assert_eq!(x264_preset_for_tier("turbo"), None);
+        assert_eq!(bitrate_factor_for_tier("fast"), 0.85);
+        assert_eq!(bitrate_factor_for_tier("balanced"), 1.0);
+        assert_eq!(bitrate_factor_for_tier("quality"), 1.35);
+        // Unknown tier does not silently boost/shrink the bitrate.
+        assert_eq!(bitrate_factor_for_tier("turbo"), 1.0);
+    }
+
+    #[test]
+    fn target_bitrate_uses_envelope_or_derives_with_a_floor() {
+        let preset = preset_h264();
+        // Explicit envelope (4 Mbps) × balanced factor 1.0.
+        assert_eq!(
+            target_video_bitrate_for_tier(&preset, 1920, 1080, 30.0, "balanced"),
+            4_000_000
+        );
+        // quality = 1.35 × 4 Mbps.
+        assert_eq!(
+            target_video_bitrate_for_tier(&preset, 1920, 1080, 30.0, "quality"),
+            5_400_000
+        );
+        // No envelope: 320x180@15 derives 86_400 → floored to 800_000.
+        let mut bare = preset.clone();
+        bare.video_max_bitrate = None;
+        assert_eq!(
+            target_video_bitrate_for_tier(&bare, 320, 180, 15.0, "balanced"),
+            800_000
+        );
+        // The envelope-less default is the same value used by the plain helper.
+        assert_eq!(default_video_bitrate(320, 180, 15.0), 800_000);
+        // 1920x1080@30 derives 6_220_800.
+        assert_eq!(default_video_bitrate(1920, 1080, 30.0), 6_220_800);
+    }
+
+    #[test]
+    fn video_plan_diag_carries_action_encoder_tier_and_bitrate() {
+        let copy = video_plan_diag(StreamAction::Copy, 4_000_000);
+        assert_eq!(
+            copy,
+            "video plan: action=copy encoder=none tier=none x264_preset=none bitrate=4000000"
+        );
+        let hw = video_plan_diag(
+            StreamAction::Encode {
+                hardware: true,
+                encoder: "hevc_mediacodec",
+                tier: "quality",
+            },
+            3_000_000,
+        );
+        assert_eq!(
+            hw,
+            "video plan: action=hw encoder=hevc_mediacodec tier=quality x264_preset=slow bitrate=3000000"
+        );
+        let sw = video_plan_diag(
+            StreamAction::Encode {
+                hardware: false,
+                encoder: "libx264",
+                tier: "fast",
+            },
+            1_000_000,
+        );
+        assert_eq!(
+            sw,
+            "video plan: action=sw encoder=libx264 tier=fast x264_preset=veryfast bitrate=1000000"
+        );
     }
 
     #[test]

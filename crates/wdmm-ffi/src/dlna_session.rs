@@ -24,8 +24,8 @@
 //! URL ends in `<video stem>[.<language>][.<title>].<ext>`.
 //!
 //! The lane is prepared *before* the transcode warm-up (§C.2): sidecars are
-//! exposed, and (HLS only) the source container's text tracks are probed and
-//! extracted in one libav pass. That keeps the shared transcode gate out of the
+//! exposed for any container, and (HLS only, MP4-family sources only) the
+//! source container's text tracks are probed and extracted in one libav pass. That keeps the shared transcode gate out of the
 //! playback path — the old on-demand extraction during playback competed with
 //! the cast job and surfaced `transcoding busy`.
 //!
@@ -46,7 +46,7 @@ use wdmm_dlna::{
     DlnaRenderer, DlnaSession, SsdpDiscovery,
 };
 use wdmm_drivers::WdmmVfs;
-use wdmm_ffmpeg::subtitle::{classify_codec, TrackKind};
+use wdmm_ffmpeg::subtitle::{classify_codec, container_supports_embedded_subs, TrackKind};
 use wdmm_proxy::{
     BindMode, BoxStream, HlsCacheOptions, HlsProgress, HlsSessionOpts, ProxyHandle, AHEAD_SEGMENTS,
 };
@@ -60,7 +60,12 @@ use crate::{
 
 /// Sidecar subtitle extensions handled by the cast path (bitmap `.idx` is not
 /// advertised — renderers can only consume text subtitles).
-const SUBTITLE_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub"];
+///
+/// This mirrors the Dart sidecar list (`lib/utils/subtitle_sidecar.dart`); the
+/// formats are exactly the MIME subtypes Kodi's UPnP renderer accepts
+/// (`SupportedSubFormats`), so every entry must also resolve in
+/// [`wdmm_dlna::subtitle_protocol_info`].
+const SUBTITLE_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "smi"];
 
 /// Extensions treated as video when deriving the subtitle base name.
 const VIDEO_EXTS: &[&str] = &[
@@ -188,7 +193,8 @@ fn put_session(entry: SessionEntry) {
 // ── Session state ────────────────────────────────────────────────────────────
 
 /// One subtitle the cast can hand to the renderer: a sidecar file next to the
-/// video, or (HLS only) a text track embedded in the source container.
+/// video, or (HLS only, MP4-family sources only) a text track embedded in the
+/// source container.
 ///
 /// Embedded tracks use a synthetic path
 /// `<media remote_path>#embedded:<stream index>` (contract §4). Embedded text
@@ -248,7 +254,7 @@ impl SubtitleCandidate {
         }
     }
 
-    /// Advertise one embedded track of the cast source (HLS mode only).
+    /// Advertise one embedded track of the cast source (HLS + MP4 family only).
     fn embedded(
         remote_path: &str,
         track: u32,
@@ -471,7 +477,7 @@ struct SessionEntry {
     /// Proxy tokens of [`Self::subtitle_resources`], released together when the
     /// media switches, the session stops or the session closes.
     subtitle_tokens: Vec<String>,
-    /// Per-track generated WebVTT, keyed by AV stream index (HLS only).
+    /// Per-track generated WebVTT, keyed by AV stream index (HLS, MP4 family).
     embedded_cache: std::collections::HashMap<u32, Arc<Vec<u8>>>,
     /// Track counts / bitmap note / scan note surfaced to the app (contract §6).
     subtitle_status: SubtitleStatus,
@@ -1288,10 +1294,23 @@ async fn extract_subtitle_tracks(
     }
 }
 
+/// Whether the cast source's embedded subtitle tracks are probed at all.
+///
+/// Embedded tracks are extracted for HLS only (a direct cast leaves them in the
+/// container for the renderer to demux), and only for MP4-family sources
+/// (contract `.tmp/contract/preset-encoder-tiers.md` §8). Opening a Matroska
+/// file with dozens of subtitle tracks just to enumerate them is exactly the
+/// cast-setup cost that rule forbids: MKV/WebM/AVI/TS casts get the external
+/// sidecar lane only.
+fn probes_embedded_subs(provider: &str, video_name: &str) -> bool {
+    provider == "hls" && container_supports_embedded_subs(video_name)
+}
+
 /// Prepare the whole subtitle lane before the cast starts (§C.2).
 ///
-/// Every auto-matched sidecar is exposed, and (HLS only) every embedded text
-/// track is extracted in one pass and exposed as WebVTT. All of it happens
+/// Every auto-matched sidecar is exposed for any container, and (HLS only,
+/// MP4-family sources only) every embedded text track is extracted in one pass
+/// and exposed as WebVTT. All of it happens
 /// before `register_hls_nowait`, so a later app-side switch is a pure metadata
 /// re-send. One failing subtitle never fails the cast: sidecar failures are
 /// reported in `subtitle_status.message` and embedded tracks flip to
@@ -1334,11 +1353,14 @@ async fn prepare_subtitles(
     let sidecar_count = candidates.len();
 
     // 2. Embedded tracks (HLS only: a direct cast leaves them in the container
-    //    for the renderer to demux itself).
+    //    for the renderer to demux itself) and only for MP4-family sources
+    //    (contract §8). Matroska/WebM/AVI/TS sources are never opened here:
+    //    enumerating their dozens of subtitle tracks is the most expensive part
+    //    of cast preparation, and MKV casts are expected to go direct.
     let mut embedded_cache: std::collections::HashMap<u32, Arc<Vec<u8>>> =
         std::collections::HashMap::new();
     let mut embedded_count = 0usize;
-    if provider == "hls" {
+    if probes_embedded_subs(provider, video_name) {
         match probe_source(loopback_url).await {
             Ok(probe) => {
                 status.apply_probe(&probe.subtitles, provider);
@@ -1383,6 +1405,15 @@ async fn prepare_subtitles(
                 status.message = Some(message);
             }
         }
+    } else if provider == "hls" {
+        let ext = extension(video_name);
+        wdmm_ffmpeg::diag::log(format!(
+            "[subtitle] embedded probing skipped: source container '{ext}' is not MP4 family"
+        ));
+        status.message = Some(format!(
+            "embedded subtitles are only converted for MP4-family sources; \
+             this {ext} source is not probed (external subtitle files still work)"
+        ));
     }
 
     // 3. Expose every deliverable resource.
@@ -1525,8 +1556,8 @@ async fn prepare_media(
     };
     let mime_ext = extension(name).to_uppercase();
 
-    // Subtitle lane (§C.2): every matched sidecar and (HLS only) every embedded
-    // text track is extracted and exposed *before* the transcode warm-up, so
+    // Subtitle lane (§C.2): every matched sidecar, and (HLS + MP4 family only)
+    // every embedded text track, is extracted and exposed *before* the warm-up, so
     // switching a subtitle never competes for the shared libav gate mid-play.
     let mut subtitle_status = SubtitleStatus::default();
     let subtitles = prepare_subtitles(
@@ -2207,7 +2238,14 @@ async fn select_embedded_subtitle(
         Some(candidate) => candidate,
         None => {
             // The pre-warm pass normally listed every track; a stale app list
-            // (or a direct cast) can still name one we have not probed.
+            // (or a direct cast) can still name one we have not probed. Only
+            // MP4-family sources are ever probed (contract §8): an MKV/AVI/TS
+            // cast must not open the source here.
+            if !container_supports_embedded_subs(&entry.name) {
+                return Err(CmdError::plain(
+                    "embedded subtitle tracks are only probed for MP4-family sources",
+                ));
+            }
             let loopback = entry.loopback_url.clone();
             let probe = tokio::task::spawn_blocking(move || {
                 wdmm_ffmpeg::probe(&loopback).map_err(|e| e.to_string())
@@ -2374,6 +2412,11 @@ fn state_json(
         None => Value::Null,
     };
     let encoder = progress.map(|p| p.encoder.clone()).unwrap_or_default();
+    // Hit-layer decision for this session (`copy`/`hw`/`sw`/`none`). These come
+    // from the per-stream StreamAction, not from the encoder mode: encode+copy
+    // has no encoder for the copied stream and cannot be derived from `mode`.
+    let video_action = encoder.video_action.as_deref();
+    let audio_action = encoder.audio_action.as_deref();
     let speed = progress.map_or(0.0, |p| p.speed);
     let content_ms = progress.map_or(0, |p| p.content_ms);
     let wall_ms = progress.map_or(0, |p| p.wall_ms);
@@ -2416,6 +2459,10 @@ fn state_json(
         "encode_mode": encoder.mode,
         "video_encoder": encoder.video,
         "audio_encoder": encoder.audio,
+        // ── contract §11.1 hit-layer telemetry ──────────────────────────────
+        // `copy`/`hw`/`sw`/`none`, straight from the per-stream decision.
+        "video_action": video_action.unwrap_or("none"),
+        "audio_action": audio_action.unwrap_or("none"),
         "encode_warnings": warnings,
         "diagnostics": wdmm_ffmpeg::diag::tail(40),
     });
@@ -2551,7 +2598,10 @@ pub extern "C" fn wdmm_dlna_session_start(config_json: *const c_char) -> FfiStri
 /// `playlist_ready`, `segments`, `estimated_realtime` (bool|null),
 /// `error` (string|null, set when `phase == "failed"`), and the §7.3
 /// diagnostics keys `encode_mode` (`remux`/`hybrid`/`hw`/`sw`),
-/// `video_encoder`, `audio_encoder`, `encode_warnings`, `diagnostics`.
+/// `video_encoder`, `audio_encoder`, then the §11.1 hit-layer keys
+/// `video_action`/`audio_action` (`copy`/`hw`/`sw`/`none`, taken from the
+/// per-stream decision so encode+copy stays expressible), plus
+/// `encode_warnings`, `diagnostics`.
 ///
 /// Every subtitle candidate also carries `embedded` (bool), `track`
 /// (AV stream index or null), `codec` (libav codec name or null),
@@ -2996,7 +3046,8 @@ mod tests {
         );
         assert_eq!(subtitle_url_name("a.mkv", &dirty, 0), "BadName.srt");
         // An embedded track keeps its title, and falls back to its ordinal.
-        let mut titled = SubtitleCandidate::embedded("/v/a.mkv", 5, "ass".to_string(), Some("chi"), None);
+        let mut titled =
+            SubtitleCandidate::embedded("/v/a.mkv", 5, "ass".to_string(), Some("chi"), None);
         titled.title = Some("Signs".to_string());
         assert_eq!(subtitle_url_name("a.mkv", &titled, 0), "a.chi.Signs.vtt");
     }
@@ -3142,6 +3193,45 @@ mod tests {
         // A bare `<stem>.srt` has no language at all.
         let plain = match_subtitle_name("Movie.mkv", "Movie.srt").unwrap();
         assert_eq!(plain.language, None);
+    }
+
+    #[test]
+    fn smi_sidecars_are_matched_with_their_real_mime_subtype() {
+        // `SAMI` is part of the external sidecar set (§8) and Kodi's
+        // `SupportedSubFormats` accepts the `smi` subtype.
+        let matched = match_subtitle_name("Movie.mkv", "Movie.zh.smi").unwrap();
+        assert_eq!(matched.lang_key, "zh");
+        let candidate = SubtitleCandidate::sidecar(
+            "Movie.zh.smi".to_string(),
+            "/v/Movie.zh.smi".to_string(),
+            matched.lang_key,
+            matched.language,
+            matched.exact,
+            42,
+        );
+        assert!(!candidate.is_bitmap());
+        assert_eq!(
+            subtitle_didl_protocol(&candidate).as_deref(),
+            Some("http-get:*:text/smi:*")
+        );
+    }
+
+    #[test]
+    fn only_mp4_family_sources_probe_embedded_subtitles() {
+        // §8 evidence: an MKV/WebM/AVI/TS cast never opens the source to
+        // enumerate subtitle tracks (33-track MKV was the cost being fixed).
+        assert!(!probes_embedded_subs("hls", "Movie.mkv"));
+        assert!(!probes_embedded_subs("hls", "Show.avi"));
+        assert!(!probes_embedded_subs("hls", "clip.ts"));
+        assert!(!probes_embedded_subs("hls", "Clip.webm"));
+        assert!(!probes_embedded_subs("hls", "Movie.mka"));
+        // MP4 family over HLS is the only combination that probes.
+        assert!(probes_embedded_subs("hls", "Movie.mp4"));
+        assert!(probes_embedded_subs("hls", "clip.M4V"));
+        assert!(probes_embedded_subs("hls", "/dir/Clip.mov"));
+        // A direct cast never probes: the renderer demuxes the container itself.
+        assert!(!probes_embedded_subs("direct", "Movie.mp4"));
+        assert!(!probes_embedded_subs("direct", "Movie.mkv"));
     }
 
     #[test]

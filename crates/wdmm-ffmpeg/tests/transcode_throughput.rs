@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use wdmm_core::models::TranscodePreset;
-use wdmm_ffmpeg::preset::preset_balanced;
+use wdmm_ffmpeg::preset::preset_h264;
 use wdmm_ffmpeg::JobOpts;
 
 /// Media used when `WDMM_TP_MEDIA` is unset.
@@ -502,13 +502,13 @@ fn repeat_count() -> usize {
     }
 }
 
-/// The balanced preset, optionally overridden by `WDMM_TP_PRESET_JSON`.
+/// The built-in h264 preset, optionally overridden by `WDMM_TP_PRESET_JSON`.
 ///
 /// The JSON object is merged field-by-field over the balanced preset, so a run
 /// can tune one knob (bitrate, segment length, fps cap) without restating all
 /// sixteen fields.
 fn preset_from_env() -> TranscodePreset {
-    let preset = preset_balanced();
+    let preset = preset_h264();
     let Some(raw) = std::env::var_os("WDMM_TP_PRESET_JSON") else {
         return preset;
     };
@@ -530,9 +530,10 @@ fn preset_from_env() -> TranscodePreset {
 }
 
 /// Scenario presets differ only in whether the cheap copy stage runs first.
-fn scenario_preset(base: &TranscodePreset, remux_first: bool) -> TranscodePreset {
+fn scenario_preset(base: &TranscodePreset, copy_first: bool) -> TranscodePreset {
     let mut preset = base.clone();
-    preset.remux_first = remux_first;
+    preset.video_copy = copy_first;
+    preset.audio_copy = copy_first;
     preset
 }
 
@@ -628,15 +629,19 @@ fn preset_summary(preset: &TranscodePreset) -> String {
     let fps_cap = preset
         .video_fps_cap
         .map_or_else(|| "none".to_string(), |fps| fps.to_string());
+    let video_encoder = if preset.hw_video_encoder.is_empty() {
+        preset.sw_video_encoder.clone()
+    } else {
+        format!("{}/{}", preset.hw_video_encoder, preset.sw_video_encoder)
+    };
     format!(
-        "{} {} {dims} {bitrate} fps_cap={fps_cap} + {} {}k {}ch {}Hz / seg {}s / remux_first={}",
-        preset.container,
-        preset.video_codec.as_deref().unwrap_or("none"),
+        "{video_encoder} {dims} {bitrate} fps_cap={fps_cap} + {} {}k {}ch {}Hz / seg {}s / video_copy={} audio_copy={}",
         preset.audio_codec,
         preset.audio_bitrate / 1000,
         preset.audio_channels,
         preset.audio_sample_rate.unwrap_or(0),
         preset.hls_segment_secs,
-        preset.remux_first
+        preset.video_copy,
+        preset.audio_copy
     )
 }

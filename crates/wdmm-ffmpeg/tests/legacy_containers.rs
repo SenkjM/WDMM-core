@@ -176,9 +176,10 @@ fn playlist_seconds(dir: &Path) -> Option<f64> {
 /// finishes cleanly with a usable VOD playlist.
 fn transcode_cleanly(media: &Path, tag: &str) -> Option<f64> {
     let out_dir = temp_dir(tag);
-    let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+    let mut preset = wdmm_ffmpeg::preset::preset_h264();
     preset.hls_segment_secs = SEGMENT_SECS;
-    preset.remux_first = false;
+    preset.video_copy = false;
+    preset.audio_copy = false;
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: media.to_string_lossy().into_owned(),
         preset,
@@ -285,9 +286,10 @@ fn legacy_containers_remux_without_timestamp_errors() {
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "media".to_string())
         ));
-        let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+        let mut preset = wdmm_ffmpeg::preset::preset_h264();
         preset.hls_segment_secs = SEGMENT_SECS;
-        preset.remux_first = true;
+        preset.video_copy = true;
+        preset.audio_copy = true;
         let opts = wdmm_ffmpeg::JobOpts {
             input_url: media.to_string_lossy().into_owned(),
             preset,
@@ -340,9 +342,10 @@ fn legacy_containers_keep_the_container_clock_after_a_seek() {
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "media".to_string())
         ));
-        let mut preset = wdmm_ffmpeg::preset::preset_dlna_compat();
+        let mut preset = wdmm_ffmpeg::preset::preset_h264();
         preset.hls_segment_secs = SEGMENT_SECS;
-        preset.remux_first = true;
+        preset.video_copy = true;
+        preset.audio_copy = true;
         let opts = wdmm_ffmpeg::JobOpts {
             input_url: media.to_string_lossy().into_owned(),
             preset,

@@ -714,6 +714,9 @@ async fn spawn_run_shared(
         start_number: first_k,
         out_dir: Some(cache_dir),
         hls_time_override_ms,
+        // Each run decides its stream layout from the source codecs + preset;
+        // the proxy does not pin a decision across restarts.
+        decision: None,
     })
     .map_err(|e| ProxyError::Ffmpeg(e.to_string()))?;
 
@@ -1210,7 +1213,7 @@ impl ProxyHandle {
             };
             if plan.is_none() {
                 info!("source plan unavailable; re-encoding the cast onto an exact grid");
-                preset.remux_first = false;
+                preset.video_copy = false;
                 plan = match wdmm_ffmpeg::source_plan(&input_url, &preset) {
                     Ok(Some(source)) => {
                         info!(
@@ -1249,16 +1252,16 @@ impl ProxyHandle {
         // The stored preset must describe the same path the plan was built for:
         // a keyframe grid only holds while the video is copied, an exact grid only
         // while it is re-encoded.
-        preset.remux_first = plan.alignment == PlanAlignment::Keyframe;
+        preset.video_copy = plan.alignment == PlanAlignment::Keyframe;
         wdmm_ffmpeg::diag::log(format!(
             "[proxy] hls plan: alignment={} segments={} seg_secs={:.2} duration_ms={} \
-             gop_ms={:?} remux_first={} cache={}",
+             gop_ms={:?} video_copy={} cache={}",
             alignment_label(plan.alignment),
             plan.segment_count(),
             plan.seg_secs,
             plan.duration_ms,
             plan.gop_ms,
-            preset.remux_first,
+            preset.video_copy,
             cache_dir.display(),
         ));
         self.cache
@@ -2374,7 +2377,7 @@ mod tests {
             cache: Arc::new(TranscodeCache::new(std::env::temp_dir(), 1 << 30)),
             cache_key: CacheKey::new("account", "/remote/movie.mkv", "balanced", 10, "etag-1"),
             cache_dir: dir,
-            preset: wdmm_ffmpeg::preset::preset_balanced(),
+            preset: wdmm_ffmpeg::preset::preset_h264(),
             input_url: "/nonexistent/movie.mkv".to_string(),
             seg_secs: 4.0,
             run: None,
@@ -2473,7 +2476,7 @@ mod tests {
         HlsSessionOpts {
             device_id: device_id.to_string(),
             input_url: path.to_string_lossy().into_owned(),
-            preset: wdmm_ffmpeg::preset::preset_balanced(),
+            preset: wdmm_ffmpeg::preset::preset_h264(),
             ttl_secs: None,
             allowed_peers: None,
             cache: HlsCacheOptions {

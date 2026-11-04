@@ -33,7 +33,8 @@ use std::sync::Arc;
 use crate::sys::*;
 use crate::{
     diag, hwdecode, AudioStream, EncoderInfo, FfmpegError, FfmpegResult, PauseControl, ProbeResult,
-    ProgressState, SourcePlan, SubtitleStream, TranscodePreset, VideoStream,
+    ProgressState, SessionDecision, SourcePlan, StreamMode, SubtitleStream, TranscodePreset,
+    VideoStream,
 };
 
 /// Time base used for millisecond content timestamps.
@@ -48,11 +49,11 @@ const PROGRESS_LOG_EVERY_MS: i64 = 2_000;
 /// that changes on every frame from spinning.
 const MAX_AUDIO_RECONFIGURES: u32 = 8;
 
-// ── Remux decision (pure logic lives in `crate::plan`, host-testable) ──────
+// ── Stream decision (pure logic lives in `crate::plan`/`crate::SessionDecision`) ─
 
 use crate::plan::{
-    choose_video_encoder, encoder_frame_rate, fallback_warning, hw_video_encoder_name,
-    hybrid_audio_codec_id, remux_dropped_streams, remux_plan, segment_gop_size, RemuxPlan,
+    decide_video_action, encoder_frame_rate, hw_gop_size, remux_dropped_streams, segment_gop_size,
+    target_video_bitrate_for_tier, video_plan_diag, x264_preset_for_tier,
 };
 /// Options for opening the loopback HTTP input: bound every blocking read so a
 /// stalled upstream fails with a real error instead of hanging the job forever.
@@ -375,10 +376,6 @@ unsafe fn first_video_packet_pts_ms(
 
 /// Implementation of [`crate::source_plan`]: one open, decide plan.
 pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Option<SourcePlan>> {
-    if preset.container == "original" {
-        // Pass-through casts have no HLS segmentation at all.
-        return Ok(None);
-    }
     let url_c = CString::new(url).map_err(|e| FfmpegError::Probe(e.to_string()))?;
     unsafe {
         let mut in_ctx: *mut AVFormatContext = std::ptr::null_mut();
@@ -428,12 +425,34 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
         let audio_codec = stream_codec_id(streams_ptr, a_idx);
         let seg_secs = f64::from(preset.hls_segment_secs);
 
+        // Decide the per-stream layout once; the plan below and every job run of
+        // this session must use the same decision (contract §2).
+        let needs_encode = video_codec.is_some_and(|id| {
+            !(preset.video_copy && crate::preset::is_mpegts_video_copy_compatible(id))
+        });
+        let hw_available = if needs_encode {
+            hw_video_encoder_available(preset, "source plan")
+        } else {
+            false
+        };
+        let decision = SessionDecision::decide(
+            preset,
+            video_codec.unwrap_or(0),
+            audio_codec.unwrap_or(0),
+            hw_available,
+        )
+        .map_err(FfmpegError::Probe)?;
+        diag::log(format!(
+            "source plan: {url} stream decision video={} audio={}",
+            decision.video_action_str(),
+            decision.audio_action_str()
+        ));
+
         let plan = if video_codec.is_none() {
             // Audio-only HLS cuts on audio packet timing; there is no index that
             // predicts it, so the warm-up calibration stays in charge.
             None
-        } else if preset.remux_first && remux_plan(video_codec, audio_codec) != RemuxPlan::Transcode
-        {
+        } else if decision.video_is_copy() {
             let mut keyframes = video_keyframe_index_ms(in_ctx, streams_ptr, v_idx, duration_ms);
             // MP4 indexes store DTS, and the B-frame delay makes the first
             // keyframe's DTS negative. Anchor the list on the first video
@@ -466,6 +485,7 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
                         plan,
                         video_copied: true,
                         keyframe_count: count,
+                        decision: decision.clone(),
                     })
                 }
                 None => {
@@ -505,6 +525,7 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
                 plan,
                 video_copied: false,
                 keyframe_count: 0,
+                decision,
             })
         };
 
@@ -1136,6 +1157,26 @@ impl ProgressTracker {
     }
 }
 
+/// Length of `ticks` in microseconds, rounded up (0 for a non-positive input).
+fn ticks_to_us_ceil(ticks: i64, tb: AVRational) -> i64 {
+    if ticks <= 0 || tb.num <= 0 || tb.den <= 0 {
+        return 0;
+    }
+    let num = (ticks as i128) * 1_000_000 * (tb.num as i128);
+    let den = tb.den as i128;
+    ((num + den - 1) / den).min(i64::MAX as i128) as i64
+}
+
+/// Length of `us` in output ticks, rounded up (0 for a non-positive input).
+fn us_to_ticks_ceil(us: i64, tb: AVRational) -> i64 {
+    if us <= 0 || tb.num <= 0 || tb.den <= 0 {
+        return 0;
+    }
+    let num = (us as i128) * (tb.den as i128);
+    let den = 1_000_000i128 * (tb.num as i128);
+    ((num + den - 1) / den).min(i64::MAX as i128) as i64
+}
+
 /// Per-job diagnostics + progress bookkeeping shared by both paths.
 struct JobCtx<'a> {
     tag: &'a str,
@@ -1144,6 +1185,10 @@ struct JobCtx<'a> {
     tracker: ProgressTracker,
     first_segment_logged: bool,
     last_progress_log_ms: i64,
+    /// Shift applied to every written timestamp, in microseconds. Zero unless a
+    /// source (or an encoder's B-frame delay) produced a negative timestamp.
+    offset_us: i64,
+    offset_logged: bool,
 }
 
 impl<'a> JobCtx<'a> {
@@ -1155,6 +1200,50 @@ impl<'a> JobCtx<'a> {
             tracker: ProgressTracker::default(),
             first_segment_logged: false,
             last_progress_log_ms: 0,
+            offset_us: 0,
+            offset_logged: false,
+        }
+    }
+
+    /// Keep every written timestamp non-negative.
+    ///
+    /// MPEG-TS cannot signal a negative timestamp (`AVFMT_TS_NEGATIVE` is not
+    /// set), and a B-frame encoder delays the first dts below zero, so a legacy
+    /// container whose clock starts before zero (FLV/WMV) made
+    /// `av_interleaved_write_frame` answer EINVAL on the very first packet. The
+    /// shift is measured once and then applied to every packet of the run in
+    /// both streams, so the A/V relationship is untouched.
+    unsafe fn align_packet(&mut self, pkt: *mut AVPacket, tb: AVRational) {
+        let mut lowest = i64::MAX;
+        for value in [(*pkt).pts, (*pkt).dts] {
+            if value != AV_NOPTS_VALUE {
+                lowest = lowest.min(value);
+            }
+        }
+        if lowest == i64::MAX {
+            return;
+        }
+        let mut delta = us_to_ticks_ceil(self.offset_us, tb);
+        if lowest.saturating_add(delta) < 0 {
+            self.offset_us = self
+                .offset_us
+                .saturating_add(ticks_to_us_ceil(-(lowest + delta), tb));
+            delta = us_to_ticks_ceil(self.offset_us, tb);
+            if !self.offset_logged {
+                self.offset_logged = true;
+                diag::log(format!(
+                    "{} output timestamps shifted by {} us so the muxer never sees a negative one",
+                    self.tag, self.offset_us
+                ));
+            }
+        }
+        if delta != 0 {
+            if (*pkt).pts != AV_NOPTS_VALUE {
+                (*pkt).pts = (*pkt).pts.saturating_add(delta);
+            }
+            if (*pkt).dts != AV_NOPTS_VALUE {
+                (*pkt).dts = (*pkt).dts.saturating_add(delta);
+            }
         }
     }
 
@@ -1223,35 +1312,51 @@ pub fn run_hls_job(
     job_id: &str,
     start_number: u64,
     hls_time_override_ms: Option<u32>,
+    decision: Option<SessionDecision>,
 ) -> FfmpegResult<()> {
     telemetry.start();
     telemetry.set_start_ms((start_offset_secs * 1000.0).round() as i64);
     let tag = job_tag(job_id);
     diag::log(format!(
-        "{tag} job start preset={} container={} remux_first={} video_codec={:?} audio_codec={} start_offset={start_offset_secs:.2} start_number={start_number} hls_time_override_ms={hls_time_override_ms:?} seg_dir={} input={}",
+        "{tag} job start preset={} hw_video_encoder={} sw_video_encoder={} video_copy={} audio_codec={} audio_copy={} start_offset={start_offset_secs:.2} start_number={start_number} hls_time_override_ms={hls_time_override_ms:?} seg_dir={} input={}",
         preset.id,
-        preset.container,
-        preset.remux_first,
-        preset.video_codec,
+        preset.hw_video_encoder,
+        preset.sw_video_encoder,
+        preset.video_copy,
         preset.audio_codec,
+        preset.audio_copy,
         segment_dir.display(),
         sanitize_url(input_url),
     ));
 
-    // Passthrough preset — no HLS wrapping, direct stream. Callers should not
-    // call run_hls_job for passthrough; return immediately.
-    if preset.container == "original" {
-        diag::log(format!(
-            "{tag} container=original → no HLS output (pass-through preset)"
-        ));
-        return Ok(());
-    }
+    // Per-stream decision, decided once per session (contract §2): a reopen /
+    // seek reuses the decision handed in by the caller so the produced stream
+    // layout can never drift between runs.
+    let decision = match decision {
+        Some(decision) => decision,
+        None => {
+            let resolved = unsafe { decide_session(input_url, preset, telemetry, &tag) }?;
+            diag::log(format!(
+                "{tag} stream decision (fresh) video={} audio={}",
+                resolved.video_action_str(),
+                resolved.audio_action_str()
+            ));
+            resolved
+        }
+    };
+    telemetry.set_actions(decision.video_action_str(), decision.audio_action_str());
 
-    // Decide: remux or transcode?
-    let result = if preset.remux_first {
+    // Only a video stream that actually has to be re-encoded needs the transcode
+    // path. Everything else — including an audio-only source, whose decision is
+    // `video = None` — goes through the remux path, which copies the video stream
+    // when there is one and copies or re-encodes the audio stream.
+    let video_needs_encode = matches!(decision.video, StreamMode::Hardware | StreamMode::Software);
+
+    let result = if !video_needs_encode {
         match run_remux(
             input_url,
             preset,
+            &decision,
             start_offset_secs,
             segment_dir,
             cancel.clone(),
@@ -1269,9 +1374,25 @@ pub fn run_hls_job(
                 if cancel.load(Ordering::Relaxed) {
                     Ok(())
                 } else {
+                    let fallback = SessionDecision {
+                        // An audio-only source has no video stream to encode; keep
+                        // that decision so the transcode path stays audio-only.
+                        video: if decision.video == StreamMode::None {
+                            StreamMode::None
+                        } else {
+                            StreamMode::Software
+                        },
+                        // The copy marker is not an encoder name: let the software
+                        // path pick the preset's encoder and tier.
+                        video_encoder: None,
+                        video_tier: None,
+                        audio: decision.audio,
+                        ..decision.clone()
+                    };
                     run_transcode(
                         input_url,
                         preset,
+                        &fallback,
                         start_offset_secs,
                         segment_dir,
                         cancel,
@@ -1288,6 +1409,7 @@ pub fn run_hls_job(
         run_transcode(
             input_url,
             preset,
+            &decision,
             start_offset_secs,
             segment_dir,
             cancel,
@@ -1315,6 +1437,174 @@ pub fn run_hls_job(
         Err(e) => diag::log(format!("{tag} job end error: {e}")),
     }
     result
+}
+
+/// Decide the per-stream layout by probing the source once.
+///
+/// Only used when the caller has no cached decision (a fresh session); every
+/// reopen passes the session's decision down, so this probe runs once per cast.
+unsafe fn decide_session(
+    input_url: &str,
+    preset: &wdmm_core::models::TranscodePreset,
+    telemetry: &ProgressState,
+    tag: &str,
+) -> FfmpegResult<SessionDecision> {
+    let c_url = CString::new(input_url)
+        .map_err(|_| FfmpegError::Probe("input URL contains an interior NUL byte".to_string()))?;
+    let mut opts = input_open_options();
+    let mut in_ctx: *mut AVFormatContext = std::ptr::null_mut();
+    let ret = avformat_open_input(&mut in_ctx, c_url.as_ptr(), std::ptr::null_mut(), &mut opts);
+    av_dict_free(&mut opts);
+    if ret < 0 {
+        return Err(ffmpeg_err("avformat_open_input", ret));
+    }
+    let probe = (|| {
+        let ret = avformat_find_stream_info(in_ctx, std::ptr::null_mut());
+        if ret < 0 {
+            return Err(ffmpeg_err("avformat_find_stream_info", ret));
+        }
+        let streams = fmtctx_streams(in_ctx);
+        let nb = fmtctx_nb_streams(in_ctx) as usize;
+        let v_idx =
+            av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, std::ptr::null_mut(), 0);
+        let a_idx =
+            av_find_best_stream(in_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, std::ptr::null_mut(), 0);
+        let mut video_codec = 0u32;
+        let mut audio_codec = 0u32;
+        let mut src_w = 0u32;
+        let mut src_h = 0u32;
+        let mut src_rate = AVRational::new(0, 1);
+        if v_idx >= 0 {
+            let st = *streams.add(v_idx as usize);
+            let cp = (*st).codecpar;
+            video_codec = (*cp).codec_id as u32;
+            src_w = (*cp).width.max(0) as u32;
+            src_h = (*cp).height.max(0) as u32;
+            src_rate = stream_r_frame_rate(st);
+        }
+        if a_idx >= 0 {
+            let st = *streams.add(a_idx as usize);
+            audio_codec = (*(*st).codecpar).codec_id as u32;
+        }
+        let _ = nb;
+        let needs_video_encode = video_codec != 0
+            && !(preset.video_copy && crate::preset::is_mpegts_video_copy_compatible(video_codec));
+        let hw_available = if needs_video_encode {
+            hw_video_encoder_available(preset, tag)
+        } else {
+            false
+        };
+        let decision = SessionDecision::decide(preset, video_codec, audio_codec, hw_available)
+            .map_err(FfmpegError::Probe)?;
+        if video_codec != 0 {
+            let action = decide_video_action(preset, video_codec, hw_available)
+                .map_err(FfmpegError::Probe)?;
+            let bitrate = match action.tier() {
+                Some(tier) => {
+                    let params = plan_video_encode(preset, src_w, src_h, src_rate, tier);
+                    params.bitrate as u32
+                }
+                None => 0,
+            };
+            diag::log(format!("{tag} {}", video_plan_diag(action, bitrate)));
+        }
+        Ok(decision)
+    })();
+    avformat_close_input(&mut in_ctx);
+    let decision = probe?;
+    telemetry.set_actions(decision.video_action_str(), decision.audio_action_str());
+    Ok(decision)
+}
+
+/// Whether the preset's hardware video encoder is really usable: found by name
+/// *and* `avcodec_open2` succeeded (contract §2 — presence alone is not proof).
+unsafe fn hw_video_encoder_available(
+    preset: &wdmm_core::models::TranscodePreset,
+    tag: &str,
+) -> bool {
+    if preset.hw_video_encoder.is_empty() {
+        return false;
+    }
+    let Ok(name) = CString::new(preset.hw_video_encoder.clone()) else {
+        return false;
+    };
+    let codec = avcodec_find_encoder_by_name(name.as_ptr());
+    if codec.is_null() {
+        diag::log(format!(
+            "{tag} hw encoder {} not present in libavcodec",
+            preset.hw_video_encoder
+        ));
+        return false;
+    }
+    match open_hw_video_encoder(
+        tag,
+        &preset.hw_video_encoder,
+        codec,
+        preset,
+        1280,
+        720,
+        AVRational::new(30, 1),
+        hw_gop_size(30, 1),
+    ) {
+        Ok((mut ctx, _)) => {
+            avcodec_free_context(&mut ctx);
+            true
+        }
+        Err(err) => {
+            diag::log(format!(
+                "{tag} hw encoder {} unavailable: {err}",
+                preset.hw_video_encoder
+            ));
+            false
+        }
+    }
+}
+
+/// Everything the video encoder needs, derived from the preset and the source.
+pub(crate) struct VideoEncodeParams {
+    pub width: c_int,
+    pub height: c_int,
+    pub framerate: AVRational,
+    pub gop: c_int,
+    pub bitrate: i64,
+}
+
+/// Derive the encoder geometry/bitrate for one preset tier.
+pub(crate) fn plan_video_encode(
+    preset: &wdmm_core::models::TranscodePreset,
+    src_w: u32,
+    src_h: u32,
+    src_rate: AVRational,
+    tier: &str,
+) -> VideoEncodeParams {
+    let (width, height) = fit_dimensions(
+        src_w.max(2) as i32,
+        src_h.max(2) as i32,
+        preset.video_max_w.map(|v| v as i32),
+        preset.video_max_h.map(|v| v as i32),
+    );
+    let configured = encoder_frame_rate(src_rate.num, src_rate.den, preset.video_fps_cap);
+    let framerate = AVRational::new(configured.0, configured.1);
+    let (gop, _step_secs) = encode_grid(src_rate, framerate, preset.hls_segment_secs);
+    let fps = if framerate.num > 0 && framerate.den > 0 {
+        f64::from(framerate.num) / f64::from(framerate.den)
+    } else {
+        30.0
+    };
+    let bitrate = i64::from(target_video_bitrate_for_tier(
+        preset,
+        width.max(0) as u32,
+        height.max(0) as u32,
+        fps,
+        tier,
+    ));
+    VideoEncodeParams {
+        width: width as c_int,
+        height: height as c_int,
+        framerate,
+        gop,
+        bitrate,
+    }
 }
 
 // ── Shared audio decode → resample → encode pipeline ────────────────────────
@@ -1358,11 +1648,62 @@ unsafe fn open_audio_decoder(
     Ok(dec_ctx)
 }
 
+/// Sample format an audio encoder wants for `codec_id`.
+///
+/// `AV_SAMPLE_FMT_S16` — packed 16-bit samples. `sys.rs` only mirrors the planar
+/// formats this crate needed before MP2 support.
+const AV_SAMPLE_FMT_S16: c_int = 1;
+
+/// MPEG-1 Layer II (`mp2`) only accepts packed 16-bit integer samples — feeding
+/// it the planar float format the resampler uses for AAC/AC3/EAC3 (or the planar
+/// S16P variant) makes `avcodec_open2` fail with EINVAL. The resampler and the
+/// fifo handle packed formats natively, so the pipeline just has to be told.
+fn audio_sample_format(codec_id: AVCodecID) -> c_int {
+    if codec_id == crate::preset::codec_ids::MP2 {
+        AV_SAMPLE_FMT_S16
+    } else {
+        AV_SAMPLE_FMT_FLTP
+    }
+}
+
+/// Snap a frame rate to one of the eight rates MPEG-2 can signal.
+///
+/// `mpeg12enc` derives its `frame_rate_code` from the frame rate and rejects
+/// everything else — a 97/6 (~16.17 fps) anime source makes `avcodec_open2`
+/// return EINVAL, even though the decoder read it fine. The nearest standard
+/// rate keeps the cast working; the caller logs the substitution.
+fn mpeg2_frame_rate(src: AVRational) -> AVRational {
+    const RATES: [(i32, i32); 8] = [
+        (24000, 1001),
+        (24, 1),
+        (25, 1),
+        (30000, 1001),
+        (30, 1),
+        (50, 1),
+        (60000, 1001),
+        (60, 1),
+    ];
+    if src.num <= 0 || src.den <= 0 {
+        return AVRational::new(24000, 1001);
+    }
+    let fps = src.num as f64 / src.den as f64;
+    let mut best = RATES[0];
+    let mut best_delta = f64::INFINITY;
+    for (num, den) in RATES {
+        let delta = (num as f64 / den as f64 - fps).abs();
+        if delta < best_delta {
+            best_delta = delta;
+            best = (num, den);
+        }
+    }
+    AVRational::new(best.0, best.1)
+}
+
 unsafe fn open_audio_encoder(
     preset: &wdmm_core::models::TranscodePreset,
     codec_id: AVCodecID,
     tag: &str,
-) -> FfmpegResult<(*mut AVCodecContext, String)> {
+) -> FfmpegResult<(*mut AVCodecContext, String, c_int)> {
     let enc_name = codec_display_name(codec_id);
     let enc_codec = avcodec_find_encoder(codec_id);
     if enc_codec.is_null() {
@@ -1384,7 +1725,8 @@ unsafe fn open_audio_encoder(
     // Set the time base *before* opening: encoders derive packet timestamps
     // from it, and the value must match the output stream's.
     codctx_set_time_base(enc_ctx, AVRational::new(1, audio_sample_rate));
-    codctx_set_sample_fmt(enc_ctx, AV_SAMPLE_FMT_FLTP);
+    let sample_fmt = audio_sample_format(codec_id);
+    codctx_set_sample_fmt(enc_ctx, sample_fmt);
     let layout = if preset.audio_channels == 1 {
         AVChannelLayout::mono()
     } else {
@@ -1394,20 +1736,17 @@ unsafe fn open_audio_encoder(
     codctx_set_bit_rate(enc_ctx, preset.audio_bitrate as i64);
     let ret = avcodec_open2(enc_ctx, enc_codec, std::ptr::null_mut());
     diag::log(format!(
-        "{tag} avcodec_open2(audio encoder {}) rc={ret}",
-        codec_display_name(codec_id)
+        "{tag} avcodec_open2(audio encoder {enc_name} sample_fmt={sample_fmt} rate={audio_sample_rate} bitrate={}) rc={ret}",
+        preset.audio_bitrate
     ));
     if ret < 0 {
         avcodec_free_context(&mut enc_ctx);
         return Err(ffmpeg_err(
-            format!(
-                "avcodec_open2(audio encoder {})",
-                codec_display_name(codec_id)
-            ),
+            format!("avcodec_open2(audio encoder {enc_name} sample_fmt={sample_fmt})"),
             ret,
         ));
     }
-    Ok((enc_ctx, codec_display_name(codec_id)))
+    Ok((enc_ctx, enc_name, sample_fmt))
 }
 
 /// Repairs timestamps for sources that do not carry per-packet time.
@@ -1564,6 +1903,11 @@ struct AudioPipeline {
     fifo: *mut AVAudioFifo,
     sample_rate: c_int,
     layout: AVChannelLayout,
+    /// Sample format the target encoder accepts (FLTP for AAC/AC3/EAC3, S16P
+    /// for MPEG-1 Layer II). The resampler, the FIFO and every encoder-input
+    /// frame are described with it, so a format the encoder refuses can never
+    /// reach `avcodec_open2`/`avcodec_send_frame`.
+    out_format: c_int,
     frame_size: c_int,
     next_pts: i64,
     /// Encoder-time-base pts of the first queued sample, seeded from the source
@@ -1595,6 +1939,7 @@ impl Default for AudioPipeline {
             fifo: std::ptr::null_mut(),
             sample_rate: 0,
             layout: AVChannelLayout::stereo(),
+            out_format: AV_SAMPLE_FMT_FLTP,
             frame_size: 0,
             next_pts: 0,
             start_samples: 0,
@@ -1610,7 +1955,12 @@ impl Default for AudioPipeline {
 impl AudioPipeline {
     /// `start_secs` is the media time this run starts at; it only seeds the
     /// fallback pts for sources whose first decoded frame carries no timestamp.
-    unsafe fn new(audio_sample_rate: i32, audio_channels: u32, start_secs: f64) -> Self {
+    unsafe fn new(
+        audio_sample_rate: i32,
+        audio_channels: u32,
+        start_secs: f64,
+        out_format: c_int,
+    ) -> Self {
         let start_samples = if audio_sample_rate > 0 && start_secs > 0.0 {
             (start_secs * f64::from(audio_sample_rate)).round() as i64
         } else {
@@ -1625,6 +1975,7 @@ impl AudioPipeline {
             },
             next_pts: start_samples,
             start_samples,
+            out_format,
             ..Self::default()
         }
     }
@@ -1653,7 +2004,7 @@ impl AudioPipeline {
         let ret = swr_alloc_set_opts2(
             &mut self.swr,
             &self.layout,
-            AV_SAMPLE_FMT_FLTP,
+            self.out_format,
             self.sample_rate,
             &src_layout,
             frame_format(dec_frame) as AVSampleFormat,
@@ -1680,7 +2031,7 @@ impl AudioPipeline {
                 self.frame_size = 1;
             }
             self.fifo = av_audio_fifo_alloc(
-                AV_SAMPLE_FMT_FLTP,
+                self.out_format,
                 self.layout.nb_channels,
                 self.frame_size * 4,
             );
@@ -1728,7 +2079,7 @@ impl AudioPipeline {
             if conv.is_null() {
                 return Ok(());
             }
-            frame_set_format(conv, AV_SAMPLE_FMT_FLTP);
+            frame_set_format(conv, self.out_format);
             frame_set_sample_rate(conv, self.sample_rate);
             frame_set_ch_layout(conv, self.layout);
             let ret = swr_convert_frame(self.swr, conv, std::ptr::null());
@@ -1786,7 +2137,7 @@ impl AudioPipeline {
             // format=NONE/sample_rate=0/empty layout, so describe the target here;
             // with linesize[0] == 0 swresample allocates the buffer and fills in
             // nb_samples itself.
-            frame_set_format(conv, AV_SAMPLE_FMT_FLTP);
+            frame_set_format(conv, self.out_format);
             frame_set_sample_rate(conv, self.sample_rate);
             frame_set_ch_layout(conv, self.layout);
             let ret = swr_convert_frame(self.swr, conv, dec_frame);
@@ -1861,7 +2212,7 @@ impl AudioPipeline {
                 ));
             }
             frame_set_nb_samples(frame, want);
-            frame_set_format(frame, AV_SAMPLE_FMT_FLTP);
+            frame_set_format(frame, self.out_format);
             frame_set_sample_rate(frame, self.sample_rate);
             frame_set_ch_layout(frame, self.layout);
             let ret = av_frame_get_buffer(frame, 0);
@@ -1971,6 +2322,10 @@ unsafe fn copy_packet_to_muxer(
         ));
     }
     av_packet_rescale_ts(pkt, (*in_st).time_base, (*out_st).time_base);
+    // The input stream index says nothing about the output layout (a FLV file
+    // lists audio before video, so its audio packet would otherwise be muxed
+    // into the video stream); route the packet by the output index we chose.
+    (*pkt).stream_index = out_idx;
     (*pkt).pos = -1;
 
     // Legacy containers may leave the timestamps unset; a muxer cannot place such
@@ -1993,6 +2348,10 @@ unsafe fn copy_packet_to_muxer(
         stamps.note((*pkt).pts);
     }
 
+    // Legacy containers may start their clock before zero; the MPEG-TS muxer
+    // cannot express a negative timestamp, so the run is shifted as a whole.
+    job.align_packet(pkt, (*out_st).time_base);
+
     // Capture before the write consumes the packet.
     let pts = (*pkt).pts;
     let tb = (*out_st).time_base;
@@ -2009,6 +2368,7 @@ unsafe fn copy_packet_to_muxer(
 fn run_remux(
     input_url: &str,
     preset: &wdmm_core::models::TranscodePreset,
+    decision: &SessionDecision,
     start_offset_secs: f64,
     segment_dir: &Path,
     cancel: Arc<AtomicBool>,
@@ -2062,15 +2422,19 @@ fn run_remux(
         let a_idx = av_find_best_stream(in_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &mut a_dec_codec, 0);
         let video_codec_id = stream_codec_id(streams_ptr, v_idx);
         let audio_codec_id = stream_codec_id(streams_ptr, a_idx);
-        let plan = remux_plan(video_codec_id, audio_codec_id);
+        // The copy layout was decided once for the whole session (contract §2):
+        // this function copies the video stream and either copies or encodes the
+        // audio stream, never re-decides.
+        let audio_encode = decision.audio == StreamMode::Software;
         diag::log(format!(
-            "{tag} remux plan: video_idx={v_idx} video_codec={} audio_idx={a_idx} audio_codec={} → {plan:?}",
+            "{tag} remux layout: video_idx={v_idx} video_codec={} audio_idx={a_idx} audio_codec={} audio={}",
             video_codec_id
                 .map(codec_display_name)
                 .unwrap_or_else(|| "none".into()),
             audio_codec_id
                 .map(codec_display_name)
                 .unwrap_or_else(|| "none".into()),
+            decision.audio_action_str(),
         ));
         for dropped in remux_dropped_streams(v_idx, a_idx, nb) {
             let st = *streams_ptr.add(dropped);
@@ -2085,23 +2449,31 @@ fn run_remux(
                 (*cp).codec_id
             ));
         }
-        if plan == RemuxPlan::Transcode {
-            diag::log(format!(
-                "{tag} remux decision: no MPEG-TS copyable A/V stream → full transcode fallback"
-            ));
+        // Video is either copied or absent (audio-only source); this path never
+        // re-encodes video, so anything else was dispatched wrongly.
+        if !matches!(decision.video, StreamMode::Copy | StreamMode::None) {
             avformat_close_input(&mut in_ctx);
             return Err(FfmpegError::Probe(
-                "no mpegts-copy-compatible audio/video stream".into(),
+                "remux path requires a copyable video stream".into(),
             ));
         }
+        if v_idx < 0 {
+            diag::log(format!(
+                "{tag} remux: source has no decodable video stream → audio-only output"
+            ));
+            telemetry.warn("源文件没有视频流，已转为纯音频输出");
+        }
 
-        // ── Hybrid mode: decode the incompatible audio, encode AAC/MP3 ──────
+        // ── Hybrid mode: decode the incompatible audio, encode it with the
+        // preset's audio codec ─────────────────────────────────────────────
         let audio_sample_rate = preset.audio_sample_rate.unwrap_or(48_000) as i32;
         let mut a_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
         let mut a_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
         let mut audio_enc_name: Option<String> = None;
-        if plan == RemuxPlan::Hybrid {
-            let audio_codec = hybrid_audio_codec_id(&preset.audio_codec);
+        let mut a_enc_fmt: c_int = AV_SAMPLE_FMT_FLTP;
+        if audio_encode {
+            let audio_codec =
+                crate::preset::audio_encoder_codec_id(&preset.audio_codec) as AVCodecID;
             diag::log(format!(
                 "{tag} remux hybrid: {}re-encoding audio {} → {}",
                 if v_idx >= 0 {
@@ -2122,9 +2494,10 @@ fn run_remux(
                 }
             };
             match open_audio_encoder(preset, audio_codec, tag) {
-                Ok((ctx, name)) => {
+                Ok((ctx, name, fmt)) => {
                     a_enc_ctx = ctx;
                     audio_enc_name = Some(name);
+                    a_enc_fmt = fmt;
                 }
                 Err(e) => {
                     cleanup_transcode(
@@ -2143,7 +2516,7 @@ fn run_remux(
         // ── Telemetry ───────────────────────────────────────────────────────
         // Both copy paths leave the video stream untouched, so no encoder was
         // probed or opened — the hardware fields are false by definition.
-        let audio_mode = if plan == RemuxPlan::Hybrid {
+        let audio_mode = if audio_encode {
             audio_enc_name.clone()
         } else if a_idx >= 0 {
             Some("copy".to_string())
@@ -2151,7 +2524,7 @@ fn run_remux(
             None
         };
         telemetry.set_encoder(EncoderInfo {
-            mode: if plan == RemuxPlan::Hybrid {
+            mode: if audio_encode {
                 "hybrid".into()
             } else {
                 "remux".into()
@@ -2165,8 +2538,10 @@ fn run_remux(
             audio: audio_mode,
             hw_requested: false,
             hw_available: false,
+            video_action: None,
+            audio_action: None,
         });
-        if plan == RemuxPlan::Hybrid {
+        if audio_encode {
             let src_name = audio_codec_id
                 .map(codec_display_name)
                 .unwrap_or_else(|| "?".into());
@@ -2235,7 +2610,7 @@ fn run_remux(
                     "avformat_new_stream(audio) returned null (remux)".into()
                 ));
             }
-            if plan == RemuxPlan::Hybrid {
+            if audio_encode {
                 if a_enc_ctx.is_null() {
                     fail_remux!(FfmpegError::Probe(
                         "hybrid audio encoder is null (remux)".into()
@@ -2325,7 +2700,7 @@ fn run_remux(
         }
         let mut dec_frame: *mut AVFrame = std::ptr::null_mut();
         let mut out_pkt: *mut AVPacket = std::ptr::null_mut();
-        if plan == RemuxPlan::Hybrid {
+        if audio_encode {
             dec_frame = av_frame_alloc();
             out_pkt = av_packet_alloc();
             if dec_frame.is_null() || out_pkt.is_null() {
@@ -2345,6 +2720,7 @@ fn run_remux(
             audio_sample_rate,
             u32::from(preset.audio_channels),
             start_offset_secs,
+            a_enc_fmt,
         );
         if a_idx >= 0 {
             audio.set_source_time_base((*(*streams_ptr.add(a_idx as usize))).time_base);
@@ -2384,7 +2760,7 @@ fn run_remux(
                 continue;
             }
 
-            if plan == RemuxPlan::Hybrid && in_st_idx == a_idx as usize {
+            if audio_encode && in_st_idx == a_idx as usize {
                 // Audio: decode → resample → AAC/MP3, then write the encoded
                 // packets into the same muxer as the copied video.
                 let res = drain_audio_frames(
@@ -2438,7 +2814,7 @@ fn run_remux(
         }
 
         // Flush the hybrid audio encoder so the last frames reach the muxer.
-        if plan == RemuxPlan::Hybrid && write_error.is_none() && !a_enc_ctx.is_null() {
+        if audio_encode && write_error.is_none() && !a_enc_ctx.is_null() {
             if let Err(e) = audio.drain(a_enc_ctx, out_pkt, out_ctx, out_a_idx, &mut job, true) {
                 write_error = Some(e);
             }
@@ -2577,6 +2953,7 @@ unsafe fn open_video_decoder_hw_or_sw(
 fn run_transcode(
     input_url: &str,
     preset: &wdmm_core::models::TranscodePreset,
+    decision: &SessionDecision,
     start_offset_secs: f64,
     segment_dir: &Path,
     cancel: Arc<AtomicBool>,
@@ -2620,7 +2997,7 @@ fn run_transcode(
         }
 
         // ── Find best streams ─────────────────────────────────────────────
-        let want_video = preset.video_codec.is_some();
+        let want_video = decision.video != StreamMode::None;
         let mut v_dec_codec: *const AVCodec = std::ptr::null();
         let mut a_dec_codec: *const AVCodec = std::ptr::null();
         // Always look for a video stream: audio-only sources (music) must work
@@ -2638,7 +3015,7 @@ fn run_transcode(
         ));
         log_streams(tag, "transcode", streams_ptr, nb);
 
-        if want_video && !has_video_stream {
+        if !has_video_stream {
             diag::log(format!(
                 "{tag} transcode: source has no decodable video stream → audio-only output"
             ));
@@ -2664,7 +3041,7 @@ fn run_transcode(
         // is freed (see the cleanup section below).
         let mut hw_decode: Option<hwdecode::HwDecode> = None;
 
-        if a_idx >= 0 && !a_dec_codec.is_null() {
+        if a_idx >= 0 && !a_dec_codec.is_null() && decision.audio != StreamMode::Copy {
             match open_audio_decoder(streams_ptr, a_idx, a_dec_codec, tag) {
                 Ok(ctx) => a_dec_ctx = ctx,
                 Err(e) => {
@@ -2693,14 +3070,26 @@ fn run_transcode(
         let mut v_enc_pix_fmt: c_int = AV_PIX_FMT_YUV420P;
         let mut hw_available = false;
 
-        let a_codec_id = match preset.audio_codec.as_str() {
-            "mp3" => AV_CODEC_ID_MP3,
-            "copy" => 0u32,
-            _ => AV_CODEC_ID_AAC,
-        };
         let audio_stream_present = a_idx >= 0 && !a_dec_codec.is_null();
+        // The session decision is authoritative: `copy` keeps the source codec
+        // (the source was proven MPEG-TS compatible when the decision was made),
+        // otherwise the preset's audio codec is encoded.
+        let audio_copy = audio_stream_present && decision.audio == StreamMode::Copy;
+        let a_codec_id: AVCodecID = if audio_copy || !audio_stream_present {
+            0
+        } else {
+            crate::preset::audio_encoder_codec_id(&preset.audio_codec) as AVCodecID
+        };
         let mut a_enc_codec: *const AVCodec = std::ptr::null();
-        if audio_stream_present && a_codec_id > 0 {
+        let mut a_enc_fmt: c_int = AV_SAMPLE_FMT_FLTP;
+        if audio_copy {
+            diag::log(format!(
+                "{tag} transcode audio copy: keeping source codec {} untouched",
+                stream_codec_id(streams_ptr, a_idx)
+                    .map(codec_display_name)
+                    .unwrap_or_else(|| "?".into())
+            ));
+        } else if audio_stream_present {
             a_enc_codec = avcodec_find_encoder(a_codec_id);
             if a_enc_codec.is_null() {
                 let name = codec_display_name(a_codec_id);
@@ -2723,91 +3112,113 @@ fn run_transcode(
                 "{tag} transcode encoder selected audio={}",
                 preset.audio_codec
             ));
-        } else if audio_stream_present && a_codec_id == 0 {
-            diag::log(format!(
-                "{tag} transcode WARNING: audio stream copy requested, but the transcode path only muxes re-encoded audio → audio dropped"
-            ));
-            telemetry.warn("转码路径暂不支持音频直拷，音频已丢弃");
         }
 
-        // ── Open video encoder (hardware probe, then software fallback) ────
+        // ── Open video encoder ────────────────────────────────────────────
+        // The session decision already chose hardware vs software and the exact
+        // encoder, so this only opens it. A hardware open that fails after the
+        // decision falls back to the preset's software encoder — never silently:
+        // the warning names the downgrade and telemetry records it (contract §2/§4).
         if decode_video {
             let in_st = *streams_ptr.add(v_idx as usize);
             let src_w = (*(*in_st).codecpar).width;
             let src_h = (*(*in_st).codecpar).height;
-            let (out_w, out_h) = fit_dimensions(
-                src_w,
-                src_h,
-                preset.video_max_w.map(|v| v as i32),
-                preset.video_max_h.map(|v| v as i32),
-            );
             let src_rate = stream_r_frame_rate(in_st);
-            let (fps_num, fps_den) =
-                encoder_frame_rate(src_rate.num, src_rate.den, preset.video_fps_cap);
-            let framerate = AVRational::new(fps_num, fps_den);
-            // GOP frames are sized for the frames the encoder actually sees, not
-            // for the capped hint (see `encoder_grid_rate`).
-            let (video_gop, _) = encode_grid(src_rate, framerate, preset.hls_segment_secs);
-            let hw_name = hw_video_encoder_name(preset.video_codec.as_deref());
-            let hw_name_c = CString::new(hw_name).unwrap();
-            let hw_codec = if preset.video_hw_preferred {
-                avcodec_find_encoder_by_name(hw_name_c.as_ptr())
-            } else {
-                std::ptr::null()
-            };
-            let hw_present = !hw_codec.is_null();
-            let mut hw_open_error: Option<String> = None;
-            if hw_present {
-                match open_hw_video_encoder(
-                    tag, hw_name, hw_codec, preset, out_w, out_h, framerate, video_gop,
-                ) {
-                    Ok((ctx, pix_fmt)) => {
-                        v_enc_ctx = ctx;
-                        v_enc_codec = hw_codec;
-                        v_enc_pix_fmt = pix_fmt;
-                        v_enc_name = Some(hw_name.to_string());
-                        hw_available = true;
-                    }
-                    Err(err) => hw_open_error = Some(err),
+            let hardware = decision.video == StreamMode::Hardware;
+            let tier = decision.video_tier.clone().unwrap_or_else(|| {
+                if hardware {
+                    preset.hw_video_tier.clone()
+                } else {
+                    preset.sw_video_tier.clone()
                 }
-            }
-            // Pure decision after the probe. Hardware is selected only when it
-            // actually opened, so the warning names the real fallback reason.
-            let choice = choose_video_encoder(
-                preset.video_codec.as_deref(),
-                preset.video_hw_preferred,
-                hw_present,
-                hw_available,
+            });
+            let planned = plan_video_encode(
+                preset,
+                src_w.max(0) as u32,
+                src_h.max(0) as u32,
+                src_rate,
+                &tier,
             );
+            let (out_w, out_h) = (planned.width, planned.height);
+            let framerate = planned.framerate;
+            let video_gop = planned.gop;
+            let encoder_label = decision.video_encoder.as_deref().unwrap_or("?");
             diag::log(format!(
-                "{tag} transcode encoder choice: requested_hw={hw_name} present={hw_present} opened={hw_available} fps={}/{} source_fps={}/{} gop={}",
+                "{tag} transcode video plan: action={} encoder={encoder_label} tier={tier} x264_preset={} bitrate={} gop={video_gop} rate={}/{} → {out_w}x{out_h}",
+                if hardware { "hw" } else { "sw" },
+                x264_preset_for_tier(&tier).unwrap_or("-"),
+                planned.bitrate,
                 framerate.num,
                 framerate.den,
-                src_rate.num,
-                src_rate.den,
-                video_gop
             ));
-            if let Some(warning) = fallback_warning(choice, hw_name, hw_open_error.as_deref()) {
-                diag::log(format!("{tag} transcode hardware fallback: {warning}"));
-                telemetry.warn(warning);
-            }
-            if !hw_available {
-                // Software path: libx264 first, then any H.264 encoder. The key
-                // difference to a generic encode is that the GOP is pinned to
-                // one segment so the exact plan grid is what the muxer cuts on.
-                v_enc_codec = avcodec_find_encoder_by_name(c"libx264".as_ptr());
-                if !v_enc_codec.is_null() {
-                    v_enc_name = Some("libx264".into());
+
+            if hardware {
+                let hw_name = decision
+                    .video_encoder
+                    .as_deref()
+                    .unwrap_or(preset.hw_video_encoder.as_str());
+                let hw_name_c = CString::new(hw_name).unwrap();
+                let hw_codec = avcodec_find_encoder_by_name(hw_name_c.as_ptr());
+                if hw_codec.is_null() {
+                    diag::log(format!(
+                        "{tag} transcode hardware encoder {hw_name} no longer resolves"
+                    ));
+                } else {
+                    match open_hw_video_encoder(
+                        tag, hw_name, hw_codec, preset, out_w, out_h, framerate, video_gop,
+                    ) {
+                        Ok((ctx, pix_fmt)) => {
+                            v_enc_ctx = ctx;
+                            v_enc_codec = hw_codec;
+                            v_enc_pix_fmt = pix_fmt;
+                            v_enc_name = Some(hw_name.to_string());
+                            hw_available = true;
+                        }
+                        Err(err) => {
+                            diag::log(format!("{tag} transcode hardware open failed: {err}"));
+                        }
+                    }
                 }
+            }
+
+            if !hw_available {
+                let decision_encoder = decision
+                    .video_encoder
+                    .as_deref()
+                    .filter(|name| !name.is_empty() && *name != "copy");
+                let sw_name = if decision.video == StreamMode::Software {
+                    decision_encoder.unwrap_or(preset.sw_video_encoder.as_str())
+                } else {
+                    preset.sw_video_encoder.as_str()
+                };
+                // An hevc preset with a libx264 software fallback really encodes
+                // H.264; say so instead of letting the UI believe it got HEVC.
+                if sw_name == "libx264" && crate::plan::sw_fallback_downgrades_hevc(preset) {
+                    let warning = "video: sw fallback downgrades hevc to h264";
+                    diag::log(format!("{tag} transcode {warning}"));
+                    telemetry.warn(warning);
+                }
+                if decision.video == StreamMode::Hardware {
+                    // The decision promised hardware; report why it did not happen.
+                    let warning = format!(
+                        "video: hardware encoder {} unavailable, fell back to {} ({tier})",
+                        decision.video_encoder.as_deref().unwrap_or("?"),
+                        sw_name
+                    );
+                    diag::log(format!("{tag} transcode {warning}"));
+                    telemetry.warn(warning);
+                }
+                let sw_name_c = CString::new(sw_name).unwrap();
+                v_enc_codec = avcodec_find_encoder_by_name(sw_name_c.as_ptr());
                 if v_enc_codec.is_null() {
-                    v_enc_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-                    if !v_enc_codec.is_null() {
-                        v_enc_name = Some("h264".into());
+                    if let Some(fallback_id) = crate::preset::video_encoder_output_codec_id(sw_name)
+                    {
+                        v_enc_codec = avcodec_find_encoder(fallback_id);
                     }
                 }
                 if v_enc_codec.is_null() {
                     diag::log(format!(
-                        "{tag} transcode failed: no H.264 encoder available in libavcodec"
+                        "{tag} transcode failed: no {sw_name} encoder available in libavcodec"
                     ));
                     cleanup_transcode(
                         in_ctx,
@@ -2817,10 +3228,11 @@ fn run_transcode(
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                     );
-                    return Err(FfmpegError::Probe(
-                        "no H.264 encoder available (libx264 missing)".into(),
-                    ));
+                    return Err(FfmpegError::Probe(format!(
+                        "no {sw_name} encoder available"
+                    )));
                 }
+                v_enc_name = Some(sw_name.to_string());
                 v_enc_pix_fmt = AV_PIX_FMT_YUV420P;
                 v_enc_ctx = avcodec_alloc_context3(v_enc_codec);
                 if v_enc_ctx.is_null() {
@@ -2839,42 +3251,100 @@ fn run_transcode(
                 codctx_set_width(v_enc_ctx, out_w);
                 codctx_set_height(v_enc_ctx, out_h);
                 codctx_set_pix_fmt(v_enc_ctx, v_enc_pix_fmt);
-                let sw_gop = video_gop;
-                codctx_set_time_base(v_enc_ctx, AVRational::new(1, 90000));
-                codctx_set_gop_size(v_enc_ctx, sw_gop);
-                codctx_set_max_b_frames(v_enc_ctx, 2);
-                codctx_set_framerate(v_enc_ctx, framerate);
-                // Force an IDR exactly every `sw_gop` frames: `keyint` = one
-                // segment, `min-keyint` blocks early IDRs, `scenecut=0` stops
-                // scene changes from shifting the cut points off the plan grid.
+                // libx264 treats time_base purely as a tick scale; the MPEG-1/2/4
+                // encoders instead read it as the frame rate and reject anything
+                // else (`MPEG-1/2 does not support 90000/1 fps`), so they get the
+                // inverse of the output frame rate. MPEG-2 additionally only
+                // signals its eight standard rates, so a 97/6 source is snapped
+                // (and the GOP re-derived from the snapped rate) instead of making
+                // `avcodec_open2` fail with EINVAL.
+                let encoder_framerate = if sw_name == "mpeg2video" {
+                    let snapped = mpeg2_frame_rate(framerate);
+                    if snapped.num != framerate.num || snapped.den != framerate.den {
+                        let warning = format!(
+                            "video: frame rate {}/{} is not an MPEG-2 frame rate, snapped to {}/{}",
+                            framerate.num, framerate.den, snapped.num, snapped.den
+                        );
+                        diag::log(format!("{tag} transcode {warning}"));
+                        telemetry.warn(warning);
+                    }
+                    snapped
+                } else {
+                    framerate
+                };
+                let encoder_gop = if encoder_framerate.num == framerate.num
+                    && encoder_framerate.den == framerate.den
+                {
+                    video_gop
+                } else {
+                    segment_gop_size(
+                        encoder_framerate.num,
+                        encoder_framerate.den,
+                        preset.hls_segment_secs,
+                    )
+                };
+                let encoder_time_base = if sw_name == "libx264" {
+                    AVRational::new(1, 90000)
+                } else {
+                    AVRational::new(encoder_framerate.den.max(1), encoder_framerate.num.max(1))
+                };
+                codctx_set_time_base(v_enc_ctx, encoder_time_base);
+                codctx_set_gop_size(v_enc_ctx, encoder_gop);
+                codctx_set_framerate(v_enc_ctx, encoder_framerate);
                 let mut enc_opts: *mut AVDictionary = std::ptr::null_mut();
-                if v_enc_name.as_deref() == Some("libx264") {
-                    let params =
-                        CString::new(format!("keyint={sw_gop}:min-keyint={sw_gop}:scenecut=0"))
-                            .unwrap();
-                    av_dict_set(&mut enc_opts, c"x264-params".as_ptr(), params.as_ptr(), 0);
+                // Every software encoder must start each segment with an IDR: the
+                // MPEG-2/MPEG-4 encoders only honour that through the codec
+                // context flag (the `-flags +cgop` CLI switch answers ENOSYS once
+                // the encoder is driven through libavcodec's API).
+                let mut flags = codctx_flags(v_enc_ctx) | AV_CODEC_FLAG_CLOSED_GOP;
+                if sw_name == "libx264" {
+                    // mpegtsenc only inserts h264_mp4toannexb when the stream
+                    // carries AVCC extradata, which libx264 emits for global
+                    // header mode.
+                    flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+                    codctx_set_max_b_frames(v_enc_ctx, 2);
+                    // Force an IDR exactly every `video_gop` frames: `keyint` = one
+                    // segment, `min-keyint` blocks early IDRs, `scenecut=0` stops
+                    // scene changes from shifting the cut points off the plan grid.
+                    let x264_params = CString::new(format!(
+                        "keyint={video_gop}:min-keyint={video_gop}:scenecut=0"
+                    ))
+                    .unwrap();
+                    av_dict_set(
+                        &mut enc_opts,
+                        c"x264-params".as_ptr(),
+                        x264_params.as_ptr(),
+                        0,
+                    );
+                    // The tier is the speed/quality knob, expressed as the
+                    // libx264 `preset` option.
+                    // Unknown tiers keep libx264's default (contract §3).
+                    if let Some(tier_preset) = x264_preset_for_tier(&tier) {
+                        let tier_preset = CString::new(tier_preset).unwrap();
+                        av_dict_set(&mut enc_opts, c"preset".as_ptr(), tier_preset.as_ptr(), 0);
+                    }
+                } else {
+                    codctx_set_max_b_frames(v_enc_ctx, 0);
+                    // The MPEG-2/MPEG-4 encoders refuse AV_CODEC_FLAG_CLOSED_GOP
+                    // while scene-change detection is on: libavcodec asks for the
+                    // threshold to be effectively infinite
+                    // ("closed gop with scene change detection are not supported
+                    // yet, set threshold to 1000000000").
+                    av_dict_set(
+                        &mut enc_opts,
+                        c"sc_threshold".as_ptr(),
+                        c"1000000000".as_ptr(),
+                        0,
+                    );
                 }
-                // mpegtsenc only inserts h264_mp4toannexb when the stream
-                // carries AVCC extradata, which libx264 emits for global header
-                // mode. Without this the muxer has no SPS/PPS to start from.
-                // CLOSED_GOP keeps every segment independently decodable.
-                codctx_set_flags(
-                    v_enc_ctx,
-                    codctx_flags(v_enc_ctx)
-                        | AV_CODEC_FLAG_GLOBAL_HEADER
-                        | AV_CODEC_FLAG_CLOSED_GOP,
-                );
-                if let Some(br) = preset.video_max_bitrate {
-                    codctx_set_bit_rate(v_enc_ctx, br as i64);
-                }
+                codctx_set_flags(v_enc_ctx, flags);
+                codctx_set_bit_rate(v_enc_ctx, planned.bitrate);
                 let ret = avcodec_open2(v_enc_ctx, v_enc_codec, &mut enc_opts);
                 av_dict_free(&mut enc_opts);
                 diag::log(format!(
-                    "{tag} transcode avcodec_open2(video encoder {}) rc={ret}",
-                    v_enc_name.as_deref().unwrap_or("?")
+                    "{tag} transcode avcodec_open2(video encoder {sw_name}, tier={tier}) rc={ret}"
                 ));
                 if ret < 0 {
-                    let name = v_enc_name.clone().unwrap_or_else(|| "h264".into());
                     cleanup_transcode(
                         in_ctx,
                         std::ptr::null_mut(),
@@ -2884,13 +3354,13 @@ fn run_transcode(
                         std::ptr::null_mut(),
                     );
                     return Err(ffmpeg_err(
-                        format!("avcodec_open2(video encoder {name})"),
+                        format!("avcodec_open2(video encoder {sw_name})"),
                         ret,
                     ));
                 }
             }
             diag::log(format!(
-                "{tag} transcode encoder selected video={} mode={} pix_fmt={}",
+                "{tag} transcode encoder selected video={} mode={} tier={tier} pix_fmt={}",
                 v_enc_name.as_deref().unwrap_or("?"),
                 if hw_available { "hw" } else { "sw" },
                 pix_fmt_name(v_enc_pix_fmt)
@@ -2902,9 +3372,10 @@ fn run_transcode(
         let audio_sample_rate = preset.audio_sample_rate.unwrap_or(48_000) as i32;
         if !a_enc_codec.is_null() && !a_dec_ctx.is_null() {
             match open_audio_encoder(preset, a_codec_id, tag) {
-                Ok((ctx, name)) => {
+                Ok((ctx, name, fmt)) => {
                     a_enc_ctx = ctx;
                     a_enc_name = Some(name);
+                    a_enc_fmt = fmt;
                 }
                 Err(e) => {
                     cleanup_transcode(
@@ -2922,7 +3393,7 @@ fn run_transcode(
 
         // A job with no encoder cannot produce any output: fail before the
         // muxer writes a header instead of reporting an empty success.
-        if v_enc_ctx.is_null() && a_enc_ctx.is_null() {
+        if v_enc_ctx.is_null() && a_enc_ctx.is_null() && !audio_copy {
             diag::log(format!(
                 "{tag} transcode failed: no usable video or audio encoder"
             ));
@@ -2946,17 +3417,17 @@ fn run_transcode(
                 "sw".into()
             },
             video: v_enc_name.clone(),
-            audio: if audio_stream_present {
-                Some(if a_codec_id == 0 {
-                    "copy".to_string()
-                } else {
-                    a_enc_name.unwrap_or_else(|| preset.audio_codec.clone())
-                })
+            audio: if audio_copy {
+                Some("copy".to_string())
+            } else if audio_stream_present {
+                Some(a_enc_name.unwrap_or_else(|| preset.audio_codec.clone()))
             } else {
                 None
             },
-            hw_requested: preset.video_hw_preferred && decode_video,
+            hw_requested: decision.video == StreamMode::Hardware,
             hw_available,
+            video_action: None,
+            audio_action: None,
         });
 
         // ── Open HLS output ───────────────────────────────────────────────
@@ -3001,7 +3472,25 @@ fn run_transcode(
             (*out_st).time_base = codctx_time_base(v_enc_ctx);
             out_v_idx = (*out_st).index;
         }
-        if !a_enc_ctx.is_null() {
+        if audio_copy {
+            // Audio copy: the output stream mirrors the source stream, exactly like
+            // the remux path does for video.
+            let in_st = *streams_ptr.add(a_idx as usize);
+            let out_st = avformat_new_stream(out_ctx, std::ptr::null());
+            if out_st.is_null() {
+                cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
+                return Err(FfmpegError::Probe(
+                    "avformat_new_stream(audio copy) returned null".into(),
+                ));
+            }
+            let ret = avcodec_parameters_copy((*out_st).codecpar, (*in_st).codecpar);
+            if ret < 0 {
+                cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
+                return Err(ffmpeg_err("avcodec_parameters_copy(audio copy)", ret));
+            }
+            (*out_st).time_base = (*in_st).time_base;
+            out_a_idx = (*out_st).index;
+        } else if !a_enc_ctx.is_null() {
             let out_st = avformat_new_stream(out_ctx, a_enc_codec);
             if out_st.is_null() {
                 cleanup_transcode(in_ctx, out_ctx, v_dec_ctx, a_dec_ctx, v_enc_ctx, a_enc_ctx);
@@ -3095,6 +3584,7 @@ fn run_transcode(
             audio_sample_rate,
             u32::from(preset.audio_channels),
             start_offset_secs,
+            a_enc_fmt,
         );
         if a_idx >= 0 {
             audio.set_source_time_base((*(*streams_ptr.add(a_idx as usize))).time_base);
@@ -3208,6 +3698,13 @@ fn run_transcode(
                 ));
             }
         }
+        // Audio copy keeps the source clock; the repair only fills in timestamps a
+        // legacy container leaves unset, anchored on the run's start position.
+        let mut audio_stamps = TimestampRepair::seeded(if audio_copy {
+            run_start_ticks(out_ctx, out_a_idx, start_offset_secs)
+        } else {
+            0
+        });
 
         'decode: loop {
             if cancel.load(Ordering::Relaxed) {
@@ -3426,6 +3923,20 @@ fn run_transcode(
                         av_frame_unref(hw_sw_frame);
                     }
                 }
+            } else if stream_idx == a_idx && audio_copy {
+                // encode+copy quadrant: the audio packet goes to the muxer
+                // verbatim — no decoder, no resampler, no FIFO (`contract §2`).
+                if let Err(e) = copy_packet_to_muxer(
+                    in_pkt,
+                    *streams_ptr.add(a_idx as usize),
+                    out_ctx,
+                    out_a_idx,
+                    &mut job,
+                    &mut audio_stamps,
+                ) {
+                    fatal = Some(e);
+                    break 'decode;
+                }
             } else if stream_idx == a_idx && !a_dec_ctx.is_null() && !a_enc_ctx.is_null() {
                 if let Err(e) = drain_audio_frames(
                     a_dec_ctx,
@@ -3556,6 +4067,9 @@ unsafe fn encode_and_write(
         if (*out_pkt).dts == AV_NOPTS_VALUE {
             (*out_pkt).dts = (*out_pkt).pts;
         }
+        // A B-frame encoder delays the first dts below zero, which the MPEG-TS
+        // muxer cannot express; shift the whole run instead of failing the write.
+        job.align_packet(out_pkt, (*out_st).time_base);
 
         // Capture before the write consumes the packet.
         let pts = (*out_pkt).pts;
@@ -3733,5 +4247,22 @@ mod tests {
         stamps.observe_step(1_000);
         assert_eq!(stamps.repair_monotonic(7_500), 7_500);
         assert_eq!(stamps.repair_monotonic(AV_NOPTS_VALUE), 8_500);
+    }
+
+    #[test]
+    fn mpeg2_frame_rate_keeps_standard_rates_and_snaps_the_rest() {
+        let rate = |num, den| {
+            let snapped = super::mpeg2_frame_rate(super::AVRational::new(num, den));
+            (snapped.num, snapped.den)
+        };
+        // The eight signalled rates pass through untouched.
+        assert_eq!(rate(24000, 1001), (24000, 1001));
+        assert_eq!(rate(25, 1), (25, 1));
+        assert_eq!(rate(30000, 1001), (30000, 1001));
+        assert_eq!(rate(60, 1), (60, 1));
+        // 97/6 (~16.17 fps) and 120 fps are not signalled: snap to the nearest.
+        assert_eq!(rate(97, 6), (24000, 1001));
+        assert_eq!(rate(120, 1), (60, 1));
+        assert_eq!(rate(0, 1), (24000, 1001));
     }
 }

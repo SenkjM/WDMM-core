@@ -146,7 +146,7 @@ fn mid_file_hybrid_run_keeps_audio_on_the_container_clock() {
     const START_NUMBER: u64 = 3;
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: media.to_string_lossy().into_owned(),
-        preset: wdmm_ffmpeg::preset::preset_balanced(),
+        preset: wdmm_ffmpeg::preset::preset_h264(),
         start_offset_secs: START_OFFSET,
         start_number: START_NUMBER,
         out_dir: Some(out_dir.clone()),
