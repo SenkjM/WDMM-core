@@ -238,6 +238,101 @@ pub fn envelope_decrypt(data: &[u8], passphrase: &str) -> SyncResult<Vec<u8>> {
         .map_err(|_| SyncError::Other("backup decrypt failed (bad passphrase?)".into()))
 }
 
+/// Verdict for "would this archive restore with this passphrase?".
+///
+/// Produced by [`probe_backup_bytes`] without touching any database, so a UI can
+/// warn *before* the irreversible apply step. `reason` is a machine token:
+/// `bad-passphrase` (the archive opens, but the passphrase is wrong) or
+/// `not-backup` (the bytes are not a WDMM backup container at all).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BackupProbe {
+    pub valid: bool,
+    /// Archive `formatVersion` from the META note (`0` when the archive predates it).
+    pub version: u32,
+    pub created_at: Option<String>,
+    pub reason: Option<&'static str>,
+}
+
+const PROBE_BAD_PASSPHRASE: &str = "bad-passphrase";
+const PROBE_NOT_BACKUP: &str = "not-backup";
+/// Canary written into PASS_CHECK by `build_backup_bytes` (see `restore_backup_bytes`).
+const PASS_CHECK_PLAIN: &str = "WDMM-BACKUP-PASS-OK\u{0001}";
+
+/// Probe an archive **without restoring it** (audit item 1: the Dart execution layer
+/// must not re-implement PBKDF2/GCM just to ask "is this the right password?").
+///
+/// The envelope (`WDMMEN01`) is opened first — its GCM tag already proves the
+/// passphrase. Passphrase checks are only stored for protected archives, so an
+/// unprotected container always probes as valid; a protected one without a check
+/// section can only be fully verified by restoring (undecryptable fields stay empty).
+pub fn probe_backup_bytes(data: &[u8], passphrase: &str) -> BackupProbe {
+    let bad_passphrase = BackupProbe {
+        valid: false,
+        version: 0,
+        created_at: None,
+        reason: Some(PROBE_BAD_PASSPHRASE),
+    };
+    let not_backup = BackupProbe {
+        valid: false,
+        version: 0,
+        created_at: None,
+        reason: Some(PROBE_NOT_BACKUP),
+    };
+
+    let encrypted = data.len() >= 8 && &data[0..8] == MAGIC_EN;
+    let plain = if encrypted {
+        match envelope_decrypt(data, passphrase) {
+            Ok(plain) => plain,
+            Err(_) => return bad_passphrase,
+        }
+    } else {
+        data.to_vec()
+    };
+
+    let Ok(sections) = parse_bk_container(&plain) else {
+        return not_backup;
+    };
+
+    if let Some(raw) = sections.get(&SEC_PASS_CHECK) {
+        let Ok(token) = std::str::from_utf8(raw) else {
+            return bad_passphrase;
+        };
+        if passphrase.is_empty()
+            || try_decrypt_aesgcmv1(token, passphrase).as_deref() != Some(PASS_CHECK_PLAIN)
+        {
+            return bad_passphrase;
+        }
+    }
+
+    let mut version = 0u32;
+    let mut created_at = None;
+    if let Some(raw) = sections.get(&SEC_META) {
+        if let Ok(records) = decode_records(raw, META_INT_TAGS) {
+            if let Some(meta) = records.first() {
+                if let Some(note) = meta.get(&TAG_META_NOTE).and_then(RecordValue::as_str) {
+                    if let Ok(note) = serde_json::from_str::<serde_json::Value>(note) {
+                        version = note
+                            .get("formatVersion")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
+                    }
+                }
+                created_at = meta
+                    .get(&TAG_META_CREATED_AT)
+                    .and_then(RecordValue::as_str)
+                    .map(str::to_string);
+            }
+        }
+    }
+
+    BackupProbe {
+        valid: true,
+        version,
+        created_at,
+        reason: None,
+    }
+}
+
 fn json_bytes<T: serde::Serialize>(v: &T) -> SyncResult<Vec<u8>> {
     serde_json::to_vec(v).map_err(|e| SyncError::Serde(e.to_string()))
 }
@@ -2037,5 +2132,65 @@ mod tests {
         let written = std::fs::read(music_dir.join(&stem))
             .expect("cover file must be written for Android kind=2 (JPEG) entry");
         assert_eq!(&written, jpeg_bytes);
+    }
+
+    #[test]
+    fn probe_reads_an_archive_without_restoring_it() {
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let dmr = DmrPrefsDatabase::open(Path::new(":memory:")).unwrap();
+        let bytes = build_backup_bytes(&lib, Some(&dmr), "pw", None).unwrap();
+
+        let probe = probe_backup_bytes(&bytes, "pw");
+        assert!(probe.valid, "correct passphrase must probe valid: {probe:?}");
+        assert_eq!(probe.version, 7);
+        assert!(probe.created_at.is_some());
+        assert!(probe.reason.is_none());
+    }
+
+    #[test]
+    fn probe_reports_a_wrong_passphrase() {
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let bytes = build_backup_bytes(&lib, None, "pw", None).unwrap();
+
+        let probe = probe_backup_bytes(&bytes, "wrong");
+        assert!(!probe.valid);
+        assert_eq!(probe.reason, Some("bad-passphrase"));
+    }
+
+    #[test]
+    fn probe_accepts_an_unprotected_archive() {
+        let lib = LibraryDatabase::open(Path::new(":memory:")).unwrap();
+        let bytes = build_backup_bytes(&lib, None, "", None).unwrap();
+
+        let probe = probe_backup_bytes(&bytes, "");
+        assert!(probe.valid);
+        assert!(probe.reason.is_none());
+    }
+
+    #[test]
+    fn probe_rejects_bytes_that_are_not_a_backup() {
+        let probe = probe_backup_bytes(b"just some text", "");
+        assert!(!probe.valid);
+        assert_eq!(probe.reason, Some("not-backup"));
+    }
+
+    #[test]
+    fn probe_verifies_the_pass_check_section() {
+        let token = encrypt_aesgcmv1(PASS_CHECK_PLAIN, "pw").unwrap();
+        let bytes = build_bk_container(&[(SEC_PASS_CHECK, token.into_bytes())]);
+
+        assert!(probe_backup_bytes(&bytes, "pw").valid);
+        assert_eq!(
+            probe_backup_bytes(&bytes, "wrong").reason,
+            Some("bad-passphrase")
+        );
+        assert_eq!(
+            probe_backup_bytes(&bytes, "").reason,
+            Some("bad-passphrase")
+        );
+        // No META section: the probe still succeeds with unknown metadata.
+        let probe = probe_backup_bytes(&bytes, "pw");
+        assert_eq!(probe.version, 0);
+        assert!(probe.created_at.is_none());
     }
 }

@@ -2106,6 +2106,7 @@ dependencies = [
  "lofty",
  "reqwest",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
