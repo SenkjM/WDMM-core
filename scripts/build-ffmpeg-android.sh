@@ -141,6 +141,15 @@ fi
 log "--- FFmpeg: configure (${ABI}) ---"
 cd "$FFMPEG_SRC"
 
+# ── Component trim (measured 2026-11-04) ─────────────────────────────────────
+# --disable-encoders/muxers/avfilter drops what we never call: the whole
+# libavfilter (4.28 MB) plus every encoder/muxer outside the block below.
+# Measured on the same n9.0.2 source: 23,263,064 -> 17,289,792 bytes per ABI
+# (-25.7%).  Decoders, demuxers, parsers and protocols stay untouched, so the
+# set of source formats we can read is unchanged.  Anything enabled below MUST
+# stay in sync with the encoders the presets expose -- the
+# `encoder_options` host test asserts every one of them resolves.
+
 # --disable-symver: produce flat `libXXX.so` names (no `.61` version suffix)
 #   so Android's dlopen finds them by SONAME without version gymnastics.
 # --enable-pic:     position-independent code (we link into a .so).
@@ -183,6 +192,9 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
   --enable-pic \
   --disable-nonfree \
   --enable-gpl \
+  --disable-encoders \
+  --disable-muxers \
+  --disable-avfilter \
   --enable-libx264 \
   --enable-encoder=libx264 \
   --enable-jni \
@@ -198,6 +210,8 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
   --enable-muxer=hls \
   --enable-muxer=mpegts \
   --enable-muxer=mp4 \
+  --enable-encoder=mpeg1video,mpeg2video,mpeg4,mpeg4_mediacodec,aac,ac3,eac3,mp2 \
+  --enable-muxer=mov,ipod,matroska \
   --enable-demuxer=hls \
   --enable-demuxer=mpegts \
   --enable-demuxer=matroska \
@@ -247,7 +261,7 @@ make install
 
 # ── Install shared libs to OUTPUT_DIR ──────────────────────────────────────
 log "--- install .so → ${OUTPUT_DIR} ---"
-for lib in avcodec avformat avutil swresample swscale avfilter; do
+for lib in avcodec avformat avutil swresample swscale; do
   # --disable-symver yields a flat libXXX.so; fall back to a versioned name
   # just in case a future FFmpeg tag re-introduces suffixes.
   so="${FFMPEG_INSTALL}/lib/lib${lib}.so"

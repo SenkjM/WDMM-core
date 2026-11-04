@@ -27,14 +27,12 @@ fn main() {
         }
     }
 
-    for lib in [
-        "avformat",
-        "avcodec",
-        "avfilter",
-        "swresample",
-        "swscale",
-        "avutil",
-    ] {
+    // No `avfilter`: we never build a filter graph (every pixel-level step is
+    // our own FFI call), so the Android build is configured with
+    // `--disable-avfilter` and the library is not shipped at all. Linking it
+    // here would fail on those trimmed libraries, and the linker would drop it
+    // anyway (zero undefined avfilter_* symbols in the whole crate).
+    for lib in ["avformat", "avcodec", "swresample", "swscale", "avutil"] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
 }
