@@ -35,7 +35,6 @@ mod library_manga;
 pub use library_manga::MangaLibrarySyncEngine;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -182,53 +181,54 @@ async fn driver_list_files(driver: &Arc<dyn WdmmVfs>, dir: &str) -> SyncResult<V
 
 // ── Credential Sync ───────────────────────────────────────────────────────────
 
-/// Wire payload for `credentials.json`. `updated_at` (epoch seconds) drives
-/// last-write-wins at the account level. `credentials_encrypted` is base64 so
-/// the JSON survives text round-trips; it is **already vault-encrypted** at the
-/// application layer, so the remote file carries ciphertext only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemoteAccount {
-    id: String,
-    provider_type: String,
-    display_name: String,
-    base_url: Option<String>,
-    /// Base64 of `CloudAccount.credentials_encrypted`.
-    credentials_encrypted_b64: String,
-    updated_at: i64,
-}
-
-impl From<&CloudAccount> for RemoteAccount {
-    fn from(a: &CloudAccount) -> Self {
-        use base64::prelude::*;
-        Self {
-            id: a.id.clone(),
-            provider_type: a.provider_type.clone(),
-            display_name: a.display_name.clone(),
-            base_url: a.base_url.clone(),
-            credentials_encrypted_b64: BASE64_STANDARD.encode(&a.credentials_encrypted),
-            updated_at: chrono::Utc::now().timestamp(),
-        }
+/// Map a local cloud account onto its record inside the engine snapshot.
+///
+/// The snapshot's password tag carries the opaque
+/// `CloudAccount.credentials_encrypted` blob as base64, so the document is
+/// ciphertext-only on the wire. `engine_updated_at` (epoch seconds) drives
+/// last-write-wins at the account level.
+fn account_to_record(account: &CloudAccount) -> wmp::VaultRecordDoc {
+    use base64::prelude::*;
+    wmp::VaultRecordDoc {
+        id: account.id.clone(),
+        name: account.display_name.clone(),
+        provider_type: account.provider_type.clone(),
+        url: account.base_url.clone().unwrap_or_default(),
+        username: String::new(),
+        password: BASE64_STANDARD.encode(&account.credentials_encrypted),
+        password_encrypted: false,
+        remote_path: "/".to_string(),
+        driver_config: None,
+        engine_updated_at: chrono::Utc::now().timestamp(),
     }
 }
 
-impl From<&RemoteAccount> for CloudAccount {
-    fn from(r: &RemoteAccount) -> Self {
-        use base64::prelude::*;
-        let credentials_encrypted = BASE64_STANDARD
-            .decode(&r.credentials_encrypted_b64)
-            .unwrap_or_default();
-        CloudAccount {
-            id: r.id.clone(),
-            provider_type: r.provider_type.clone(),
-            display_name: r.display_name.clone(),
-            base_url: r.base_url.clone(),
-            credentials_encrypted,
-        }
+fn account_from_record(record: &wmp::VaultRecordDoc) -> CloudAccount {
+    use base64::prelude::*;
+    CloudAccount {
+        id: record.id.clone(),
+        provider_type: record.provider_type.clone(),
+        display_name: record.name.clone(),
+        base_url: if record.url.is_empty() {
+            None
+        } else {
+            Some(record.url.clone())
+        },
+        credentials_encrypted: BASE64_STANDARD
+            .decode(&record.password)
+            .unwrap_or_default(),
     }
 }
 
 /// Credential sync engine — syncs cloud account credentials to/from a remote
 /// `WdmmVfs` store (WebDAV happy path).
+///
+/// The remote snapshot is a `WDMMCV01` document at
+/// `{remote_dir}/accounts.wdmcv` (`wmp::ENGINE_ACCOUNTS_FILE_NAME`). It shares the
+/// container format with the user credential vault (`credentials.wdmcv`) but is
+/// **not** that file: the snapshot stores the opaque encrypted credential blob
+/// and no username, the vault stores url/username plus a plaintext or
+/// `AESGCMv1:` password. Different documents — never interchange them.
 pub struct CredentialSyncEngine {
     db: Arc<LibraryDatabase>,
     driver: Arc<dyn WdmmVfs>,
@@ -237,8 +237,8 @@ pub struct CredentialSyncEngine {
 
 impl CredentialSyncEngine {
     /// `remote_dir` is the base directory on the remote for sync metadata
-    /// (e.g. `"/wdmm_sync"`). The credentials file lands at
-    /// `{remote_dir}/credentials.json`.
+    /// (e.g. `"/wdmm_sync"`). The snapshot lands at
+    /// `{remote_dir}/accounts.wdmcv`.
     pub fn new(
         db: Arc<LibraryDatabase>,
         driver: Arc<dyn WdmmVfs>,
@@ -252,21 +252,25 @@ impl CredentialSyncEngine {
     }
 
     fn file_path(&self) -> String {
-        join_path(&self.remote_dir, "credentials.json")
+        join_path(&self.remote_dir, wmp::ENGINE_ACCOUNTS_FILE_NAME)
     }
 
-    async fn fetch_remote(&self) -> SyncResult<Vec<RemoteAccount>> {
+    async fn fetch_remote(&self) -> SyncResult<Vec<wmp::VaultRecordDoc>> {
         match driver_read(&self.driver, &self.file_path()).await? {
             None => Ok(vec![]),
-            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Some(bytes) => Ok(wmp::VaultDocument::decode(&bytes)?.records),
         }
     }
 
     async fn push_all(&self, accounts: &[CloudAccount]) -> SyncResult<()> {
         driver_ensure_dir(&self.driver, &self.remote_dir).await?;
-        let remote: Vec<RemoteAccount> = accounts.iter().map(RemoteAccount::from).collect();
-        let bytes = serde_json::to_vec(&remote)?;
-        driver_write(&self.driver, &self.file_path(), &bytes).await
+        let document = wmp::VaultDocument {
+            format_version: 1,
+            device_id: String::new(),
+            created_at: wmp::now_iso8601(),
+            records: accounts.iter().map(account_to_record).collect(),
+        };
+        driver_write(&self.driver, &self.file_path(), &document.encode()).await
     }
 }
 
@@ -277,7 +281,7 @@ impl SyncEngine for CredentialSyncEngine {
         let remote = self.fetch_remote().await?;
 
         // Build remote map by id for merge.
-        let remote_by_id: HashMap<&str, &RemoteAccount> =
+        let remote_by_id: HashMap<&str, &wmp::VaultRecordDoc> =
             remote.iter().map(|r| (r.id.as_str(), r)).collect();
 
         let mut outcomes = Vec::new();
@@ -286,12 +290,12 @@ impl SyncEngine for CredentialSyncEngine {
         let local_ids: Vec<String> = local.iter().map(|a| a.id.clone()).collect();
         for r in &remote {
             if !local_ids.iter().any(|id| id == &r.id) {
-                let account = CloudAccount::from(r);
+                let account = account_from_record(r);
                 self.db.insert_account(&account)?;
                 outcomes.push(SyncOutcome {
                     entity_id: r.id.clone(),
                     action: SyncAction::Pulled,
-                    rev: RevClock::new(r.updated_at.max(1) as u64),
+                    rev: RevClock::new(r.engine_updated_at.max(1) as u64),
                 });
             }
         }
@@ -330,37 +334,77 @@ impl SyncEngine for CredentialSyncEngine {
 
 // ── Playlist Sync ─────────────────────────────────────────────────────────────
 
-/// Wire payload for one playlist file. `updated_at` drives last-write-wins.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemotePlaylist {
-    id: String,
-    name: String,
-    created_at: i64,
-    updated_at: i64,
-    entries: Vec<RemotePlaylistEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemotePlaylistEntry {
-    position: i64,
-    music_id: String,
-    source_name: String,
-    remote_path: String,
-    title: String,
-    duration_ms: i64,
-}
-
-impl RemotePlaylist {
-    fn file_name(id: &str) -> String {
-        format!("{id}.json")
+/// Map a local playlist + its entries onto a `WDMMPL01` document.
+///
+/// The engine mirror does not carry covers or cue indexes (the app's playlist
+/// mirror does); playlist identity and last-write-wins clock travel inside the
+/// document, so file names never matter for correctness.
+fn playlist_to_document(pl: &Playlist, entries: &[PlaylistEntry]) -> wmp::PlaylistDocument {
+    wmp::PlaylistDocument {
+        id: pl.id.clone(),
+        name: pl.name.clone(),
+        created_at: wmp::iso8601_from_epoch(pl.created_at.timestamp()),
+        updated_at: wmp::iso8601_from_epoch(pl.updated_at.timestamp()),
+        device_id: String::new(),
+        entries: entries
+            .iter()
+            .map(|entry| wmp::PlaylistEntryDoc {
+                music_id: entry.music_id.clone(),
+                source_name: entry.source_name.clone(),
+                remote_path: entry.remote_path.clone(),
+                title: entry.title.clone(),
+                duration_ms: Some(entry.duration_ms),
+                cue_track_index: None,
+                cover_index: None,
+                remote_missing: false,
+            })
+            .collect(),
+        covers: Vec::new(),
     }
+}
+
+/// Rebuild a local playlist + entries from a `WDMMPL01` document, plus the
+/// epoch seconds of the document's `updated_at` (the LWW clock).
+fn playlist_from_document(
+    document: wmp::PlaylistDocument,
+) -> (Playlist, Vec<PlaylistEntry>, i64) {
+    let created_seconds = wmp::epoch_from_iso8601(&document.created_at);
+    let updated_seconds = wmp::epoch_from_iso8601(&document.updated_at)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let playlist_id = document.id.clone();
+    let entries: Vec<PlaylistEntry> = document
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| PlaylistEntry {
+            playlist_id: playlist_id.clone(),
+            position: position as i64,
+            music_id: entry.music_id.clone(),
+            source_name: entry.source_name.clone(),
+            remote_path: entry.remote_path.clone(),
+            title: entry.title.clone(),
+            duration_ms: entry.duration_ms.unwrap_or(0),
+        })
+        .collect();
+    let playlist = Playlist {
+        id: document.id,
+        name: document.name,
+        created_at: created_seconds
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            .unwrap_or_else(chrono::Utc::now),
+        updated_at: chrono::DateTime::from_timestamp(updated_seconds, 0)
+            .unwrap_or_else(chrono::Utc::now),
+    };
+    (playlist, entries, updated_seconds)
 }
 
 /// Playlist sync engine — syncs playlist definitions to/from remote storage.
 ///
-/// Round 4 scope: push/pull **one** playlist format path (JSON at
-/// `{remote_dir}/playlists/{id}.json`), aligning with docs/10 essentials.
-/// Tombstones / deletion packages (`WDMMPD01`) are out of scope this round.
+/// The engine mirror speaks the app's playlist container: one `WDMMPL01`
+/// document per playlist at `{remote_dir}/playlists/{id}.wdmp`. Tombstones /
+/// deletion packs (`WDMMPD01`) are produced by the app document lane
+/// (`wdmm_playlist_encode`) and are skipped here; the mirror is identity-based
+/// and keyed by id, so it never orphans a renamed playlist.
 pub struct PlaylistSyncEngine {
     db: Arc<LibraryDatabase>,
     driver: Arc<dyn WdmmVfs>,
@@ -385,37 +429,20 @@ impl PlaylistSyncEngine {
     }
 
     fn file_path(&self, id: &str) -> String {
-        join_path(&self.playlists_dir(), &RemotePlaylist::file_name(id))
+        join_path(&self.playlists_dir(), &wmp::engine_playlist_file_name(id))
     }
 
-    async fn fetch_remote(&self, id: &str) -> SyncResult<Option<RemotePlaylist>> {
+    async fn fetch_remote(&self, id: &str) -> SyncResult<Option<wmp::PlaylistDocument>> {
         match driver_read(&self.driver, &self.file_path(id)).await? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Some(bytes) => Ok(Some(wmp::PlaylistDocument::decode(&bytes)?)),
         }
     }
 
     async fn push_one(&self, pl: &Playlist, entries: &[PlaylistEntry]) -> SyncResult<()> {
         driver_ensure_dir(&self.driver, &self.playlists_dir()).await?;
-        let remote = RemotePlaylist {
-            id: pl.id.clone(),
-            name: pl.name.clone(),
-            created_at: pl.created_at.timestamp(),
-            updated_at: pl.updated_at.timestamp(),
-            entries: entries
-                .iter()
-                .map(|e| RemotePlaylistEntry {
-                    position: e.position,
-                    music_id: e.music_id.clone(),
-                    source_name: e.source_name.clone(),
-                    remote_path: e.remote_path.clone(),
-                    title: e.title.clone(),
-                    duration_ms: e.duration_ms,
-                })
-                .collect(),
-        };
-        let bytes = serde_json::to_vec(&remote)?;
-        driver_write(&self.driver, &self.file_path(&pl.id), &bytes).await
+        let document = playlist_to_document(pl, entries);
+        driver_write(&self.driver, &self.file_path(&pl.id), &document.encode()).await
     }
 }
 
@@ -430,41 +457,24 @@ impl SyncEngine for PlaylistSyncEngine {
         // Pull remote-only playlists (not present locally).
         let remote_files = driver_list_files(&self.driver, &self.playlists_dir()).await?;
         for fname in &remote_files {
-            // file name is "<id>.json"
-            let Some(pl_id) = fname.strip_suffix(".json") else {
+            // Mirror files are "<id>.wdmp"; deletion packs belong to the app lane.
+            if !wmp::looks_like_playlist_document(fname) {
+                continue;
+            }
+            let Some(pl_id) = fname.strip_suffix(".wdmp") else {
                 continue;
             };
             if local_ids.contains(pl_id) {
                 continue; // handled in local loop below
             }
-            if let Some(remote) = self.fetch_remote(pl_id).await? {
-                let pulled = Playlist {
-                    id: remote.id.clone(),
-                    name: remote.name.clone(),
-                    created_at: chrono::DateTime::from_timestamp(remote.created_at, 0)
-                        .unwrap_or_else(chrono::Utc::now),
-                    updated_at: chrono::DateTime::from_timestamp(remote.updated_at, 0)
-                        .unwrap_or_else(chrono::Utc::now),
-                };
+            if let Some(document) = self.fetch_remote(pl_id).await? {
+                let (pulled, pulled_entries, updated_epoch) = playlist_from_document(document);
                 self.db.upsert_playlist(&pulled)?;
-                let pulled_entries: Vec<PlaylistEntry> = remote
-                    .entries
-                    .iter()
-                    .map(|e| PlaylistEntry {
-                        playlist_id: pl_id.to_string(),
-                        position: e.position,
-                        music_id: e.music_id.clone(),
-                        source_name: e.source_name.clone(),
-                        remote_path: e.remote_path.clone(),
-                        title: e.title.clone(),
-                        duration_ms: e.duration_ms,
-                    })
-                    .collect();
                 self.db.set_playlist_entries(pl_id, &pulled_entries)?;
                 outcomes.push(SyncOutcome {
                     entity_id: pl_id.to_string(),
                     action: SyncAction::Pulled,
-                    rev: RevClock::new(remote.updated_at.max(1) as u64),
+                    rev: RevClock::new(updated_epoch.max(1) as u64),
                 });
             }
         }
@@ -472,52 +482,42 @@ impl SyncEngine for PlaylistSyncEngine {
         // Process local playlists: pull if remote is newer, else push.
         for pl in &local {
             let entries = self.db.list_playlist_entries(&pl.id)?;
+            let local_epoch = pl.updated_at.timestamp();
             match self.fetch_remote(&pl.id).await? {
-                Some(remote) if remote.updated_at > pl.updated_at.timestamp() => {
-                    // Remote is strictly newer → pull.
-                    let pulled = Playlist {
-                        id: remote.id.clone(),
-                        name: remote.name.clone(),
-                        created_at: chrono::DateTime::from_timestamp(remote.created_at, 0)
-                            .unwrap_or_else(chrono::Utc::now),
-                        updated_at: chrono::DateTime::from_timestamp(remote.updated_at, 0)
-                            .unwrap_or_else(chrono::Utc::now),
-                    };
-                    self.db.upsert_playlist(&pulled)?;
-                    let pulled_entries: Vec<PlaylistEntry> = remote
-                        .entries
-                        .iter()
-                        .map(|e| PlaylistEntry {
-                            playlist_id: pl.id.clone(),
-                            position: e.position,
-                            music_id: e.music_id.clone(),
-                            source_name: e.source_name.clone(),
-                            remote_path: e.remote_path.clone(),
-                            title: e.title.clone(),
-                            duration_ms: e.duration_ms,
-                        })
-                        .collect();
-                    self.db.set_playlist_entries(&pl.id, &pulled_entries)?;
-                    outcomes.push(SyncOutcome {
-                        entity_id: pl.id.clone(),
-                        action: SyncAction::Pulled,
-                        rev: RevClock::new(remote.updated_at.max(1) as u64),
-                    });
+                Some(document) => {
+                    let (pulled, pulled_entries, remote_epoch) = playlist_from_document(document);
+                    if remote_epoch > local_epoch {
+                        // Remote is strictly newer → pull.
+                        self.db.upsert_playlist(&pulled)?;
+                        self.db.set_playlist_entries(&pl.id, &pulled_entries)?;
+                        outcomes.push(SyncOutcome {
+                            entity_id: pl.id.clone(),
+                            action: SyncAction::Pulled,
+                            rev: RevClock::new(remote_epoch.max(1) as u64),
+                        });
+                    } else if remote_epoch == local_epoch {
+                        outcomes.push(SyncOutcome {
+                            entity_id: pl.id.clone(),
+                            action: SyncAction::NoChange,
+                            rev: RevClock::new(remote_epoch.max(1) as u64),
+                        });
+                    } else {
+                        // Local is newer → push.
+                        self.push_one(pl, &entries).await?;
+                        outcomes.push(SyncOutcome {
+                            entity_id: pl.id.clone(),
+                            action: SyncAction::Pushed,
+                            rev: RevClock::new(local_epoch.max(1) as u64),
+                        });
+                    }
                 }
-                Some(remote) if remote.updated_at == pl.updated_at.timestamp() => {
-                    outcomes.push(SyncOutcome {
-                        entity_id: pl.id.clone(),
-                        action: SyncAction::NoChange,
-                        rev: RevClock::new(remote.updated_at.max(1) as u64),
-                    });
-                }
-                _ => {
-                    // No remote or local is newer → push.
+                None => {
+                    // No remote → push.
                     self.push_one(pl, &entries).await?;
                     outcomes.push(SyncOutcome {
                         entity_id: pl.id.clone(),
                         action: SyncAction::Pushed,
-                        rev: RevClock::new(pl.updated_at.timestamp().max(1) as u64),
+                        rev: RevClock::new(local_epoch.max(1) as u64),
                     });
                 }
             }
@@ -725,7 +725,7 @@ mod tests {
         let db = tmp_db();
         let driver = Arc::new(MockDriver::new());
 
-        // Device A: has one account → sync (pushes credentials.json).
+        // Device A: has one account → sync (pushes the WDMMCV01 snapshot).
         let account = CloudAccount {
             id: "acc1".into(),
             provider_type: "webdav".into(),
@@ -740,14 +740,28 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].action, SyncAction::Pushed);
 
-        // Verify the remote file exists and decodes.
+        // Verify the remote snapshot is a WDMMCV01 document at accounts.wdmcv,
+        // and that it is not the user vault file name.
         let remote_bytes = driver
-            .get_content("/sync/credentials.json")
+            .get_content("/sync/accounts.wdmcv")
             .await
             .unwrap();
-        let remote: Vec<RemoteAccount> = serde_json::from_slice(&remote_bytes).unwrap();
-        assert_eq!(remote.len(), 1);
-        assert_eq!(remote[0].id, "acc1");
+        assert_eq!(
+            wmp::container_file_kind(&remote_bytes),
+            Some(*wmp::FILE_KIND_VAULT)
+        );
+        let remote = wmp::VaultDocument::decode(&remote_bytes).unwrap();
+        assert_eq!(remote.records.len(), 1);
+        assert_eq!(remote.records[0].id, "acc1");
+        assert_eq!(remote.records[0].name, "My NAS");
+        assert!(
+            !driver
+                .files
+                .lock()
+                .await
+                .contains_key("/sync/credentials.wdmcv"),
+            "the engine must never write the user vault file"
+        );
 
         // Device B: empty DB, same remote → sync pulls the account in.
         let db2 = tmp_db();
@@ -932,6 +946,20 @@ mod tests {
         let outcomes = engine.sync_incremental().await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].action, SyncAction::Pushed);
+
+        // The mirror is a WDMMPL01 document, not JSON.
+        let remote_bytes = driver
+            .get_content("/sync/playlists/pl-1.wdmp")
+            .await
+            .unwrap();
+        assert_eq!(
+            wmp::container_file_kind(&remote_bytes),
+            Some(*wmp::FILE_KIND_PLAYLIST)
+        );
+        let remote_document = wmp::PlaylistDocument::decode(&remote_bytes).unwrap();
+        assert_eq!(remote_document.name, "Mix");
+        assert_eq!(remote_document.entries.len(), 1);
+        assert_eq!(remote_document.entries[0].title, "A");
 
         // Remote now has pl-1. A second device with no local playlist pulls it.
         let db2 = tmp_db();
