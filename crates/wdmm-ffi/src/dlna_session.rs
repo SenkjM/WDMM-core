@@ -1080,31 +1080,34 @@ const DEFAULT_SUBTITLE_LANGUAGE: &str = "default";
 /// Renderer-visible file name for one subtitle resource (contract §C.3).
 ///
 /// A renderer derives the external track's language/label from the URL's last
-/// path segment (`CUtil::GetExternalStreamDetailsFromFilename`), so a sidecar is
-/// served as `<video stem>.<language>.<ext>` and nothing else: every extra token
-/// is parsed back as part of the stream's name. A sidecar whose file name states
-/// no language becomes `<video stem>.default.<ext>`.
+/// path segment (`CUtil::GetExternalStreamDetailsFromFilename`), which parses the
+/// tokens *after* the video stem — a name without the stem is read as tokens of
+/// its own. A sidecar is therefore served as just `<language>.<ext>`; a sidecar
+/// whose file name states no language becomes `default.<ext>`.
 ///
 /// Embedded tracks are always WebVTT and keep their track title, which is the
 /// only thing distinguishing (say) 33 tracks of the same container:
 /// `<video stem>[.<language>][.<title>].vtt`.
 fn subtitle_url_name(video_name: &str, candidate: &SubtitleCandidate, index: usize) -> String {
     let stem = video_stem(video_name);
-    let ext = if candidate.embedded {
-        "vtt".to_string()
-    } else {
-        let ext = extension(&candidate.name);
-        if ext.is_empty() {
-            "srt".to_string()
-        } else {
-            ext
-        }
-    };
     let language = candidate
         .language
         .as_deref()
         .map(sanitize_url_token)
         .filter(|token| !token.is_empty());
+    if !candidate.embedded {
+        // Sidecars carry their own name only: the renderer has nothing to strip,
+        // so the language is the first token it sees.
+        let ext = extension(&candidate.name);
+        let ext = if ext.is_empty() {
+            "srt".to_string()
+        } else {
+            ext
+        };
+        let token = language.unwrap_or_else(|| DEFAULT_SUBTITLE_LANGUAGE.to_string());
+        return format!("{token}.{ext}");
+    }
+    let ext = "vtt".to_string();
     let mut tokens = vec![stem];
     match language {
         Some(language) => tokens.push(language),
@@ -2956,28 +2959,29 @@ mod tests {
 
     #[test]
     fn subtitle_url_name_follows_the_video_name() {
-        // A sidecar is stem + language + real format; a title would be parsed
-        // back as part of the stream's name, so it is dropped.
+        // A sidecar is language + real format, and nothing else: the renderer
+        // parses every token it sees as the stream's language/name, and the video
+        // stem would only become part of that name.
         let mut candidate = SubtitleCandidate::sidecar(
-            "a.zh.chi.Signs.ass".to_string(),
-            "/v/a.zh.chi.Signs.ass".to_string(),
+            "Movie.zh.chi.Signs.ass".to_string(),
+            "/v/Movie.zh.chi.Signs.ass".to_string(),
             "zh".to_string(),
             Some("chi".to_string()),
             false,
             0,
         );
         candidate.title = Some("Signs".to_string());
-        assert_eq!(subtitle_url_name("a.mkv", &candidate, 0), "a.chi.ass");
+        assert_eq!(subtitle_url_name("Movie.mkv", &candidate, 0), "chi.ass");
         // No language: the renderer is told this is the default subtitle.
         let plain = SubtitleCandidate::sidecar(
-            "a.srt".to_string(),
-            "/v/a.srt".to_string(),
+            "Movie.srt".to_string(),
+            "/v/Movie.srt".to_string(),
             String::new(),
             None,
             false,
             0,
         );
-        assert_eq!(subtitle_url_name("a.mkv", &plain, 2), "a.default.srt");
+        assert_eq!(subtitle_url_name("Movie.mkv", &plain, 2), "default.srt");
         // Embedded tracks are always WebVTT.
         let embedded = SubtitleCandidate::embedded("/v/a.mkv", 3, "subrip".to_string(), None, None);
         assert_eq!(subtitle_url_name("a.mkv", &embedded, 0), "a.1.vtt");
@@ -2990,7 +2994,7 @@ mod tests {
             false,
             0,
         );
-        assert_eq!(subtitle_url_name("a.mkv", &dirty, 0), "a.BadName.srt");
+        assert_eq!(subtitle_url_name("a.mkv", &dirty, 0), "BadName.srt");
         // An embedded track keeps its title, and falls back to its ordinal.
         let mut titled = SubtitleCandidate::embedded("/v/a.mkv", 5, "ass".to_string(), Some("chi"), None);
         titled.title = Some("Signs".to_string());
