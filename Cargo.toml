@@ -11,6 +11,7 @@ members = [
     "crates/wdmm-proxy",
     "crates/wdmm-ffmpeg",
     "crates/wdmm-platform",
+    "crates/wdmm-text",
     "crates/wdmm-openapi",
     "crates/wdmm-ffi",
 ]
@@ -32,6 +33,7 @@ wdmm-dlna     = { path = "crates/wdmm-dlna"     }
 wdmm-proxy    = { path = "crates/wdmm-proxy"    }
 wdmm-ffmpeg   = { path = "crates/wdmm-ffmpeg"   }
 wdmm-platform = { path = "crates/wdmm-platform" }
+wdmm-text     = { path = "crates/wdmm-text"     }
 wdmm-openapi  = { path = "crates/wdmm-openapi"  }
 
 # ── async ──────────────────────────────────────────────────────────────────────
@@ -81,6 +83,13 @@ flate2   = { version = "1.0" }
 
 # ── XML (WebDAV PROPFIND) ─────────────────────────────────────────────────────
 quick-xml = { version = "0.36" }
+
+# ── text / archives / tags (Dart cut-over: wdmm-text, wdmm-ffi::ext) ─────────
+# Versions pinned to the newest release at introduction time; re-check with
+# `cargo search <name>` before touching them (AGENTS.md dependency freshness).
+encoding_rs = { version = "=0.8.44", default-features = false }
+zip         = { version = "=9.3.0", default-features = false, features = ["deflate"] }
+lofty       = { version = "=0.25.5", default-features = false, features = ["id3v2_compression_support"] }
 
 # ── misc ──────────────────────────────────────────────────────────────────────
 chrono      = { version = "0.4",  features = ["serde"] }

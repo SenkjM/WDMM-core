@@ -21,10 +21,11 @@ use wdmm_queue::TaskQueue;
 use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase};
 
 mod dlna_session;
+pub(crate) mod ext;
 
 // ── Runtime singleton ─────────────────────────────────────────────────────────
 
-fn rt() -> &'static Runtime {
+pub(crate) fn rt() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| Runtime::new().expect("tokio runtime"))
 }
@@ -38,7 +39,7 @@ pub struct FfiString {
 }
 
 impl FfiString {
-    fn from(s: impl Into<Vec<u8>>) -> Self {
+    pub(crate) fn from(s: impl Into<Vec<u8>>) -> Self {
         let s = CString::new(s).unwrap_or_else(|_| CString::new("?").unwrap());
         Self { ptr: s.into_raw() }
     }
@@ -443,7 +444,7 @@ pub extern "C" fn wdmm_openapi_port() -> i32 {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn ptr_to_str(p: *const c_char) -> Option<&'static str> {
+pub(crate) fn ptr_to_str(p: *const c_char) -> Option<&'static str> {
     if p.is_null() {
         return None;
     }
@@ -529,7 +530,7 @@ pub extern "C" fn wdmm_crypto_decrypt(
 // ── Sync FFI ─────────────────────────────────────────────────────────────────
 
 /// Helper: look up an account by ID and construct its WdmmVfs.
-fn driver_for_account(
+pub(crate) fn driver_for_account(
     account_id_str: &str,
 ) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, FfiString> {
     let account = match global_library_db().get_account(account_id_str) {
@@ -544,6 +545,70 @@ fn driver_for_account(
     match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
         Ok(d) => Ok(std::sync::Arc::from(d)),
         Err(e) => Err(FfiString::from(format!("error:driver: {e}"))),
+    }
+}
+
+/// Read a byte range from a remote file for the `ext` modules.
+///
+/// This is the single range-read path for the migrated capabilities (ZIP central
+/// directories, tag headers, backup probes): it resolves the driver, refreshes
+/// the token once on `AuthFailed` and maps everything else to a string error.
+/// `end` is inclusive; `None` means "to end of file".
+pub(crate) fn read_account_range(
+    account_id_str: &str,
+    path: &str,
+    start: u64,
+    end: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    let mut account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err("account not found".to_string()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let config = build_driver_config(&account)?;
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return Err(format!("driver: {e}")),
+    };
+    match rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
+        &*driver, path, start, end,
+    )) {
+        Ok(data) => Ok(data),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let refreshed = rt()
+                .block_on(refresh_and_rebuild(&mut account))
+                .map_err(|e| e.to_string())?;
+            rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
+                &*refreshed, path, start, end,
+            ))
+            .map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Fetch the whole content of a remote file (used by the backup probe).
+pub(crate) fn read_account_content(account_id_str: &str, path: &str) -> Result<Vec<u8>, String> {
+    let mut account = match global_library_db().get_account(account_id_str) {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err("account not found".to_string()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let config = build_driver_config(&account)?;
+    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(d) => d,
+        Err(e) => return Err(format!("driver: {e}")),
+    };
+    match rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*driver, path)) {
+        Ok(data) => Ok(data),
+        Err(wdmm_drivers::DriverError::AuthFailed) => {
+            let refreshed = rt()
+                .block_on(refresh_and_rebuild(&mut account))
+                .map_err(|e| e.to_string())?;
+            rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*refreshed, path))
+                .map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
