@@ -178,8 +178,8 @@ fn transcode_cleanly(media: &Path, tag: &str) -> Option<f64> {
     let out_dir = temp_dir(tag);
     let mut preset = wdmm_ffmpeg::preset::preset_h264();
     preset.hls_segment_secs = SEGMENT_SECS;
-    preset.video_copy = false;
-    preset.audio_copy = false;
+    preset.video_remux = "off".to_string();
+    preset.audio_remux = "off".to_string();
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: media.to_string_lossy().into_owned(),
         preset,
@@ -273,7 +273,7 @@ fn legacy_containers_transcode_without_layout_or_timestamp_errors() {
     }
 }
 
-/// The same sources must also survive the hybrid/remux path, which copies video
+/// The same sources must also survive the remux path, which copies video
 /// packets straight through and therefore needs the timestamp repair even more.
 #[test]
 #[ignore = "needs WDMM_LEGACY_TEST_MEDIA"]
@@ -288,8 +288,8 @@ fn legacy_containers_remux_without_timestamp_errors() {
         ));
         let mut preset = wdmm_ffmpeg::preset::preset_h264();
         preset.hls_segment_secs = SEGMENT_SECS;
-        preset.video_copy = true;
-        preset.audio_copy = true;
+        preset.video_remux = "on".to_string();
+        preset.audio_remux = "on".to_string();
         let opts = wdmm_ffmpeg::JobOpts {
             input_url: media.to_string_lossy().into_owned(),
             preset,
@@ -344,8 +344,8 @@ fn legacy_containers_keep_the_container_clock_after_a_seek() {
         ));
         let mut preset = wdmm_ffmpeg::preset::preset_h264();
         preset.hls_segment_secs = SEGMENT_SECS;
-        preset.video_copy = true;
-        preset.audio_copy = true;
+        preset.video_remux = "on".to_string();
+        preset.audio_remux = "on".to_string();
         let opts = wdmm_ffmpeg::JobOpts {
             input_url: media.to_string_lossy().into_owned(),
             preset,

@@ -228,24 +228,26 @@ fn four_quadrants_are_reachable_from_one_source() {
     let dir = temp_dir("quadrants");
     let input = h264_aac_fixture(&dir);
 
-    // (video_copy, audio_copy, expected mode, expected video action, expected audio action)
+    // (video_remux, audio_remux, expected mode, expected video action, expected audio action)
+    // The source is H.264 + AAC, so `on` copies and `off` encodes; `mode` is
+    // "transcode" exactly when the video branch re-encodes (contract `remux-modes` §4).
     let quadrants = [
-        (true, true, "remux", "copy", "copy"),
-        (false, true, "sw", "sw", "copy"),
-        (true, false, "hybrid", "copy", "sw"),
-        (false, false, "sw", "sw", "sw"),
+        ("on", "on", "remux", "copy", "copy"),
+        ("off", "on", "transcode", "sw", "copy"),
+        ("on", "off", "remux", "copy", "sw"),
+        ("off", "off", "transcode", "sw", "sw"),
     ];
 
-    for (index, (video_copy, audio_copy, mode, video_action, audio_action)) in
+    for (index, (video_remux, audio_remux, mode, video_action, audio_action)) in
         quadrants.into_iter().enumerate()
     {
         let mut preset = matrix_base();
-        preset.video_copy = video_copy;
-        preset.audio_copy = audio_copy;
+        preset.video_remux = video_remux.to_string();
+        preset.audio_remux = audio_remux.to_string();
         let tag = format!("q{index}");
         let (info, log, out_dir) = run_job(&input, &preset, &tag, 2);
         eprintln!(
-            "quadrant {tag}: video_copy={video_copy} audio_copy={audio_copy} -> mode={} video={:?} audio={:?}",
+            "quadrant {tag}: video_remux={video_remux} audio_remux={audio_remux} -> mode={} video={:?} audio={:?}",
             info.mode, info.video_action, info.audio_action
         );
         assert_eq!(info.mode, mode, "{tag} mode\n{log}");
@@ -262,7 +264,7 @@ fn four_quadrants_are_reachable_from_one_source() {
 
         // encode (video) + copy (audio) must write the source audio packets
         // straight to the muxer.
-        if !video_copy && audio_copy {
+        if video_remux == "off" && audio_remux == "on" {
             assert!(
                 log.contains("transcode audio copy: keeping source codec aac untouched"),
                 "{tag} must copy audio without a decoder/resampler\n{log}"
@@ -295,8 +297,8 @@ fn rate_control_and_speed_preset_reach_the_encoder_dictionary() {
     // avcodec_open2 through the option dictionary (§4, §13.3).
     for (x264_preset, rate_control) in [("ultrafast", "vbr"), ("medium", "cq"), ("slow", "cbr")] {
         let mut preset = matrix_base();
-        preset.video_copy = false;
-        preset.audio_copy = false;
+        preset.video_remux = "off".to_string();
+        preset.audio_remux = "off".to_string();
         preset.sw_video_encoder = "libx264".into();
         preset.sw_video_preset = x264_preset.into();
         preset.video_rate_control = rate_control.into();
@@ -362,8 +364,8 @@ fn audio_encoders_produce_aac_ac3_and_mp2() {
     for codec in ["aac", "ac3", "mp2"] {
         let mut preset = matrix_base();
         // Copy the video, re-encode the audio: this is the copy+encode quadrant.
-        preset.video_copy = true;
-        preset.audio_copy = false;
+        preset.video_remux = "on".to_string();
+        preset.audio_remux = "off".to_string();
         preset.audio_codec = codec.into();
         let (info, log, out_dir) = run_job(&input, &preset, &format!("audio-{codec}"), 2);
         assert_eq!(
@@ -408,8 +410,8 @@ fn every_segment_starts_on_an_i_frame() {
 
     for encoder in ["libx264", "mpeg2video", "mpeg4"] {
         let mut preset = matrix_base();
-        preset.video_copy = false;
-        preset.audio_copy = false;
+        preset.video_remux = "off".to_string();
+        preset.audio_remux = "off".to_string();
         preset.sw_video_encoder = encoder.into();
         preset.sw_video_preset = "veryfast".into();
         preset.video_max_w = Some(160);
@@ -444,8 +446,8 @@ fn hevc_preset_software_fallback_logs_the_downgrade() {
     let input = h264_aac_fixture(&dir);
 
     let mut preset = preset::preset_hevc();
-    preset.video_copy = false;
-    preset.audio_copy = true;
+    preset.video_remux = "off".to_string();
+    preset.audio_remux = "on".to_string();
     preset.hls_segment_secs = 2;
     preset.video_max_w = Some(320);
     preset.video_max_h = Some(240);
@@ -485,8 +487,8 @@ fn portrait_non_integer_fps_media_encodes_with_mpeg2_and_mpeg4() {
     for encoder in ["mpeg4", "mpeg2video"] {
         let mut preset = preset::preset_h264();
         preset.hw_video_encoder = String::new(); // software encoder only
-        preset.video_copy = false;
-        preset.audio_copy = false;
+        preset.video_remux = "off".to_string();
+        preset.audio_remux = "off".to_string();
         preset.sw_video_encoder = encoder.into();
         preset.sw_video_preset = "medium".into();
         preset.hls_segment_secs = 2;
@@ -543,8 +545,8 @@ fn every_rate_control_encodes_segments_that_start_on_i_frames() {
 
     for rate_control in ["auto", "vbr", "cbr", "cq"] {
         let mut preset = matrix_base();
-        preset.video_copy = false;
-        preset.audio_copy = false;
+        preset.video_remux = "off".to_string();
+        preset.audio_remux = "off".to_string();
         preset.sw_video_encoder = "libx264".into();
         preset.sw_video_preset = "ultrafast".into();
         preset.video_rate_control = rate_control.into();
@@ -581,8 +583,8 @@ fn cbr_and_cq_produce_different_bytes_per_second() {
     let mut sizes = Vec::new();
     for rate_control in ["cbr", "cq"] {
         let mut preset = matrix_base();
-        preset.video_copy = false;
-        preset.audio_copy = false;
+        preset.video_remux = "off".to_string();
+        preset.audio_remux = "off".to_string();
         preset.sw_video_encoder = "libx264".into();
         preset.sw_video_preset = "ultrafast".into();
         preset.video_rate_control = rate_control.into();
@@ -618,8 +620,8 @@ fn anamorphic_source_is_scaled_by_display_width() {
 
     let mut preset = preset::preset_h264();
     preset.hw_video_encoder = String::new(); // software encoder only
-    preset.video_copy = false;
-    preset.audio_copy = true;
+    preset.video_remux = "off".to_string();
+    preset.audio_remux = "on".to_string();
     preset.sw_video_encoder = "libx264".into();
     preset.sw_video_preset = "ultrafast".into();
     preset.hls_segment_secs = 2;

@@ -53,8 +53,8 @@ const MAX_AUDIO_RECONFIGURES: u32 = 8;
 
 use crate::plan::{
     decide_video_action, encoder_av_options, encoder_frame_rate, fit_display_dimensions,
-    hw_gop_size, options_line, remux_dropped_streams, segment_gop_size, target_video_bitrate,
-    video_plan_diag, RateControl, StreamAction,
+    hw_gop_size, hw_probe_needed, options_line, remux_dropped_streams, segment_gop_size,
+    target_video_bitrate, video_plan_diag, RateControl, StreamAction,
 };
 /// Options for opening the loopback HTTP input: bound every blocking read so a
 /// stalled upstream fails with a real error instead of hanging the job forever.
@@ -427,15 +427,14 @@ pub fn source_plan_impl(url: &str, preset: &TranscodePreset) -> FfmpegResult<Opt
         let seg_secs = f64::from(preset.hls_segment_secs);
 
         // Decide the per-stream layout once; the plan below and every job run of
-        // this session must use the same decision (contract §2).
-        let needs_encode = video_codec.is_some_and(|id| {
-            !(preset.video_copy && crate::preset::is_mpegts_video_copy_compatible(id))
-        });
-        let hw_available = if needs_encode {
-            hw_video_encoder_available(preset, "source plan")
-        } else {
-            false
-        };
+        // this session must use the same decision (contract `remux-modes` §3).
+        // The hardware layer is only probed when the remux mode depends on it.
+        let hw_available =
+            if hw_probe_needed(preset, video_codec.unwrap_or(0)).map_err(FfmpegError::Probe)? {
+                hw_video_encoder_available(preset, "source plan")
+            } else {
+                false
+            };
         let decision = SessionDecision::decide(
             preset,
             video_codec.unwrap_or(0),
@@ -1413,13 +1412,13 @@ pub fn run_hls_job(
     telemetry.set_start_ms((start_offset_secs * 1000.0).round() as i64);
     let tag = job_tag(job_id);
     diag::log(format!(
-        "{tag} job start preset={} hw_video_encoder={} sw_video_encoder={} video_copy={} audio_codec={} audio_copy={} start_offset={start_offset_secs:.2} start_number={start_number} hls_time_override_ms={hls_time_override_ms:?} seg_dir={} input={}",
+        "{tag} job start preset={} hw_video_encoder={} sw_video_encoder={} video_remux={} audio_codec={} audio_remux={} start_offset={start_offset_secs:.2} start_number={start_number} hls_time_override_ms={hls_time_override_ms:?} seg_dir={} input={}",
         preset.id,
         preset.hw_video_encoder,
         preset.sw_video_encoder,
-        preset.video_copy,
+        preset.video_remux,
         preset.audio_codec,
-        preset.audio_copy,
+        preset.audio_remux,
         segment_dir.display(),
         sanitize_url(input_url),
     ));
@@ -1583,9 +1582,7 @@ unsafe fn decide_session(
             audio_codec = (*(*st).codecpar).codec_id as u32;
         }
         let _ = nb;
-        let needs_video_encode = video_codec != 0
-            && !(preset.video_copy && crate::preset::is_mpegts_video_copy_compatible(video_codec));
-        let hw_available = if needs_video_encode {
+        let hw_available = if hw_probe_needed(preset, video_codec).map_err(FfmpegError::Probe)? {
             hw_video_encoder_available(preset, tag)
         } else {
             false
@@ -1593,7 +1590,8 @@ unsafe fn decide_session(
         let decision = SessionDecision::decide(preset, video_codec, audio_codec, hw_available)
             .map_err(FfmpegError::Probe)?;
         if video_codec != 0 {
-            let action = decide_video_action(preset, video_codec, hw_available)
+            let target_codec = crate::video_target_codec_id(preset, hw_available);
+            let action = decide_video_action(preset, video_codec, target_codec, hw_available)
                 .map_err(FfmpegError::Probe)?;
             let planned = plan_video_encode(preset, src_w, src_h, src_sar, src_rate);
             let rate_control =
@@ -1738,8 +1736,8 @@ pub(crate) fn plan_video_encode(
 }
 
 // ── Shared audio decode → resample → encode pipeline ────────────────────────
-// Used by both the full transcode path and the hybrid remux path (copy video,
-// re-encode only the audio track). Keeping one implementation means the hybrid
+// Used by both the full transcode path and the audio re-encode remux path (copy
+// video, re-encode only the audio track). Keeping one implementation means the
 // mode cannot silently drift away from the transcode path.
 
 unsafe fn open_audio_decoder(
@@ -2541,7 +2539,7 @@ fn run_remux(
             ));
         }
 
-        // ── Pick best streams, then decide remux / hybrid / transcode ─────
+        // ── Pick best streams, then decide remux / transcode ─────────────
         let nb = fmtctx_nb_streams(in_ctx) as usize;
         let streams_ptr = fmtctx_streams(in_ctx);
         log_streams(tag, "remux", streams_ptr, nb);
@@ -2594,8 +2592,8 @@ fn run_remux(
             telemetry.warn("源文件没有视频流，已转为纯音频输出");
         }
 
-        // ── Hybrid mode: decode the incompatible audio, encode it with the
-        // preset's audio codec ─────────────────────────────────────────────
+        // ── Audio re-encode mode: decode the incompatible audio, encode it with
+        // the preset's audio codec ────────────────────────────────────────────
         let audio_sample_rate = preset.audio_sample_rate.unwrap_or(48_000) as i32;
         let mut a_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
         let mut a_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
@@ -2605,7 +2603,7 @@ fn run_remux(
             let audio_codec =
                 crate::preset::audio_encoder_codec_id(&preset.audio_codec) as AVCodecID;
             diag::log(format!(
-                "{tag} remux hybrid: {}re-encoding audio {} → {}",
+                "{tag} video remux: {}audio re-encoded {} → {}",
                 if v_idx >= 0 {
                     "copying video, "
                 } else {
@@ -2641,11 +2639,13 @@ fn run_remux(
                     return Err(e);
                 }
             }
+        } else if a_idx >= 0 {
+            diag::log(format!("{tag} video remux: audio remux"));
         }
 
         // ── Telemetry ───────────────────────────────────────────────────────
-        // Both copy paths leave the video stream untouched, so no encoder was
-        // probed or opened — the hardware fields are false by definition.
+        // Video is never re-encoded on this path, so no encoder was probed or
+        // opened — the hardware fields are false by definition.
         let audio_mode = if audio_encode {
             audio_enc_name.clone()
         } else if a_idx >= 0 {
@@ -2654,11 +2654,7 @@ fn run_remux(
             None
         };
         telemetry.set_encoder(EncoderInfo {
-            mode: if audio_encode {
-                "hybrid".into()
-            } else {
-                "remux".into()
-            },
+            mode: "remux".into(),
             // Audio-only sources copy nothing from a video stream.
             video: if v_idx >= 0 {
                 Some("copy".into())
@@ -2742,14 +2738,12 @@ fn run_remux(
             }
             if audio_encode {
                 if a_enc_ctx.is_null() {
-                    fail_remux!(FfmpegError::Probe(
-                        "hybrid audio encoder is null (remux)".into()
-                    ));
+                    fail_remux!(FfmpegError::Probe("remux audio encoder is null".into()));
                 }
                 let ret = avcodec_parameters_from_context((*out_st).codecpar, a_enc_ctx);
                 if ret < 0 {
                     fail_remux!(ffmpeg_err(
-                        "avcodec_parameters_from_context(audio, hybrid)",
+                        "avcodec_parameters_from_context(audio, remux)",
                         ret
                     ));
                 }
@@ -2803,7 +2797,7 @@ fn run_remux(
                 0,
             );
         }
-        // With video both copy paths (pure remux and hybrid audio re-encode) cut
+        // With video the remux path (pure copy or audio re-encode) cuts
         // on video keyframes only; `split_by_time` is deliberately NOT set there
         // because it would let the muxer cut mid-GOP, producing segments that
         // cannot be decoded independently and contradicting the keyframe plan.
@@ -2838,7 +2832,7 @@ fn run_remux(
                 av_packet_free(&mut out_pkt);
                 av_packet_free(&mut pkt);
                 fail_remux!(FfmpegError::Probe(
-                    "av_frame_alloc/av_packet_alloc returned null (hybrid remux)".into()
+                    "av_frame_alloc/av_packet_alloc returned null (remux audio encode)".into()
                 ));
             }
         }
@@ -2943,7 +2937,7 @@ fn run_remux(
             }
         }
 
-        // Flush the hybrid audio encoder so the last frames reach the muxer.
+        // Flush the re-encoded audio so the last frames reach the muxer.
         if audio_encode && write_error.is_none() && !a_enc_ctx.is_null() {
             if let Err(e) = audio.drain(a_enc_ctx, out_pkt, out_ctx, out_a_idx, &mut job, true) {
                 write_error = Some(e);
@@ -3524,11 +3518,9 @@ fn run_transcode(
         }
 
         telemetry.set_encoder(EncoderInfo {
-            mode: if hw_available {
-                "hw".into()
-            } else {
-                "sw".into()
-            },
+            // Contract `remux-modes` §4: the only two modes are remux and
+            // transcode. The hardware/software layer is visible through `video`.
+            mode: "transcode".into(),
             video: v_enc_name.clone(),
             audio: if audio_copy {
                 Some("copy".to_string())

@@ -2669,11 +2669,13 @@ pub extern "C" fn wdmm_dlna_session_start(config_json: *const c_char) -> FfiStri
 /// (0.0 when direct/unknown), `encode_content_ms`, `encode_wall_ms`,
 /// `playlist_ready`, `segments`, `estimated_realtime` (bool|null),
 /// `error` (string|null, set when `phase == "failed"`), and the §7.3
-/// diagnostics keys `encode_mode` (`remux`/`hybrid`/`hw`/`sw`),
-/// `video_encoder`, `audio_encoder`, then the §11.1 hit-layer keys
+/// diagnostics keys `encode_mode` (`remux`/`transcode` only: `remux` means the
+/// video stream was remuxed, which still allows the audio stream to be
+/// re-encoded), `video_encoder`, `audio_encoder`, then the §11.1 hit-layer keys
 /// `video_action`/`audio_action` (`copy`/`hw`/`sw`/`none`, taken from the
-/// per-stream decision so encode+copy stays expressible), plus
-/// `encode_warnings`, `diagnostics`.
+/// per-stream decision so "video remux + audio encode" stays expressible: the
+/// session reports `encode_mode == "remux"` together with
+/// `audio_action != "copy"`), plus `encode_warnings`, `diagnostics`.
 ///
 /// Every subtitle candidate also carries `embedded` (bool), `track`
 /// (AV stream index or null), `codec` (libav codec name or null),

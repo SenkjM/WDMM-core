@@ -34,7 +34,7 @@
 #![allow(dead_code)]
 
 pub mod diag; // always compiled — diagnostics must work without libav
-pub mod plan; // always compiled — pure remux/hybrid decision rules, host-testable
+pub mod plan; // always compiled — pure remux-mode decision rules, host-testable
 pub mod preset;
 pub mod subtitle; // always compiled — pure text/timing → WebVTT conversion, host-testable
 mod sys;
@@ -60,10 +60,10 @@ use thiserror::Error;
 
 pub use plan::{
     decide_audio_action, decide_video_action, default_video_bitrate, display_width,
-    encoder_av_options, encoder_frame_rate, fit_display_dimensions, hw_gop_size, options_line,
-    remux_dropped_streams, remux_plan, remux_stream_selection, segment_gop_size,
+    encoder_av_options, encoder_frame_rate, fit_display_dimensions, hw_gop_size, hw_probe_needed,
+    options_line, remux_dropped_streams, remux_stream_selection, segment_gop_size,
     sw_fallback_downgrades_hevc, target_video_bitrate, video_encoder_catalog, video_plan_diag,
-    AudioAction, EncoderFamily, RateControl, RemuxPlan, StreamAction, VideoEncoderInfo,
+    AudioAction, EncoderFamily, RateControl, RemuxMode, StreamAction, VideoEncoderInfo,
     INVARIANT_X264_PARAMS, SHIPPED_AUDIO_ENCODERS, SHIPPED_VIDEO_ENCODERS,
 };
 pub use subtitle::{classify_codec, Cue, TrackKind};
@@ -159,11 +159,13 @@ pub struct JobProgress {
 /// Encoder selection actually used by a job (§7.3).
 #[derive(Clone, Debug, Default)]
 pub struct EncoderInfo {
-    /// `"remux"`/`"hybrid"` for the copy paths, `"hw"` when a MediaCodec
-    /// hardware encoder was actually opened, `"sw"` when libx264 encodes.
+    /// `"remux"` when the video stream was copied through unchanged,
+    /// `"transcode"` when it was re-encoded (contract `remux-modes` §4 — the
+    /// old `hybrid`/`hw`/`sw` values are gone; the encoder names in `video`
+    /// carry the layer detail).
     pub mode: String,
-    /// Actual video encoder name; `None` for a remux, `"copy"` for hybrid
-    /// remux (video packets are copied, not re-encoded).
+    /// Actual video encoder name; `None` for a remux, `"copy"` when the video
+    /// packets are copied while audio is re-encoded.
     pub video: Option<String>,
     /// Actual audio encoder name, or `"copy"` for stream copy.
     pub audio: Option<String>,
@@ -224,24 +226,50 @@ pub struct SessionDecision {
     pub audio_encoder: Option<String>,
 }
 
+/// Codec id the video encoder layer would produce right now, `0` when the
+/// preset has no usable encoder.
+///
+/// The hardware encoder wins when it is configured *and* proved usable;
+/// otherwise the software encoder is the layer that would run. `strict` remux
+/// compares the source against this id, so it has to be computed exactly the
+/// same way here and in the diagnostics (`contract remux-modes §3`).
+pub(crate) fn video_target_codec_id(preset: &TranscodePreset, hw_encoder_available: bool) -> u32 {
+    let encoder = if !preset.hw_video_encoder.is_empty() && hw_encoder_available {
+        &preset.hw_video_encoder
+    } else {
+        &preset.sw_video_encoder
+    };
+    crate::preset::video_encoder_output_codec_id(encoder).unwrap_or(0)
+}
+
+/// Codec id the audio encoder layer would produce: the preset's `audio_codec`.
+///
+/// Audio has no hardware layer, so this is the single target `strict` compares
+/// the source against.
+pub(crate) fn audio_target_codec_id(preset: &TranscodePreset) -> u32 {
+    crate::preset::audio_encoder_codec_id(&preset.audio_codec)
+}
+
 impl SessionDecision {
     /// Decide both streams for a source whose best video stream is
     /// `video_codec_id` (0 = no video stream) and best audio stream is
     /// `audio_codec_id` (0 = no audio stream).
     ///
     /// `hw_encoder_available` must mean "found by name *and* `avcodec_open2`
-    /// succeeded" — presence in libavcodec is not proof on device. It is only
-    /// consulted when the video stream must be re-encoded.
+    /// succeeded" — presence in libavcodec is not proof on device. Callers probe
+    /// according to [`hw_probe_needed`] and pass the result down.
     pub fn decide(
         preset: &TranscodePreset,
         video_codec_id: u32,
         audio_codec_id: u32,
         hw_encoder_available: bool,
     ) -> Result<Self, String> {
+        let video_target = video_target_codec_id(preset, hw_encoder_available);
+        let audio_target = audio_target_codec_id(preset);
         let (video, video_encoder) = if video_codec_id == 0 {
             (StreamMode::None, None)
         } else {
-            match decide_video_action(preset, video_codec_id, hw_encoder_available)? {
+            match decide_video_action(preset, video_codec_id, video_target, hw_encoder_available)? {
                 StreamAction::Copy => (StreamMode::Copy, Some("copy".to_string())),
                 StreamAction::Encode { hardware, encoder } => (
                     if hardware {
@@ -256,7 +284,7 @@ impl SessionDecision {
         let (audio, audio_encoder) = if audio_codec_id == 0 {
             (StreamMode::None, None)
         } else {
-            match decide_audio_action(preset, audio_codec_id) {
+            match decide_audio_action(preset, audio_codec_id, audio_target)? {
                 AudioAction::Copy => (StreamMode::Copy, Some("copy".to_string())),
                 AudioAction::Encode { encoder } => {
                     (StreamMode::Software, Some(encoder.to_string()))
@@ -584,7 +612,7 @@ pub fn extract_subtitle_tracks(
 /// The proxy calls [`source_plan`] before it starts an HLS job so the synthesized
 /// VOD playlist matches what the muxer will actually produce:
 ///
-/// - video-copyable source (remux/hybrid) with a usable keyframe index →
+/// - video-copyable source (remux mode) with a usable keyframe index →
 ///   [`PlanAlignment::Keyframe`], boundaries are the muxer's real cut points;
 /// - video that must be re-encoded → [`PlanAlignment::Exact`], and the encoder is
 ///   forced to emit one keyframe per segment;
@@ -594,7 +622,7 @@ pub fn extract_subtitle_tracks(
 pub struct SourcePlan {
     /// The plan the playlist should be synthesized from.
     pub plan: SegmentPlan,
-    /// Whether the video stream is copied (remux/hybrid) rather than re-encoded.
+    /// Whether the video stream is copied (remux mode) rather than re-encoded.
     pub video_copied: bool,
     /// Number of keyframes the plan was built from (0 for exact plans).
     pub keyframe_count: usize,
@@ -1080,7 +1108,7 @@ mod tests {
     #[test]
     fn decision_encode_copy_uses_the_sw_encoder_and_copies_audio() {
         let mut p = decision_preset();
-        p.video_copy = false;
+        p.video_remux = "off".to_string();
         p.sw_video_encoder = "mpeg2video".to_string();
         let d = SessionDecision::decide(&p, preset::codec_ids::HEVC, preset::codec_ids::AAC, false)
             .expect("decision");
@@ -1093,6 +1121,7 @@ mod tests {
     fn decision_copy_encode_re_encodes_audio_only() {
         let mut p = decision_preset();
         p.audio_codec = "ac3".to_string();
+        p.audio_remux = "off".to_string();
         let d = SessionDecision::decide(&p, preset::codec_ids::H264, preset::codec_ids::MP2, false)
             .expect("decision");
         assert_eq!(d.video, StreamMode::Copy);
@@ -1103,11 +1132,50 @@ mod tests {
     #[test]
     fn decision_hardware_when_available() {
         let mut p = decision_preset();
-        p.video_copy = false;
+        p.video_remux = "off".to_string();
         let d = SessionDecision::decide(&p, preset::codec_ids::HEVC, preset::codec_ids::AAC, true)
             .expect("decision");
         assert_eq!(d.video, StreamMode::Hardware);
         assert_eq!(d.video_encoder.as_deref(), Some("h264_mediacodec"));
+    }
+
+    #[test]
+    fn strict_mode_copies_the_runtime_target_codec() {
+        // hevc preset: the hardware layer produces H.265 and the software layer
+        // H.264, so `strict` follows whichever layer would actually run.
+        let mut p = preset::preset_hevc();
+        p.video_remux = "strict".to_string();
+
+        let hw_hevc =
+            SessionDecision::decide(&p, preset::codec_ids::HEVC, preset::codec_ids::AAC, true)
+                .expect("decision");
+        assert_eq!(hw_hevc.video, StreamMode::Copy, "hw target is HEVC");
+        let hw_h264 =
+            SessionDecision::decide(&p, preset::codec_ids::H264, preset::codec_ids::AAC, true)
+                .expect("decision");
+        assert_eq!(hw_h264.video, StreamMode::Hardware);
+
+        let sw_hevc =
+            SessionDecision::decide(&p, preset::codec_ids::HEVC, preset::codec_ids::AAC, false)
+                .expect("decision");
+        assert_eq!(sw_hevc.video, StreamMode::Software);
+        let sw_h264 =
+            SessionDecision::decide(&p, preset::codec_ids::H264, preset::codec_ids::AAC, false)
+                .expect("decision");
+        assert_eq!(sw_h264.video, StreamMode::Copy, "sw target is H.264");
+    }
+
+    #[test]
+    fn hevc_preset_with_unavailable_hw_copies_h264_in_strict_mode() {
+        // Regression from contract `remux-modes` §8: the old `video_copy` flag
+        // made this encode (source != preset's promised HEVC), while the actual
+        // software target is H.264 — the source is already what libx264 emits.
+        let mut p = preset::preset_hevc();
+        p.video_remux = "strict".to_string();
+        let d = SessionDecision::decide(&p, preset::codec_ids::H264, preset::codec_ids::AAC, false)
+            .expect("decision");
+        assert_eq!(d.video, StreamMode::Copy);
+        assert_eq!(d.video_encoder.as_deref(), Some("copy"));
     }
 
     #[test]

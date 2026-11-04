@@ -1213,7 +1213,7 @@ impl ProxyHandle {
             };
             if plan.is_none() {
                 info!("source plan unavailable; re-encoding the cast onto an exact grid");
-                preset.video_copy = false;
+                preset.video_remux = "off".to_string();
                 plan = match wdmm_ffmpeg::source_plan(&input_url, &preset) {
                     Ok(Some(source)) => {
                         info!(
@@ -1252,16 +1252,21 @@ impl ProxyHandle {
         // The stored preset must describe the same path the plan was built for:
         // a keyframe grid only holds while the video is copied, an exact grid only
         // while it is re-encoded.
-        preset.video_copy = plan.alignment == PlanAlignment::Keyframe;
+        preset.video_remux = if plan.alignment == PlanAlignment::Keyframe {
+            "on"
+        } else {
+            "off"
+        }
+        .to_string();
         wdmm_ffmpeg::diag::log(format!(
             "[proxy] hls plan: alignment={} segments={} seg_secs={:.2} duration_ms={} \
-             gop_ms={:?} video_copy={} cache={}",
+             gop_ms={:?} video_remux={} cache={}",
             alignment_label(plan.alignment),
             plan.segment_count(),
             plan.seg_secs,
             plan.duration_ms,
             plan.gop_ms,
-            preset.video_copy,
+            preset.video_remux,
             cache_dir.display(),
         ));
         self.cache

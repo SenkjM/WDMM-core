@@ -4,15 +4,22 @@
 //! on a host build without the `ffmpeg` feature — the Windows host has no
 //! libav, which is exactly where the decision rules must be provable.
 //!
-//! The model is (see `preset-rate-control-and-codec-probe` contract §1–§4):
+//! Each stream has its own remux mode (`off` / `strict` / `on`, contract
+//! `remux-modes` §3):
 //!
-//! 1. copy the source stream when MPEG-TS can carry it and the preset allows it;
-//! 2. otherwise encode with the preset's MediaCodec (hardware) encoder;
-//! 3. otherwise encode with the preset's software encoder.
+//! - `off` re-encodes the stream;
+//! - `on` copies it whenever MPEG-TS can carry the source codec;
+//! - `strict` copies it only when the source codec is both MPEG-TS legal and
+//!   identical to the codec the selected encoder would produce.
 //!
-//! [`decide_video_action`] / [`decide_audio_action`] implement that order for
+//! [`decide_video_action`] / [`decide_audio_action`] implement that rule for
 //! one stream. The caller decides each stream once per session and caches the
 //! result — reopen/seek restarts must reuse the same decision.
+//!
+//! The target codec is a *runtime* value: the hardware encoder's output when it
+//! is usable, otherwise the software encoder's. [`crate::SessionDecision::decide`]
+//! computes it once and passes it down; audio has no hardware layer, so its
+//! target is simply the preset's `audio_codec`.
 //!
 //! [`encoder_av_options`] then turns the preset's structured rate-control
 //! fields into the exact `AVDictionary` handed to `avcodec_open2`. The preset
@@ -25,42 +32,51 @@ use wdmm_core::models::TranscodePreset;
 
 use crate::sys::AVRational;
 
-/// What the cheap remux stage should do for the selected best streams.
+/// What a remux mode does with one stream, one of
+/// `wdmm_core::models::REMUX_MODES` (contract `remux-modes` §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemuxPlan {
-    /// Video and audio can both be copied verbatim (`-c copy`).
-    Remux,
-    /// Video is copied verbatim, audio is decoded/re-encoded (e.g. HEVC+Opus).
-    Hybrid,
-    /// Video cannot be copied; the caller falls back to the full transcode path.
-    Transcode,
+pub enum RemuxMode {
+    /// Always re-encode the stream.
+    Off,
+    /// Copy only when the source codec is MPEG-TS legal *and* already the codec
+    /// the selected encoder would produce.
+    Strict,
+    /// Copy whenever the source codec is MPEG-TS legal.
+    On,
 }
 
-/// Decide the remux-stage plan from the best video/audio codec ids.
-///
-/// Audio-only sources (music, no video stream) keep the cheap path too: the
-/// audio track is copied when MPEG-TS can carry it, and otherwise only the
-/// audio is re-encoded — the hybrid machinery already does exactly that and
-/// simply has no video stream to copy alongside.
-pub fn remux_plan(video_codec_id: Option<u32>, audio_codec_id: Option<u32>) -> RemuxPlan {
-    let Some(video_id) = video_codec_id else {
-        return match audio_codec_id {
-            Some(audio_id) if crate::preset::is_mpegts_audio_copy_compatible(audio_id) => {
-                RemuxPlan::Remux
-            }
-            Some(_) => RemuxPlan::Hybrid,
-            None => RemuxPlan::Transcode,
-        };
-    };
-    if !crate::preset::is_mpegts_video_copy_compatible(video_id) {
-        return RemuxPlan::Transcode;
-    }
-    match audio_codec_id {
-        None => RemuxPlan::Remux,
-        Some(audio_id) if crate::preset::is_mpegts_audio_copy_compatible(audio_id) => {
-            RemuxPlan::Remux
+impl RemuxMode {
+    /// Parse the preset value, with the exact user-facing error message used by
+    /// `TranscodePreset::validate`.
+    pub fn parse(mode: &str) -> Result<Self, String> {
+        match mode {
+            "off" => Ok(RemuxMode::Off),
+            "strict" => Ok(RemuxMode::Strict),
+            "on" => Ok(RemuxMode::On),
+            other => Err(format!("unknown remux mode: {other}")),
         }
-        Some(_) => RemuxPlan::Hybrid,
+    }
+
+    /// Stable preset token: `"off"`/`"strict"`/`"on"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemuxMode::Off => "off",
+            RemuxMode::Strict => "strict",
+            RemuxMode::On => "on",
+        }
+    }
+
+    /// Whether a legal source stream may be copied, given the codec the
+    /// selected encoder would produce (`0` = no encoder to run).
+    fn copies(self, source_codec_id: u32, target_codec_id: u32) -> bool {
+        if source_codec_id == 0 {
+            return false;
+        }
+        match self {
+            RemuxMode::Off => false,
+            RemuxMode::Strict => target_codec_id != 0 && source_codec_id == target_codec_id,
+            RemuxMode::On => true,
+        }
     }
 }
 
@@ -141,19 +157,27 @@ impl<'a> AudioAction<'a> {
     }
 }
 
-/// Decide the video action for a source stream (contract §2).
+/// Decide the video action for a source stream (contract `remux-modes` §3).
 ///
-/// Order: copy (when allowed and MPEG-TS compatible) → hardware encode (when
-/// configured *and* the device encoder is available) → software encode →
-/// error. `hw_encoder_available` is the caller's `avcodec_find_encoder_by_name`
-/// probe plus a successful `avcodec_open2` attempt; presence alone is not proof
-/// that the device codec works.
+/// `target_codec_id` is the codec the encoder layer would produce right now:
+/// the usable hardware encoder's output when there is one, otherwise the
+/// software encoder's (`0` when neither is configured). The remux mode decides
+/// whether that makes the source copyable; a codec MPEG-TS cannot carry is
+/// always re-encoded, whatever the mode says.
+///
+/// `hw_encoder_available` is the caller's `avcodec_find_encoder_by_name` probe
+/// plus a successful `avcodec_open2` attempt; presence alone is not proof that
+/// the device codec works.
 pub fn decide_video_action<'a>(
     preset: &'a TranscodePreset,
     source_codec_id: u32,
+    target_codec_id: u32,
     hw_encoder_available: bool,
 ) -> Result<StreamAction<'a>, String> {
-    if preset.video_copy && crate::preset::is_mpegts_video_copy_compatible(source_codec_id) {
+    let mode = RemuxMode::parse(&preset.video_remux)?;
+    if crate::preset::is_ts_legal_video(source_codec_id)
+        && mode.copies(source_codec_id, target_codec_id)
+    {
         return Ok(StreamAction::Copy);
     }
     if !preset.hw_video_encoder.is_empty() && hw_encoder_available {
@@ -174,30 +198,59 @@ pub fn decide_video_action<'a>(
     ))
 }
 
-/// Decide the audio action for a source stream (contract §2).
+/// Decide the audio action for a source stream (contract `remux-modes` §3).
 ///
-/// Audio has no hardware encoder: copy when allowed and MPEG-TS compatible,
-/// otherwise encode with the preset's `audio_codec`. Audio-only sources (no
-/// video stream) still go through this same decision.
+/// Audio has no hardware layer, so `target_codec_id` is the codec
+/// `preset.audio_codec` encodes to. Audio-only sources (no video stream) still
+/// go through this same decision.
 pub fn decide_audio_action<'a>(
     preset: &'a TranscodePreset,
     source_codec_id: u32,
-) -> AudioAction<'a> {
-    if preset.audio_copy && crate::preset::is_mpegts_audio_copy_compatible(source_codec_id) {
-        return AudioAction::Copy;
+    target_codec_id: u32,
+) -> Result<AudioAction<'a>, String> {
+    let mode = RemuxMode::parse(&preset.audio_remux)?;
+    if crate::preset::is_ts_legal_audio(source_codec_id)
+        && mode.copies(source_codec_id, target_codec_id)
+    {
+        return Ok(AudioAction::Copy);
     }
-    AudioAction::Encode {
+    Ok(AudioAction::Encode {
         encoder: &preset.audio_codec,
-    }
+    })
 }
 
-/// `true` when a software fallback downgrades the intended HEVC output to
-/// H.264 (software HEVC encoding is not shipped, contract §2).
+/// `true` when a software fallback changes the encoder's output codec (the
+/// shipped HEVC preset: MediaCodec H.265 → libx264 H.264, contract §2.1).
 ///
 /// Callers must log `video: sw fallback downgrades hevc to h264` when this is
 /// true and the software branch actually runs.
 pub fn sw_fallback_downgrades_hevc(preset: &TranscodePreset) -> bool {
-    preset.hw_video_encoder == "hevc_mediacodec" && preset.sw_video_encoder == "libx264"
+    match (
+        crate::preset::video_encoder_output_codec_id(&preset.hw_video_encoder),
+        crate::preset::video_encoder_output_codec_id(&preset.sw_video_encoder),
+    ) {
+        (Some(hw), Some(sw)) => hw != sw,
+        _ => false,
+    }
+}
+
+/// Whether the caller must probe the preset's hardware encoder before deciding.
+///
+/// `off` always has to choose an encoder layer, and `strict` compares the
+/// source against that layer's output — both therefore depend on whether the
+/// hardware encoder actually opens. `on` copies a legal source without looking
+/// at the encoders, so it only probes when the source cannot be copied anyway.
+pub fn hw_probe_needed(
+    preset: &TranscodePreset,
+    source_video_codec_id: u32,
+) -> Result<bool, String> {
+    if source_video_codec_id == 0 || preset.hw_video_encoder.is_empty() {
+        return Ok(false);
+    }
+    Ok(match RemuxMode::parse(&preset.video_remux)? {
+        RemuxMode::Off | RemuxMode::Strict => true,
+        RemuxMode::On => !crate::preset::is_ts_legal_video(source_video_codec_id),
+    })
 }
 
 // ── Video rate control (contract §4) ─────────────────────────────────────────
@@ -655,47 +708,116 @@ mod tests {
     use crate::preset::{codec_ids, preset_h264, preset_hevc};
 
     #[test]
-    fn remux_plan_matrix_matches_stream_compatibility() {
-        use codec_ids::*;
-        // Both copyable → pure remux.
-        assert_eq!(remux_plan(Some(H264), Some(AAC)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(Some(HEVC), Some(AC3)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(Some(MPEG2VIDEO), Some(EAC3)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(Some(H264), Some(MP3)), RemuxPlan::Remux);
-        // Video copyable, audio not → hybrid (the HEVC+Opus case).
-        assert_eq!(remux_plan(Some(H264), Some(OPUS_ID)), RemuxPlan::Hybrid);
-        assert_eq!(remux_plan(Some(HEVC), Some(FLAC_ID)), RemuxPlan::Hybrid);
-        // Video not copyable → full transcode.
+    fn remux_modes_parse_with_the_models_tokens() {
+        for mode in wdmm_core::models::REMUX_MODES {
+            assert_eq!(RemuxMode::parse(mode).unwrap().as_str(), mode);
+        }
+        assert_eq!(RemuxMode::parse("off"), Ok(RemuxMode::Off));
+        assert_eq!(RemuxMode::parse("strict"), Ok(RemuxMode::Strict));
+        assert_eq!(RemuxMode::parse("on"), Ok(RemuxMode::On));
         assert_eq!(
-            remux_plan(Some(VP9_ID), Some(OPUS_ID)),
-            RemuxPlan::Transcode
+            RemuxMode::parse("hybrid").unwrap_err(),
+            "unknown remux mode: hybrid"
         );
-        assert_eq!(remux_plan(Some(AV1_ID), Some(AAC)), RemuxPlan::Transcode);
-        // No audio is fine: video-only remux.
-        assert_eq!(remux_plan(Some(H264), None), RemuxPlan::Remux);
-        assert_eq!(remux_plan(None, None), RemuxPlan::Transcode);
     }
 
-    // Codecs not modelled by the preset layer; values are only used by these
-    // tests (FFmpeg 9.0 numbering, see `preset::codec_ids`).
-    const VP9_ID: u32 = 166;
-    const AV1_ID: u32 = 222;
-    const OPUS_ID: u32 = 86076;
-    const FLAC_ID: u32 = 86028;
+    #[test]
+    fn video_remux_modes_cover_every_source_class() {
+        // (mode, source codec, runtime target codec, must copy)
+        let cases = [
+            ("off", codec_ids::H264, codec_ids::H264, false),
+            ("off", codec_ids::H264, codec_ids::MPEG4, false),
+            ("strict", codec_ids::H264, codec_ids::H264, true),
+            ("strict", codec_ids::H264, codec_ids::HEVC, false),
+            ("strict", codec_ids::H264, 0, false),
+            ("on", codec_ids::H264, codec_ids::HEVC, true),
+            // A codec MPEG-TS cannot carry is never copied, not even with `on`.
+            ("on", VP9_ID, codec_ids::H264, false),
+        ];
+        for (mode, source, target, copy) in cases {
+            let mut preset = preset_h264();
+            preset.video_remux = mode.to_string();
+            let action = decide_video_action(&preset, source, target, false).unwrap();
+            assert_eq!(
+                action.is_copy(),
+                copy,
+                "mode={mode} source={source} target={target}"
+            );
+        }
+    }
 
     #[test]
-    fn audio_only_sources_stay_on_the_cheap_path() {
-        use codec_ids::*;
-        // Audio-only source (no video stream): copy the audio when MPEG-TS can
-        // carry it, otherwise hybrid re-encodes only the audio.
-        assert_eq!(remux_plan(None, Some(AAC)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(None, Some(MP3)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(None, Some(AC3)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(None, Some(EAC3)), RemuxPlan::Remux);
-        assert_eq!(remux_plan(None, Some(OPUS_ID)), RemuxPlan::Hybrid);
-        assert_eq!(remux_plan(None, Some(FLAC_ID)), RemuxPlan::Hybrid);
-        // Nothing playable at all still falls back to the transcode path.
-        assert_eq!(remux_plan(None, None), RemuxPlan::Transcode);
+    fn audio_remux_modes_cover_every_source_class() {
+        // (mode, source codec, runtime target codec, must copy)
+        let cases = [
+            ("off", codec_ids::AAC, codec_ids::AAC, false),
+            ("strict", codec_ids::AAC, codec_ids::AAC, true),
+            ("strict", codec_ids::AAC, codec_ids::AC3, false),
+            ("strict", codec_ids::AAC, 0, false),
+            ("on", codec_ids::MP3, codec_ids::AAC, true),
+            // Opus is not legal in MPEG-TS, so it is re-encoded even with `on`.
+            ("on", OPUS_ID, codec_ids::AAC, false),
+        ];
+        for (mode, source, target, copy) in cases {
+            let mut preset = preset_h264();
+            preset.audio_remux = mode.to_string();
+            let action = decide_audio_action(&preset, source, target).unwrap();
+            assert_eq!(
+                action.is_copy(),
+                copy,
+                "mode={mode} source={source} target={target}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_remux_modes_are_loud() {
+        let mut preset = preset_h264();
+        preset.video_remux = "hybrid".to_string();
+        assert_eq!(
+            decide_video_action(&preset, codec_ids::H264, codec_ids::H264, false).unwrap_err(),
+            "unknown remux mode: hybrid"
+        );
+        preset.video_remux = "on".to_string();
+        preset.audio_remux = "sometimes".to_string();
+        assert_eq!(
+            decide_audio_action(&preset, codec_ids::AAC, codec_ids::AAC).unwrap_err(),
+            "unknown remux mode: sometimes"
+        );
+    }
+
+    // Codec not modelled by the preset layer; the value is only used by these
+    // tests (FFmpeg 9.0 numbering, see `preset::codec_ids`).
+    const VP9_ID: u32 = 166;
+    const OPUS_ID: u32 = 86076;
+
+    #[test]
+    fn hw_probe_is_needed_only_when_the_mode_depends_on_the_encoder_layer() {
+        let mut preset = preset_h264();
+        // No video stream: there is nothing to encode or probe.
+        assert!(!hw_probe_needed(&preset, 0).unwrap());
+        // No hardware encoder configured: the software layer is the only choice.
+        let mut no_hw = preset_h264();
+        no_hw.hw_video_encoder = String::new();
+        assert!(!hw_probe_needed(&no_hw, VP9_ID).unwrap());
+        // `off` always picks an encoder layer and `strict` compares against that
+        // layer's output, so both probe even for a copyable source.
+        preset.video_remux = "off".to_string();
+        assert!(hw_probe_needed(&preset, codec_ids::H264).unwrap());
+        assert!(hw_probe_needed(&preset, VP9_ID).unwrap());
+        preset.video_remux = "strict".to_string();
+        assert!(hw_probe_needed(&preset, codec_ids::H264).unwrap());
+        // `on` copies a legal source without looking at the encoders and only
+        // probes when the source has to be re-encoded anyway.
+        preset.video_remux = "on".to_string();
+        assert!(!hw_probe_needed(&preset, codec_ids::H264).unwrap());
+        assert!(hw_probe_needed(&preset, VP9_ID).unwrap());
+        // An invalid mode is reported instead of silently choosing a layer.
+        preset.video_remux = "hybrid".to_string();
+        assert_eq!(
+            hw_probe_needed(&preset, codec_ids::H264).unwrap_err(),
+            "unknown remux mode: hybrid"
+        );
     }
 
     #[test]
@@ -717,93 +839,100 @@ mod tests {
 
     #[test]
     fn four_quadrants_are_decidable() {
-        // The built-ins allow copy, so a compatible source copies both streams.
+        // The built-ins default to remux `on`, so a legal source copies both
+        // streams; the runtime target only matters for `strict`.
         let preset = preset_h264();
         assert_eq!(
-            decide_video_action(&preset, codec_ids::H264, true),
+            decide_video_action(&preset, codec_ids::H264, codec_ids::H264, true),
             Ok(StreamAction::Copy)
         );
         assert_eq!(
-            decide_audio_action(&preset, codec_ids::AAC),
-            AudioAction::Copy
+            decide_audio_action(&preset, codec_ids::AAC, codec_ids::AAC),
+            Ok(AudioAction::Copy)
         );
 
         // copy + encode: video copies, Opus audio must be re-encoded.
         assert_eq!(
-            decide_video_action(&preset, codec_ids::H264, true),
+            decide_video_action(&preset, codec_ids::H264, codec_ids::H264, true),
             Ok(StreamAction::Copy)
         );
         assert_eq!(
-            decide_audio_action(&preset, OPUS_ID),
-            AudioAction::Encode { encoder: "aac" }
+            decide_audio_action(&preset, OPUS_ID, codec_ids::AAC),
+            Ok(AudioAction::Encode { encoder: "aac" })
         );
 
         // encode + copy: VP9 video cannot be copied, AAC audio can.
         assert_eq!(
-            decide_video_action(&preset, VP9_ID, true),
+            decide_video_action(&preset, VP9_ID, codec_ids::H264, true),
             Ok(StreamAction::Encode {
                 hardware: true,
                 encoder: "h264_mediacodec",
             })
         );
         assert_eq!(
-            decide_audio_action(&preset, codec_ids::AAC),
-            AudioAction::Copy
+            decide_audio_action(&preset, codec_ids::AAC, codec_ids::AAC),
+            Ok(AudioAction::Copy)
         );
 
         // encode + encode: VP9 video + Opus audio both re-encoded.
         assert_eq!(
-            decide_video_action(&preset, VP9_ID, false),
+            decide_video_action(&preset, VP9_ID, codec_ids::H264, false),
             Ok(StreamAction::Encode {
                 hardware: false,
                 encoder: "libx264",
             })
         );
         assert_eq!(
-            decide_audio_action(&preset, OPUS_ID),
-            AudioAction::Encode { encoder: "aac" }
+            decide_audio_action(&preset, OPUS_ID, codec_ids::AAC),
+            Ok(AudioAction::Encode { encoder: "aac" })
         );
     }
 
     #[test]
-    fn copy_off_and_hardware_unavailable_fall_through_to_software() {
+    fn remux_off_and_hardware_unavailable_fall_through_to_software() {
         let mut preset = preset_h264();
-        preset.video_copy = false;
-        preset.audio_copy = false;
+        preset.video_remux = "off".to_string();
+        preset.audio_remux = "off".to_string();
         assert_eq!(
-            decide_video_action(&preset, codec_ids::H264, true),
+            decide_video_action(&preset, codec_ids::H264, codec_ids::H264, true),
             Ok(StreamAction::Encode {
                 hardware: true,
                 encoder: "h264_mediacodec",
             })
         );
         assert_eq!(
-            decide_video_action(&preset, codec_ids::H264, false),
+            decide_video_action(&preset, codec_ids::H264, codec_ids::H264, false),
             Ok(StreamAction::Encode {
                 hardware: false,
                 encoder: "libx264",
             })
         );
         assert_eq!(
-            decide_audio_action(&preset, codec_ids::AAC),
-            AudioAction::Encode { encoder: "aac" }
+            decide_audio_action(&preset, codec_ids::AAC, codec_ids::AAC),
+            Ok(AudioAction::Encode { encoder: "aac" })
         );
     }
 
     #[test]
     fn no_usable_layer_is_a_loud_error() {
         let mut preset = preset_h264();
-        preset.video_copy = false;
+        preset.video_remux = "off".to_string();
         preset.hw_video_encoder = String::new();
         preset.sw_video_encoder = String::new();
-        let err = decide_video_action(&preset, VP9_ID, true).unwrap_err();
+        let err = decide_video_action(&preset, VP9_ID, codec_ids::H264, true).unwrap_err();
         assert_eq!(err, "no video encoder available for preset h264");
     }
 
     #[test]
-    fn sw_fallback_downgrades_hevc_only_for_the_hevc_builtin() {
+    fn sw_fallback_downgrades_hevc_only_when_the_output_codec_changes() {
+        // hevc preset: MediaCodec H.265 vs libx264 H.264.
         assert!(sw_fallback_downgrades_hevc(&preset_hevc()));
+        // h264 preset: both layers produce H.264, so falling back is invisible.
         assert!(!sw_fallback_downgrades_hevc(&preset_h264()));
+        // No hardware encoder configured: there is no promised codec to lose.
+        let mut no_hw = preset_hevc();
+        no_hw.hw_video_encoder = String::new();
+        assert!(!sw_fallback_downgrades_hevc(&no_hw));
     }
     #[test]
     fn rate_control_parses_the_four_modes() {

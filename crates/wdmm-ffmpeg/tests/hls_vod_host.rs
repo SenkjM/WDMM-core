@@ -351,19 +351,24 @@ fn audio_only_source_reencodes_unmuxable_audio() {
         ..wdmm_ffmpeg::JobOpts::default()
     };
     let mut job = wdmm_ffmpeg::open_job(opts).expect("open_job");
-    let durations = assert_audio_only_output(&mut job, &out_dir, "audio-only hybrid", 2);
+    let durations = assert_audio_only_output(&mut job, &out_dir, "audio-only remux", 2);
     let encoder = job.encoder_info();
     assert_eq!(
-        encoder.mode, "hybrid",
+        encoder.mode, "remux",
         "FLAC cannot be muxed into MPEG-TS, so only the audio is re-encoded"
+    );
+    assert_eq!(
+        encoder.audio_action.as_deref(),
+        Some("sw"),
+        "the video stream is untouched, the audio branch encodes"
     );
     assert_eq!(encoder.audio.as_deref(), Some("aac"));
     let log = diagnostics();
     assert!(
-        log.contains("remux hybrid: audio-only"),
-        "diag must state that the hybrid run is audio-only:\n{log}"
+        log.contains("video remux: audio-only, audio re-encoded"),
+        "diag must state that the remux run is audio-only:\n{log}"
     );
-    eprintln!("audio-only hybrid: durations={durations:?} encoder={encoder:?}\n{log}");
+    eprintln!("audio-only remux: durations={durations:?} encoder={encoder:?}\n{log}");
     drop(job);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
@@ -378,8 +383,8 @@ fn audio_only_source_survives_the_transcode_path() {
     };
     let out_dir = temp_dir("audio-transcode");
     let mut preset = wdmm_ffmpeg::preset::preset_h264();
-    preset.video_copy = false; // force the transcode path
-    preset.audio_copy = false;
+    preset.video_remux = "off".to_string(); // force the encoder path
+    preset.audio_remux = "off".to_string();
     preset.hls_segment_secs = 4;
     let opts = wdmm_ffmpeg::JobOpts {
         input_url: media.to_string_lossy().into_owned(),
@@ -786,8 +791,8 @@ fn encode_path_cuts_on_the_exact_grid() {
     let url = media.to_string_lossy().into_owned();
     // Force the real re-encode path at a cheap resolution, with a 2 s grid.
     let mut preset = wdmm_ffmpeg::preset::preset_h264();
-    preset.video_copy = false;
-    preset.audio_copy = false;
+    preset.video_remux = "off".to_string();
+    preset.audio_remux = "off".to_string();
     preset.hls_segment_secs = 2;
     preset.video_max_w = Some(320);
     preset.video_max_h = Some(180);
@@ -912,8 +917,8 @@ fn source_plan_refuses_a_truncated_keyframe_index() {
 /// pause; a stream-copy job can finish in a fraction of a second.
 fn long_running_preset() -> wdmm_core::models::TranscodePreset {
     let mut preset = wdmm_ffmpeg::preset::preset_h264();
-    preset.video_copy = false;
-    preset.audio_copy = false;
+    preset.video_remux = "off".to_string();
+    preset.audio_remux = "off".to_string();
     preset.hls_segment_secs = 2;
     preset.video_max_w = Some(320);
     preset.video_max_h = Some(180);

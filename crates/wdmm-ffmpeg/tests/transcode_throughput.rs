@@ -448,19 +448,23 @@ fn probe_source(media: &Path) -> Result<SourceInfo, String> {
 
 /// Why the `remux_first` stage cannot stream-copy this source, if it cannot.
 ///
-/// Mirrors `plan.rs::remux_plan`: MPEG-TS can carry H.264/HEVC/MPEG-2 video and
-/// AAC/MP3/AC-3/E-AC-3 audio. Anything else falls back to a full re-encode.
+/// Mirrors `plan.rs` in `video_remux = "on"` mode (`contract remux-modes §3`):
+/// MPEG-TS can carry MPEG-1/2/4, H.264 and HEVC video and MP2/MP3/AAC/AC-3/E-AC-3
+/// audio. Anything else falls back to a full re-encode.
 fn copy_path_refusal(source: &SourceInfo) -> Option<String> {
-    if !matches!(source.video_codec.as_str(), "h264" | "hevc" | "mpeg2video") {
+    if !matches!(
+        source.video_codec.as_str(),
+        "h264" | "hevc" | "mpeg1video" | "mpeg2video" | "mpeg4"
+    ) {
         return Some(format!(
             "video codec '{}' cannot be copied into MPEG-TS",
             source.video_codec
         ));
     }
     match source.audio_codec.as_deref() {
-        None | Some("aac" | "mp3" | "ac3" | "eac3") => None,
+        None | Some("aac" | "mp3" | "mp2" | "ac3" | "eac3") => None,
         Some(codec) => Some(format!(
-            "audio codec '{codec}' cannot be copied into MPEG-TS (hybrid would re-encode it)"
+            "audio codec '{codec}' cannot be copied into MPEG-TS (it would be re-encoded)"
         )),
     }
 }
@@ -532,8 +536,9 @@ fn preset_from_env() -> TranscodePreset {
 /// Scenario presets differ only in whether the cheap copy stage runs first.
 fn scenario_preset(base: &TranscodePreset, copy_first: bool) -> TranscodePreset {
     let mut preset = base.clone();
-    preset.video_copy = copy_first;
-    preset.audio_copy = copy_first;
+    let mode = if copy_first { "on" } else { "off" }.to_string();
+    preset.video_remux = mode.clone();
+    preset.audio_remux = mode;
     preset
 }
 
@@ -635,13 +640,13 @@ fn preset_summary(preset: &TranscodePreset) -> String {
         format!("{}/{}", preset.hw_video_encoder, preset.sw_video_encoder)
     };
     format!(
-        "{video_encoder} {dims} {bitrate} fps_cap={fps_cap} + {} {}k {}ch {}Hz / seg {}s / video_copy={} audio_copy={}",
+        "{video_encoder} {dims} {bitrate} fps_cap={fps_cap} + {} {}k {}ch {}Hz / seg {}s / video_remux={} audio_remux={}",
         preset.audio_codec,
         preset.audio_bitrate / 1000,
         preset.audio_channels,
         preset.audio_sample_rate.unwrap_or(0),
         preset.hls_segment_secs,
-        preset.video_copy,
-        preset.audio_copy
+        preset.video_remux,
+        preset.audio_remux
     )
 }

@@ -1,10 +1,15 @@
 //! Preset constants and helpers for `wdmm-ffmpeg` (B3.5).
 //!
 //! The two built-in `TranscodePreset` values mirror the seeds written to the
-//! `transcode_presets` DB table in `wdmm-storage` schema v15. The DB is the
+//! `transcode_presets` DB table in `wdmm-storage` schema v16. The DB is the
 //! primary source of truth; these constants are used when the DB rows are not
 //! available (unit tests, probe-only contexts) and by the
 //! `wdmm_transcode_preset_reset` FFI call to restore the factory values.
+//!
+//! `is_ts_legal_video` / `is_ts_legal_audio` are the **single** MPEG-TS
+//! legality check shared by the `on` and `strict` remux modes (contract
+//! `remux-modes.md` §2) — there is deliberately no second copy-compatibility
+//! list.
 //!
 //! Built-ins stay fully editable; only deletion is refused (see
 //! `delete_transcode_preset`).
@@ -19,8 +24,8 @@ pub fn preset_h264() -> TranscodePreset {
     TranscodePreset {
         id: "h264".into(),
         label: "H.264（兼容优先）".into(),
-        video_copy: true,
-        audio_copy: true,
+        video_remux: "on".into(),
+        audio_remux: "on".into(),
         hw_video_encoder: "h264_mediacodec".into(),
         sw_video_encoder: "libx264".into(),
         sw_video_preset: "veryfast".into(),
@@ -50,8 +55,8 @@ pub fn preset_hevc() -> TranscodePreset {
     TranscodePreset {
         id: "hevc".into(),
         label: "H.265（更高压缩）".into(),
-        video_copy: true,
-        audio_copy: true,
+        video_remux: "on".into(),
+        audio_remux: "on".into(),
         hw_video_encoder: "hevc_mediacodec".into(),
         sw_video_encoder: "libx264".into(),
         sw_video_preset: "veryfast".into(),
@@ -82,15 +87,18 @@ pub fn builtin_preset(id: &str) -> Option<TranscodePreset> {
     all_builtin_presets().into_iter().find(|p| p.id == id)
 }
 
-/// Numeric `AVCodecID` constants used by the preset/three-layer logic.
+/// Numeric `AVCodecID` constants used by the preset/remux logic.
 ///
 /// `AVCodecID` values shift across libav major versions (FFmpeg 9.0 renumbered
 /// HEVC 173→172, VP9 167→166, AV1 226→222), and the hand-written bindings in
 /// [`crate::sys`] only expose the ones the transcode path itself needs. Per the
 /// preset-encoder-tiers contract, **every new numeric codec id lives here** with
-/// a comment, instead of being scattered across the ffmpeg crate. Re-verify all
-/// of them on every libav bump.
+/// a comment, instead of being scattered across the ffmpeg crate. All values
+/// below were checked against FFmpeg 9.0.2 `libavcodec/codec_id.h`;
+/// **re-verify on every libav major bump**.
 pub mod codec_ids {
+    /// `AV_CODEC_ID_MPEG1VIDEO`.
+    pub const MPEG1VIDEO: u32 = 1;
     /// `AV_CODEC_ID_H264`.
     pub const H264: u32 = 27;
     /// `AV_CODEC_ID_HEVC` (a.k.a. H.265; renumbered from 173 in FFmpeg 9.0).
@@ -121,6 +129,7 @@ pub fn video_encoder_output_codec_id(encoder: &str) -> Option<u32> {
         "h264_mediacodec" | "libx264" => Some(H264),
         "hevc_mediacodec" => Some(HEVC),
         "mpeg4_mediacodec" | "mpeg4" => Some(MPEG4),
+        "mpeg1video" => Some(MPEG1VIDEO),
         "mpeg2video" => Some(MPEG2VIDEO),
         _ => None,
     }
@@ -149,27 +158,39 @@ pub fn audio_encoder_codec_id(codec: &str) -> u32 {
     }
 }
 
-/// Return `true` when the source **video** codec is HLS/MPEG-TS compatible
-/// for copy (no re-encode needed). Only H.264, H.265, and MPEG-2 are safe
-/// to remux into MPEG-TS without transcoding.
+/// Return `true` when a **video** codec is legal in MPEG-TS *and* a realistic
+/// renderer can decode it.
 ///
-/// The video and audio verdicts are intentionally separate: MKV files whose
-/// video is copyable but whose audio is not (e.g. HEVC + Opus) can still run
-/// in the cheap hybrid mode instead of a full re-encode.
-pub fn is_mpegts_video_copy_compatible(codec_id: u32) -> bool {
+/// This is the single legality check behind the `on` and `strict` remux modes
+/// (contract `remux-modes.md` §2). The set follows
+/// `libavformat/mpegtsenc.c::get_dvb_stream_type` but is narrowed: VVC, CAVS,
+/// AVS2/AVS3, Dirac and VC-1 are deliberately **excluded**. MPEG-TS can wrap
+/// them, but we never encode to those codecs and no realistic renderer decodes
+/// them, so remuxing would produce a stream that muxes fine yet cannot play.
+pub fn is_ts_legal_video(codec_id: u32) -> bool {
     matches!(
         codec_id,
-        v if v == codec_ids::H264 || v == codec_ids::HEVC || v == codec_ids::MPEG2VIDEO
+        v if v == codec_ids::MPEG1VIDEO
+            || v == codec_ids::MPEG2VIDEO
+            || v == codec_ids::MPEG4
+            || v == codec_ids::H264
+            || v == codec_ids::HEVC
     )
 }
 
-/// Return `true` when the source **audio** codec can be copied into
-/// MPEG-TS without re-encoding (AAC, MP3, AC-3, E-AC-3).
-pub fn is_mpegts_audio_copy_compatible(codec_id: u32) -> bool {
+/// Return `true` when an **audio** codec is legal in MPEG-TS *and* a realistic
+/// renderer can decode it (MP2, MP3, AAC, AC-3, E-AC-3).
+///
+/// Same single source of truth as [`is_ts_legal_video`]. DTS, TrueHD and Opus
+/// are deliberately **excluded**: MPEG-TS can carry them, but no DMR-class
+/// renderer decodes them, so remuxing them would only produce unplayable
+/// output.
+pub fn is_ts_legal_audio(codec_id: u32) -> bool {
     matches!(
         codec_id,
-        v if v == codec_ids::AAC
+        v if v == codec_ids::MP2
             || v == codec_ids::MP3
+            || v == codec_ids::AAC
             || v == codec_ids::AC3
             || v == codec_ids::EAC3
     )
@@ -178,39 +199,66 @@ pub fn is_mpegts_audio_copy_compatible(codec_id: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys::{AV_CODEC_ID_AAC, AV_CODEC_ID_H264, AV_CODEC_ID_MP3};
+    use crate::preset::codec_ids;
 
-    // AVCodecID values not modelled in `sys`. They shift across libav major
-    // versions (FFmpeg 9.0: HEVC 173→172, VP9 167→166, AV1 226→222); re-verify
-    // on every libav bump.
-    const AV_CODEC_ID_HEVC: u32 = 172;
-    const AV_CODEC_ID_MPEG2: u32 = 2;
-    const AV_CODEC_ID_OPUS: u32 = 86076;
-    const AV_CODEC_ID_FLAC: u32 = 86028;
+    // Codecs MPEG-TS *can* carry but which we deliberately never remux to: we
+    // never encode to them and no realistic renderer decodes them. Values
+    // checked against FFmpeg 9.0.2 `libavcodec/codec_id.h`; re-verify on every
+    // libav bump.
+    const AV_CODEC_ID_VVC: u32 = 195;
+    const AV_CODEC_ID_CAVS: u32 = 87;
+    const AV_CODEC_ID_AVS2: u32 = 191;
+    const AV_CODEC_ID_AVS3: u32 = 193;
+    const AV_CODEC_ID_DIRAC: u32 = 116;
+    const AV_CODEC_ID_VC1: u32 = 70;
     const AV_CODEC_ID_VP9: u32 = 166;
     const AV_CODEC_ID_AV1: u32 = 222;
-    const AV_CODEC_ID_AC3: u32 = 86019;
-    const AV_CODEC_ID_EAC3: u32 = 86056;
+    const AV_CODEC_ID_OPUS: u32 = 86076;
+    const AV_CODEC_ID_FLAC: u32 = 86028;
 
     #[test]
-    fn video_copy_compatibility_matrix() {
-        assert!(is_mpegts_video_copy_compatible(AV_CODEC_ID_H264));
-        assert!(is_mpegts_video_copy_compatible(AV_CODEC_ID_HEVC));
-        assert!(is_mpegts_video_copy_compatible(AV_CODEC_ID_MPEG2));
-        assert!(!is_mpegts_video_copy_compatible(AV_CODEC_ID_VP9));
-        assert!(!is_mpegts_video_copy_compatible(AV_CODEC_ID_AV1));
-        assert!(!is_mpegts_video_copy_compatible(AV_CODEC_ID_AAC));
+    fn ts_legal_video_matrix() {
+        for id in [
+            codec_ids::MPEG1VIDEO,
+            codec_ids::MPEG2VIDEO,
+            codec_ids::MPEG4,
+            codec_ids::H264,
+            codec_ids::HEVC,
+        ] {
+            assert!(is_ts_legal_video(id), "codec {id} must be remuxable");
+        }
+        // Muxable but intentionally excluded, plus an audio id and 0.
+        for id in [
+            AV_CODEC_ID_VP9,
+            AV_CODEC_ID_AV1,
+            AV_CODEC_ID_VVC,
+            AV_CODEC_ID_CAVS,
+            AV_CODEC_ID_AVS2,
+            AV_CODEC_ID_AVS3,
+            AV_CODEC_ID_DIRAC,
+            AV_CODEC_ID_VC1,
+            codec_ids::AAC,
+            0,
+        ] {
+            assert!(!is_ts_legal_video(id), "codec {id} must be re-encoded");
+        }
     }
 
     #[test]
-    fn audio_copy_compatibility_matrix() {
-        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_AAC));
-        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_MP3));
-        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_AC3));
-        assert!(is_mpegts_audio_copy_compatible(AV_CODEC_ID_EAC3));
-        assert!(!is_mpegts_audio_copy_compatible(AV_CODEC_ID_OPUS));
-        assert!(!is_mpegts_audio_copy_compatible(AV_CODEC_ID_FLAC));
-        assert!(!is_mpegts_audio_copy_compatible(AV_CODEC_ID_H264));
+    fn ts_legal_audio_matrix() {
+        for id in [
+            codec_ids::MP2,
+            codec_ids::MP3,
+            codec_ids::AAC,
+            codec_ids::AC3,
+            codec_ids::EAC3,
+        ] {
+            assert!(is_ts_legal_audio(id), "codec {id} must be remuxable");
+        }
+        // Muxable but intentionally excluded, plus a video id and 0.
+        for id in [AV_CODEC_ID_OPUS, AV_CODEC_ID_FLAC, codec_ids::H264, 0] {
+            assert!(!is_ts_legal_audio(id), "codec {id} must be re-encoded");
+        }
     }
 
     #[test]
@@ -221,7 +269,9 @@ mod tests {
         assert_eq!(presets[1].id, "hevc");
         for preset in &presets {
             assert!(preset.is_builtin);
-            assert!(preset.video_copy && preset.audio_copy);
+            // Both remux modes on = the old copy-first behaviour.
+            assert_eq!(preset.video_remux, "on");
+            assert_eq!(preset.audio_remux, "on");
             assert!(preset.has_usable_video_path());
             // v14 rate control: both built-ins ship plain VBR (no CQ value).
             assert_eq!(preset.video_rate_control, "vbr");
@@ -240,6 +290,8 @@ mod tests {
     fn factory_values_match_the_contract_table() {
         let h264 = preset_h264();
         assert_eq!(h264.label, "H.264（兼容优先）");
+        assert_eq!(h264.video_remux, "on");
+        assert_eq!(h264.audio_remux, "on");
         assert_eq!(h264.hw_video_encoder, "h264_mediacodec");
         assert_eq!(h264.sw_video_encoder, "libx264");
         assert_eq!(h264.sw_video_preset, "veryfast");
@@ -265,6 +317,8 @@ mod tests {
 
         let hevc = preset_hevc();
         assert_eq!(hevc.label, "H.265（更高压缩）");
+        assert_eq!(hevc.video_remux, "on");
+        assert_eq!(hevc.audio_remux, "on");
         assert_eq!(hevc.hw_video_encoder, "hevc_mediacodec");
         assert_eq!(hevc.sw_video_encoder, "libx264");
         assert_eq!(hevc.sw_video_preset, "veryfast");
@@ -295,6 +349,10 @@ mod tests {
         assert_eq!(
             video_encoder_output_codec_id("mpeg4"),
             Some(codec_ids::MPEG4)
+        );
+        assert_eq!(
+            video_encoder_output_codec_id("mpeg1video"),
+            Some(codec_ids::MPEG1VIDEO)
         );
         assert_eq!(
             video_encoder_output_codec_id("mpeg2video"),

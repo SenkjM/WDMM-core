@@ -39,7 +39,7 @@ rejected — classify with `classify_codec` first. Requires the `ffmpeg` feature
 
 ## HLS job
 ### `pub struct JobOpts {`
-- `input_url: String`, `preset: TranscodePreset` (per-stream copy/encoder
+- `input_url: String`, `preset: TranscodePreset` (per-stream remux-mode/encoder
   config, rate control and `hls_segment_secs`)
 - `start_offset_secs: f64` — media time to start from (`0.0` = head)
 - `segment_dir: PathBuf` — caller-provided; ignored when `out_dir` is set
@@ -52,7 +52,7 @@ rejected — classify with `classify_codec` first. Requires the `ffmpeg` feature
   reopens for another segment range passes the decision it cached first so the
   grid never drifts.
 - `hls_time_override_ms: Option<u32>` — `hls_time` in ms. `Some(1)` makes the
-  HLS muxer cut on every video keyframe (copy/hybrid) or every forced IDR
+  HLS muxer cut on every video keyframe (remux mode) or every forced IDR
   (encode path), so the plan grid is anchor-independent. Audio-only jobs keep
   `hls_segment_secs` with `split_by_time`.
 ### `pub fn open_job(opts: JobOpts) -> FfmpegResult<JobHandle>`
@@ -71,7 +71,7 @@ the caller's job — `wdmm-proxy` holds the process-wide `JobGate` permit.
   `content_ms` is media produced since the run's seek anchor, `start_ms` is that
   anchor (absolute media ms = `start_offset_secs * 1000`), `wall_ms` the elapsed
   job time.
-- `encoder_info()` (`mode` = `remux`/`hybrid`/`hw`/`sw`; `video_action` /
+- `encoder_info()` (`mode` = `remux`/`transcode`; `video_action` /
   `audio_action` = `copy`/`hw`/`sw`/`none`, straight from the per-stream
   decision — `mode` alone cannot express encode+copy), `warnings()`
   (deduplicated fallbacks).
@@ -92,21 +92,33 @@ change the grid):
 ### `pub struct SessionDecision {`
 - `video: StreamMode`, `video_encoder: Option<String>`
 - `audio: StreamMode`, `audio_encoder: Option<String>`
+### `pub enum RemuxMode { Off, Strict, On }`
+`preset.video_remux` / `preset.audio_remux` are parsed by `RemuxMode::parse(&str)`
+(`unknown remux mode: <mode>` error) and round-trip through `as_str()` (contract
+`remux-modes` §3). `Off` always encodes; `Strict` copies only when the source
+codec equals the codec the encoder layer would produce *right now*; `On` copies
+every source MPEG-TS can carry.
 ### `pub fn SessionDecision::decide(preset, video_codec_id, audio_codec_id, hw_encoder_available) -> Result<SessionDecision, String>`
-Applies the copy priority (`preset.video_copy`/`audio_copy` and MPEG-TS
-copyability), picks the encoder path from the preset, and errors when the preset
-has no usable video path. `hw_encoder_available` must mean *found and opened*:
-the job probes the hardware encoder once and falls back to the
-software encoder (logging `video: sw fallback downgrades hevc to h264` when the
-fallback changes the codec).
-### `pub fn decide_video_action(preset, source_codec_id, hw_encoder_available) -> Result<StreamAction, String>`
-### `pub fn decide_audio_action(preset, source_codec_id) -> AudioAction`
+Applies `video_remux`/`audio_remux` against MPEG-TS legality and the runtime
+target codec (the hardware encoder's output when it is available, otherwise the
+software encoder's), picks the encoder path from the preset, and errors when the
+preset has no usable video path. `hw_encoder_available` must mean *found and
+opened*: the job probes the hardware encoder once and falls back to the software
+encoder (logging `video: sw fallback downgrades hevc to h264` when the fallback
+changes the codec).
+### `pub fn decide_video_action(preset, source_codec_id, target_codec_id, hw_encoder_available) -> Result<StreamAction, String>`
+### `pub fn decide_audio_action(preset, source_codec_id, target_codec_id) -> Result<AudioAction, String>`
+### `pub fn hw_probe_needed(preset, source_video_codec_id) -> Result<bool, String>`
+True when the remux decision depends on the encoder layer: always for `off`/
+`strict`, and for `on` only when the source video codec is not legal in MPEG-TS.
+Without video (or a hardware encoder) it is false.
 ### `pub enum StreamAction<'a> { Copy, Encode { hardware, encoder } }`
 ### `pub enum AudioAction<'a> { Copy, Encode { encoder } }`
 The primitives `SessionDecision` is built from; `encoder_name()`, `uses_hardware()`,
 `is_copy()` describe the chosen path.
 ### `pub fn sw_fallback_downgrades_hevc(preset) -> bool`
-True when the hw encoder is HEVC but the sw fallback is `libx264`.
+True when the preset promises HEVC through its hardware encoder but the software
+fallback produces another codec.
 
 ## Encoder catalog and rate control
 The preset editor renders a closed encoder list; free-form advanced options are
@@ -166,7 +178,7 @@ by design there is **no approximate/calibrated grid**, because a plan whose
 boundaries are not real cut points makes seeking land on the wrong segment:
 - `Exact` — forced re-encode: strict `k * seg_secs`. The encoder emits one IDR
   per step (closed GOP) and `hls_time` is tiny, so the muxer cuts on the grid.
-- `Keyframe` — copy/hybrid with a usable container keyframe index (mp4 `stss`,
+- `Keyframe` — remux mode with a usable container keyframe index (mp4 `stss`,
   mkv `cues`): one segment per keyframe interval, so the synthesized `EXTINF`
   values match the segment files exactly. A source without a usable index is
   not planned approximately: it takes the `Exact` re-encode path instead.
@@ -210,18 +222,18 @@ new lines to a file for `adb exec-out run-as`; works without libav.
 ### `pub fn preset_h264() -> TranscodePreset`
 ### `pub fn preset_hevc() -> TranscodePreset`
 ### `pub fn all_builtin_presets() -> [TranscodePreset; 2]`
-In order: `h264`, `hevc`. Both are copy-first (video/audio copied when the
-source is already MPEG-TS compatible), with `h264_mediacodec`/`hevc_mediacodec`
+In order: `h264`, `hevc`. Both default to `video_remux`/`audio_remux` = `on` (video/audio copied when the
+source is already MPEG-TS legal), with `h264_mediacodec`/`hevc_mediacodec`
 as the hardware encoders and `libx264` as the software fallback.
 ### `pub fn builtin_preset(id: &str) -> Option<TranscodePreset>`
 ### `pub mod codec_ids`
-`H264`, `HEVC`, `MPEG2VIDEO`, `MPEG4`, `AAC`, `MP2`, `MP3`, `AC3`, `EAC3`.
+`MPEG1VIDEO`, `MPEG2VIDEO`, `MPEG4`, `H264`, `HEVC`, `AAC`, `MP2`, `MP3`, `AC3`, `EAC3`.
 ### `pub fn video_encoder_output_codec_id(encoder: &str) -> Option<u32>`
 The output codec of an encoder name — never reverse-derived from a codec name.
 ### `pub fn audio_encoder_name(codec: &str) -> &'static str`
 ### `pub fn audio_encoder_codec_id(codec: &str) -> u32`
 `aac`/`ac3`/`eac3`/`mp2`; unknown values fall back to AAC.
-### `pub fn is_mpegts_video_copy_compatible(codec_id: u32) -> bool`
-H.264, HEVC and MPEG-2 can be copied into MPEG-TS.
-### `pub fn is_mpegts_audio_copy_compatible(codec_id: u32) -> bool`
-AAC, MP3, AC-3 and E-AC-3 can be copied into MPEG-TS.
+### `pub fn is_ts_legal_video(codec_id: u32) -> bool`
+MPEG-1, MPEG-2 and MPEG-4 video, H.264 and HEVC are legal in MPEG-TS. This is the single legality check the remux modes consult.
+### `pub fn is_ts_legal_audio(codec_id: u32) -> bool`
+MP2, MP3, AAC, AC-3 and E-AC-3 are legal in MPEG-TS.

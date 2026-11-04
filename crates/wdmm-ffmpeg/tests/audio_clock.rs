@@ -5,7 +5,7 @@
 //! Host-only regression test: a job that starts **mid-file** must carry the
 //! container clock in *both* streams.
 //!
-//! The hybrid plan copies video packets (so they keep the container pts) while
+//! The remux plan copies video packets (so they keep the container pts) while
 //! re-encoding audio. When the audio pipeline used to restart its pts counter at
 //! zero, a run anchored at 10 s produced segments whose audio sat at 0 s and
 //! whose video sat at 10 s. Players see two unrelated clocks: they report the
@@ -129,7 +129,7 @@ fn wait_for_segment(dir: &Path, number: u64, timeout: Duration) -> bool {
 
 #[test]
 #[ignore = "needs WDMM_AUDIO_CLOCK_MEDIA (h264 + flac) and a linked FFmpeg 7.1"]
-fn mid_file_hybrid_run_keeps_audio_on_the_container_clock() {
+fn mid_file_audio_reencode_run_keeps_audio_on_the_container_clock() {
     let Some(media) = std::env::var_os("WDMM_AUDIO_CLOCK_MEDIA")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
