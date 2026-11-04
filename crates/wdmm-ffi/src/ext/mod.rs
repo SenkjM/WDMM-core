@@ -10,6 +10,7 @@
 pub mod backup_probe;
 pub mod crypto;
 pub mod cue;
+pub mod policy;
 pub mod sync_codec;
 pub mod tags;
 pub mod text;

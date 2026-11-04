@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod policy;
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -318,10 +320,12 @@ impl TaskQueue {
     }
 
     /// Get retry delay based on attempt count (exponential backoff with jitter).
+    ///
+    /// The schedule itself lives in [`policy`] so the Dart queue and these pumps
+    /// cannot drift apart.
     pub fn retry_delay(attempts: u32) -> std::time::Duration {
-        let base_seconds = 1u64 << attempts.min(5); // 2, 4, 8, 16, 32
         let jitter_ms = rand::random::<u64>() % 1000;
-        std::time::Duration::from_millis(base_seconds * 1000 + jitter_ms)
+        std::time::Duration::from_millis(policy::backoff_delay_ms(attempts, jitter_ms))
     }
 
     /// Check if task should be automatically retried.
@@ -343,22 +347,10 @@ impl TaskQueue {
 }
 
 /// Check if error is retryable (network errors are retryable, data errors are not).
+///
+/// Shared with the Dart-facing policy through [`policy::message_is_retryable`].
 fn is_retryable_error(error: &str) -> bool {
-    let lower = error.to_lowercase();
-    // Network errors are retryable
-    if lower.contains("network") || lower.contains("timeout") || lower.contains("connection") {
-        return true;
-    }
-    // Cancellation is not retryable
-    if lower.contains("cancel") {
-        return false;
-    }
-    // Data errors are not retryable
-    if lower.contains("decrypt") || lower.contains("corrupt") {
-        return false;
-    }
-    // Default to retryable for unknown errors
-    true
+    policy::message_is_retryable(error)
 }
 
 impl Default for TaskQueue {
