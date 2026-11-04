@@ -1,7 +1,7 @@
 //! Preset constants and helpers for `wdmm-ffmpeg` (B3.5).
 //!
 //! The two built-in `TranscodePreset` values mirror the seeds written to the
-//! `transcode_presets` DB table in `wdmm-storage` schema v14. The DB is the
+//! `transcode_presets` DB table in `wdmm-storage` schema v15. The DB is the
 //! primary source of truth; these constants are used when the DB rows are not
 //! available (unit tests, probe-only contexts) and by the
 //! `wdmm_transcode_preset_reset` FFI call to restore the factory values.
@@ -22,10 +22,8 @@ pub fn preset_h264() -> TranscodePreset {
         video_copy: true,
         audio_copy: true,
         hw_video_encoder: "h264_mediacodec".into(),
-        hw_video_options: Default::default(),
         sw_video_encoder: "libx264".into(),
         sw_video_preset: "veryfast".into(),
-        sw_video_options: Default::default(),
         video_max_w: Some(1920),
         video_max_h: Some(1080),
         video_max_bitrate: Some(4_000_000),
@@ -55,10 +53,8 @@ pub fn preset_hevc() -> TranscodePreset {
         video_copy: true,
         audio_copy: true,
         hw_video_encoder: "hevc_mediacodec".into(),
-        hw_video_options: Default::default(),
         sw_video_encoder: "libx264".into(),
         sw_video_preset: "veryfast".into(),
-        sw_video_options: Default::default(),
         video_max_w: Some(1920),
         video_max_h: Some(1080),
         video_max_bitrate: Some(3_000_000),
@@ -230,8 +226,6 @@ mod tests {
             // v14 rate control: both built-ins ship plain VBR (no CQ value).
             assert_eq!(preset.video_rate_control, "vbr");
             assert_eq!(preset.video_quality, None);
-            assert!(preset.hw_video_options.is_empty());
-            assert!(preset.sw_video_options.is_empty());
             // Built-ins must always pass the same validation the storage layer
             // applies to user saves.
             preset.validate().expect("factory preset must be valid");

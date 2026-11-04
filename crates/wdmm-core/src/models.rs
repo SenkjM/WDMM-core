@@ -4,7 +4,6 @@
 //! This is the *subset* needed for the Rust core to operate. Full FFI
 //! serialisation lives in `wdmm-ffi`.
 
-use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -157,7 +156,7 @@ pub struct QueueTask {
     pub local_path: Option<String>,  // destination path
 }
 
-// ── Transcode presets (B3.5, schema v14) ─────────────────────────────────────
+// ── Transcode presets (B3.5, schema v15) ─────────────────────────────────────
 
 /// Hardware (MediaCodec) video encoders a preset may select in
 /// [`TranscodePreset::hw_video_encoder`].
@@ -173,7 +172,7 @@ pub const SW_VIDEO_ENCODERS: [&str; 3] = ["libx264", "mpeg2video", "mpeg4"];
 /// [`TranscodePreset::sw_video_preset`].
 ///
 /// Only `libx264` has such a name ladder; `mpeg2video`/`mpeg4` leave the field
-/// empty and are tuned through [`TranscodePreset::sw_video_options`] instead.
+/// empty.
 pub const X264_PRESETS: [&str; 10] = [
     "ultrafast",
     "superfast",
@@ -202,7 +201,7 @@ pub const DEFAULT_VIDEO_RATE_CONTROL: &str = "vbr";
 pub const AUDIO_CODECS: [&str; 4] = ["aac", "ac3", "eac3", "mp2"];
 
 /// A DLNA cast transcode preset. Canonical type shared by wdmm-storage,
-/// wdmm-ffmpeg and the FFI layer. See `wdmm-storage` schema v14 for the DB
+/// wdmm-ffmpeg and the FFI layer. See `wdmm-storage` schema v15 for the DB
 /// layout.
 ///
 /// The video side is decided in three layers, in this order:
@@ -210,13 +209,12 @@ pub const AUDIO_CODECS: [&str; 4] = ["aac", "ac3", "eac3", "mp2"];
 /// 1. **copy** — [`video_copy`](Self::video_copy): pass the source stream
 ///    through when MPEG-TS can carry it (no re-encode at all);
 /// 2. **hardware encode** — [`hw_video_encoder`](Self::hw_video_encoder)
-///    (empty = disabled), tuned by [`video_max_bitrate`](Self::video_max_bitrate),
-///    [`video_rate_control`](Self::video_rate_control) and the advanced
-///    [`hw_video_options`](Self::hw_video_options);
+///    (empty = disabled), tuned by [`video_max_bitrate`](Self::video_max_bitrate)
+///    and [`video_rate_control`](Self::video_rate_control);
 /// 3. **software encode** — [`sw_video_encoder`](Self::sw_video_encoder)
 ///    (empty = disabled), the fallback when hardware is missing or fails, tuned
-///    by [`sw_video_preset`](Self::sw_video_preset), the same bitrate/rate
-///    control knobs and [`sw_video_options`](Self::sw_video_options).
+///    by [`sw_video_preset`](Self::sw_video_preset) and the same
+///    bitrate/rate-control knobs.
 ///
 /// Audio has its own two-state copy/encode switch ([`audio_copy`](Self::audio_copy)).
 /// HLS output is always MPEG-TS fragments — pass-through is a session-level
@@ -237,11 +235,6 @@ pub struct TranscodePreset {
     // ── ② hardware encoder layer ("" = disabled) ────────────────────────────
     /// MediaCodec encoder name, one of [`HW_VIDEO_ENCODERS`] or `""`.
     pub hw_video_encoder: String,
-    /// Advanced `AVDictionary` options handed to the hardware encoder's
-    /// `avcodec_open2`, serialised as a JSON object. Whitelisted by
-    /// `wdmm-ffmpeg`; empty = none.
-    #[serde(default)]
-    pub hw_video_options: BTreeMap<String, String>,
     // ── ③ software encoder fallback ("" = disabled) ─────────────────────────
     /// Software encoder name, one of [`SW_VIDEO_ENCODERS`] or `""`.
     pub sw_video_encoder: String,
@@ -249,11 +242,6 @@ pub struct TranscodePreset {
     /// software encoder has no preset ladder (`mpeg2video`/`mpeg4`).
     #[serde(default)]
     pub sw_video_preset: String,
-    /// Advanced `AVDictionary` options handed to the software encoder's
-    /// `avcodec_open2`, serialised as a JSON object. Whitelisted by
-    /// `wdmm-ffmpeg`; empty = none.
-    #[serde(default)]
-    pub sw_video_options: BTreeMap<String, String>,
     // ── output envelope (independent of the layer) ──────────────────────────
     /// Max output width px (scale-down only). `None` = no limit.
     pub video_max_w: Option<u32>,
@@ -385,8 +373,6 @@ mod tests {
             "omitted rate control defaults to vbr"
         );
         assert_eq!(preset.video_quality, None);
-        assert!(preset.hw_video_options.is_empty());
-        assert!(preset.sw_video_options.is_empty());
         assert_eq!(preset.video_max_w, None);
         assert_eq!(preset.audio_sample_rate, None);
         assert_eq!(preset.updated_at, 0, "omitted timestamps default to zero");
@@ -394,8 +380,10 @@ mod tests {
     }
 
     /// `list`/`get` output is fed straight back into the editor, so the round
-    /// trip has to survive a timestamp and the v14 structured fields, including
-    /// serialising the advanced options as JSON objects.
+    /// trip has to survive a timestamp and the v14 structured fields. The JSON
+    /// still carries the `*_video_options` keys v14 stored: v15 dropped those
+    /// fields, and serde must ignore the leftover keys instead of rejecting the
+    /// row (no `deny_unknown_fields`).
     #[test]
     fn preset_json_with_a_timestamp_round_trips() {
         let json = r#"{
@@ -430,16 +418,16 @@ mod tests {
         assert_eq!(preset.video_rate_control, "cq");
         assert_eq!(preset.video_quality, Some(23));
         assert_eq!(preset.sw_video_preset, "veryfast");
-        assert_eq!(
-            preset.hw_video_options.get("profile").map(String::as_str),
-            Some("high")
-        );
         let again: TranscodePreset =
             serde_json::from_str(&serde_json::to_string(&preset).unwrap()).unwrap();
         assert_eq!(again.updated_at, preset.updated_at);
         assert_eq!(again.id, preset.id);
-        assert_eq!(again.sw_video_options, preset.sw_video_options);
         assert_eq!(again.video_quality, preset.video_quality);
+        // v15 removed the advanced option maps: they must not reappear in the
+        // JSON a `list`/`get` feeds back to the editor.
+        let serialized = serde_json::to_string(&preset).unwrap();
+        assert!(!serialized.contains("hw_video_options"), "{serialized}");
+        assert!(!serialized.contains("sw_video_options"), "{serialized}");
     }
 
     /// The v14 enum-like fields are validated before they reach the DB, with

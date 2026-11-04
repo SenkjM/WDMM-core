@@ -2247,16 +2247,17 @@ pub extern "C" fn wdmm_transcode_preset_reset(id: *const c_char) -> FfiString {
     }
 }
 
-/// Return the encoder option schema for the preset editor as JSON.
+/// Return the closed list of video encoders the preset editor may offer, as JSON.
 ///
-/// Contract §13.4: the editor renders exactly this list of encoders and option
-/// keys instead of hard-coding them. Returns an object
-/// `{"codecs":[{"id","kind","label","output_codec","rate_control","options"}]}`
+/// Contract `preset-editor-slimming` §2: the editor renders exactly this list
+/// instead of hard-coding encoder ids or per-encoder AVOptions (the advanced
+/// option editor is gone). Returns an object
+/// `{"codecs":[{"id","label","hardware","output_codec","rate_control"}]}`
 /// on success, or `"error:<message>"` on failure. Caller must free the result
 /// via [`wdmm_ffi_free_string`].
 #[no_mangle]
-pub extern "C" fn wdmm_encoder_options_schema_json() -> FfiString {
-    match wdmm_ffmpeg::encoder_options_schema_json() {
+pub extern "C" fn wdmm_video_encoder_catalog_json() -> FfiString {
+    match wdmm_ffmpeg::video_encoder_catalog_json() {
         Ok(json) => FfiString::from(json),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
@@ -5281,6 +5282,24 @@ mod tests {
         let s = unsafe { CStr::from_ptr(v.ptr) }.to_str().unwrap();
         assert!(!s.is_empty());
         wdmm_ffi_free_string(v);
+    }
+
+    #[test]
+    fn video_encoder_catalog_json_lists_the_closed_six() {
+        let _guard = global_test_lock().lock().unwrap();
+        let s = wdmm_video_encoder_catalog_json();
+        let raw = unsafe { CStr::from_ptr(s.ptr) }.to_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let codecs = v["codecs"].as_array().expect("codecs array");
+        assert_eq!(codecs.len(), 6, "expected the closed six encoders: {raw}");
+        for codec in codecs {
+            for key in ["id", "label", "hardware", "output_codec"] {
+                assert!(codec.get(key).is_some(), "missing {key} in {codec}");
+            }
+            let modes = codec["rate_control"].as_array().expect("rate_control");
+            assert_eq!(modes.len(), 3, "cq/vbr/cbr for {codec}");
+        }
+        wdmm_ffi_free_string(s);
     }
 
     #[test]

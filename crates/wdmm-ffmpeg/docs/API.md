@@ -86,7 +86,7 @@ change the grid):
 - `Copy` — remux the source packets into MPEG-TS unchanged.
 - `Hardware` — encode with `preset.hw_video_encoder` (MediaCodec).
 - `Software` — encode with `preset.sw_video_encoder`, tuned by
-  `preset.sw_video_preset` and `video_rate_control` (see *Encoder options*).
+  `preset.sw_video_preset` and `video_rate_control` (see *Encoder catalog*).
 `StreamMode::as_str()` yields `none`/`copy`/`hw`/`sw` (the session-status
 `video_action`/`audio_action` values).
 ### `pub struct SessionDecision {`
@@ -96,8 +96,7 @@ change the grid):
 Applies the copy priority (`preset.video_copy`/`audio_copy` and MPEG-TS
 copyability), picks the encoder path from the preset, and errors when the preset
 has no usable video path. `hw_encoder_available` must mean *found and opened*:
-the job probes the hardware encoder once (with the preset's advanced options,
-retrying without them when the codec refuses them) and falls back to the
+the job probes the hardware encoder once and falls back to the
 software encoder (logging `video: sw fallback downgrades hevc to h264` when the
 fallback changes the codec).
 ### `pub fn decide_video_action(preset, source_codec_id, hw_encoder_available) -> Result<StreamAction, String>`
@@ -109,46 +108,49 @@ The primitives `SessionDecision` is built from; `encoder_name()`, `uses_hardware
 ### `pub fn sw_fallback_downgrades_hevc(preset) -> bool`
 True when the hw encoder is HEVC but the sw fallback is `libx264`.
 
-## Encoder options and rate control
-The preset no longer carries an opaque "tier": `video_rate_control`
-(`auto`/`vbr`/`cbr`/`cq`), `video_quality`, `sw_video_preset` (the x264 speed
-ladder; empty for the MPEG encoders) and the two advanced-option maps
-(`hw_video_options`/`sw_video_options`) are turned into the exact
-`AVDictionary` handed to `avcodec_open2`.
+## Encoder catalog and rate control
+The preset editor renders a closed encoder list; free-form advanced options are
+gone (contract `preset-editor-slimming` §2). The structured fields
+(`video_rate_control`, `video_quality`, `sw_video_preset`, the bitrate envelope)
+plus the invariants are turned into the exact `AVDictionary` handed to
+`avcodec_open2`.
 ### `pub enum RateControl { Auto, Vbr, Cbr, Cq }`
 `RateControl::parse(&preset.video_rate_control)` returns the user-facing
-`unknown rate control: <mode>` error; `as_str()` round-trips.
+`unknown rate control: <mode>` error; `as_str()` round-trips and the enum
+serialises lowercase for the catalog JSON.
 ### `pub enum EncoderFamily { Hardware, LibX264, MpegVideo }`
-`EncoderFamily::of(encoder)` classifies a name; `allowed_keys()` is the
-whitelist an advanced-option map may use for that family.
-### `pub struct VideoEncoderOptions {`
-- `entries: Vec<(String, String)>` — the dictionary entries, in priority order
-- `overridden: Vec<String>` — preset keys an invariant took over
-- `user_option_count: usize` — advanced options from the preset (0 ⇒ the retry
-  pass is pointless)
-- `get(key)` (last writer wins), `dict_line()` (`k=v,…` for the diagnostics)
-### `pub fn video_encoder_options(preset, encoder, hardware, bitrate, gop) -> Result<VideoEncoderOptions, String>`
-### `pub fn video_encoder_options_without_user(preset, encoder, hardware, bitrate, gop) -> Result<VideoEncoderOptions, String>`
-Priority (contract §13.5): invariants > the preset's advanced options >
-structured fields > platform defaults. Invariants are
+`EncoderFamily::of(encoder)` classifies a name; used to validate a requested
+encoder against the chosen path.
+### `pub fn encoder_av_options(preset, encoder, hardware, bitrate, gop) -> Result<Vec<(String, String)>, String>`
+The complete, closed dictionary for one encoder: the structured rate-control
+mapping plus the invariants. Unknown names and family mismatches are loud
+(`unknown encoder: <name>`, `encoder <name> is not a hardware/software encoder`,
+`unknown rate control: <mode>`). Invariants (a preset cannot override them):
 `AV_CODEC_FLAG_GLOBAL_HEADER`, `max_b_frames=0` for the hardware path,
-`keyint=min-keyint=<segment frames>` + `scenecut=0` for libx264 and the closed
-GOP threshold for the MPEG encoders; a preset cannot override them (attempts are
-dropped and reported in `overridden`). Unknown keys fail with
-`unknown option: <key>`. `*_without_user` is the retry pass used when the codec
-refuses the preset's advanced options.
+`keyint=min-keyint=<segment frames>` + `scenecut=0` for libx264 and the
+closed-GOP threshold for the MPEG encoders. The dictionary also pins
+`aspect=1/1`: the plan scales the *display* geometry, so the encoded pixels are
+square (§3.2).
+### `pub fn options_line(entries) -> String`
+`k=v,…` list for the plan diagnostics (`none` when the encoder keeps defaults).
 ### `pub fn target_video_bitrate(preset, width, height, fps) -> u32`
 `preset.video_max_bitrate`, or the resolution/fps-derived envelope
 (`w*h*fps*0.1`, floored at 800 kbit/s). No tier factor.
 ### `pub fn video_plan_diag(action, bitrate, rate_control, options) -> String`
 The diagnostic line naming the effective encoder, rate control, bitrate and
 options dictionary (not the requested ones).
-### `pub fn encoder_options_schema() -> EncoderOptionsSchema`
-### `pub fn encoder_options_schema_json() -> Result<String, serde_json::Error>`
-The preset editor renders exactly this schema (§13.4): one entry per selectable
-encoder with its `rate_control` list and whitelisted `options`
-(`key`/`label`/`type`/`values`/`min`/`max`/`default`/`advanced`). The option
-keys are the literal `AVDictionary` keys, so UI and transcoder cannot drift.
+### `pub fn display_width(width, sar) -> i32`
+### `pub fn fit_display_dimensions(src_w, src_h, sar, max_w, max_h) -> (i32, i32)`
+Anamorphic sources are scaled by their display width (`width * sar`), never
+squeezed to the coded width; the output is even-sized and never upscaled.
+### `pub struct VideoEncoderInfo { id, label, hardware, output_codec, rate_control }`
+### `pub fn video_encoder_catalog() -> &'static [VideoEncoderInfo]`
+### `pub fn video_encoder_catalog_json() -> Result<String, serde_json::Error>`
+The six editor-selectable encoders (`h264_mediacodec`, `hevc_mediacodec`,
+`mpeg4_mediacodec`, `libx264`, `mpeg2video`, `mpeg4`) with their user-facing
+label, hardware flag, output codec and supported rate-control modes. The JSON
+shape is `{"codecs":[{"id","label","hardware","output_codec","rate_control":[…]}]}`;
+the editor renders it directly instead of hard-coding names.
 ### `pub const SHIPPED_VIDEO_ENCODERS: [&str; N]`
 ### `pub const SHIPPED_AUDIO_ENCODERS: [&str; N]`
 The explicit `--enable-encoder` list of the trimmed Android build; §13.6 gate

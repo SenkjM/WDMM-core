@@ -1,5 +1,5 @@
-//! Host-only regression tests for the three-layer stream decision
-//! (`.tmp/contract/preset-encoder-tiers.md` §2/§3).
+//! Host-only regression tests for the three-layer stream decision and the
+//! closed encoder set (`.tmp/contract/preset-editor-slimming.md` §2/§3).
 //!
 //! These tests drive a real libav job, so they are `#[ignore]`d and only run on a
 //! host that links FFmpeg and has the `ffmpeg`/`ffprobe` CLI on `PATH`:
@@ -280,7 +280,7 @@ fn four_quadrants_are_reachable_from_one_source() {
 
 #[test]
 #[ignore = "host only: needs linked FFmpeg + the ffmpeg CLI"]
-fn encoder_options_carry_the_speed_preset_and_rate_control() {
+fn rate_control_and_speed_preset_reach_the_encoder_dictionary() {
     let _serial = serial();
     if !libav_ready() || !ffmpeg_cli_ready() {
         return;
@@ -333,9 +333,15 @@ fn encoder_options_carry_the_speed_preset_and_rate_control() {
             ),
             _ => {}
         }
+        // The dictionary is closed now (contract §2): no free-form options may
+        // reappear, but the invariants must still be pinned.
         assert!(
-            !log.contains("encoder options rejected by the codec"),
-            "{tag}: the structured options must be accepted\n{log}"
+            plan_line.contains("aspect=1/1"),
+            "{tag}: the encoder frame must describe square pixels\n{plan_line}"
+        );
+        assert!(
+            plan_line.contains("scenecut=0"),
+            "{tag}: the segment grid must own the scenecut invariant\n{plan_line}"
         );
         eprintln!("encoder options {rate_control}: {plan_line}");
         let _ = std::fs::remove_dir_all(&out_dir);
@@ -520,6 +526,212 @@ fn portrait_non_integer_fps_media_encodes_with_mpeg2_and_mpeg4() {
         let _ = std::fs::remove_dir_all(&out_dir);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every rate-control mode must encode segments whose first frame is a real I
+/// frame: with `max_b_frames = 0` no packet is reordered, so a segment boundary
+/// is always a display-order cut (contract `preset-editor-slimming` §3.1).
+#[test]
+#[ignore = "host only: needs linked FFmpeg + the ffmpeg CLI"]
+fn every_rate_control_encodes_segments_that_start_on_i_frames() {
+    let _serial = serial();
+    if !libav_ready() || !ffmpeg_cli_ready() {
+        return;
+    }
+    let dir = temp_dir("rate-control-start");
+    let input = h264_aac_fixture(&dir);
+
+    for rate_control in ["auto", "vbr", "cbr", "cq"] {
+        let mut preset = matrix_base();
+        preset.video_copy = false;
+        preset.audio_copy = false;
+        preset.sw_video_encoder = "libx264".into();
+        preset.sw_video_preset = "ultrafast".into();
+        preset.video_rate_control = rate_control.into();
+        preset.video_quality = Some(23);
+        let tag = format!("rc-{rate_control}");
+        let (info, log, out_dir) = run_job(&input, &preset, &tag, 2);
+        assert_eq!(info.video_action.as_deref(), Some("sw"), "{tag}\n{log}");
+        for segment in ["seg0.ts", "seg1.ts"] {
+            assert_eq!(
+                first_video_pict_type(&out_dir.join(segment)),
+                "I",
+                "{tag}: {segment} must open on an I frame\n{log}"
+            );
+        }
+        eprintln!("rate control {rate_control}: segments open on I frames");
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CBR and CQ are genuinely different rate-control modes: the same clip must
+/// come out at a different size per second, so a silently dropped
+/// `bitrate_mode` would fail here instead of only on the device.
+#[test]
+#[ignore = "host only: needs linked FFmpeg + the ffmpeg CLI"]
+fn cbr_and_cq_produce_different_bytes_per_second() {
+    let _serial = serial();
+    if !libav_ready() || !ffmpeg_cli_ready() {
+        return;
+    }
+    let dir = temp_dir("rate-control-bytes");
+    let input = h264_aac_fixture(&dir);
+
+    let mut sizes = Vec::new();
+    for rate_control in ["cbr", "cq"] {
+        let mut preset = matrix_base();
+        preset.video_copy = false;
+        preset.audio_copy = false;
+        preset.sw_video_encoder = "libx264".into();
+        preset.sw_video_preset = "ultrafast".into();
+        preset.video_rate_control = rate_control.into();
+        preset.video_quality = Some(30);
+        let tag = format!("bytes-{rate_control}");
+        let (_, log, out_dir) = run_job(&input, &preset, &tag, 2);
+        let bytes = segment_bytes(&out_dir);
+        assert!(bytes > 0, "{tag}: no segment bytes\n{log}");
+        eprintln!("rate control {rate_control}: {bytes} bytes for two segments");
+        sizes.push(bytes);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+    assert_ne!(
+        sizes[0], sizes[1],
+        "cbr and cq must not produce byte-identical output"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A DVD-style anamorphic source (720×576, SAR 64/45) is 1024 px wide on
+/// screen; the plan must scale that *display* geometry into the envelope
+/// instead of the coded 720 px, and the encoded pixels must be square
+/// (contract `preset-editor-slimming` §3.2).
+#[test]
+#[ignore = "host only: needs linked FFmpeg + the ffmpeg CLI"]
+fn anamorphic_source_is_scaled_by_display_width() {
+    let _serial = serial();
+    if !libav_ready() || !ffmpeg_cli_ready() {
+        return;
+    }
+    let dir = temp_dir("anamorphic");
+    let input = anamorphic_fixture(&dir);
+
+    let mut preset = preset::preset_h264();
+    preset.hw_video_encoder = String::new(); // software encoder only
+    preset.video_copy = false;
+    preset.audio_copy = true;
+    preset.sw_video_encoder = "libx264".into();
+    preset.sw_video_preset = "ultrafast".into();
+    preset.hls_segment_secs = 2;
+    preset.video_max_w = Some(640);
+    preset.video_max_h = Some(480);
+    let (info, log, out_dir) = run_job(&input, &preset, "anamorphic", 1);
+    assert_eq!(info.video_action.as_deref(), Some("sw"), "{log}");
+
+    let segment = out_dir.join("seg0.ts");
+    let probe = wdmm_ffmpeg::probe(&segment.to_string_lossy()).expect("probe segment");
+    let video = probe.video.first().expect("encoded video stream");
+    assert_eq!(
+        (video.width, video.height),
+        (640, 360),
+        "display geometry must drive the output size, not the coded 720×576\n{log}"
+    );
+    eprintln!(
+        "anamorphic debug: coded {}x{} SAR [{:?}]",
+        video.width,
+        video.height,
+        stream_sample_aspect_ratio(&segment)
+    );
+    assert_eq!(
+        stream_sample_aspect_ratio(&segment),
+        "1:1",
+        "the encoded frame must describe square pixels\n{log}"
+    );
+    eprintln!(
+        "anamorphic: coded 720x576 SAR 64/45 -> {}x{} SAR {}",
+        video.width,
+        video.height,
+        stream_sample_aspect_ratio(&segment)
+    );
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 720×576 H.264 with SAR 64/45 (a PAL DVD frame): 1024×576 in display space.
+fn anamorphic_fixture(dir: &Path) -> PathBuf {
+    let path = dir.join("anamorphic-720x576.mp4");
+    if path.is_file() {
+        return path;
+    }
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error"])
+        .args(["-f", "lavfi", "-i"])
+        .arg(format!(
+            "testsrc2=size=720x576:rate=25:duration={CLIP_SECS}"
+        ))
+        .args(["-f", "lavfi", "-i"])
+        .arg(format!(
+            "sine=frequency=440:sample_rate=48000:duration={CLIP_SECS}"
+        ))
+        .args(["-vf", "setsar=64/45"])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .args(["-g", "25", "-keyint_min", "25", "-sc_threshold", "0"])
+        .args(["-c:a", "aac", "-b:a", "96k", "-shortest"])
+        .arg(&path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(
+        status.success(),
+        "fixture synthesis failed: {}",
+        path.display()
+    );
+    path
+}
+
+/// Total size of the written segments, used to compare rate-control modes.
+fn segment_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("seg") && name.ends_with(".ts")
+        })
+        .filter_map(|entry| entry.metadata().ok().map(|meta| meta.len()))
+        .sum()
+}
+
+/// Sample aspect ratio of the first video stream, via the `ffprobe` CLI.
+fn stream_sample_aspect_ratio(segment: &Path) -> String {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "stream=sample_aspect_ratio"])
+        .args(["-of", "csv=p=0"])
+        .arg(segment)
+        .output()
+        .expect("spawn ffprobe");
+    assert!(
+        output.status.success(),
+        "ffprobe failed for {}: {}",
+        segment.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Picture type of the first video frame of a segment, via the `ffprobe` CLI.

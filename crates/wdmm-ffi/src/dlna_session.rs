@@ -34,7 +34,7 @@
 //! every `wdmm_dlna_session_*` result is a JSON document the Dart decoder
 //! parses (see contract §3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_char;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -170,24 +170,91 @@ impl CacheConfig {
 
 // ── Session registry ─────────────────────────────────────────────────────────
 
-static SESSIONS: OnceLock<Mutex<HashMap<u32, SessionEntry>>> = OnceLock::new();
+/// Resident session table: every handle maps to a shared, lock-protected entry.
+///
+/// Callers clone the `Arc` out of the map and lock it for the duration of one
+/// FFI call, so a `state` poll and a `cmd` call for the same handle serialise
+/// instead of removing each other's entry. The previous take/put scheme removed
+/// the entry for the whole call, so a poll that ran while a command was in
+/// flight answered `unknown session handle` — the queue-switch failure seen on
+/// device (contract §6).
+struct SessionRegistry<T> {
+    entries: Mutex<HashMap<u32, Arc<tokio::sync::Mutex<T>>>>,
+    /// Recently closed handles, kept so `close` stays idempotent and a late
+    /// `state` poll of a closed session answers `{"ok":true,"state":"idle"}`
+    /// instead of `unknown session handle`. Bounded to [`CLOSED_MEMORY`].
+    closed: Mutex<VecDeque<u32>>,
+}
+
+impl<T> SessionRegistry<T> {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            closed: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn insert(&self, handle: u32, entry: T) -> Arc<tokio::sync::Mutex<T>> {
+        let slot = Arc::new(tokio::sync::Mutex::new(entry));
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(handle, Arc::clone(&slot));
+        slot
+    }
+
+    /// Clone the slot for an open session. Never removes it: concurrent callers
+    /// serialise on the per-session mutex.
+    fn get(&self, handle: u32) -> Option<Arc<tokio::sync::Mutex<T>>> {
+        self.entries.lock().unwrap().get(&handle).cloned()
+    }
+
+    /// Remove a session and remember it as closed, atomically with respect to
+    /// other `close` calls.
+    fn retire(&self, handle: u32) -> Option<Arc<tokio::sync::Mutex<T>>> {
+        let mut entries = self.entries.lock().unwrap();
+        let slot = entries.remove(&handle);
+        if slot.is_some() {
+            let mut closed = self.closed.lock().unwrap();
+            if !closed.contains(&handle) {
+                closed.push_back(handle);
+                while closed.len() > CLOSED_MEMORY {
+                    closed.pop_front();
+                }
+            }
+        }
+        slot
+    }
+
+    /// Whether `handle` belonged to a session that has since been closed.
+    fn was_closed(&self, handle: u32) -> bool {
+        self.closed.lock().unwrap().contains(&handle)
+    }
+}
+
+static SESSIONS: OnceLock<SessionRegistry<SessionEntry>> = OnceLock::new();
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 
-fn sessions() -> &'static Mutex<HashMap<u32, SessionEntry>> {
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+/// How many closed handles stay remembered.
+const CLOSED_MEMORY: usize = 256;
+
+fn sessions() -> &'static SessionRegistry<SessionEntry> {
+    SESSIONS.get_or_init(SessionRegistry::new)
 }
 
-/// Remove a session for the duration of one FFI call.
-///
-/// Sessions are *taken* out of the map (never locked across an `await`) and put
-/// back afterwards, so a failed tick/command can still be closed by Dart and
-/// release its proxy tokens.
-fn take_session(handle: u32) -> Option<SessionEntry> {
-    sessions().lock().unwrap().remove(&handle)
-}
-
-fn put_session(entry: SessionEntry) {
-    sessions().lock().unwrap().insert(entry.handle, entry);
+/// Neutral state document for a closed session (contract §6).
+fn closed_state_json() -> Value {
+    json!({
+        "ok": true,
+        "state": "idle",
+        "phase": "idle",
+        "transport": "STOPPED",
+        "position_ms": 0,
+        "duration_ms": 0,
+        "ended": false,
+        "ended_reason": null,
+        "error": null,
+    })
 }
 
 // ── Session state ────────────────────────────────────────────────────────────
@@ -489,6 +556,10 @@ struct SessionEntry {
     cache: CacheConfig,
     /// Failure reason for `phase == Failed`.
     last_error: Option<String>,
+    /// Set by `wdmm_dlna_session_close` while it holds the session lock, so a
+    /// command that was already waiting on the lock cannot restart playback
+    /// after the close (contract §6).
+    closed: bool,
 }
 
 /// Freshly prepared media resources before they are handed to a renderer.
@@ -1831,8 +1902,9 @@ async fn start_session(cfg: &Value) -> Result<Value, String> {
         didl: prepared.didl,
         cache,
         last_error: None,
+        closed: false,
     };
-    put_session(entry);
+    sessions().insert(handle, entry);
 
     Ok(json!({
         "ok": true,
@@ -2622,20 +2694,30 @@ pub extern "C" fn wdmm_dlna_session_start(config_json: *const c_char) -> FfiStri
 /// For an HLS cast `duration_ms` comes from the segment plan (a warming
 /// renderer reports 0); a direct cast keeps the renderer's value.
 /// Returns `{"ok":false,"error":"…"}` for an unknown handle / renderer failure.
+/// A handle whose session was already closed answers
+/// `{"ok":true,"state":"idle"}` so a late poll cannot turn into a cast error
+/// (contract §6).
 #[no_mangle]
 pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString {
-    let Some(mut entry) = take_session(handle) else {
+    let Some(slot) = sessions().get(handle) else {
+        if sessions().was_closed(handle) {
+            return FfiString::from(closed_state_json().to_string());
+        }
         return err_json("unknown session handle");
     };
-    let result = rt().block_on(entry.session.tick());
-    let value = match result {
-        Ok(tick) => {
-            let progress = refresh_phase(&mut entry, &tick);
-            state_json(&entry, &tick, progress.as_ref())
+    let value = rt().block_on(async move {
+        let mut entry = slot.lock().await;
+        if entry.closed {
+            return closed_state_json();
         }
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    };
-    put_session(entry);
+        match entry.session.tick().await {
+            Ok(tick) => {
+                let progress = refresh_phase(&mut entry, &tick);
+                state_json(&entry, &tick, progress.as_ref())
+            }
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        }
+    });
     FfiString::from(value.to_string())
 }
 
@@ -2660,6 +2742,9 @@ pub extern "C" fn wdmm_dlna_session_state(handle: u32) -> FfiString {
 /// when playback had barely started). A bitmap embedded track is refused loudly
 /// with `{"ok":false,"error":"…","support":"bitmap-unsupported"}`; every other
 /// failure returns `{"ok":false,"error":"…"}`.
+///
+/// A command sent to an already closed handle is a no-op that returns `"ok"`
+/// (contract §6).
 #[no_mangle]
 pub extern "C" fn wdmm_dlna_session_cmd(handle: u32, cmd_json: *const c_char) -> FfiString {
     let raw = match ptr_to_str(cmd_json) {
@@ -2670,11 +2755,19 @@ pub extern "C" fn wdmm_dlna_session_cmd(handle: u32, cmd_json: *const c_char) ->
         Ok(cmd) => cmd,
         Err(e) => return err_json(format!("invalid cmd_json: {e}")),
     };
-    let Some(mut entry) = take_session(handle) else {
+    let Some(slot) = sessions().get(handle) else {
+        if sessions().was_closed(handle) {
+            return FfiString::from("ok");
+        }
         return err_json("unknown session handle");
     };
-    let result = rt().block_on(apply_cmd(&mut entry, &cmd));
-    put_session(entry);
+    let result = rt().block_on(async move {
+        let mut entry = slot.lock().await;
+        if entry.closed {
+            return Ok(None);
+        }
+        apply_cmd(&mut entry, &cmd).await
+    });
     match result {
         Ok(Some(doc)) => FfiString::from(doc.to_string()),
         Ok(None) => FfiString::from("ok"),
@@ -2684,20 +2777,37 @@ pub extern "C" fn wdmm_dlna_session_cmd(handle: u32, cmd_json: *const c_char) ->
 
 /// Close a session: stop playback and release every proxy token it holds.
 ///
-/// Returns `"ok"`, or `{"ok":false,"error":"…"}` for an unknown handle.
+/// Idempotent: closing an already closed handle (again) returns `"ok"`; only a
+/// handle that never existed returns `{"ok":false,"error":"unknown session
+/// handle"}` (contract §6). The entry leaves the registry before the stop runs,
+/// so a concurrent `state`/`cmd` never observes a half-closed session: it either
+/// waits on the per-session lock and then sees `closed`, or answers the idle
+/// document / `"ok"` from the closed-handle memory.
 #[no_mangle]
 pub extern "C" fn wdmm_dlna_session_close(handle: u32) -> FfiString {
-    let Some(mut entry) = take_session(handle) else {
+    let Some(slot) = sessions().retire(handle) else {
+        if sessions().was_closed(handle) {
+            return FfiString::from("ok");
+        }
         return err_json("unknown session handle");
     };
-    let _ = rt().block_on(entry.session.stop());
-    let subtitle = std::mem::take(&mut entry.subtitle_tokens);
-    unregister_media(
-        &entry.proxy,
-        Some(&entry.stream_token),
-        entry.hls_token.as_deref(),
-        &subtitle,
-    );
+    rt().block_on(async move {
+        let mut entry = slot.lock().await;
+        if entry.closed {
+            return;
+        }
+        entry.closed = true;
+        let _ = entry.session.stop().await;
+        let subtitle = std::mem::take(&mut entry.subtitle_tokens);
+        entry.subtitle_resources.clear();
+        entry.embedded_cache.clear();
+        unregister_media(
+            &entry.proxy,
+            Some(&entry.stream_token),
+            entry.hls_token.as_deref(),
+            &subtitle,
+        );
+    });
     FfiString::from("ok")
 }
 
@@ -2835,6 +2945,76 @@ mod tests {
 
     fn json_of(result: FfiString) -> Value {
         serde_json::from_str(&read(result)).expect("json result")
+    }
+
+    /// The old registry took the entry out of the map for the duration of one
+    /// call, so a poll that overlapped a command reported `unknown session
+    /// handle` (contract §6). Both callers must now see the same resident
+    /// session and serialise on its lock.
+    #[test]
+    fn concurrent_poll_and_command_never_lose_the_session() {
+        let registry = Arc::new(SessionRegistry::<u32>::new());
+        registry.insert(1, 0);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let poll = {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..200 {
+                    let slot = registry.get(1).expect("poll lost the session");
+                    futures::executor::block_on(async move {
+                        let mut value = slot.lock().await;
+                        *value += 1;
+                    });
+                }
+            })
+        };
+        let command = {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..200 {
+                    let slot = registry.get(1).expect("command lost the session");
+                    futures::executor::block_on(async move {
+                        let mut value = slot.lock().await;
+                        *value += 1;
+                    });
+                }
+            })
+        };
+
+        barrier.wait();
+        poll.join().expect("poll thread panicked");
+        command.join().expect("command thread panicked");
+
+        let slot = registry.get(1).expect("handle disappeared");
+        let total = futures::executor::block_on(async move { *slot.lock().await });
+        assert_eq!(total, 400, "every call must reach the session");
+    }
+
+    /// `close` retires the entry, and the handle stays known as closed so a
+    /// repeated close (or a late poll) cannot degrade into `unknown session
+    /// handle`.
+    #[test]
+    fn retired_handles_are_remembered_as_closed() {
+        let registry = SessionRegistry::<u32>::new();
+        registry.insert(5, 1);
+        assert!(registry.get(5).is_some());
+
+        let retired = registry.retire(5);
+        assert!(retired.is_some(), "the first close retires the session");
+        assert!(registry.get(5).is_none(), "the session left the registry");
+        assert!(registry.was_closed(5));
+
+        assert!(registry.retire(5).is_none(), "a repeated close is a no-op");
+        assert!(
+            registry.was_closed(5),
+            "and the handle stays known as closed"
+        );
+        assert!(!registry.was_closed(6), "an unknown handle stays unknown");
     }
 
     #[test]

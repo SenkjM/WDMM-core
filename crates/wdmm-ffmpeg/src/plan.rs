@@ -14,13 +14,16 @@
 //! one stream. The caller decides each stream once per session and caches the
 //! result — reopen/seek restarts must reuse the same decision.
 //!
-//! [`video_encoder_options`] then turns the preset's structured rate-control
-//! fields plus its advanced option maps into the exact `AVDictionary` handed to
-//! `avcodec_open2`, with the contract §13.5 priority (invariants > advanced
-//! options > structured fields). [`encoder_options_schema`] is the same
-//! whitelist rendered for the preset editor, so UI and transcoder cannot drift.
+//! [`encoder_av_options`] then turns the preset's structured rate-control
+//! fields into the exact `AVDictionary` handed to `avcodec_open2`. The preset
+//! editor no longer offers free-form advanced options (contract
+//! `preset-editor-slimming` §2); what remains is the closed rate-control
+//! mapping plus the invariants that keep the segment grid intact.
+//! [`video_encoder_catalog`] is the closed encoder list the editor renders.
 
 use wdmm_core::models::TranscodePreset;
+
+use crate::sys::AVRational;
 
 /// What the cheap remux stage should do for the selected best streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +203,8 @@ pub fn sw_fallback_downgrades_hevc(preset: &TranscodePreset) -> bool {
 // ── Video rate control (contract §4) ─────────────────────────────────────────
 
 /// Video rate-control mode, one of `wdmm_core::models::RATE_CONTROL_MODES`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RateControl {
     /// Leave the encoder defaults alone: the bitrate is a plain ABR target and
     /// no `bitrate_mode`/quality option is injected.
@@ -262,146 +266,33 @@ impl EncoderFamily {
             None
         }
     }
-
-    /// Advanced option keys a preset may set for this family.
-    pub fn allowed_keys(self) -> &'static [&'static str] {
-        match self {
-            EncoderFamily::Hardware => HW_VIDEO_OPTION_KEYS,
-            EncoderFamily::LibX264 => SW_X264_OPTION_KEYS,
-            EncoderFamily::MpegVideo => SW_MPEG_OPTION_KEYS,
-        }
-    }
 }
 
-/// Whitelisted `hw_video_options` keys (contract §3).
-pub const HW_VIDEO_OPTION_KEYS: &[&str] = &[
-    "bitrate_mode",
-    "global_quality",
-    "qmin",
-    "qmax",
-    "profile",
-    "level",
-    "operating_rate",
-    "codec_name",
-    "pts_as_dts",
-    "max_b_frames",
-];
-
-/// Whitelisted `sw_video_options` keys for `libx264` (contract §3).
-pub const SW_X264_OPTION_KEYS: &[&str] = &[
-    "preset",
-    "crf",
-    "tune",
-    "profile",
-    "level",
-    "max_b_frames",
-    "x264-params",
-];
-
-/// Whitelisted `sw_video_options` keys for the MPEG-1/2/4 encoders
-/// (contract §8bis — the equivalent knobs of the x264 ladder).
-pub const SW_MPEG_OPTION_KEYS: &[&str] = &[
-    "mpv_flags",
-    "lmin",
-    "lmax",
-    "noise_reduction",
-    "luma_elim_threshold",
-    "chroma_elim_threshold",
-    "mpeg_quant",
-    "data_partitioning",
-    "b_strategy",
-    "me_method",
-    "me_range",
-    "mb_decision",
-    "qmin",
-    "qmax",
-    "max_b_frames",
-    "rc_min_rate",
-    "rc_max_rate",
-    "rc_buffer_size",
-];
-
-/// `x264-params` keys the transcode plan owns. A preset that sets one of them
-/// is overridden (and the diag names the key), so the segment grid can never
-/// drift off the HLS plan (contract §13.5).
+/// `x264-params` keys the transcode plan owns. The plan injects them itself, so
+/// the segment grid can never drift off the HLS plan (contract §13.5).
 pub const INVARIANT_X264_PARAMS: &[&str] = &["keyint", "min-keyint", "scenecut"];
 
-/// The `AVDictionary` a video encoder is opened with, plus its provenance.
+/// Build the `AVDictionary` for one video encoder.
 ///
-/// `entries` is applied in order and the last writer wins (`av_dict_set`
-/// overwrites), so that order *is* the contract §13.5 priority:
-/// structured fields → preset advanced options → invariants.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VideoEncoderOptions {
-    /// Key/value pairs handed to `avcodec_open2`, in application order.
-    pub entries: Vec<(String, String)>,
-    /// Preset option keys an invariant took over (reported in the diag).
-    pub overridden: Vec<String>,
-    /// How many entries came from the preset's advanced options; a failed
-    /// `avcodec_open2` is only worth retrying when this is non-zero.
-    pub user_option_count: usize,
-}
-
-impl VideoEncoderOptions {
-    /// Get one final entry by key (last writer wins).
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// `key=value` list for the diag log; `none` when the encoder keeps every
-    /// default.
-    pub fn dict_line(&self) -> String {
-        if self.entries.is_empty() {
-            return "none".to_string();
-        }
-        self.entries
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-}
-
-/// Build the complete `AVDictionary` for one video encoder.
+/// Only two sources remain (contract `preset-editor-slimming` §2.1):
 ///
-/// Applies the contract §13.5 priority — invariants > the preset's advanced
-/// options > the structured fields — by ordering the entries, and returns a
-/// loud error for an unknown key or an encoder/family mismatch instead of
-/// silently dropping the option.
-pub fn video_encoder_options(
+/// 1. the preset's structured rate-control fields (`video_rate_control`,
+///    `video_quality`, the libx264 speed preset and the bitrate target);
+/// 2. the invariants the HLS segment grid depends on.
+///
+/// The dictionary also pins the encoder's sample aspect ratio to 1/1: the plan
+/// scales the *display* geometry into the envelope, so the encoded pixels have
+/// to describe square pixels (contract §3.2).
+///
+/// Returns a loud error for an unknown encoder or a family mismatch instead of
+/// silently dropping the rate control.
+pub fn encoder_av_options(
     preset: &TranscodePreset,
     encoder: &str,
     hardware: bool,
     bitrate: u32,
     gop: i32,
-) -> Result<VideoEncoderOptions, String> {
-    build_video_encoder_options(preset, encoder, hardware, bitrate, gop, true)
-}
-
-/// Same options without the preset's advanced entries: the retry pass after
-/// `avcodec_open2` rejected the user's options (contract §13.5).
-pub fn video_encoder_options_without_user(
-    preset: &TranscodePreset,
-    encoder: &str,
-    hardware: bool,
-    bitrate: u32,
-    gop: i32,
-) -> Result<VideoEncoderOptions, String> {
-    build_video_encoder_options(preset, encoder, hardware, bitrate, gop, false)
-}
-
-fn build_video_encoder_options(
-    preset: &TranscodePreset,
-    encoder: &str,
-    hardware: bool,
-    bitrate: u32,
-    gop: i32,
-    include_user_options: bool,
-) -> Result<VideoEncoderOptions, String> {
+) -> Result<Vec<(String, String)>, String> {
     let family = EncoderFamily::of(encoder).ok_or_else(|| format!("unknown encoder: {encoder}"))?;
     if hardware != (family == EncoderFamily::Hardware) {
         return Err(format!(
@@ -412,7 +303,7 @@ fn build_video_encoder_options(
     let rate_control = RateControl::parse(&preset.video_rate_control)?;
     let quality = preset.video_quality;
 
-    // ── Structured fields (rate control / preset ladder) ────────────────────
+    // ── Structured fields (rate control / preset ladder, contract §13.4) ────
     let mut structured: Vec<(String, String)> = Vec::new();
     let mut x264_structured: Vec<String> = Vec::new();
     match family {
@@ -462,54 +353,16 @@ fn build_video_encoder_options(
         },
     }
 
-    // ── Preset advanced options (middle priority) ───────────────────────────
-    let mut user: Vec<(String, String)> = Vec::new();
-    let mut x264_user: Vec<String> = Vec::new();
-    let mut overridden: Vec<String> = Vec::new();
-    if include_user_options {
-        let source = if hardware {
-            &preset.hw_video_options
-        } else {
-            &preset.sw_video_options
-        };
-        for (key, value) in source {
-            if !family.allowed_keys().contains(&key.as_str()) {
-                return Err(format!("unknown option: {key}"));
-            }
-            if family == EncoderFamily::Hardware && key == "max_b_frames" {
-                // Invariant: MediaCodec must not reorder frames (B-frames would
-                // delay every packet past its segment boundary).
-                overridden.push(key.clone());
-                continue;
-            }
-            if family == EncoderFamily::LibX264 && key == "x264-params" {
-                for token in value.split(':') {
-                    let token = token.trim();
-                    if token.is_empty() {
-                        continue;
-                    }
-                    let name = token.split('=').next().unwrap_or(token);
-                    if INVARIANT_X264_PARAMS.contains(&name) {
-                        overridden.push(format!("x264-params:{name}"));
-                    } else {
-                        x264_user.push(token.to_string());
-                    }
-                }
-                continue;
-            }
-            user.push((key.clone(), value.clone()));
-        }
-    }
-    let user_option_count = user.len() + x264_user.len();
-
     // ── Invariants (highest priority) ───────────────────────────────────────
     let mut invariants: Vec<(String, String)> = Vec::new();
     match family {
         EncoderFamily::Hardware => invariants.push(("max_b_frames".into(), "0".into())),
         EncoderFamily::LibX264 => {
             let mut tokens = x264_structured;
-            tokens.extend(x264_user);
-            tokens.push(format!("keyint={gop}:min-keyint={gop}:scenecut=0"));
+            tokens.push(format!(
+                "{}={gop}:{}={gop}:scenecut=0",
+                INVARIANT_X264_PARAMS[0], INVARIANT_X264_PARAMS[1]
+            ));
             invariants.push(("x264-params".into(), tokens.join(":")));
         }
         EncoderFamily::MpegVideo => {
@@ -519,16 +372,27 @@ fn build_video_encoder_options(
             invariants.push(("sc_threshold".into(), "1000000000".into()));
         }
     }
+    // The plan scales the display geometry itself, so the encoder emits square
+    // pixels (contract §3.2).
+    invariants.push(("aspect".into(), "1/1".into()));
 
-    let mut entries = Vec::with_capacity(structured.len() + user.len() + invariants.len());
+    let mut entries = Vec::with_capacity(structured.len() + invariants.len());
     entries.extend(structured);
-    entries.extend(user);
     entries.extend(invariants);
-    Ok(VideoEncoderOptions {
-        entries,
-        overridden,
-        user_option_count,
-    })
+    Ok(entries)
+}
+
+/// `key=value` list for the plan diagnostics; `none` when the encoder keeps
+/// every default.
+pub fn options_line(entries: &[(String, String)]) -> String {
+    if entries.is_empty() {
+        return "none".to_string();
+    }
+    entries
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Default video bitrate used when the preset does not set one:
@@ -553,13 +417,14 @@ pub fn target_video_bitrate(preset: &TranscodePreset, width: u32, height: u32, f
         .max(1)
 }
 
-/// One-line diag for the decided video layer (contract §3/§13.5): emitted once
-/// per plan and carrying the *actual* options that reach `avcodec_open2`.
+/// One-line diag for the decided video layer (contract §13.4): emitted once per
+/// plan and carrying the *actual* rate-control options that reach
+/// `avcodec_open2`.
 pub fn video_plan_diag(
     action: StreamAction<'_>,
     bitrate: u32,
     rate_control: RateControl,
-    options: &VideoEncoderOptions,
+    options: &[(String, String)],
 ) -> String {
     match action {
         StreamAction::Copy => format!(
@@ -570,294 +435,146 @@ pub fn video_plan_diag(
             "video plan: action={} encoder={encoder} rate_control={} bitrate={bitrate} options={}",
             if hardware { "hw" } else { "sw" },
             rate_control.as_str(),
-            options.dict_line()
+            options_line(options)
         ),
     }
 }
 
-// ── Encoder option schema for the preset editor (contract §13.4) ───────────
+// ── Display geometry (contract `preset-editor-slimming` §3.2) ───────────────
 
-/// Value type the preset editor renders for one advanced option (§13.4).
+/// Pixel width a sample aspect ratio expands the stored width to.
+///
+/// An anamorphic source (DVD 720×576 SAR 64:45) stores 720 pixels that are
+/// meant to be shown 1024 wide. Returns `width` unchanged for a missing or
+/// invalid SAR so a plain square-pixel source cannot regress.
+pub fn display_width(width: i32, sar: AVRational) -> i32 {
+    if width <= 0 || sar.num <= 0 || sar.den <= 0 {
+        return width;
+    }
+    let scaled = i64::from(width) * i64::from(sar.num);
+    let width = (scaled + i64::from(sar.den) / 2) / i64::from(sar.den);
+    width.clamp(0, i64::from(i32::MAX)) as i32
+}
+
+/// Output pixel size for a source with `sar`, capped by the preset envelope.
+///
+/// The *display* geometry (display width × stored height) is fitted into the
+/// envelope first, so a 720×576 SAR 64:45 source (1024×576 displayed) never
+/// overflows a 640×480 cap. When the display geometry already fits, the stored
+/// pixels are kept as they are — the cheap fix avoids upscaling and keeps the
+/// pixel count of ordinary sources untouched (contract §3.2).
+pub fn fit_display_dimensions(
+    src_w: i32,
+    src_h: i32,
+    sar: AVRational,
+    max_w: Option<i32>,
+    max_h: Option<i32>,
+) -> (i32, i32) {
+    if src_w <= 0 || src_h <= 0 {
+        return (src_w, src_h);
+    }
+    let display_w = display_width(src_w, sar).max(1);
+    let fits = max_w.is_none_or(|m| display_w <= m) && max_h.is_none_or(|m| src_h <= m);
+    if fits {
+        return (even(src_w), even(src_h));
+    }
+    let scale_w = max_w.map_or(f64::INFINITY, |m| f64::from(m) / f64::from(display_w));
+    let scale_h = max_h.map_or(f64::INFINITY, |m| f64::from(m) / f64::from(src_h));
+    let scale = scale_w.min(scale_h).clamp(0.0, 1.0);
+    let fitted_w = ((f64::from(display_w) * scale).round() as i32).max(2);
+    let fitted_h = ((f64::from(src_h) * scale).round() as i32).max(2);
+    if fitted_w <= src_w && fitted_h <= src_h {
+        return (even(fitted_w), even(fitted_h));
+    }
+    // The envelope wants fewer display pixels than the source stores (e.g. a
+    // 720-wide source displayed 1024 wide into a 640-wide cap): clamp the
+    // output to the source width and keep the display aspect.
+    let out_w = even(src_w.min(fitted_w).max(2));
+    let out_h =
+        ((f64::from(src_h) * f64::from(out_w) / f64::from(display_w)).round() as i32).max(2);
+    (out_w, even(out_h))
+}
+
+/// Round up to the nearest even pixel count (4:2:0-safe encoder sizes).
+fn even(v: i32) -> i32 {
+    let v = v.max(2);
+    v + (v & 1)
+}
+
+// ── Encoder catalog for the preset editor (contract §2) ─────────────────────
+
+/// One selectable video encoder the preset editor renders (contract §2).
+///
+/// This is the single source of truth for encoder ids, labels, output codecs
+/// and the rate-control modes each one accepts; Dart renders it and must not
+/// hard-code encoder names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OptionType {
-    /// Fixed set in [`EncoderOptionSpec::values`].
-    Enum,
-    /// Integer with optional [`EncoderOptionSpec::min`] / [`EncoderOptionSpec::max`].
-    Int,
-    /// Decimal number with optional bounds.
-    Float,
-    /// Boolean switch.
-    Bool,
-}
-
-/// One advanced option the preset editor may render.
-///
-/// `key` is exactly the `AVDictionary` key handed to `avcodec_open2`, so the
-/// editor and the transcoder cannot drift apart (§13.4).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EncoderOptionSpec {
-    /// `AVDictionary` key.
-    pub key: &'static str,
-    /// Human label for the editor.
-    pub label: &'static str,
-    /// Value type.
-    #[serde(rename = "type")]
-    pub kind: OptionType,
-    /// Allowed values for [`OptionType::Enum`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub values: Option<&'static [&'static str]>,
-    /// Lower bound for numeric options.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min: Option<f64>,
-    /// Upper bound for numeric options.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max: Option<f64>,
-    /// `None` = keep the encoder default.
-    pub default: Option<&'static str>,
-    /// `true` for options hidden behind the "advanced" disclosure.
-    pub advanced: bool,
-}
-
-/// Build an [`EncoderOptionSpec`] for an enum option.
-const fn enum_option(
-    key: &'static str,
-    label: &'static str,
-    values: &'static [&'static str],
-) -> EncoderOptionSpec {
-    EncoderOptionSpec {
-        key,
-        label,
-        kind: OptionType::Enum,
-        values: Some(values),
-        min: None,
-        max: None,
-        default: None,
-        advanced: true,
-    }
-}
-
-/// Build an [`EncoderOptionSpec`] for a free-form string option.
-const fn text_option(key: &'static str, label: &'static str) -> EncoderOptionSpec {
-    EncoderOptionSpec {
-        key,
-        label,
-        kind: OptionType::Enum,
-        values: None,
-        min: None,
-        max: None,
-        default: None,
-        advanced: true,
-    }
-}
-
-/// Build an [`EncoderOptionSpec`] for an integer option with bounds.
-const fn int_option(
-    key: &'static str,
-    label: &'static str,
-    min: f64,
-    max: f64,
-) -> EncoderOptionSpec {
-    EncoderOptionSpec {
-        key,
-        label,
-        kind: OptionType::Int,
-        values: None,
-        min: Some(min),
-        max: Some(max),
-        default: None,
-        advanced: true,
-    }
-}
-
-/// Build an [`EncoderOptionSpec`] for a boolean option.
-const fn bool_option(key: &'static str, label: &'static str) -> EncoderOptionSpec {
-    EncoderOptionSpec {
-        key,
-        label,
-        kind: OptionType::Bool,
-        values: None,
-        min: None,
-        max: None,
-        default: None,
-        advanced: true,
-    }
-}
-
-/// One encoder the preset editor can select (§13.4).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CodecSchema {
-    /// Encoder name (`hw_video_encoder`/`sw_video_encoder` value).
+pub struct VideoEncoderInfo {
+    /// Encoder name stored in `hw_video_encoder`/`sw_video_encoder`.
     pub id: &'static str,
-    /// `"hw"` for MediaCodec, `"sw"` for software.
-    pub kind: &'static str,
-    /// Human label for the editor.
+    /// Chinese label rendered in the editor.
     pub label: &'static str,
-    /// Codec the encoder produces (`h264`/`hevc`/`mpeg4`/`mpeg2video`/…).
+    /// `true` for MediaCodec (`hw_video_encoder`), `false` for software.
+    pub hardware: bool,
+    /// Codec the encoder produces (`h264`/`hevc`/`mpeg4`/`mpeg2video`).
     pub output_codec: &'static str,
-    /// Rate-control modes this encoder supports.
-    pub rate_control: &'static [&'static str],
-    /// Whitelisted advanced options.
-    pub options: &'static [EncoderOptionSpec],
+    /// Rate-control modes this encoder accepts, in menu order.
+    pub rate_control: &'static [RateControl],
 }
 
-/// Complete schema returned by `wdmm_encoder_options_schema_json`.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EncoderOptionsSchema {
-    /// Every selectable encoder, hardware first.
-    pub codecs: Vec<CodecSchema>,
-}
+/// Rate-control modes every catalog encoder accepts (contract §2).
+const CATALOG_RATE_CONTROL: &[RateControl] = &[RateControl::Cq, RateControl::Vbr, RateControl::Cbr];
 
-/// Rate-control modes exposed in the schema (same order as the model).
-pub const SCHEMA_RATE_CONTROL_MODES: [&str; 4] = ["auto", "vbr", "cbr", "cq"];
-
-/// MediaCodec advanced options (§3). The platform codec itself rejects an
-/// unsupported combination at `avcodec_open2`, which the transcode path turns
-/// into a loud fallback instead of a silent no-op.
-static HW_OPTION_SPECS: [EncoderOptionSpec; 10] = [
-    enum_option("bitrate_mode", "码率模式", &["vbr", "cbr", "cq"]),
-    int_option("global_quality", "固定质量（0-100）", 0.0, 100.0),
-    int_option("qmin", "最小量化器", 0.0, 51.0),
-    int_option("qmax", "最大量化器", 0.0, 51.0),
-    int_option("profile", "Profile", 0.0, 22.0),
-    int_option("level", "Level", 0.0, 62.0),
-    int_option("operating_rate", "期望帧率", 1.0, 240.0),
-    text_option("codec_name", "平台编码器名"),
-    bool_option("pts_as_dts", "用 PTS 作为 DTS"),
-    int_option("max_b_frames", "B 帧数（固定 0）", 0.0, 0.0),
-];
-
-/// libx264 advanced options (§3): the x264 speed ladder, CRF and tuning.
-static X264_OPTION_SPECS: [EncoderOptionSpec; 7] = [
-    enum_option(
-        "preset",
-        "x264 速度档位",
-        &[
-            "ultrafast",
-            "superfast",
-            "veryfast",
-            "faster",
-            "fast",
-            "medium",
-            "slow",
-            "slower",
-            "veryslow",
-            "placebo",
-        ],
-    ),
-    int_option("crf", "CRF（0-51）", 0.0, 51.0),
-    enum_option(
-        "tune",
-        "画面调优",
-        &[
-            "film",
-            "animation",
-            "grain",
-            "stillimage",
-            "fastdecode",
-            "zerolatency",
-        ],
-    ),
-    enum_option(
-        "profile",
-        "Profile",
-        &["baseline", "main", "high", "high10", "high422", "high444"],
-    ),
-    enum_option(
-        "level",
-        "Level",
-        &[
-            "3.0", "3.1", "3.2", "4.0", "4.1", "4.2", "5.0", "5.1", "5.2", "6.0",
-        ],
-    ),
-    int_option("max_b_frames", "B 帧数", 0.0, 16.0),
-    text_option("x264-params", "x264 参数串"),
-];
-
-/// MPEG-1/2/4 advanced options (§8bis): the equivalent knobs of the x264
-/// ladder, plus the MPEG quantiser and VBV controls.
-static MPEG_OPTION_SPECS: [EncoderOptionSpec; 18] = [
-    enum_option(
-        "mpv_flags",
-        "运动估计加速",
-        &["qp_rd", "cbp_rd", "skip_rd", "naq", "strict_gop"],
-    ),
-    int_option("lmin", "最小拉格朗日乘子", 0.0, 63.0),
-    int_option("lmax", "最大拉格朗日乘子", 0.0, 63.0),
-    int_option("noise_reduction", "降噪强度", 0.0, 1000.0),
-    int_option("luma_elim_threshold", "亮度零系数阈值", 0.0, 1_000_000.0),
-    int_option("chroma_elim_threshold", "色度零系数阈值", 0.0, 1_000_000.0),
-    bool_option("mpeg_quant", "MPEG 量化"),
-    bool_option("data_partitioning", "数据分区"),
-    int_option("b_strategy", "B 帧策略", 0.0, 2.0),
-    enum_option(
-        "me_method",
-        "运动估计方法",
-        &[
-            "zero", "full", "log", "phods", "epzs", "x1", "hex", "umh", "tesa",
-        ],
-    ),
-    int_option("me_range", "运动估计范围", 0.0, 4096.0),
-    int_option("mb_decision", "宏块决策", 0.0, 2.0),
-    int_option("qmin", "最小量化器", 0.0, 51.0),
-    int_option("qmax", "最大量化器", 0.0, 51.0),
-    int_option("max_b_frames", "B 帧数（固定 0）", 0.0, 0.0),
-    int_option("rc_min_rate", "最小码率", 0.0, 100_000_000.0),
-    int_option("rc_max_rate", "最大码率", 0.0, 100_000_000.0),
-    int_option("rc_buffer_size", "VBV 缓冲", 0.0, 100_000_000.0),
-];
-
-/// Editor metadata for one encoder name: `(label, output_codec)`.
-fn encoder_meta(name: &str) -> (&'static str, &'static str) {
-    match name {
-        "h264_mediacodec" => ("MediaCodec H.264（硬件）", "h264"),
-        "hevc_mediacodec" => ("MediaCodec H.265（硬件）", "hevc"),
-        "mpeg4_mediacodec" => ("MediaCodec MPEG-4（硬件）", "mpeg4"),
-        "libx264" => ("libx264（软件）", "h264"),
-        "mpeg2video" => ("MPEG-2（软件）", "mpeg2video"),
-        "mpeg4" => ("MPEG-4（软件）", "mpeg4"),
-        _ => ("未知编码器", "unknown"),
-    }
-}
-
-/// Schema for every encoder a preset may select.
+/// Every video encoder the preset editor may select (contract §2).
 ///
-/// The editor renders exactly this list and these keys; it must not hard-code
-/// option names or value ranges (§13.4). The list matches
-/// `HW_VIDEO_ENCODERS ∪ SW_VIDEO_ENCODERS` — the encoders
-/// [`decide_video_action`] can return.
-pub fn encoder_options_schema() -> EncoderOptionsSchema {
-    let rate_control: &'static [&'static str] = &SCHEMA_RATE_CONTROL_MODES;
-    let mut codecs = Vec::new();
-    for &name in wdmm_core::models::HW_VIDEO_ENCODERS.iter() {
-        let (label, output_codec) = encoder_meta(name);
-        codecs.push(CodecSchema {
-            id: name,
-            kind: "hw",
-            label,
-            output_codec,
-            rate_control,
-            options: &HW_OPTION_SPECS,
-        });
-    }
-    for &name in wdmm_core::models::SW_VIDEO_ENCODERS.iter() {
-        let (label, output_codec) = encoder_meta(name);
-        codecs.push(CodecSchema {
-            id: name,
-            kind: "sw",
-            label,
-            output_codec,
-            rate_control,
-            options: if name == "libx264" {
-                &X264_OPTION_SPECS
-            } else {
-                &MPEG_OPTION_SPECS
-            },
-        });
-    }
-    EncoderOptionsSchema { codecs }
+/// Orders hardware first, then software, matching the editor's grouping.
+pub fn video_encoder_catalog() -> &'static [VideoEncoderInfo] {
+    static CATALOG: [VideoEncoderInfo; 6] = [
+        VideoEncoderInfo {
+            id: "h264_mediacodec",
+            label: "H.264 硬编",
+            hardware: true,
+            output_codec: "h264",
+            rate_control: CATALOG_RATE_CONTROL,
+        },
+        VideoEncoderInfo {
+            id: "hevc_mediacodec",
+            label: "H.265 硬编",
+            hardware: true,
+            output_codec: "hevc",
+            rate_control: CATALOG_RATE_CONTROL,
+        },
+        VideoEncoderInfo {
+            id: "mpeg4_mediacodec",
+            label: "MPEG-4 硬编",
+            hardware: true,
+            output_codec: "mpeg4",
+            rate_control: CATALOG_RATE_CONTROL,
+        },
+        VideoEncoderInfo {
+            id: "libx264",
+            label: "x264（软件）",
+            hardware: false,
+            output_codec: "h264",
+            rate_control: CATALOG_RATE_CONTROL,
+        },
+        VideoEncoderInfo {
+            id: "mpeg2video",
+            label: "MPEG-2（软件）",
+            hardware: false,
+            output_codec: "mpeg2video",
+            rate_control: CATALOG_RATE_CONTROL,
+        },
+        VideoEncoderInfo {
+            id: "mpeg4",
+            label: "MPEG-4（软件）",
+            hardware: false,
+            output_codec: "mpeg4",
+            rate_control: CATALOG_RATE_CONTROL,
+        },
+    ];
+    &CATALOG
 }
-
 /// Video encoders the Android FFmpeg build must ship: the explicit
 /// `--enable-encoder` list of `scripts/build-ffmpeg-android.sh` (contract
 /// §13.1/§13.6).
@@ -1088,10 +805,9 @@ mod tests {
         assert!(sw_fallback_downgrades_hevc(&preset_hevc()));
         assert!(!sw_fallback_downgrades_hevc(&preset_h264()));
     }
-
     #[test]
     fn rate_control_parses_the_four_modes() {
-        for mode in SCHEMA_RATE_CONTROL_MODES {
+        for mode in wdmm_core::models::RATE_CONTROL_MODES {
             assert_eq!(RateControl::parse(mode).unwrap().as_str(), mode);
         }
         assert_eq!(RateControl::parse("auto"), Ok(RateControl::Auto));
@@ -1104,31 +820,37 @@ mod tests {
         );
     }
 
+    /// Final value of one option key (last writer wins).
+    fn entry<'a>(entries: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        entries
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
     #[test]
     fn libx264_options_carry_the_speed_preset_and_the_gop_invariant() {
         let preset = preset_h264();
-        let opts = video_encoder_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
-        assert_eq!(opts.get("preset"), Some("veryfast"));
+        let options = encoder_av_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
+        assert_eq!(entry(&options, "preset"), Some("veryfast"));
         // vbr leaves the encoder's own rate control alone: no crf, no vbv.
-        assert_eq!(opts.get("crf"), None);
+        assert_eq!(entry(&options, "crf"), None);
         assert_eq!(
-            opts.get("x264-params"),
+            entry(&options, "x264-params"),
             Some("keyint=120:min-keyint=120:scenecut=0")
         );
-        assert_eq!(opts.user_option_count, 0);
-        assert!(opts.overridden.is_empty());
-        assert_eq!(
-            opts.dict_line(),
-            "preset=veryfast,x264-params=keyint=120:min-keyint=120:scenecut=0"
-        );
+        // The plan re-scales the display geometry itself, so the pixels are
+        // square and the segment grid stays untouched.
+        assert_eq!(entry(&options, "aspect"), Some("1/1"));
     }
 
     #[test]
     fn cbr_and_cq_map_to_encoder_specific_knobs() {
         let mut preset = preset_h264();
         preset.video_rate_control = "cbr".into();
-        let opts = video_encoder_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
-        let params = opts.get("x264-params").unwrap();
+        let options = encoder_av_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
+        let params = entry(&options, "x264-params").unwrap();
         assert!(params.contains("nal-hrd=cbr:force-cfr=1"));
         // 4 Mbps target → 4000 kbit/s HRD at a 2 s buffer.
         assert!(params.contains("vbv-maxrate=4000:vbv-bufsize=8000"));
@@ -1136,108 +858,61 @@ mod tests {
 
         // cq → CRF (default 23) with the bitrate as a VBV bound.
         preset.video_rate_control = "cq".into();
-        let opts = video_encoder_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
-        assert_eq!(opts.get("crf"), Some("23"));
-        assert!(opts
-            .get("x264-params")
+        let options = encoder_av_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
+        assert_eq!(entry(&options, "crf"), Some("23"));
+        assert!(entry(&options, "x264-params")
             .unwrap()
             .contains("vbv-maxrate=4000"));
         // The preset's quality value replaces the default CRF.
         preset.video_quality = Some(18);
-        let opts = video_encoder_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
-        assert_eq!(opts.get("crf"), Some("18"));
+        let options = encoder_av_options(&preset, "libx264", false, 4_000_000, 120).unwrap();
+        assert_eq!(entry(&options, "crf"), Some("18"));
 
         // MPEG-2 cbr → explicit RC window instead of a bitrate_mode option.
         preset.video_rate_control = "cbr".into();
-        let opts = video_encoder_options(&preset, "mpeg2video", false, 3_000_000, 60).unwrap();
-        assert_eq!(opts.get("minrate"), Some("3000000"));
-        assert_eq!(opts.get("maxrate"), Some("3000000"));
-        assert_eq!(opts.get("bufsize"), Some("6000000"));
-        assert_eq!(opts.get("max_b_frames"), Some("0"));
-        assert_eq!(opts.get("sc_threshold"), Some("1000000000"));
+        let options = encoder_av_options(&preset, "mpeg2video", false, 3_000_000, 60).unwrap();
+        assert_eq!(entry(&options, "minrate"), Some("3000000"));
+        assert_eq!(entry(&options, "maxrate"), Some("3000000"));
+        assert_eq!(entry(&options, "bufsize"), Some("6000000"));
+        assert_eq!(entry(&options, "max_b_frames"), Some("0"));
+        assert_eq!(entry(&options, "sc_threshold"), Some("1000000000"));
 
         // MPEG-2 cq → a fixed quantiser, still pinned to a constant GOP.
         preset.video_rate_control = "cq".into();
         preset.video_quality = Some(4);
-        let opts = video_encoder_options(&preset, "mpeg2video", false, 3_000_000, 60).unwrap();
-        assert_eq!(opts.get("qmin"), Some("4"));
-        assert_eq!(opts.get("qmax"), Some("4"));
-        assert_eq!(opts.get("sc_threshold"), Some("1000000000"));
+        let options = encoder_av_options(&preset, "mpeg2video", false, 3_000_000, 60).unwrap();
+        assert_eq!(entry(&options, "qmin"), Some("4"));
+        assert_eq!(entry(&options, "qmax"), Some("4"));
+        assert_eq!(entry(&options, "sc_threshold"), Some("1000000000"));
     }
 
     #[test]
     fn hardware_options_inject_the_rate_mode_and_pin_b_frames() {
         let mut preset = preset_h264();
         preset.video_rate_control = "cq".into();
-        preset
-            .hw_video_options
-            .insert("max_b_frames".into(), "3".into());
-        let opts = video_encoder_options(&preset, "h264_mediacodec", true, 4_000_000, 60).unwrap();
-        assert_eq!(opts.get("bitrate_mode"), Some("cq"));
-        assert_eq!(opts.get("global_quality"), Some("23"));
+        let options = encoder_av_options(&preset, "h264_mediacodec", true, 4_000_000, 60).unwrap();
+        assert_eq!(entry(&options, "bitrate_mode"), Some("cq"));
+        assert_eq!(entry(&options, "global_quality"), Some("23"));
         // The invariant wins: MediaCodec must never reorder frames.
-        assert_eq!(opts.get("max_b_frames"), Some("0"));
-        assert_eq!(opts.overridden, vec!["max_b_frames".to_string()]);
-        assert_eq!(opts.user_option_count, 0);
+        assert_eq!(entry(&options, "max_b_frames"), Some("0"));
+        assert_eq!(entry(&options, "aspect"), Some("1/1"));
     }
 
     #[test]
-    fn preset_options_cannot_override_the_gop_invariant() {
-        let mut preset = preset_h264();
-        preset
-            .sw_video_options
-            .insert("x264-params".into(), "ref=3:keyint=999".into());
-        preset
-            .sw_video_options
-            .insert("tune".into(), "animation".into());
-        let opts = video_encoder_options(&preset, "libx264", false, 1_000_000, 60).unwrap();
-        let params = opts.get("x264-params").unwrap();
-        assert!(params.starts_with("ref=3"));
-        assert!(params.ends_with("keyint=60:min-keyint=60:scenecut=0"));
-        assert_eq!(opts.get("tune"), Some("animation"));
-        assert!(opts.overridden.iter().any(|k| k == "x264-params:keyint"));
-        assert_eq!(opts.user_option_count, 2);
-    }
-
-    #[test]
-    fn unknown_options_and_family_mismatches_are_loud() {
-        let mut preset = preset_h264();
-        preset.sw_video_options.insert("bogus".into(), "1".into());
-        assert_eq!(
-            video_encoder_options(&preset, "libx264", false, 1_000_000, 60).unwrap_err(),
-            "unknown option: bogus"
-        );
+    fn unknown_encoders_and_family_mismatches_are_loud() {
         let clean = preset_h264();
         assert_eq!(
-            video_encoder_options(&clean, "libx264", true, 1_000_000, 60).unwrap_err(),
+            encoder_av_options(&clean, "libx264", true, 1_000_000, 60).unwrap_err(),
             "encoder libx264 is not a hardware encoder"
         );
         assert_eq!(
-            video_encoder_options(&clean, "h264_mediacodec", false, 1_000_000, 60).unwrap_err(),
+            encoder_av_options(&clean, "h264_mediacodec", false, 1_000_000, 60).unwrap_err(),
             "encoder h264_mediacodec is not a software encoder"
         );
         assert_eq!(
-            video_encoder_options(&clean, "x265", false, 1_000_000, 60).unwrap_err(),
+            encoder_av_options(&clean, "x265", false, 1_000_000, 60).unwrap_err(),
             "unknown encoder: x265"
         );
-    }
-
-    #[test]
-    fn dropping_the_user_options_keeps_the_structured_fields() {
-        let mut preset = preset_h264();
-        preset.video_rate_control = "cq".into();
-        preset.video_quality = Some(20);
-        preset
-            .sw_video_options
-            .insert("x264-params".into(), "ref=3".into());
-        let full = video_encoder_options(&preset, "libx264", false, 2_000_000, 60).unwrap();
-        let retry =
-            video_encoder_options_without_user(&preset, "libx264", false, 2_000_000, 60).unwrap();
-        assert_eq!(full.get("crf"), retry.get("crf"));
-        assert_eq!(full.get("preset"), retry.get("preset"));
-        assert_eq!(full.user_option_count, 1);
-        assert_eq!(retry.user_option_count, 0);
-        assert!(!retry.get("x264-params").unwrap().contains("ref=3"));
     }
 
     #[test]
@@ -1257,14 +932,13 @@ mod tests {
 
     #[test]
     fn video_plan_diag_spells_out_the_effective_options() {
-        let options = VideoEncoderOptions::default();
-        let copy = video_plan_diag(StreamAction::Copy, 4_000_000, RateControl::Vbr, &options);
+        let copy = video_plan_diag(StreamAction::Copy, 4_000_000, RateControl::Vbr, &[]);
         assert_eq!(
             copy,
             "video plan: action=copy encoder=none rate_control=vbr bitrate=4000000 options=none"
         );
         let hw_options =
-            video_encoder_options(&preset_hevc(), "hevc_mediacodec", true, 3_000_000, 60).unwrap();
+            encoder_av_options(&preset_hevc(), "hevc_mediacodec", true, 3_000_000, 60).unwrap();
         let hw = video_plan_diag(
             StreamAction::Encode {
                 hardware: true,
@@ -1276,10 +950,11 @@ mod tests {
         );
         assert_eq!(
             hw,
-            "video plan: action=hw encoder=hevc_mediacodec rate_control=vbr bitrate=3000000 options=bitrate_mode=vbr,max_b_frames=0"
+            "video plan: action=hw encoder=hevc_mediacodec rate_control=vbr bitrate=3000000 \
+             options=bitrate_mode=vbr,max_b_frames=0,aspect=1/1"
         );
         let sw_options =
-            video_encoder_options(&preset_h264(), "libx264", false, 1_000_000, 60).unwrap();
+            encoder_av_options(&preset_h264(), "libx264", false, 1_000_000, 60).unwrap();
         let sw = video_plan_diag(
             StreamAction::Encode {
                 hardware: false,
@@ -1289,41 +964,87 @@ mod tests {
             RateControl::Vbr,
             &sw_options,
         );
-        assert!(sw.starts_with("video plan: action=sw encoder=libx264 rate_control=vbr bitrate=1000000 options=preset=veryfast,x264-params="));
+        assert!(sw.starts_with(
+            "video plan: action=sw encoder=libx264 rate_control=vbr bitrate=1000000 \
+             options=preset=veryfast,x264-params="
+        ));
     }
 
     #[test]
-    fn schema_lists_every_shippable_encoder_with_whitelisted_keys() {
-        let schema = encoder_options_schema();
-        assert_eq!(
-            schema.codecs.len(),
-            wdmm_core::models::HW_VIDEO_ENCODERS.len() + wdmm_core::models::SW_VIDEO_ENCODERS.len()
-        );
-        for codec in &schema.codecs {
-            let family = EncoderFamily::of(codec.id).expect("schema names a known encoder");
+    fn catalog_lists_the_six_editor_encoders() {
+        let catalog = video_encoder_catalog();
+        assert_eq!(catalog.len(), 6);
+        let expected = [
+            ("h264_mediacodec", "H.264 硬编", true, "h264"),
+            ("hevc_mediacodec", "H.265 硬编", true, "hevc"),
+            ("mpeg4_mediacodec", "MPEG-4 硬编", true, "mpeg4"),
+            ("libx264", "x264（软件）", false, "h264"),
+            ("mpeg2video", "MPEG-2（软件）", false, "mpeg2video"),
+            ("mpeg4", "MPEG-4（软件）", false, "mpeg4"),
+        ];
+        for (codec, (id, label, hardware, output_codec)) in catalog.iter().zip(expected) {
+            assert_eq!(codec.id, id);
+            assert_eq!(codec.label, label);
+            assert_eq!(codec.hardware, hardware);
+            assert_eq!(codec.output_codec, output_codec);
             assert_eq!(
-                codec.kind,
-                if family == EncoderFamily::Hardware {
-                    "hw"
-                } else {
-                    "sw"
-                }
+                codec.rate_control,
+                &[RateControl::Cq, RateControl::Vbr, RateControl::Cbr]
             );
-            assert_eq!(codec.rate_control, &SCHEMA_RATE_CONTROL_MODES[..]);
-            for spec in codec.options {
-                assert!(
-                    family.allowed_keys().contains(&spec.key),
-                    "{} is not whitelisted for {}",
-                    spec.key,
-                    codec.id
-                );
-            }
+            // The catalog and the transcode path must agree on the family.
+            assert_eq!(
+                EncoderFamily::of(codec.id),
+                Some(if hardware {
+                    EncoderFamily::Hardware
+                } else if id == "libx264" {
+                    EncoderFamily::LibX264
+                } else {
+                    EncoderFamily::MpegVideo
+                })
+            );
             assert!(SHIPPED_VIDEO_ENCODERS.contains(&codec.id));
         }
-        // Hardware encoders first, mirroring the preset editor order.
-        let k = wdmm_core::models::HW_VIDEO_ENCODERS.len();
-        assert!(schema.codecs[..k].iter().all(|c| c.kind == "hw"));
-        assert!(schema.codecs[k..].iter().all(|c| c.kind == "sw"));
+        // Hardware first, then software: the editor groups them in this order.
+        assert!(catalog[..3].iter().all(|c| c.hardware));
+        assert!(catalog[3..].iter().all(|c| !c.hardware));
+    }
+
+    #[test]
+    fn anamorphic_source_is_scaled_by_display_width() {
+        let anamorphic = AVRational::new(64, 45);
+        // DVD 720x576 SAR 64:45 is shown 1024 wide.
+        assert_eq!(display_width(720, anamorphic), 1024);
+        // Square pixels or a missing SAR never change the width.
+        assert_eq!(display_width(720, AVRational::new(1, 1)), 720);
+        assert_eq!(display_width(720, AVRational::new(0, 1)), 720);
+        assert_eq!(display_width(720, AVRational::new(1, 90)), 8);
+        // A 1920x1080 envelope is wider than the display geometry: the stored
+        // pixels are kept (no upscale, no needless re-scale).
+        assert_eq!(
+            fit_display_dimensions(720, 576, anamorphic, Some(1920), Some(1080)),
+            (720, 576)
+        );
+        // A 640x480 envelope is narrower than the 1024-pixel display width:
+        // scale by the display width, not by the stored 720 pixels.
+        assert_eq!(
+            fit_display_dimensions(720, 576, anamorphic, Some(640), Some(480)),
+            (640, 360)
+        );
+        // An intermediate cap keeps the display aspect (1024:576 → 16:9) and
+        // the output stays 4:2:0-safe (even height).
+        assert_eq!(
+            fit_display_dimensions(720, 576, anamorphic, Some(800), Some(600)),
+            (720, 406)
+        );
+        // Square-pixel sources keep the plain envelope behaviour.
+        assert_eq!(
+            fit_display_dimensions(1920, 1080, AVRational::new(1, 1), Some(1280), Some(720)),
+            (1280, 720)
+        );
+        assert_eq!(
+            fit_display_dimensions(320, 240, AVRational::new(0, 0), None, None),
+            (320, 240)
+        );
     }
 
     #[test]
