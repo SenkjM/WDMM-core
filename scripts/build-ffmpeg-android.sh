@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/build-ffmpeg-android.sh
 #
-# Build FFmpeg 7.1 shared libraries for a single Android ABI, with libx264
+# Build FFmpeg 9.0 shared libraries for a single Android ABI, with libx264
 # (GPL) as the software H.264 encode fallback.  Produces the six `.so` files
 # that the in-process libav transcoder (`crates/wdmm-ffmpeg`) dynamically
 # links against, and which ship inside the APK under `jniLibs/<abi>/`.
@@ -13,7 +13,7 @@
 #
 # Optional env:
 #   MIN_API            — Android min API level (default: 24, matches minSdk)
-#   FFMPEG_VERSION     — FFmpeg git tag (default: n7.1)
+#   FFMPEG_VERSION     — FFmpeg git tag (default: n9.0.2, latest release checked 2026-11-04)
 #   X264_BRANCH        — x264 branch (default: stable)
 #   BUILD_DIR          — scratch dir (default: /tmp/wdmm-ffmpeg-build-<abi>)
 #   JOBS               — make parallelism (default: nproc)
@@ -33,7 +33,7 @@ ABI="${ABI:?ABI must be set (arm64-v8a | x86_64)}"
 NDK="${ANDROID_NDK_HOME:?ANDROID_NDK_HOME must be set (NDK r28.x)}"
 OUTPUT_DIR="${OUTPUT_DIR:?OUTPUT_DIR must be set}"
 MIN_API="${MIN_API:-24}"
-FFMPEG_VERSION="${FFMPEG_VERSION:-n7.1}"
+FFMPEG_VERSION="${FFMPEG_VERSION:-n9.0.2}"
 X264_BRANCH="${X264_BRANCH:-stable}"
 BUILD_DIR="${BUILD_DIR:-/tmp/wdmm-ffmpeg-build-${ABI}}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
@@ -179,7 +179,6 @@ PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384"
   --disable-programs \
   --disable-doc \
   --disable-avdevice \
-  --disable-postproc \
   --disable-symver \
   --enable-pic \
   --disable-nonfree \
