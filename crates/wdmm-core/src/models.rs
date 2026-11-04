@@ -4,6 +4,8 @@
 //! This is the *subset* needed for the Rust core to operate. Full FFI
 //! serialisation lives in `wdmm-ffi`.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -155,8 +157,7 @@ pub struct QueueTask {
     pub local_path: Option<String>,  // destination path
 }
 
-
-// ── Transcode presets (B3.5, schema v13) ─────────────────────────────────────
+// ── Transcode presets (B3.5, schema v14) ─────────────────────────────────────
 
 /// Hardware (MediaCodec) video encoders a preset may select in
 /// [`TranscodePreset::hw_video_encoder`].
@@ -168,14 +169,40 @@ pub const HW_VIDEO_ENCODERS: [&str; 3] = ["h264_mediacodec", "hevc_mediacodec", 
 /// There is deliberately no `libx265`: software HEVC encoding is not shipped.
 pub const SW_VIDEO_ENCODERS: [&str; 3] = ["libx264", "mpeg2video", "mpeg4"];
 
-/// Speed/quality tiers a preset may select in `hw_video_tier`/`sw_video_tier`.
-pub const VIDEO_TIERS: [&str; 3] = ["fast", "balanced", "quality"];
+/// libx264 `preset` names a preset may select in
+/// [`TranscodePreset::sw_video_preset`].
+///
+/// Only `libx264` has such a name ladder; `mpeg2video`/`mpeg4` leave the field
+/// empty and are tuned through [`TranscodePreset::sw_video_options`] instead.
+pub const X264_PRESETS: [&str; 10] = [
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+];
+
+/// Video rate-control modes a preset may select in
+/// [`TranscodePreset::video_rate_control`].
+///
+/// `auto` leaves the encoder defaults alone, `vbr`/`cbr` map onto the encoder's
+/// bitrate mode, and `cq` additionally requires
+/// [`TranscodePreset::video_quality`].
+pub const RATE_CONTROL_MODES: [&str; 4] = ["auto", "vbr", "cbr", "cq"];
+
+/// Default for [`TranscodePreset::video_rate_control`] when a client omits it.
+pub const DEFAULT_VIDEO_RATE_CONTROL: &str = "vbr";
 
 /// Output audio codecs a preset may select in [`TranscodePreset::audio_codec`].
 pub const AUDIO_CODECS: [&str; 4] = ["aac", "ac3", "eac3", "mp2"];
 
 /// A DLNA cast transcode preset. Canonical type shared by wdmm-storage,
-/// wdmm-ffmpeg and the FFI layer. See `wdmm-storage` schema v13 for the DB
+/// wdmm-ffmpeg and the FFI layer. See `wdmm-storage` schema v14 for the DB
 /// layout.
 ///
 /// The video side is decided in three layers, in this order:
@@ -183,9 +210,13 @@ pub const AUDIO_CODECS: [&str; 4] = ["aac", "ac3", "eac3", "mp2"];
 /// 1. **copy** — [`video_copy`](Self::video_copy): pass the source stream
 ///    through when MPEG-TS can carry it (no re-encode at all);
 /// 2. **hardware encode** — [`hw_video_encoder`](Self::hw_video_encoder)
-///    (empty = disabled) with the [`hw_video_tier`](Self::hw_video_tier) knobs;
+///    (empty = disabled), tuned by [`video_max_bitrate`](Self::video_max_bitrate),
+///    [`video_rate_control`](Self::video_rate_control) and the advanced
+///    [`hw_video_options`](Self::hw_video_options);
 /// 3. **software encode** — [`sw_video_encoder`](Self::sw_video_encoder)
-///    (empty = disabled), the fallback when hardware is missing or fails.
+///    (empty = disabled), the fallback when hardware is missing or fails, tuned
+///    by [`sw_video_preset`](Self::sw_video_preset), the same bitrate/rate
+///    control knobs and [`sw_video_options`](Self::sw_video_options).
 ///
 /// Audio has its own two-state copy/encode switch ([`audio_copy`](Self::audio_copy)).
 /// HLS output is always MPEG-TS fragments — pass-through is a session-level
@@ -206,13 +237,23 @@ pub struct TranscodePreset {
     // ── ② hardware encoder layer ("" = disabled) ────────────────────────────
     /// MediaCodec encoder name, one of [`HW_VIDEO_ENCODERS`] or `""`.
     pub hw_video_encoder: String,
-    /// Speed/quality tier for the hardware encoder, one of [`VIDEO_TIERS`].
-    pub hw_video_tier: String,
+    /// Advanced `AVDictionary` options handed to the hardware encoder's
+    /// `avcodec_open2`, serialised as a JSON object. Whitelisted by
+    /// `wdmm-ffmpeg`; empty = none.
+    #[serde(default)]
+    pub hw_video_options: BTreeMap<String, String>,
     // ── ③ software encoder fallback ("" = disabled) ─────────────────────────
     /// Software encoder name, one of [`SW_VIDEO_ENCODERS`] or `""`.
     pub sw_video_encoder: String,
-    /// Speed/quality tier for the software encoder, one of [`VIDEO_TIERS`].
-    pub sw_video_tier: String,
+    /// libx264 `preset` name, one of [`X264_PRESETS`] or `""` when the selected
+    /// software encoder has no preset ladder (`mpeg2video`/`mpeg4`).
+    #[serde(default)]
+    pub sw_video_preset: String,
+    /// Advanced `AVDictionary` options handed to the software encoder's
+    /// `avcodec_open2`, serialised as a JSON object. Whitelisted by
+    /// `wdmm-ffmpeg`; empty = none.
+    #[serde(default)]
+    pub sw_video_options: BTreeMap<String, String>,
     // ── output envelope (independent of the layer) ──────────────────────────
     /// Max output width px (scale-down only). `None` = no limit.
     pub video_max_w: Option<u32>,
@@ -222,6 +263,15 @@ pub struct TranscodePreset {
     pub video_max_bitrate: Option<u32>,
     /// Frame-rate cap (e.g. 30). `None` = no cap.
     pub video_fps_cap: Option<u32>,
+    /// Video rate-control mode, one of [`RATE_CONTROL_MODES`]. Defaults to
+    /// [`DEFAULT_VIDEO_RATE_CONTROL`] when an older client omits it.
+    #[serde(default = "default_video_rate_control")]
+    pub video_rate_control: String,
+    /// Constant-quality value used when
+    /// [`video_rate_control`](Self::video_rate_control) is `"cq"` (hardware
+    /// `global_quality` 0–100, libx264 CRF 0–51). `None` otherwise.
+    #[serde(default)]
+    pub video_quality: Option<u8>,
     // ── audio ───────────────────────────────────────────────────────────────
     /// Audio codec used when [`audio_copy`](Self::audio_copy) is off: one of
     /// [`AUDIO_CODECS`].
@@ -267,11 +317,16 @@ impl TranscodePreset {
         {
             return Err(format!("unknown encoder: {}", self.sw_video_encoder));
         }
-        if !VIDEO_TIERS.contains(&self.hw_video_tier.as_str()) {
-            return Err(format!("unknown tier: {}", self.hw_video_tier));
+        if !self.sw_video_preset.is_empty()
+            && !X264_PRESETS.contains(&self.sw_video_preset.as_str())
+        {
+            return Err(format!("unknown encoder preset: {}", self.sw_video_preset));
         }
-        if !VIDEO_TIERS.contains(&self.sw_video_tier.as_str()) {
-            return Err(format!("unknown tier: {}", self.sw_video_tier));
+        if !RATE_CONTROL_MODES.contains(&self.video_rate_control.as_str()) {
+            return Err(format!("unknown rate control: {}", self.video_rate_control));
+        }
+        if self.video_rate_control == "cq" && self.video_quality.is_none() {
+            return Err("cq rate control needs a quality value".to_string());
         }
         if !self.has_usable_video_path() {
             return Err("no usable video path".to_string());
@@ -286,25 +341,30 @@ impl TranscodePreset {
     }
 }
 
+/// `serde` default for [`TranscodePreset::video_rate_control`].
+fn default_video_rate_control() -> String {
+    DEFAULT_VIDEO_RATE_CONTROL.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::TranscodePreset;
 
-    /// The exact shape the Flutter editor hands to `wdmm_transcode_preset_save`:
-    /// `TranscodePreset.toJson()` in `lib/models/transcode_preset.dart` omits
-    /// every `null` envelope field and never sends `updated_at`. Deserialization
-    /// must accept it — the timestamp is the storage layer's business.
+    /// The exact shape the Flutter editor handed to `wdmm_transcode_preset_save`
+    /// **before v14**: `TranscodePreset.toJson()` in
+    /// `lib/models/transcode_preset.dart` omits every `null` envelope field,
+    /// never sends `updated_at`, and has no v14 keys at all. Deserialization
+    /// must keep accepting it — an older client must not start failing with
+    /// `error:parse:missing field …` just because the model grew fields.
     #[test]
-    fn preset_json_from_the_editor_parses_without_updated_at() {
+    fn preset_json_from_the_old_editor_parses_with_v14_defaults() {
         let json = r#"{
             "id": "my-h265",
             "label": "My H.265",
             "video_copy": false,
             "audio_copy": false,
             "hw_video_encoder": "hevc_mediacodec",
-            "hw_video_tier": "fast",
             "sw_video_encoder": "libx264",
-            "sw_video_tier": "quality",
             "audio_codec": "aac",
             "audio_bitrate": 128000,
             "audio_channels": 2,
@@ -313,10 +373,20 @@ mod tests {
             "is_builtin": false
         }"#;
         let preset: TranscodePreset =
-            serde_json::from_str(json).expect("editor JSON must deserialize");
+            serde_json::from_str(json).expect("old editor JSON must deserialize");
         assert_eq!(preset.id, "my-h265");
         assert_eq!(preset.hw_video_encoder, "hevc_mediacodec");
-        assert_eq!(preset.sw_video_tier, "quality");
+        assert_eq!(
+            preset.sw_video_preset, "",
+            "omitted preset defaults to none"
+        );
+        assert_eq!(
+            preset.video_rate_control, "vbr",
+            "omitted rate control defaults to vbr"
+        );
+        assert_eq!(preset.video_quality, None);
+        assert!(preset.hw_video_options.is_empty());
+        assert!(preset.sw_video_options.is_empty());
         assert_eq!(preset.video_max_w, None);
         assert_eq!(preset.audio_sample_rate, None);
         assert_eq!(preset.updated_at, 0, "omitted timestamps default to zero");
@@ -324,7 +394,8 @@ mod tests {
     }
 
     /// `list`/`get` output is fed straight back into the editor, so the round
-    /// trip has to survive a timestamp that is present.
+    /// trip has to survive a timestamp and the v14 structured fields, including
+    /// serialising the advanced options as JSON objects.
     #[test]
     fn preset_json_with_a_timestamp_round_trips() {
         let json = r#"{
@@ -333,13 +404,16 @@ mod tests {
             "video_copy": true,
             "audio_copy": true,
             "hw_video_encoder": "h264_mediacodec",
-            "hw_video_tier": "balanced",
+            "hw_video_options": {"profile": "high", "level": "4.1"},
             "sw_video_encoder": "libx264",
-            "sw_video_tier": "balanced",
+            "sw_video_preset": "veryfast",
+            "sw_video_options": {"crf": "23", "tune": "film"},
             "video_max_w": 1920,
             "video_max_h": 1080,
             "video_max_bitrate": 4000000,
             "video_fps_cap": 30,
+            "video_rate_control": "cq",
+            "video_quality": 23,
             "audio_codec": "aac",
             "audio_bitrate": 128000,
             "audio_channels": 2,
@@ -353,9 +427,52 @@ mod tests {
             serde_json::from_str(json).expect("stored JSON must deserialize");
         assert_eq!(preset.updated_at, 1_760_000_000);
         assert_eq!(preset.video_max_bitrate, Some(4_000_000));
+        assert_eq!(preset.video_rate_control, "cq");
+        assert_eq!(preset.video_quality, Some(23));
+        assert_eq!(preset.sw_video_preset, "veryfast");
+        assert_eq!(
+            preset.hw_video_options.get("profile").map(String::as_str),
+            Some("high")
+        );
         let again: TranscodePreset =
             serde_json::from_str(&serde_json::to_string(&preset).unwrap()).unwrap();
         assert_eq!(again.updated_at, preset.updated_at);
         assert_eq!(again.id, preset.id);
+        assert_eq!(again.sw_video_options, preset.sw_video_options);
+        assert_eq!(again.video_quality, preset.video_quality);
+    }
+
+    /// The v14 enum-like fields are validated before they reach the DB, with
+    /// the exact user-facing messages the FFI prefixes with `error:`.
+    #[test]
+    fn validate_rejects_unknown_rate_control_and_preset() {
+        let mut preset: TranscodePreset = serde_json::from_str(
+            r#"{
+                "id": "x", "label": "X",
+                "video_copy": true, "audio_copy": true,
+                "hw_video_encoder": "h264_mediacodec",
+                "sw_video_encoder": "libx264",
+                "audio_codec": "aac", "audio_bitrate": 128000,
+                "audio_channels": 2, "hls_segment_secs": 4,
+                "sort_order": 0, "is_builtin": false
+            }"#,
+        )
+        .unwrap();
+        preset.sw_video_preset = "turbo".into();
+        assert_eq!(
+            preset.validate().unwrap_err(),
+            "unknown encoder preset: turbo"
+        );
+        preset.sw_video_preset = "veryfast".into();
+        preset.video_rate_control = "crf".into();
+        assert_eq!(preset.validate().unwrap_err(), "unknown rate control: crf");
+        preset.video_rate_control = "cq".into();
+        preset.video_quality = None;
+        assert_eq!(
+            preset.validate().unwrap_err(),
+            "cq rate control needs a quality value"
+        );
+        preset.video_quality = Some(23);
+        preset.validate().expect("cq with a quality value is valid");
     }
 }

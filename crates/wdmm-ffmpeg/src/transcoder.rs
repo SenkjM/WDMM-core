@@ -53,7 +53,8 @@ const MAX_AUDIO_RECONFIGURES: u32 = 8;
 
 use crate::plan::{
     decide_video_action, encoder_frame_rate, hw_gop_size, remux_dropped_streams, segment_gop_size,
-    target_video_bitrate_for_tier, video_plan_diag, x264_preset_for_tier,
+    target_video_bitrate, video_encoder_options, video_encoder_options_without_user,
+    video_plan_diag, RateControl, StreamAction, VideoEncoderOptions,
 };
 /// Options for opening the loopback HTTP input: bound every blocking read so a
 /// stalled upstream fails with a real error instead of hanging the job forever.
@@ -1046,7 +1047,12 @@ fn encode_grid(source_rate: AVRational, configured_rate: AVRational, seg_secs: u
 /// it unset does not mean "automatic" — it hands quality to the codec's default,
 /// which is far below what a 1080p stream needs. The caller passes the value
 /// from [`plan_video_encode`], so an unset `video_max_bitrate` still produces a
-/// resolution-derived bitrate (and the preset's tier scales it).
+/// resolution-derived bitrate.
+///
+/// `options` is the preset's `AVDictionary` (rate control + advanced options +
+/// invariants, built by [`crate::plan::video_encoder_options`]); it is applied to
+/// `avcodec_open2` so the MediaCodec bridge actually sees those keys instead of
+/// the old silent no-op.
 ///
 /// Returns the opened context plus the pixel format, or a diagnostic string
 /// describing the last failure (caller falls back to libx264 and reports it).
@@ -1059,8 +1065,18 @@ unsafe fn open_hw_video_encoder(
     height: c_int,
     framerate: AVRational,
     gop: c_int,
+    options: &[(String, String)],
 ) -> Result<(*mut AVCodecContext, c_int), String> {
     let mut last_err = String::from("unknown error");
+    let options_line = if options.is_empty() {
+        "none".to_string()
+    } else {
+        options
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     for pix_fmt in [AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P] {
         let mut ctx = avcodec_alloc_context3(codec);
         if ctx.is_null() {
@@ -1076,9 +1092,11 @@ unsafe fn open_hw_video_encoder(
         codctx_set_max_b_frames(ctx, 0);
         codctx_set_bit_rate(ctx, bitrate);
         codctx_set_flags(ctx, codctx_flags(ctx) | AV_CODEC_FLAG_GLOBAL_HEADER);
-        let ret = avcodec_open2(ctx, codec, std::ptr::null_mut());
+        let mut enc_opts = dict_from_entries(options)?;
+        let ret = avcodec_open2(ctx, codec, &mut enc_opts);
+        av_dict_free(&mut enc_opts);
         diag::log(format!(
-            "{tag} transcode avcodec_open2(hw video encoder {hw_name} pix_fmt={} gop={gop} bitrate={bitrate} max_b_frames=0) rc={ret}",
+            "{tag} transcode avcodec_open2(hw video encoder {hw_name} pix_fmt={} gop={gop} bitrate={bitrate} max_b_frames=0 options={options_line}) rc={ret}",
             pix_fmt_name(pix_fmt)
         ));
         if ret >= 0 {
@@ -1092,6 +1110,82 @@ unsafe fn open_hw_video_encoder(
         avcodec_free_context(&mut ctx);
     }
     Err(last_err)
+}
+
+/// Build an `AVDictionary` for `avcodec_open2` from `key=value` entries.
+///
+/// `av_dict_set` copies both strings, so the temporary CStrings may be dropped;
+/// a value containing a NUL byte is a loud error rather than a silently dropped
+/// option.
+unsafe fn dict_from_entries(entries: &[(String, String)]) -> Result<*mut AVDictionary, String> {
+    let mut dict: *mut AVDictionary = std::ptr::null_mut();
+    for (key, value) in entries {
+        let key_c = CString::new(key.as_str())
+            .map_err(|_| format!("encoder option {key} contains a NUL byte"))?;
+        let value_c = CString::new(value.as_str())
+            .map_err(|_| format!("encoder option {key} contains a NUL byte"))?;
+        av_dict_set(&mut dict, key_c.as_ptr(), value_c.as_ptr(), 0);
+    }
+    Ok(dict)
+}
+
+/// Open a software video encoder with the preset's `AVDictionary`.
+///
+/// `avcodec_open2` consumes the dictionary, and a failed open leaves the codec
+/// context unusable, so every attempt gets a fresh context — that is what makes
+/// the "retry without the preset's advanced options" pass (contract §13.5)
+/// possible without a half-configured encoder.
+#[allow(clippy::too_many_arguments)]
+unsafe fn open_sw_video_encoder(
+    tag: &str,
+    sw_name: &str,
+    codec: *const AVCodec,
+    out_w: c_int,
+    out_h: c_int,
+    time_base: AVRational,
+    gop: c_int,
+    framerate: AVRational,
+    bitrate: i64,
+    flags: c_int,
+    max_b_frames: c_int,
+    options: &[(String, String)],
+) -> Result<*mut AVCodecContext, FfmpegError> {
+    let mut ctx = avcodec_alloc_context3(codec);
+    if ctx.is_null() {
+        return Err(FfmpegError::Probe(
+            "avcodec_alloc_context3(video encoder) returned null".into(),
+        ));
+    }
+    codctx_set_width(ctx, out_w);
+    codctx_set_height(ctx, out_h);
+    codctx_set_pix_fmt(ctx, AV_PIX_FMT_YUV420P);
+    codctx_set_time_base(ctx, time_base);
+    codctx_set_gop_size(ctx, gop);
+    codctx_set_framerate(ctx, framerate);
+    codctx_set_flags(ctx, flags);
+    codctx_set_max_b_frames(ctx, max_b_frames);
+    codctx_set_bit_rate(ctx, bitrate);
+    let mut enc_opts = match dict_from_entries(options) {
+        Ok(dict) => dict,
+        Err(err) => {
+            avcodec_free_context(&mut ctx);
+            return Err(FfmpegError::Probe(err));
+        }
+    };
+    let ret = avcodec_open2(ctx, codec, &mut enc_opts);
+    av_dict_free(&mut enc_opts);
+    diag::log(format!(
+        "{tag} transcode avcodec_open2(video encoder {sw_name}) rc={ret}"
+    ));
+    if ret >= 0 {
+        Ok(ctx)
+    } else {
+        avcodec_free_context(&mut ctx);
+        Err(ffmpeg_err(
+            format!("avcodec_open2(video encoder {sw_name})"),
+            ret,
+        ))
+    }
 }
 
 /// Build a contextual error for a failed libav call.
@@ -1388,9 +1482,8 @@ pub fn run_hls_job(
                             StreamMode::Software
                         },
                         // The copy marker is not an encoder name: let the software
-                        // path pick the preset's encoder and tier.
+                        // path pick the preset's encoder.
                         video_encoder: None,
-                        video_tier: None,
                         audio: decision.audio,
                         ..decision.clone()
                     };
@@ -1504,14 +1597,24 @@ unsafe fn decide_session(
         if video_codec != 0 {
             let action = decide_video_action(preset, video_codec, hw_available)
                 .map_err(FfmpegError::Probe)?;
-            let bitrate = match action.tier() {
-                Some(tier) => {
-                    let params = plan_video_encode(preset, src_w, src_h, src_rate, tier);
-                    params.bitrate as u32
-                }
-                None => 0,
+            let planned = plan_video_encode(preset, src_w, src_h, src_rate);
+            let rate_control =
+                RateControl::parse(&preset.video_rate_control).map_err(FfmpegError::Probe)?;
+            let options = match action {
+                StreamAction::Encode { hardware, encoder } => video_encoder_options(
+                    preset,
+                    encoder,
+                    hardware,
+                    planned.bitrate as u32,
+                    planned.gop,
+                )
+                .map_err(FfmpegError::Probe)?,
+                StreamAction::Copy => VideoEncoderOptions::default(),
             };
-            diag::log(format!("{tag} {}", video_plan_diag(action, bitrate)));
+            diag::log(format!(
+                "{tag} {}",
+                video_plan_diag(action, planned.bitrate as u32, rate_control, &options)
+            ));
         }
         Ok(decision)
     })();
@@ -1543,36 +1646,76 @@ unsafe fn hw_video_encoder_available(
     }
     // Probe with the same bitrate the real session would use, at 720p30: an
     // encoder that only accepts a sane bitrate range must not fail here and
-    // then succeed (or vice versa) during the actual cast.
-    let probe_bitrate = i64::from(target_video_bitrate_for_tier(
-        preset,
-        1280,
-        720,
-        30.0,
-        &preset.hw_video_tier,
-    ));
-    match open_hw_video_encoder(
-        tag,
-        &preset.hw_video_encoder,
-        codec,
-        probe_bitrate,
-        1280,
-        720,
-        AVRational::new(30, 1),
-        hw_gop_size(30, 1),
-    ) {
-        Ok((mut ctx, _)) => {
-            avcodec_free_context(&mut ctx);
-            true
-        }
-        Err(err) => {
-            diag::log(format!(
-                "{tag} hw encoder {} unavailable: {err}",
-                preset.hw_video_encoder
-            ));
-            false
+    // then succeed (or vice versa) during the actual cast. The preset's
+    // `AVDictionary` is applied too, and if the user's advanced options are
+    // rejected the probe retries with the structured fields only — exactly the
+    // retry `run_transcode` performs (contract §13.5).
+    let probe_bitrate = i64::from(target_video_bitrate(preset, 1280, 720, 30.0));
+    let gop = hw_gop_size(30, 1);
+    let mut attempts: Vec<Vec<(String, String)>> = Vec::new();
+    for include_user in [true, false] {
+        let built = if include_user {
+            video_encoder_options(
+                preset,
+                &preset.hw_video_encoder,
+                true,
+                probe_bitrate as u32,
+                gop,
+            )
+        } else {
+            video_encoder_options_without_user(
+                preset,
+                &preset.hw_video_encoder,
+                true,
+                probe_bitrate as u32,
+                gop,
+            )
+        };
+        match built {
+            Ok(options) => attempts.push(options.entries),
+            Err(err) => {
+                diag::log(format!(
+                    "{tag} hw encoder {} options rejected: {err}",
+                    preset.hw_video_encoder
+                ));
+                return false;
+            }
         }
     }
+    let last = attempts.len() - 1;
+    for (index, options) in attempts.iter().enumerate() {
+        match open_hw_video_encoder(
+            tag,
+            &preset.hw_video_encoder,
+            codec,
+            probe_bitrate,
+            1280,
+            720,
+            AVRational::new(30, 1),
+            gop,
+            options,
+        ) {
+            Ok((mut ctx, _)) => {
+                avcodec_free_context(&mut ctx);
+                if index == last && last > 0 {
+                    diag::log(format!(
+                        "{tag} hw encoder {} opened only after dropping the preset's advanced options",
+                        preset.hw_video_encoder
+                    ));
+                }
+                return true;
+            }
+            Err(err) => {
+                if index == last {
+                    diag::log(format!(
+                        "{tag} hw encoder {} unavailable: {err}",
+                        preset.hw_video_encoder
+                    ));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Everything the video encoder needs, derived from the preset and the source.
@@ -1584,13 +1727,12 @@ pub(crate) struct VideoEncodeParams {
     pub bitrate: i64,
 }
 
-/// Derive the encoder geometry/bitrate for one preset tier.
+/// Derive the encoder geometry/bitrate from the preset and the source.
 pub(crate) fn plan_video_encode(
     preset: &wdmm_core::models::TranscodePreset,
     src_w: u32,
     src_h: u32,
     src_rate: AVRational,
-    tier: &str,
 ) -> VideoEncodeParams {
     let (width, height) = fit_dimensions(
         src_w.max(2) as i32,
@@ -1606,12 +1748,11 @@ pub(crate) fn plan_video_encode(
     } else {
         30.0
     };
-    let bitrate = i64::from(target_video_bitrate_for_tier(
+    let bitrate = i64::from(target_video_bitrate(
         preset,
         width.max(0) as u32,
         height.max(0) as u32,
         fps,
-        tier,
     ));
     VideoEncodeParams {
         width: width as c_int,
@@ -3140,32 +3281,13 @@ fn run_transcode(
             let src_h = (*(*in_st).codecpar).height;
             let src_rate = stream_r_frame_rate(in_st);
             let hardware = decision.video == StreamMode::Hardware;
-            let tier = decision.video_tier.clone().unwrap_or_else(|| {
-                if hardware {
-                    preset.hw_video_tier.clone()
-                } else {
-                    preset.sw_video_tier.clone()
-                }
-            });
-            let planned = plan_video_encode(
-                preset,
-                src_w.max(0) as u32,
-                src_h.max(0) as u32,
-                src_rate,
-                &tier,
-            );
+            let planned =
+                plan_video_encode(preset, src_w.max(0) as u32, src_h.max(0) as u32, src_rate);
             let (out_w, out_h) = (planned.width, planned.height);
             let framerate = planned.framerate;
             let video_gop = planned.gop;
-            let encoder_label = decision.video_encoder.as_deref().unwrap_or("?");
-            diag::log(format!(
-                "{tag} transcode video plan: action={} encoder={encoder_label} tier={tier} x264_preset={} bitrate={} gop={video_gop} rate={}/{} → {out_w}x{out_h}",
-                if hardware { "hw" } else { "sw" },
-                x264_preset_for_tier(&tier).unwrap_or("-"),
-                planned.bitrate,
-                framerate.num,
-                framerate.den,
-            ));
+            let rate_control =
+                RateControl::parse(&preset.video_rate_control).map_err(FfmpegError::Probe)?;
 
             if hardware {
                 let hw_name = decision
@@ -3179,25 +3301,78 @@ fn run_transcode(
                         "{tag} transcode hardware encoder {hw_name} no longer resolves"
                     ));
                 } else {
-                    match open_hw_video_encoder(
-                        tag,
+                    let mut attempts: Vec<Vec<(String, String)>> = Vec::new();
+                    match video_encoder_options(
+                        preset,
                         hw_name,
-                        hw_codec,
-                        planned.bitrate,
-                        out_w,
-                        out_h,
-                        framerate,
+                        true,
+                        planned.bitrate as u32,
                         video_gop,
                     ) {
-                        Ok((ctx, pix_fmt)) => {
-                            v_enc_ctx = ctx;
-                            v_enc_codec = hw_codec;
-                            v_enc_pix_fmt = pix_fmt;
-                            v_enc_name = Some(hw_name.to_string());
-                            hw_available = true;
+                        Ok(options) => {
+                            let user_option_count = options.user_option_count;
+                            diag::log(format!(
+                                "{tag} transcode video plan: action=hw encoder={hw_name} rate_control={} bitrate={} gop={video_gop} rate={}/{} → {out_w}x{out_h} options={}",
+                                rate_control.as_str(),
+                                planned.bitrate,
+                                framerate.num,
+                                framerate.den,
+                                options.dict_line()
+                            ));
+                            attempts.push(options.entries);
+                            if user_option_count > 0 {
+                                match video_encoder_options_without_user(
+                                    preset,
+                                    hw_name,
+                                    true,
+                                    planned.bitrate as u32,
+                                    video_gop,
+                                ) {
+                                    Ok(retry) => attempts.push(retry.entries),
+                                    Err(err) => diag::log(format!(
+                                        "{tag} transcode hardware encoder {hw_name} retry options rejected: {err}"
+                                    )),
+                                }
+                            }
                         }
-                        Err(err) => {
-                            diag::log(format!("{tag} transcode hardware open failed: {err}"));
+                        Err(err) => diag::log(format!(
+                            "{tag} transcode hardware encoder {hw_name} options rejected: {err}"
+                        )),
+                    }
+                    for (index, options) in attempts.iter().enumerate() {
+                        match open_hw_video_encoder(
+                            tag,
+                            hw_name,
+                            hw_codec,
+                            planned.bitrate,
+                            out_w,
+                            out_h,
+                            framerate,
+                            video_gop,
+                            options,
+                        ) {
+                            Ok((ctx, pix_fmt)) => {
+                                if index > 0 {
+                                    // The user's advanced options were refused; say so
+                                    // instead of pretending they took effect.
+                                    let warning = "video: encoder options rejected by the codec";
+                                    diag::log(format!("{tag} transcode {warning}"));
+                                    telemetry.warn(warning);
+                                }
+                                v_enc_ctx = ctx;
+                                v_enc_codec = hw_codec;
+                                v_enc_pix_fmt = pix_fmt;
+                                v_enc_name = Some(hw_name.to_string());
+                                hw_available = true;
+                                break;
+                            }
+                            Err(err) => {
+                                if index + 1 == attempts.len() {
+                                    diag::log(format!(
+                                        "{tag} transcode hardware open failed: {err}"
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -3223,9 +3398,10 @@ fn run_transcode(
                 if decision.video == StreamMode::Hardware {
                     // The decision promised hardware; report why it did not happen.
                     let warning = format!(
-                        "video: hardware encoder {} unavailable, fell back to {} ({tier})",
+                        "video: hardware encoder {} unavailable, fell back to {} ({})",
                         decision.video_encoder.as_deref().unwrap_or("?"),
-                        sw_name
+                        sw_name,
+                        rate_control.as_str()
                     );
                     diag::log(format!("{tag} transcode {warning}"));
                     telemetry.warn(warning);
@@ -3256,23 +3432,6 @@ fn run_transcode(
                 }
                 v_enc_name = Some(sw_name.to_string());
                 v_enc_pix_fmt = AV_PIX_FMT_YUV420P;
-                v_enc_ctx = avcodec_alloc_context3(v_enc_codec);
-                if v_enc_ctx.is_null() {
-                    cleanup_transcode(
-                        in_ctx,
-                        std::ptr::null_mut(),
-                        v_dec_ctx,
-                        a_dec_ctx,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    );
-                    return Err(FfmpegError::Probe(
-                        "avcodec_alloc_context3(video encoder) returned null".into(),
-                    ));
-                }
-                codctx_set_width(v_enc_ctx, out_w);
-                codctx_set_height(v_enc_ctx, out_h);
-                codctx_set_pix_fmt(v_enc_ctx, v_enc_pix_fmt);
                 // libx264 treats time_base purely as a tick scale; the MPEG-1/2/4
                 // encoders instead read it as the frame rate and reject anything
                 // else (`MPEG-1/2 does not support 90000/1 fps`), so they get the
@@ -3310,79 +3469,100 @@ fn run_transcode(
                 } else {
                     AVRational::new(encoder_framerate.den.max(1), encoder_framerate.num.max(1))
                 };
-                codctx_set_time_base(v_enc_ctx, encoder_time_base);
-                codctx_set_gop_size(v_enc_ctx, encoder_gop);
-                codctx_set_framerate(v_enc_ctx, encoder_framerate);
-                let mut enc_opts: *mut AVDictionary = std::ptr::null_mut();
                 // Every software encoder must start each segment with an IDR: the
                 // MPEG-2/MPEG-4 encoders only honour that through the codec
                 // context flag (the `-flags +cgop` CLI switch answers ENOSYS once
                 // the encoder is driven through libavcodec's API).
-                let mut flags = codctx_flags(v_enc_ctx) | AV_CODEC_FLAG_CLOSED_GOP;
-                if sw_name == "libx264" {
+                let mut flags = AV_CODEC_FLAG_CLOSED_GOP;
+                let max_b_frames = if sw_name == "libx264" {
                     // mpegtsenc only inserts h264_mp4toannexb when the stream
                     // carries AVCC extradata, which libx264 emits for global
                     // header mode.
                     flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-                    codctx_set_max_b_frames(v_enc_ctx, 2);
-                    // Force an IDR exactly every `video_gop` frames: `keyint` = one
-                    // segment, `min-keyint` blocks early IDRs, `scenecut=0` stops
-                    // scene changes from shifting the cut points off the plan grid.
-                    let x264_params = CString::new(format!(
-                        "keyint={video_gop}:min-keyint={video_gop}:scenecut=0"
-                    ))
-                    .unwrap();
-                    av_dict_set(
-                        &mut enc_opts,
-                        c"x264-params".as_ptr(),
-                        x264_params.as_ptr(),
-                        0,
-                    );
-                    // The tier is the speed/quality knob, expressed as the
-                    // libx264 `preset` option.
-                    // Unknown tiers keep libx264's default (contract §3).
-                    if let Some(tier_preset) = x264_preset_for_tier(&tier) {
-                        let tier_preset = CString::new(tier_preset).unwrap();
-                        av_dict_set(&mut enc_opts, c"preset".as_ptr(), tier_preset.as_ptr(), 0);
-                    }
+                    2
                 } else {
-                    codctx_set_max_b_frames(v_enc_ctx, 0);
-                    // The MPEG-2/MPEG-4 encoders refuse AV_CODEC_FLAG_CLOSED_GOP
-                    // while scene-change detection is on: libavcodec asks for the
-                    // threshold to be effectively infinite
-                    // ("closed gop with scene change detection are not supported
-                    // yet, set threshold to 1000000000").
-                    av_dict_set(
-                        &mut enc_opts,
-                        c"sc_threshold".as_ptr(),
-                        c"1000000000".as_ptr(),
-                        0,
-                    );
-                }
-                codctx_set_flags(v_enc_ctx, flags);
-                codctx_set_bit_rate(v_enc_ctx, planned.bitrate);
-                let ret = avcodec_open2(v_enc_ctx, v_enc_codec, &mut enc_opts);
-                av_dict_free(&mut enc_opts);
+                    0
+                };
+                let options = video_encoder_options(
+                    preset,
+                    sw_name,
+                    false,
+                    planned.bitrate as u32,
+                    encoder_gop,
+                )
+                .map_err(FfmpegError::Probe)?;
+                let user_option_count = options.user_option_count;
                 diag::log(format!(
-                    "{tag} transcode avcodec_open2(video encoder {sw_name}, tier={tier}) rc={ret}"
+                    "{tag} transcode video plan: action=sw encoder={sw_name} rate_control={} bitrate={} gop={encoder_gop} rate={}/{} → {out_w}x{out_h} options={}",
+                    rate_control.as_str(),
+                    planned.bitrate,
+                    encoder_framerate.num,
+                    encoder_framerate.den,
+                    options.dict_line()
                 ));
-                if ret < 0 {
+                let mut attempts: Vec<Vec<(String, String)>> = vec![options.entries];
+                if user_option_count > 0 {
+                    // The preset's advanced options are the only optional input;
+                    // drop them and try once more before failing the job.
+                    match video_encoder_options_without_user(
+                        preset,
+                        sw_name,
+                        false,
+                        planned.bitrate as u32,
+                        encoder_gop,
+                    ) {
+                        Ok(retry) => attempts.push(retry.entries),
+                        Err(err) => diag::log(format!(
+                            "{tag} transcode video encoder {sw_name} retry options rejected: {err}"
+                        )),
+                    }
+                }
+                let mut last_err: Option<FfmpegError> = None;
+                for (index, entries) in attempts.iter().enumerate() {
+                    match open_sw_video_encoder(
+                        tag,
+                        sw_name,
+                        v_enc_codec,
+                        out_w,
+                        out_h,
+                        encoder_time_base,
+                        encoder_gop,
+                        encoder_framerate,
+                        planned.bitrate,
+                        flags,
+                        max_b_frames,
+                        entries,
+                    ) {
+                        Ok(ctx) => {
+                            if index > 0 {
+                                // The user's advanced options were refused; say so
+                                // instead of pretending they took effect.
+                                let warning = "video: encoder options rejected by the codec";
+                                diag::log(format!("{tag} transcode {warning}"));
+                                telemetry.warn(warning);
+                            }
+                            v_enc_ctx = ctx;
+                            break;
+                        }
+                        Err(err) => last_err = Some(err),
+                    }
+                }
+                if v_enc_ctx.is_null() {
                     cleanup_transcode(
                         in_ctx,
                         std::ptr::null_mut(),
                         v_dec_ctx,
                         a_dec_ctx,
-                        v_enc_ctx,
+                        std::ptr::null_mut(),
                         std::ptr::null_mut(),
                     );
-                    return Err(ffmpeg_err(
-                        format!("avcodec_open2(video encoder {sw_name})"),
-                        ret,
-                    ));
+                    return Err(last_err.unwrap_or_else(|| {
+                        FfmpegError::Probe(format!("no {sw_name} encoder available"))
+                    }));
                 }
             }
             diag::log(format!(
-                "{tag} transcode encoder selected video={} mode={} tier={tier} pix_fmt={}",
+                "{tag} transcode encoder selected video={} mode={} pix_fmt={}",
                 v_enc_name.as_deref().unwrap_or("?"),
                 if hw_available { "hw" } else { "sw" },
                 pix_fmt_name(v_enc_pix_fmt)

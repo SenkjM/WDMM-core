@@ -280,53 +280,66 @@ fn four_quadrants_are_reachable_from_one_source() {
 
 #[test]
 #[ignore = "host only: needs linked FFmpeg + the ffmpeg CLI"]
-fn tier_selects_the_x264_speed_preset_and_bitrate() {
+fn encoder_options_carry_the_speed_preset_and_rate_control() {
     let _serial = serial();
     if !libav_ready() || !ffmpeg_cli_ready() {
         return;
     }
-    let dir = temp_dir("tiers");
+    let dir = temp_dir("options");
     let input = h264_aac_fixture(&dir);
-    let mut bitrates = Vec::new();
+    let target_bitrate = matrix_base()
+        .video_max_bitrate
+        .expect("the matrix preset carries a bitrate envelope");
 
-    for (tier, x264_preset) in [
-        ("fast", "veryfast"),
-        ("balanced", "medium"),
-        ("quality", "slow"),
-    ] {
+    // (libx264 preset, rate control): the two structured knobs that reach
+    // avcodec_open2 through the option dictionary (§4, §13.3).
+    for (x264_preset, rate_control) in [("ultrafast", "vbr"), ("medium", "cq"), ("slow", "cbr")] {
         let mut preset = matrix_base();
         preset.video_copy = false;
         preset.audio_copy = false;
         preset.sw_video_encoder = "libx264".into();
-        preset.sw_video_tier = tier.into();
-        let (info, log, out_dir) = run_job(&input, &preset, &format!("tier-{tier}"), 2);
-        assert_eq!(info.video_action.as_deref(), Some("sw"), "{tier}\n{log}");
-        assert!(
-            log.contains(&format!("tier={tier}")),
-            "{tier}: diag must name the tier\n{log}"
-        );
-        assert!(
-            log.contains(&format!("x264_preset={x264_preset}")),
-            "{tier}: diag must map the tier to libx264's preset\n{log}"
-        );
+        preset.sw_video_preset = x264_preset.into();
+        preset.video_rate_control = rate_control.into();
+        if rate_control == "cq" {
+            preset.video_quality = Some(23);
+        }
+        let tag = format!("options-{rate_control}");
+        let (info, log, out_dir) = run_job(&input, &preset, &tag, 2);
+        assert_eq!(info.video_action.as_deref(), Some("sw"), "{tag}\n{log}");
         let plan_line = log
             .lines()
-            .find(|line| line.contains("video plan: action=") && line.contains("bitrate="))
-            .unwrap_or_else(|| panic!("{tier}: no video plan diagnostic\n{log}"));
-        let bitrate: u64 = plan_line
-            .rsplit_once("bitrate=")
-            .and_then(|(_, value)| value.split_whitespace().next())
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| panic!("{tier}: unparsable bitrate in {plan_line}"));
-        eprintln!("tier {tier}: x264_preset={x264_preset} target_bitrate={bitrate}");
-        bitrates.push(bitrate);
+            .find(|line| line.contains("video plan: action=sw") && line.contains("rate_control="))
+            .unwrap_or_else(|| panic!("{tag}: no video plan diagnostic\n{log}"));
+        assert!(
+            plan_line.contains(&format!("rate_control={rate_control}")),
+            "{tag}: the plan must name the requested rate control\n{plan_line}"
+        );
+        assert!(
+            plan_line.contains(&format!("bitrate={target_bitrate} ")),
+            "{tag}: the envelope bitrate must reach the encoder\n{plan_line}"
+        );
+        assert!(
+            plan_line.contains(&format!("options=preset={x264_preset}")),
+            "{tag}: the configured x264 preset must be handed to avcodec_open2\n{plan_line}"
+        );
+        match rate_control {
+            "cbr" => assert!(
+                plan_line.contains("nal-hrd=cbr"),
+                "{tag}: CBR must map to libx264's nal-hrd= cbr mode\n{plan_line}"
+            ),
+            "cq" => assert!(
+                plan_line.contains("crf=23"),
+                "{tag}: CQ must map to libx264's crf\n{plan_line}"
+            ),
+            _ => {}
+        }
+        assert!(
+            !log.contains("encoder options rejected by the codec"),
+            "{tag}: the structured options must be accepted\n{log}"
+        );
+        eprintln!("encoder options {rate_control}: {plan_line}");
         let _ = std::fs::remove_dir_all(&out_dir);
     }
-    // The tier also scales the bitrate envelope: fast < balanced < quality.
-    assert!(
-        bitrates[0] < bitrates[1] && bitrates[1] < bitrates[2],
-        "the tier must scale the target bitrate, got {bitrates:?}"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -392,7 +405,7 @@ fn every_segment_starts_on_an_i_frame() {
         preset.video_copy = false;
         preset.audio_copy = false;
         preset.sw_video_encoder = encoder.into();
-        preset.sw_video_tier = "fast".into();
+        preset.sw_video_preset = "veryfast".into();
         preset.video_max_w = Some(160);
         preset.video_max_h = Some(120);
         let tag = format!("kf-{encoder}");
@@ -469,7 +482,7 @@ fn portrait_non_integer_fps_media_encodes_with_mpeg2_and_mpeg4() {
         preset.video_copy = false;
         preset.audio_copy = false;
         preset.sw_video_encoder = encoder.into();
-        preset.sw_video_tier = "balanced".into();
+        preset.sw_video_preset = "medium".into();
         preset.hls_segment_secs = 2;
         preset.video_max_w = Some(1280);
         preset.video_max_h = Some(1280);

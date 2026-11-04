@@ -1,7 +1,7 @@
 //! Preset constants and helpers for `wdmm-ffmpeg` (B3.5).
 //!
 //! The two built-in `TranscodePreset` values mirror the seeds written to the
-//! `transcode_presets` DB table in `wdmm-storage` schema v13. The DB is the
+//! `transcode_presets` DB table in `wdmm-storage` schema v14. The DB is the
 //! primary source of truth; these constants are used when the DB rows are not
 //! available (unit tests, probe-only contexts) and by the
 //! `wdmm_transcode_preset_reset` FFI call to restore the factory values.
@@ -13,6 +13,8 @@ use wdmm_core::models::TranscodePreset;
 
 /// Build the `h264` factory preset: copy-first, MediaCodec H.264 with an
 /// `libx264` software fallback, 1080p60 / 4 Mbps envelope, AAC 128 kbps.
+///
+/// Value table: contract `preset-rate-control-and-codec-probe.md` §13.2.
 pub fn preset_h264() -> TranscodePreset {
     TranscodePreset {
         id: "h264".into(),
@@ -20,13 +22,16 @@ pub fn preset_h264() -> TranscodePreset {
         video_copy: true,
         audio_copy: true,
         hw_video_encoder: "h264_mediacodec".into(),
-        hw_video_tier: "balanced".into(),
+        hw_video_options: Default::default(),
         sw_video_encoder: "libx264".into(),
-        sw_video_tier: "balanced".into(),
+        sw_video_preset: "veryfast".into(),
+        sw_video_options: Default::default(),
         video_max_w: Some(1920),
         video_max_h: Some(1080),
         video_max_bitrate: Some(4_000_000),
         video_fps_cap: Some(60),
+        video_rate_control: "vbr".into(),
+        video_quality: None,
         audio_codec: "aac".into(),
         audio_bitrate: 128_000,
         audio_channels: 2,
@@ -41,6 +46,8 @@ pub fn preset_h264() -> TranscodePreset {
 /// Build the `hevc` factory preset: copy-first, MediaCodec HEVC with an
 /// `libx264` software fallback (software HEVC is not shipped, so the fallback
 /// downgrades to H.264), 1080p60 / 3 Mbps envelope, AAC 128 kbps.
+///
+/// Value table: contract `preset-rate-control-and-codec-probe.md` §13.2.
 pub fn preset_hevc() -> TranscodePreset {
     TranscodePreset {
         id: "hevc".into(),
@@ -48,13 +55,16 @@ pub fn preset_hevc() -> TranscodePreset {
         video_copy: true,
         audio_copy: true,
         hw_video_encoder: "hevc_mediacodec".into(),
-        hw_video_tier: "balanced".into(),
+        hw_video_options: Default::default(),
         sw_video_encoder: "libx264".into(),
-        sw_video_tier: "balanced".into(),
+        sw_video_preset: "veryfast".into(),
+        sw_video_options: Default::default(),
         video_max_w: Some(1920),
         video_max_h: Some(1080),
         video_max_bitrate: Some(3_000_000),
         video_fps_cap: Some(60),
+        video_rate_control: "vbr".into(),
+        video_quality: None,
         audio_codec: "aac".into(),
         audio_bitrate: 128_000,
         audio_channels: 2,
@@ -217,6 +227,11 @@ mod tests {
             assert!(preset.is_builtin);
             assert!(preset.video_copy && preset.audio_copy);
             assert!(preset.has_usable_video_path());
+            // v14 rate control: both built-ins ship plain VBR (no CQ value).
+            assert_eq!(preset.video_rate_control, "vbr");
+            assert_eq!(preset.video_quality, None);
+            assert!(preset.hw_video_options.is_empty());
+            assert!(preset.sw_video_options.is_empty());
             // Built-ins must always pass the same validation the storage layer
             // applies to user saves.
             preset.validate().expect("factory preset must be valid");
@@ -232,9 +247,10 @@ mod tests {
         let h264 = preset_h264();
         assert_eq!(h264.label, "H.264（兼容优先）");
         assert_eq!(h264.hw_video_encoder, "h264_mediacodec");
-        assert_eq!(h264.hw_video_tier, "balanced");
         assert_eq!(h264.sw_video_encoder, "libx264");
-        assert_eq!(h264.sw_video_tier, "balanced");
+        assert_eq!(h264.sw_video_preset, "veryfast");
+        assert_eq!(h264.video_rate_control, "vbr");
+        assert_eq!(h264.video_quality, None);
         assert_eq!(
             (h264.video_max_w, h264.video_max_h),
             (Some(1920), Some(1080))
@@ -257,6 +273,8 @@ mod tests {
         assert_eq!(hevc.label, "H.265（更高压缩）");
         assert_eq!(hevc.hw_video_encoder, "hevc_mediacodec");
         assert_eq!(hevc.sw_video_encoder, "libx264");
+        assert_eq!(hevc.sw_video_preset, "veryfast");
+        assert_eq!(hevc.video_rate_control, "vbr");
         assert_eq!(hevc.video_max_bitrate, Some(3_000_000));
         assert_eq!(hevc.sort_order, 1);
         assert!(hevc.is_builtin);

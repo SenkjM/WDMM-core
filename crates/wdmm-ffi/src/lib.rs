@@ -2247,6 +2247,21 @@ pub extern "C" fn wdmm_transcode_preset_reset(id: *const c_char) -> FfiString {
     }
 }
 
+/// Return the encoder option schema for the preset editor as JSON.
+///
+/// Contract §13.4: the editor renders exactly this list of encoders and option
+/// keys instead of hard-coding them. Returns an object
+/// `{"codecs":[{"id","kind","label","output_codec","rate_control","options"}]}`
+/// on success, or `"error:<message>"` on failure. Caller must free the result
+/// via [`wdmm_ffi_free_string`].
+#[no_mangle]
+pub extern "C" fn wdmm_encoder_options_schema_json() -> FfiString {
+    match wdmm_ffmpeg::encoder_options_schema_json() {
+        Ok(json) => FfiString::from(json),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
 /// Register an HLS session with the proxy.
 ///
 /// `device_id` — unique identifier for the player device (null-terminated UTF-8).

@@ -27,6 +27,10 @@ use std::time::{Duration, Instant};
 
 use wdmm_ffmpeg::diag;
 
+/// Serialise the suite: the diagnostics ring buffer is process-global, so
+/// concurrent tests would truncate each other's window.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Master gate: no test runs unless this is set (mirrors the existing HLS tests).
 fn gate_open() -> bool {
     std::env::var_os("WDMM_HLS_TEST_MEDIA").is_some()
@@ -49,7 +53,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn diagnostics() -> String {
-    diag::tail(80).join("\n")
+    diag::tail(256).join("\n")
 }
 
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -100,6 +104,7 @@ fn playlist_len(dir: &Path) -> u64 {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
 fn vod_job_honours_start_number_out_dir_and_hls_time() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
         return;
@@ -162,6 +167,7 @@ fn vod_job_honours_start_number_out_dir_and_hls_time() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_TRANSCODE + linked FFmpeg 7.1"]
 fn transcode_path_produces_a_full_vod_playlist() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_TRANSCODE") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_TRANSCODE not set");
         return;
@@ -278,6 +284,7 @@ fn assert_audio_only_output(
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_AUDIO + linked FFmpeg 7.1"]
 fn audio_only_source_remuxes_to_audio_only_playlist() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_AUDIO") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_AUDIO not set");
         return;
@@ -329,6 +336,7 @@ fn audio_only_source_remuxes_to_audio_only_playlist() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID + linked FFmpeg 7.1"]
 fn audio_only_source_reencodes_unmuxable_audio() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_AUDIO_HYBRID not set");
         return;
@@ -363,6 +371,7 @@ fn audio_only_source_reencodes_unmuxable_audio() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_AUDIO + linked FFmpeg 7.1"]
 fn audio_only_source_survives_the_transcode_path() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_AUDIO") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_AUDIO not set");
         return;
@@ -398,6 +407,7 @@ fn audio_only_source_survives_the_transcode_path() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_SUBTITLES + linked FFmpeg 7.1"]
 fn embedded_subtitle_tracks_expose_language_and_title() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_SUBTITLES") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_SUBTITLES not set");
         return;
@@ -433,6 +443,7 @@ fn embedded_subtitle_tracks_expose_language_and_title() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_SUBTITLES + linked FFmpeg 7.1"]
 fn extract_subtitle_tracks_decodes_every_text_track_in_one_pass() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_SUBTITLES") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_SUBTITLES not set");
         return;
@@ -583,6 +594,7 @@ mod libav_video_key {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD (MP4) / WDMM_HLS_TEST_MEDIA_MKV (Cues MKV) + linked FFmpeg 7.1"]
 fn source_plan_reports_the_container_keyframe_grid() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut checked = 0;
     for (env, expected_keyframes, label) in [
         ("WDMM_HLS_TEST_MEDIA_HEAD", 27_usize, "MP4"),
@@ -686,6 +698,7 @@ fn source_plan_reports_the_container_keyframe_grid() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
 fn keyframe_plan_matches_muxer_cuts_for_sampled_segments() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
         return;
@@ -765,6 +778,7 @@ fn keyframe_plan_matches_muxer_cuts_for_sampled_segments() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
 fn encode_path_cuts_on_the_exact_grid() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
         return;
@@ -871,6 +885,7 @@ fn encode_path_cuts_on_the_exact_grid() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_NOCUES + linked FFmpeg 7.1"]
 fn source_plan_refuses_a_truncated_keyframe_index() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_NOCUES") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_NOCUES not set");
         return;
@@ -911,6 +926,7 @@ fn long_running_preset() -> wdmm_core::models::TranscodePreset {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
 fn paused_job_holds_progress_and_resume_finishes() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
         return;
@@ -967,6 +983,7 @@ fn paused_job_holds_progress_and_resume_finishes() {
 #[test]
 #[ignore = "needs WDMM_HLS_TEST_MEDIA_HEAD + linked FFmpeg 7.1"]
 fn cancelling_a_paused_job_exits_without_deadlock() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(media) = env_media("WDMM_HLS_TEST_MEDIA_HEAD") else {
         eprintln!("skip: WDMM_HLS_TEST_MEDIA_HEAD not set");
         return;

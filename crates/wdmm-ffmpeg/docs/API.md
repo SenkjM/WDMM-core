@@ -39,8 +39,8 @@ rejected — classify with `classify_codec` first. Requires the `ffmpeg` feature
 
 ## HLS job
 ### `pub struct JobOpts {`
-- `input_url: String`, `preset: TranscodePreset` (per-stream copy/encoder/tier
-  config and `hls_segment_secs`)
+- `input_url: String`, `preset: TranscodePreset` (per-stream copy/encoder
+  config, rate control and `hls_segment_secs`)
 - `start_offset_secs: f64` — media time to start from (`0.0` = head)
 - `segment_dir: PathBuf` — caller-provided; ignored when `out_dir` is set
 - `start_number: u64` — index of the first segment, so a pull job can restart
@@ -84,33 +84,78 @@ change the grid):
 ### `pub enum StreamMode {`
 - `None` — the source has no such stream, nothing is muxed.
 - `Copy` — remux the source packets into MPEG-TS unchanged.
-- `Hardware` — encode with `preset.hw_video_encoder` at `preset.hw_video_tier`.
-- `Software` — encode with `preset.sw_video_encoder` at `preset.sw_video_tier`.
+- `Hardware` — encode with `preset.hw_video_encoder` (MediaCodec).
+- `Software` — encode with `preset.sw_video_encoder`, tuned by
+  `preset.sw_video_preset` and `video_rate_control` (see *Encoder options*).
 `StreamMode::as_str()` yields `none`/`copy`/`hw`/`sw` (the session-status
 `video_action`/`audio_action` values).
 ### `pub struct SessionDecision {`
-- `video: StreamMode`, `video_encoder: Option<String>`, `video_tier: Option<String>`
+- `video: StreamMode`, `video_encoder: Option<String>`
 - `audio: StreamMode`, `audio_encoder: Option<String>`
 ### `pub fn SessionDecision::decide(preset, video_codec_id, audio_codec_id, hw_encoder_available) -> Result<SessionDecision, String>`
 Applies the copy priority (`preset.video_copy`/`audio_copy` and MPEG-TS
 copyability), picks the encoder path from the preset, and errors when the preset
 has no usable video path. `hw_encoder_available` must mean *found and opened*:
-the job probes the hardware encoder once and falls back to the software encoder
-(logging `video: sw fallback downgrades hevc to h264` when the fallback changes
-the codec).
+the job probes the hardware encoder once (with the preset's advanced options,
+retrying without them when the codec refuses them) and falls back to the
+software encoder (logging `video: sw fallback downgrades hevc to h264` when the
+fallback changes the codec).
 ### `pub fn decide_video_action(preset, source_codec_id, hw_encoder_available) -> Result<StreamAction, String>`
 ### `pub fn decide_audio_action(preset, source_codec_id) -> AudioAction`
-### `pub enum StreamAction<'a> { Copy, Encode { hardware, encoder, tier } }`
+### `pub enum StreamAction<'a> { Copy, Encode { hardware, encoder } }`
 ### `pub enum AudioAction<'a> { Copy, Encode { encoder } }`
-The primitives `SessionDecision` is built from; `encoder_name()`, `tier()`,
+The primitives `SessionDecision` is built from; `encoder_name()`, `uses_hardware()`,
 `is_copy()` describe the chosen path.
-### `pub fn x264_preset_for_tier(tier: &str) -> Option<&'static str>`
-`fast` → `veryfast`, `balanced` → `medium`, `quality` → `slow`.
-### `pub fn target_video_bitrate_for_tier(preset, width, height, fps, tier) -> u32`
-`preset.video_max_bitrate` scaled by `bitrate_factor_for_tier` (`fast` ×0.85,
-`balanced` ×1.0, `quality` ×1.35), or a resolution/fps-derived base.
 ### `pub fn sw_fallback_downgrades_hevc(preset) -> bool`
 True when the hw encoder is HEVC but the sw fallback is `libx264`.
+
+## Encoder options and rate control
+The preset no longer carries an opaque "tier": `video_rate_control`
+(`auto`/`vbr`/`cbr`/`cq`), `video_quality`, `sw_video_preset` (the x264 speed
+ladder; empty for the MPEG encoders) and the two advanced-option maps
+(`hw_video_options`/`sw_video_options`) are turned into the exact
+`AVDictionary` handed to `avcodec_open2`.
+### `pub enum RateControl { Auto, Vbr, Cbr, Cq }`
+`RateControl::parse(&preset.video_rate_control)` returns the user-facing
+`unknown rate control: <mode>` error; `as_str()` round-trips.
+### `pub enum EncoderFamily { Hardware, LibX264, MpegVideo }`
+`EncoderFamily::of(encoder)` classifies a name; `allowed_keys()` is the
+whitelist an advanced-option map may use for that family.
+### `pub struct VideoEncoderOptions {`
+- `entries: Vec<(String, String)>` — the dictionary entries, in priority order
+- `overridden: Vec<String>` — preset keys an invariant took over
+- `user_option_count: usize` — advanced options from the preset (0 ⇒ the retry
+  pass is pointless)
+- `get(key)` (last writer wins), `dict_line()` (`k=v,…` for the diagnostics)
+### `pub fn video_encoder_options(preset, encoder, hardware, bitrate, gop) -> Result<VideoEncoderOptions, String>`
+### `pub fn video_encoder_options_without_user(preset, encoder, hardware, bitrate, gop) -> Result<VideoEncoderOptions, String>`
+Priority (contract §13.5): invariants > the preset's advanced options >
+structured fields > platform defaults. Invariants are
+`AV_CODEC_FLAG_GLOBAL_HEADER`, `max_b_frames=0` for the hardware path,
+`keyint=min-keyint=<segment frames>` + `scenecut=0` for libx264 and the closed
+GOP threshold for the MPEG encoders; a preset cannot override them (attempts are
+dropped and reported in `overridden`). Unknown keys fail with
+`unknown option: <key>`. `*_without_user` is the retry pass used when the codec
+refuses the preset's advanced options.
+### `pub fn target_video_bitrate(preset, width, height, fps) -> u32`
+`preset.video_max_bitrate`, or the resolution/fps-derived envelope
+(`w*h*fps*0.1`, floored at 800 kbit/s). No tier factor.
+### `pub fn video_plan_diag(action, bitrate, rate_control, options) -> String`
+The diagnostic line naming the effective encoder, rate control, bitrate and
+options dictionary (not the requested ones).
+### `pub fn encoder_options_schema() -> EncoderOptionsSchema`
+### `pub fn encoder_options_schema_json() -> Result<String, serde_json::Error>`
+The preset editor renders exactly this schema (§13.4): one entry per selectable
+encoder with its `rate_control` list and whitelisted `options`
+(`key`/`label`/`type`/`values`/`min`/`max`/`default`/`advanced`). The option
+keys are the literal `AVDictionary` keys, so UI and transcoder cannot drift.
+### `pub const SHIPPED_VIDEO_ENCODERS: [&str; N]`
+### `pub const SHIPPED_AUDIO_ENCODERS: [&str; N]`
+The explicit `--enable-encoder` list of the trimmed Android build; §13.6 gate
+tests assert every one resolves.
+### `pub fn encoder_available(name: &str) -> bool`
+Whether libavcodec resolves that encoder name (false without the `ffmpeg`
+feature).
 
 ## Segment plan
 The proxy synthesises a VOD playlist from a `SegmentPlan` before playback, so

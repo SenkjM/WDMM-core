@@ -18,8 +18,12 @@
 //! A [`wdmm_core::models::TranscodePreset`] drives the job through a per-stream
 //! decision (see [`SessionDecision`]): each stream is either copied when the
 //! source is already MPEG-TS compatible and the preset allows it, or encoded
-//! with the preset's hardware/software encoder. The output container is always
-//! MPEG-TS (HLS segments); direct playback never reaches this crate.
+//! with the preset's hardware/software encoder. The encoder itself is opened
+//! with the `AVDictionary` built by
+//! [`video_encoder_options`] (rate control + advanced options, contract
+//! `preset-rate-control-and-codec-probe` §13.5), and [`encoder_options_schema`]
+//! exposes the same whitelist to the preset editor. The output container is
+//! always MPEG-TS (HLS segments); direct playback never reaches this crate.
 //!
 //! ## License
 //! This crate links against FFmpeg shared libraries, licensed under LGPL v2.1+
@@ -55,16 +59,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use plan::{
-    bitrate_factor_for_tier, decide_audio_action, decide_video_action, default_video_bitrate,
-    encoder_frame_rate, hw_gop_size, remux_dropped_streams, remux_plan, remux_stream_selection,
-    segment_gop_size, sw_fallback_downgrades_hevc, target_video_bitrate_for_tier, video_plan_diag,
-    x264_preset_for_tier, AudioAction, RemuxPlan, StreamAction,
+    decide_audio_action, decide_video_action, default_video_bitrate, encoder_frame_rate,
+    encoder_options_schema, hw_gop_size, remux_dropped_streams, remux_plan, remux_stream_selection,
+    segment_gop_size, sw_fallback_downgrades_hevc, target_video_bitrate, video_encoder_options,
+    video_encoder_options_without_user, video_plan_diag, AudioAction, CodecSchema, EncoderFamily,
+    EncoderOptionSpec, EncoderOptionsSchema, OptionType, RateControl, RemuxPlan, StreamAction,
+    VideoEncoderOptions, HW_VIDEO_OPTION_KEYS, SCHEMA_RATE_CONTROL_MODES, SHIPPED_AUDIO_ENCODERS,
+    SHIPPED_VIDEO_ENCODERS, SW_MPEG_OPTION_KEYS, SW_X264_OPTION_KEYS,
 };
 pub use subtitle::{classify_codec, Cue, TrackKind};
 pub use vod::{
     exact_plan, keyframe_plan, PlanAlignment, SegEntry, SegmentPlan, MIN_KEYFRAMES_FOR_PLAN,
 };
 pub use wdmm_core::models::TranscodePreset;
+
+/// Serialized [`encoder_options_schema`] for the FFI boundary (contract
+/// `preset-rate-control-and-codec-probe` §13.4).
+///
+/// The schema is static data, so serialization cannot fail; an `Err` here would
+/// be a code bug rather than runtime input.
+pub fn encoder_options_schema_json() -> Result<String, serde_json::Error> {
+    serde_json::to_string(&plan::encoder_options_schema())
+}
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -86,6 +102,28 @@ pub type FfmpegResult<T> = std::result::Result<T, FfmpegError>;
 /// unavailable) without probing [`open_job`].
 pub const fn is_available() -> bool {
     cfg!(feature = "ffmpeg")
+}
+
+/// Whether libavcodec can resolve an encoder with this exact name.
+///
+/// This is the runtime half of the shipped-encoder contract (§13.6): the
+/// Android build trims `libavcodec` down to an explicit `--enable-encoder`
+/// list, so every name a preset may carry (#[`SHIPPED_VIDEO_ENCODERS`],
+/// [`SHIPPED_AUDIO_ENCODERS`]) must still resolve there. A name that stops
+/// resolving makes the editor option look merely "greyed out" instead of
+/// failing loudly, which is exactly what this probe prevents.
+#[cfg(feature = "ffmpeg")]
+pub fn encoder_available(name: &str) -> bool {
+    let Ok(name_c) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    unsafe { !crate::sys::avcodec_find_encoder_by_name(name_c.as_ptr()).is_null() }
+}
+
+/// Stub: without the `ffmpeg` feature no encoder is linked in.
+#[cfg(not(feature = "ffmpeg"))]
+pub const fn encoder_available(_name: &str) -> bool {
+    false
 }
 
 // ── Progress telemetry (§1) ───────────────────────────────────────────────────
@@ -174,8 +212,6 @@ pub struct SessionDecision {
     pub video: StreamMode,
     /// Video encoder name when [`video`](Self::video) is an `Encode` variant.
     pub video_encoder: Option<String>,
-    /// Tier (`"fast"`/`"balanced"`/`"quality"`) backing the video encoder knobs.
-    pub video_tier: Option<String>,
     /// Audio stream action.
     pub audio: StreamMode,
     /// Audio encoder name when [`audio`](Self::audio) is [`StreamMode::Software`].
@@ -196,23 +232,18 @@ impl SessionDecision {
         audio_codec_id: u32,
         hw_encoder_available: bool,
     ) -> Result<Self, String> {
-        let (video, video_encoder, video_tier) = if video_codec_id == 0 {
-            (StreamMode::None, None, None)
+        let (video, video_encoder) = if video_codec_id == 0 {
+            (StreamMode::None, None)
         } else {
             match decide_video_action(preset, video_codec_id, hw_encoder_available)? {
-                StreamAction::Copy => (StreamMode::Copy, Some("copy".to_string()), None),
-                StreamAction::Encode {
-                    hardware,
-                    encoder,
-                    tier,
-                } => (
+                StreamAction::Copy => (StreamMode::Copy, Some("copy".to_string())),
+                StreamAction::Encode { hardware, encoder } => (
                     if hardware {
                         StreamMode::Hardware
                     } else {
                         StreamMode::Software
                     },
                     Some(encoder.to_string()),
-                    Some(tier.to_string()),
                 ),
             }
         };
@@ -229,7 +260,6 @@ impl SessionDecision {
         Ok(Self {
             video,
             video_encoder,
-            video_tier,
             audio,
             audio_encoder,
         })
@@ -1045,12 +1075,11 @@ mod tests {
     fn decision_encode_copy_uses_the_sw_encoder_and_copies_audio() {
         let mut p = decision_preset();
         p.video_copy = false;
-        p.sw_video_tier = "fast".to_string();
+        p.sw_video_encoder = "mpeg2video".to_string();
         let d = SessionDecision::decide(&p, preset::codec_ids::HEVC, preset::codec_ids::AAC, false)
             .expect("decision");
         assert_eq!(d.video, StreamMode::Software);
-        assert_eq!(d.video_encoder.as_deref(), Some("libx264"));
-        assert_eq!(d.video_tier.as_deref(), Some("fast"));
+        assert_eq!(d.video_encoder.as_deref(), Some("mpeg2video"));
         assert_eq!(d.audio, StreamMode::Copy);
     }
 

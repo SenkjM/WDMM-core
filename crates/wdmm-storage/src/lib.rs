@@ -22,6 +22,7 @@
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use thiserror::Error as ThisError;
 use uuid::Uuid;
@@ -51,7 +52,37 @@ impl From<rusqlite::Error> for StorageError {
 
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
 
-/// Decode one `transcode_presets` row (schema v13 column order). Shared by
+/// Map a schema-v13 speed/quality tier onto the v14 `sw_video_preset` name.
+///
+/// The v13 model had three generic tiers for both encoders; v14 stores the
+/// libx264 preset name directly. Contract §13.2 seeds both built-ins with
+/// `veryfast`, so `fast` and the old `balanced` land there, `quality` gets the
+/// next step down (`medium`), and anything else (including the empty string)
+/// falls back to `veryfast` — the same value the factory presets use.
+fn migrate_sw_video_preset(tier: &str) -> &'static str {
+    match tier {
+        "quality" => "medium",
+        // `fast`, `balanced`, empty and unknown values all resolve to the
+        // factory default.
+        _ => "veryfast",
+    }
+}
+
+/// Serialise a preset's advanced encoder options into the JSON TEXT stored in
+/// `hw_video_options`/`sw_video_options`. Called with an empty map it produces
+/// `{}` (never `null`), so the Dart editor never has to special-case absence.
+fn encode_video_options(options: &BTreeMap<String, String>) -> String {
+    serde_json::to_string(options).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Decode an options column. `NULL`/invalid JSON degrades to an empty map —
+/// options are advisory, and a corrupt row must not make the presets list
+/// unreadable.
+fn decode_video_options(text: &str) -> BTreeMap<String, String> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+/// Decode one `transcode_presets` row (schema v14 column order). Shared by
 /// [`LibraryDatabase::list_transcode_presets`] and
 /// [`LibraryDatabase::get_transcode_preset`] so the two can never drift.
 fn transcode_preset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscodePreset> {
@@ -61,21 +92,24 @@ fn transcode_preset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transc
         video_copy: row.get::<_, i64>(2)? != 0,
         audio_copy: row.get::<_, i64>(3)? != 0,
         hw_video_encoder: row.get(4)?,
-        hw_video_tier: row.get(5)?,
+        hw_video_options: decode_video_options(&row.get::<_, String>(5)?),
         sw_video_encoder: row.get(6)?,
-        sw_video_tier: row.get(7)?,
-        video_max_w: row.get(8)?,
-        video_max_h: row.get(9)?,
-        video_max_bitrate: row.get(10)?,
-        video_fps_cap: row.get(11)?,
-        audio_codec: row.get(12)?,
-        audio_bitrate: row.get::<_, i64>(13)? as u32,
-        audio_channels: row.get::<_, i64>(14)? as u8,
-        audio_sample_rate: row.get(15)?,
-        hls_segment_secs: row.get::<_, i64>(16)? as u32,
-        sort_order: row.get(17)?,
-        is_builtin: row.get::<_, i64>(18)? != 0,
-        updated_at: row.get(19)?,
+        sw_video_preset: row.get(7)?,
+        sw_video_options: decode_video_options(&row.get::<_, String>(8)?),
+        video_max_w: row.get(9)?,
+        video_max_h: row.get(10)?,
+        video_max_bitrate: row.get(11)?,
+        video_fps_cap: row.get(12)?,
+        video_rate_control: row.get(13)?,
+        video_quality: row.get::<_, Option<i64>>(14)?.map(|q| q as u8),
+        audio_codec: row.get(15)?,
+        audio_bitrate: row.get::<_, i64>(16)? as u32,
+        audio_channels: row.get::<_, i64>(17)? as u8,
+        audio_sample_rate: row.get(18)?,
+        hls_segment_secs: row.get::<_, i64>(19)? as u32,
+        sort_order: row.get(20)?,
+        is_builtin: row.get::<_, i64>(21)? != 0,
+        updated_at: row.get(22)?,
     })
 }
 
@@ -1113,6 +1147,209 @@ impl LibraryDatabase {
             ))?;
         }
 
+        // ── v14 migration: rate control + structured encoder options ─────────
+        //
+        // v14 deletes the hardware "tier" (it never affected the encoder), turns
+        // the software tier into a real libx264 preset name, and adds the
+        // rate-control mode, the CQ value and the two advanced AVOptions maps
+        // (stored as JSON objects).
+        //
+        // Fresh installs run through v13 above and then this transform, so there
+        // is exactly one schema authority.
+        if current_ver < 14 {
+            let now = chrono::Utc::now().timestamp();
+            conn.execute_batch(
+                r#"
+                BEGIN;
+
+                ALTER TABLE transcode_presets RENAME TO transcode_presets_v13;
+
+                CREATE TABLE transcode_presets (
+                    id                 TEXT PRIMARY KEY,
+                    label              TEXT NOT NULL,
+                    -- ① copy layer: pass the source stream through when MPEG-TS
+                    -- can carry it (highest priority)
+                    video_copy         INTEGER NOT NULL DEFAULT 1,
+                    audio_copy         INTEGER NOT NULL DEFAULT 1,
+                    -- ② hardware (MediaCodec) encoder layer ('' = disabled)
+                    hw_video_encoder   TEXT NOT NULL DEFAULT '',
+                    hw_video_options   TEXT NOT NULL DEFAULT '{}',
+                    -- ③ software encoder fallback ('' = disabled)
+                    sw_video_encoder   TEXT NOT NULL DEFAULT '',
+                    -- libx264 preset name; '' = the encoder has no preset ladder
+                    -- (mpeg2video/mpeg4)
+                    sw_video_preset    TEXT NOT NULL DEFAULT '',
+                    sw_video_options   TEXT NOT NULL DEFAULT '{}',
+                    -- output envelope
+                    video_max_w        INTEGER,
+                    video_max_h        INTEGER,
+                    video_max_bitrate  INTEGER,        -- bits per second
+                    video_fps_cap      INTEGER,
+                    -- rate control
+                    video_rate_control TEXT NOT NULL DEFAULT 'vbr',
+                    video_quality      INTEGER,
+                    -- audio
+                    audio_codec        TEXT NOT NULL DEFAULT 'aac',
+                    audio_bitrate      INTEGER NOT NULL DEFAULT 128000,
+                    audio_channels     INTEGER NOT NULL DEFAULT 2,
+                    audio_sample_rate  INTEGER,
+                    -- hls
+                    hls_segment_secs   INTEGER NOT NULL DEFAULT 4,
+                    -- ui
+                    sort_order         INTEGER NOT NULL DEFAULT 0,
+                    is_builtin         INTEGER NOT NULL DEFAULT 0,
+                    updated_at         INTEGER NOT NULL
+                );
+                "#,
+            )?;
+
+            // Copy user-created rows only: the old built-ins — including a row
+            // that claims `is_builtin = 1` under an edited id — are dropped and
+            // the two factory presets are re-seeded below. The v13-tier →
+            // libx264-preset mapping is the Rust helper
+            // `migrate_sw_video_preset` (unit-tested) rather than SQL.
+            let mut migrated: Vec<TranscodePreset> = Vec::new();
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT id, label, video_copy, audio_copy,
+                            hw_video_encoder, sw_video_encoder, sw_video_tier,
+                            video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                            audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
+                            hls_segment_secs, sort_order, updated_at
+                       FROM transcode_presets_v13
+                      WHERE is_builtin = 0
+                        AND id NOT IN ('h264', 'hevc')",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let sw_video_encoder: String = row.get(5)?;
+                    // The libx264 preset name only means something for libx264;
+                    // mpeg2video/mpeg4 rows keep an empty preset ("no preset
+                    // ladder") per the v14 contract.
+                    let sw_video_preset = if sw_video_encoder == "libx264" {
+                        migrate_sw_video_preset(&row.get::<_, String>(6)?).to_string()
+                    } else {
+                        String::new()
+                    };
+                    Ok(TranscodePreset {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        video_copy: row.get::<_, i64>(2)? != 0,
+                        audio_copy: row.get::<_, i64>(3)? != 0,
+                        hw_video_encoder: row.get(4)?,
+                        hw_video_options: BTreeMap::new(),
+                        sw_video_encoder,
+                        sw_video_preset,
+                        sw_video_options: BTreeMap::new(),
+                        video_max_w: row.get(7)?,
+                        video_max_h: row.get(8)?,
+                        video_max_bitrate: row.get(9)?,
+                        video_fps_cap: row.get(10)?,
+                        // v13 had no rate-control knob; `vbr` preserves the
+                        // encoders' ABR behaviour.
+                        video_rate_control: "vbr".to_string(),
+                        video_quality: None,
+                        audio_codec: row.get(11)?,
+                        audio_bitrate: row.get::<_, i64>(12)? as u32,
+                        audio_channels: row.get::<_, i64>(13)? as u8,
+                        audio_sample_rate: row.get(14)?,
+                        hls_segment_secs: row.get::<_, i64>(15)? as u32,
+                        sort_order: row.get(16)?,
+                        is_builtin: false,
+                        updated_at: row.get(17)?,
+                    })
+                })?;
+                for row in rows {
+                    migrated.push(row?);
+                }
+            }
+
+            // Defensive net for the "no video path" rule: a row that lost its
+            // hardware flag in v13 and has no software encoder gets libx264 so
+            // it stays usable, with the factory preset name.
+            for preset in &mut migrated {
+                if !preset.video_copy
+                    && preset.hw_video_encoder.is_empty()
+                    && preset.sw_video_encoder.is_empty()
+                {
+                    preset.sw_video_encoder = "libx264".to_string();
+                    if preset.sw_video_preset.is_empty() {
+                        preset.sw_video_preset = migrate_sw_video_preset("").to_string();
+                    }
+                }
+            }
+
+            for preset in &migrated {
+                conn.execute(
+                    "INSERT INTO transcode_presets
+                     (id, label, video_copy, audio_copy,
+                      hw_video_encoder, hw_video_options, sw_video_encoder, sw_video_preset,
+                      sw_video_options, video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                      video_rate_control, video_quality,
+                      audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
+                      hls_segment_secs, sort_order, is_builtin, updated_at)
+                     VALUES (?1,?2,?3,?4, ?5,?6,?7,?8,?9, ?10,?11,?12,?13,
+                             ?14,?15, ?16,?17,?18,?19, ?20,?21,?22,?23)",
+                    params![
+                        &preset.id,
+                        &preset.label,
+                        preset.video_copy as i64,
+                        preset.audio_copy as i64,
+                        &preset.hw_video_encoder,
+                        encode_video_options(&preset.hw_video_options),
+                        &preset.sw_video_encoder,
+                        &preset.sw_video_preset,
+                        encode_video_options(&preset.sw_video_options),
+                        preset.video_max_w,
+                        preset.video_max_h,
+                        preset.video_max_bitrate,
+                        preset.video_fps_cap,
+                        &preset.video_rate_control,
+                        preset.video_quality.map(i64::from),
+                        &preset.audio_codec,
+                        preset.audio_bitrate as i64,
+                        preset.audio_channels as i64,
+                        preset.audio_sample_rate,
+                        preset.hls_segment_secs as i64,
+                        preset.sort_order,
+                        preset.is_builtin as i64,
+                        preset.updated_at,
+                    ],
+                )?;
+            }
+
+            conn.execute_batch(&format!(
+                r#"
+                DROP TABLE transcode_presets_v13;
+
+                INSERT INTO transcode_presets
+                    (id, label, video_copy, audio_copy,
+                     hw_video_encoder, hw_video_options, sw_video_encoder, sw_video_preset,
+                     sw_video_options, video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                     video_rate_control, video_quality,
+                     audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
+                     hls_segment_secs, sort_order, is_builtin, updated_at)
+                VALUES
+                    ('h264', 'H.264（兼容优先）', 1, 1,
+                     'h264_mediacodec', '{{}}', 'libx264', 'veryfast', '{{}}',
+                     1920, 1080, 4000000, 60,
+                     'vbr', NULL,
+                     'aac', 128000, 2, 44100,
+                     4, 0, 1, {now}),
+                    ('hevc', 'H.265（更高压缩）', 1, 1,
+                     'hevc_mediacodec', '{{}}', 'libx264', 'veryfast', '{{}}',
+                     1920, 1080, 3000000, 60,
+                     'vbr', NULL,
+                     'aac', 128000, 2, 44100,
+                     4, 1, 1, {now});
+
+                INSERT OR IGNORE INTO _schema_version (version) VALUES (14);
+
+                COMMIT;
+                "#,
+                now = now,
+            ))?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1890,7 +2127,7 @@ impl LibraryDatabase {
         Ok(())
     }
 
-    // ── Transcode presets (B3.5, schema v13) ─────────────────────────────────
+    // ── Transcode presets (B3.5, schema v14) ─────────────────────────────────
 
     /// List all transcode presets ordered by sort_order.
     pub fn list_transcode_presets(&self) -> StorageResult<Vec<TranscodePreset>> {
@@ -1898,8 +2135,9 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, label,
                     video_copy, audio_copy,
-                    hw_video_encoder, hw_video_tier, sw_video_encoder, sw_video_tier,
-                    video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                    hw_video_encoder, hw_video_options, sw_video_encoder, sw_video_preset,
+                    sw_video_options, video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                    video_rate_control, video_quality,
                     audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
                     hls_segment_secs, sort_order, is_builtin, updated_at
              FROM transcode_presets
@@ -1919,8 +2157,9 @@ impl LibraryDatabase {
         let mut stmt = conn.prepare(
             "SELECT id, label,
                     video_copy, audio_copy,
-                    hw_video_encoder, hw_video_tier, sw_video_encoder, sw_video_tier,
-                    video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                    hw_video_encoder, hw_video_options, sw_video_encoder, sw_video_preset,
+                    sw_video_options, video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+                    video_rate_control, video_quality,
                     audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
                     hls_segment_secs, sort_order, is_builtin, updated_at
              FROM transcode_presets WHERE id = ?1",
@@ -1935,9 +2174,10 @@ impl LibraryDatabase {
     /// Upsert a transcode preset. `updated_at` is set to now.
     ///
     /// Built-in presets are editable like any other row, but the fields are
-    /// validated first: unknown encoder/tier names and a preset with no video
-    /// path at all are rejected with [`StorageError::Validation`] (the FFI
-    /// layer prefixes the message with `error:`).
+    /// validated first: unknown encoder/preset/rate-control names, a `cq` mode
+    /// without a quality value, and a preset with no video path at all are
+    /// rejected with [`StorageError::Validation`] (the FFI layer prefixes the
+    /// message with `error:`).
     pub fn save_transcode_preset(&self, preset: &TranscodePreset) -> StorageResult<()> {
         preset.validate().map_err(StorageError::Validation)?;
         let conn = self.conn.lock().unwrap();
@@ -1945,24 +2185,29 @@ impl LibraryDatabase {
         conn.execute(
             "INSERT OR REPLACE INTO transcode_presets
              (id, label, video_copy, audio_copy,
-              hw_video_encoder, hw_video_tier, sw_video_encoder, sw_video_tier,
-              video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+              hw_video_encoder, hw_video_options, sw_video_encoder, sw_video_preset,
+              sw_video_options, video_max_w, video_max_h, video_max_bitrate, video_fps_cap,
+              video_rate_control, video_quality,
               audio_codec, audio_bitrate, audio_channels, audio_sample_rate,
               hls_segment_secs, sort_order, is_builtin, updated_at)
-             VALUES (?1,?2,?3,?4, ?5,?6,?7,?8, ?9,?10,?11,?12, ?13,?14,?15,?16, ?17,?18,?19,?20)",
+             VALUES (?1,?2,?3,?4, ?5,?6,?7,?8, ?9,?10,?11,?12, ?13,?14,?15,
+                     ?16,?17,?18,?19, ?20,?21,?22,?23)",
             params![
                 &preset.id,
                 &preset.label,
                 preset.video_copy as i64,
                 preset.audio_copy as i64,
                 &preset.hw_video_encoder,
-                &preset.hw_video_tier,
+                encode_video_options(&preset.hw_video_options),
                 &preset.sw_video_encoder,
-                &preset.sw_video_tier,
+                &preset.sw_video_preset,
+                encode_video_options(&preset.sw_video_options),
                 preset.video_max_w,
                 preset.video_max_h,
                 preset.video_max_bitrate,
                 preset.video_fps_cap,
+                &preset.video_rate_control,
+                preset.video_quality.map(i64::from),
                 &preset.audio_codec,
                 preset.audio_bitrate as i64,
                 preset.audio_channels as i64,
@@ -4346,7 +4591,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 13);
+        assert_eq!(db.schema_version().unwrap(), 14);
     }
 
     #[test]
@@ -5874,7 +6119,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 13);
+        assert_eq!(db.schema_version().unwrap(), 14);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -6407,7 +6652,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 13);
+        assert_eq!(db.schema_version().unwrap(), 14);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -6849,7 +7094,7 @@ mod tests {
 
         // Open through LibraryDatabase — triggers v10 migration.
         let db = LibraryDatabase::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 13, "schema must reach v13");
+        assert_eq!(db.schema_version().unwrap(), 14, "schema must reach v14");
 
         let mangas = db.list_mangas().unwrap();
         let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");
@@ -7002,7 +7247,8 @@ mod tests {
     /// Build a schema-v12 database (old one-video-codec preset table) with two
     /// user rows and old built-ins (one under a renamed id), then verify the
     /// v13 mapping: built-ins are dropped unconditionally, user rows are
-    /// mapped to the three-layer fields, schema reaches v13.
+    /// mapped to the three-layer fields; v14 then applies its defaults, so the
+    /// chain ends at schema v14.
     #[test]
     fn migrate_v13_three_layer_presets() {
         use rusqlite::Connection;
@@ -7059,7 +7305,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 13);
+        assert_eq!(db.schema_version().unwrap(), 14);
 
         let all = db.list_transcode_presets().unwrap();
         assert_eq!(all.len(), 4, "two built-ins + two migrated user rows: {all:?}");
@@ -7067,15 +7313,18 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, ["h264", "hevc", "my-h264", "my-mpeg2"]);
 
-        // New factory built-ins.
+        // New factory built-ins (v14: no hardware tier, real x264 preset name).
         let h264 = db.get_transcode_preset("h264").unwrap().unwrap();
         assert!(h264.is_builtin);
         assert_eq!(h264.label, "H.264（兼容优先）");
         assert!(h264.video_copy && h264.audio_copy);
         assert_eq!(h264.hw_video_encoder, "h264_mediacodec");
-        assert_eq!(h264.hw_video_tier, "balanced");
         assert_eq!(h264.sw_video_encoder, "libx264");
-        assert_eq!(h264.sw_video_tier, "balanced");
+        assert_eq!(h264.sw_video_preset, "veryfast");
+        assert_eq!(h264.video_rate_control, "vbr");
+        assert_eq!(h264.video_quality, None);
+        assert!(h264.hw_video_options.is_empty());
+        assert!(h264.sw_video_options.is_empty());
         assert_eq!(h264.video_max_bitrate, Some(4_000_000));
         assert_eq!(h264.hls_segment_secs, 4);
         assert_eq!(h264.sort_order, 0);
@@ -7083,15 +7332,19 @@ mod tests {
         let hevc = db.get_transcode_preset("hevc").unwrap().unwrap();
         assert!(hevc.is_builtin);
         assert_eq!(hevc.hw_video_encoder, "hevc_mediacodec");
+        assert_eq!(hevc.sw_video_preset, "veryfast");
         assert_eq!(hevc.video_max_bitrate, Some(3_000_000));
         assert_eq!(hevc.sort_order, 1);
 
         // Migrated user row: copy both layers, hw+sw encoders, 'copy' audio → AAC.
+        // Its v13 tier `balanced` maps to the factory `veryfast` preset.
         let custom = db.get_transcode_preset("my-h264").unwrap().unwrap();
         assert!(!custom.is_builtin);
         assert!(custom.video_copy && custom.audio_copy);
         assert_eq!(custom.hw_video_encoder, "h264_mediacodec");
         assert_eq!(custom.sw_video_encoder, "libx264");
+        assert_eq!(custom.sw_video_preset, "veryfast");
+        assert_eq!(custom.video_rate_control, "vbr");
         assert_eq!(custom.audio_codec, "aac");
         assert_eq!(custom.audio_bitrate, 96_000);
         assert_eq!(custom.hls_segment_secs, 6);
@@ -7099,14 +7352,159 @@ mod tests {
         assert_eq!(custom.updated_at, 13);
 
         // Migrated row with the hardware switch off: no hardware path, MPEG-2
-        // software encoder, 'mp3' → AAC.
+        // software encoder, 'mp3' → AAC. mpeg2video has no preset ladder, so
+        // `sw_video_preset` stays empty.
         let mpeg2 = db.get_transcode_preset("my-mpeg2").unwrap().unwrap();
         assert_eq!(mpeg2.hw_video_encoder, "");
         assert_eq!(mpeg2.sw_video_encoder, "mpeg2video");
+        assert_eq!(mpeg2.sw_video_preset, "");
+        assert_eq!(mpeg2.video_rate_control, "vbr");
         assert_eq!(mpeg2.audio_codec, "aac");
         assert_eq!(mpeg2.audio_channels, 1);
         assert!(mpeg2.has_usable_video_path());
         assert_eq!(mpeg2.updated_at, 14);
+    }
+
+    #[test]
+    fn migrate_sw_video_preset_maps_v13_tiers() {
+        // `fast`/`balanced` collapse onto the factory default `veryfast`; the old
+        // `quality` tier becomes x264's `medium`; anything unrecognised (including
+        // an empty string) falls back to `veryfast` so a migrated preset is never
+        // left without a usable preset name.
+        assert_eq!(migrate_sw_video_preset("fast"), "veryfast");
+        assert_eq!(migrate_sw_video_preset("balanced"), "veryfast");
+        assert_eq!(migrate_sw_video_preset("quality"), "medium");
+        assert_eq!(migrate_sw_video_preset(""), "veryfast");
+        assert_eq!(migrate_sw_video_preset("turbo"), "veryfast");
+        assert_eq!(migrate_sw_video_preset("FAST"), "veryfast");
+    }
+
+    /// Build a schema-v13 database (three-layer presets with the generic
+    /// `hw_video_tier` / `sw_video_tier`) and verify the v14 transform: tiers
+    /// become libx264 preset names, rate control defaults to `vbr`, the
+    /// advanced-option columns are empty JSON objects, the old built-ins are
+    /// replaced (never duplicated) and the schema reaches v14.
+    #[test]
+    fn migrate_v14_rate_control_and_encoder_options() {
+        use rusqlite::Connection;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("wdmm_migrate_v14_test_{}.db", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).expect("create v13 db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE _schema_version (version INTEGER PRIMARY KEY);
+                INSERT INTO _schema_version VALUES (13);
+
+                CREATE TABLE transcode_presets (
+                    id                TEXT PRIMARY KEY,
+                    label             TEXT NOT NULL,
+                    video_copy        INTEGER NOT NULL DEFAULT 1,
+                    audio_copy        INTEGER NOT NULL DEFAULT 1,
+                    hw_video_encoder  TEXT NOT NULL DEFAULT '',
+                    hw_video_tier     TEXT NOT NULL DEFAULT 'balanced',
+                    sw_video_encoder  TEXT NOT NULL DEFAULT '',
+                    sw_video_tier     TEXT NOT NULL DEFAULT 'balanced',
+                    video_max_w       INTEGER,
+                    video_max_h       INTEGER,
+                    video_max_bitrate INTEGER,
+                    video_fps_cap     INTEGER,
+                    audio_codec       TEXT NOT NULL DEFAULT 'aac',
+                    audio_bitrate     INTEGER NOT NULL DEFAULT 128000,
+                    audio_channels    INTEGER NOT NULL DEFAULT 2,
+                    audio_sample_rate INTEGER,
+                    hls_segment_secs  INTEGER NOT NULL DEFAULT 4,
+                    sort_order        INTEGER NOT NULL DEFAULT 0,
+                    is_builtin        INTEGER NOT NULL DEFAULT 0,
+                    updated_at        INTEGER NOT NULL
+                );
+
+                -- v13 built-ins: one under its normal id, one under an edited
+                -- id. Both carry is_builtin = 1 and must be replaced by the two
+                -- fresh factory presets rather than duplicated.
+                INSERT INTO transcode_presets VALUES
+                    ('h264', 'Old H264', 1,1,'h264_mediacodec','balanced','libx264','balanced',
+                     1920,1080,4000000,60,'aac',128000,2,44100,4,0,1,21),
+                    ('renamed-old', 'Renamed', 1,1,'hevc_mediacodec','quality','libx264','quality',
+                     1920,1080,3000000,60,'aac',128000,2,44100,4,9,1,22),
+                    -- User rows, one per v13 tier.
+                    ('user-fast', 'Fast', 1,1,'h264_mediacodec','fast','libx264','fast',
+                     1280,720,2000000,30,'aac',96000,2,48000,6,5,0,31),
+                    ('user-quality', 'Quality', 0,1,'','','libx264','quality',
+                     1920,1080,8000000,30,'ac3',192000,6,48000,4,6,0,32),
+                    ('user-invalid-tier', 'Odd', 0,0,'h264_mediacodec','fast','libx264','weird',
+                     640,480,500000,25,'mp2',64000,2,44100,4,7,0,33),
+                    ('user-mpeg2', 'Mpeg2', 0,0,'','fast','mpeg2video','balanced',
+                     720,576,1500000,25,'aac',64000,1,44100,4,8,0,34),
+                    ('user-no-path', 'NoPath', 0,0,'','fast','','fast',
+                     640,480,500000,25,'aac',64000,2,44100,4,9,0,35);
+                "#,
+            )
+            .expect("seed v13 db");
+        }
+
+        let db = LibraryDatabase::open(&path).expect("open db and migrate");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(db.schema_version().unwrap(), 14);
+
+        let all = db.list_transcode_presets().unwrap();
+        let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "h264",
+                "hevc",
+                "user-fast",
+                "user-invalid-tier",
+                "user-mpeg2",
+                "user-no-path",
+                "user-quality",
+            ]
+        );
+
+        // Fresh factory built-ins with the v14 rate-control defaults.
+        let h264 = db.get_transcode_preset("h264").unwrap().unwrap();
+        assert!(h264.is_builtin);
+        assert_eq!(h264.label, "H.264（兼容优先）");
+        assert_eq!(h264.hw_video_encoder, "h264_mediacodec");
+        assert_eq!(h264.sw_video_preset, "veryfast");
+        assert_eq!(h264.video_rate_control, "vbr");
+        assert_eq!(h264.video_quality, None);
+        assert!(h264.hw_video_options.is_empty());
+        assert!(h264.sw_video_options.is_empty());
+        let hevc = db.get_transcode_preset("hevc").unwrap().unwrap();
+        assert_eq!(hevc.label, "H.265（更高压缩）");
+        assert_eq!(hevc.sw_video_preset, "veryfast");
+        assert!(db.get_transcode_preset("renamed-old").unwrap().is_none());
+
+        // v13 tier → x264 preset name.
+        let fast = db.get_transcode_preset("user-fast").unwrap().unwrap();
+        assert_eq!(fast.sw_video_preset, "veryfast");
+        assert_eq!(fast.video_rate_control, "vbr");
+        assert_eq!(fast.hls_segment_secs, 6);
+        assert_eq!(fast.sort_order, 5);
+        assert_eq!(fast.updated_at, 31);
+        let quality = db.get_transcode_preset("user-quality").unwrap().unwrap();
+        assert_eq!(quality.sw_video_preset, "medium");
+        let odd = db
+            .get_transcode_preset("user-invalid-tier")
+            .unwrap()
+            .unwrap();
+        assert_eq!(odd.sw_video_preset, "veryfast");
+        // A non-libx264 software encoder has no preset ladder.
+        let mpeg2 = db.get_transcode_preset("user-mpeg2").unwrap().unwrap();
+        assert_eq!(mpeg2.sw_video_encoder, "mpeg2video");
+        assert_eq!(mpeg2.sw_video_preset, "");
+        // Defensive net: no video path at all → libx264 with the factory preset.
+        let no_path = db.get_transcode_preset("user-no-path").unwrap().unwrap();
+        assert_eq!(no_path.sw_video_encoder, "libx264");
+        assert_eq!(no_path.sw_video_preset, "veryfast");
+        assert!(no_path.has_usable_video_path());
     }
 
     #[test]
@@ -7117,16 +7515,29 @@ mod tests {
         let all = db.list_transcode_presets().unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|p| p.is_builtin));
+        for builtin in &all {
+            // v14 factory values: real x264 preset name, VBR, no CQ value and
+            // empty advanced-option objects.
+            assert_eq!(builtin.sw_video_preset, "veryfast", "{builtin:?}");
+            assert_eq!(builtin.video_rate_control, "vbr");
+            assert_eq!(builtin.video_quality, None);
+            assert!(builtin.hw_video_options.is_empty());
+            assert!(builtin.sw_video_options.is_empty());
+        }
 
         // A built-in can be edited and saved.
         let mut edited = db.get_transcode_preset("h264").unwrap().unwrap();
         edited.label = "My H.264".into();
-        edited.hw_video_tier = "fast".into();
+        edited.sw_video_preset = "medium".into();
+        edited.video_rate_control = "cq".into();
+        edited.video_quality = Some(23);
         edited.video_max_bitrate = Some(2_500_000);
         db.save_transcode_preset(&edited).unwrap();
         let got = db.get_transcode_preset("h264").unwrap().unwrap();
         assert_eq!(got.label, "My H.264");
-        assert_eq!(got.hw_video_tier, "fast");
+        assert_eq!(got.sw_video_preset, "medium");
+        assert_eq!(got.video_rate_control, "cq");
+        assert_eq!(got.video_quality, Some(23));
         assert_eq!(got.video_max_bitrate, Some(2_500_000));
 
         // ...but it cannot be deleted.
@@ -7181,11 +7592,28 @@ mod tests {
             "got {err:?}"
         );
 
-        let mut bad_tier = base.clone();
-        bad_tier.hw_video_tier = "turbo".into();
-        let err = db.save_transcode_preset(&bad_tier).unwrap_err();
+        let mut bad_preset = base.clone();
+        bad_preset.sw_video_preset = "turbo".into();
+        let err = db.save_transcode_preset(&bad_preset).unwrap_err();
         assert!(
-            matches!(err, StorageError::Validation(ref m) if m == "unknown tier: turbo"),
+            matches!(err, StorageError::Validation(ref m) if m == "unknown encoder preset: turbo"),
+            "got {err:?}"
+        );
+
+        let mut bad_rate_control = base.clone();
+        bad_rate_control.video_rate_control = "crf".into();
+        let err = db.save_transcode_preset(&bad_rate_control).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Validation(ref m) if m == "unknown rate control: crf"),
+            "got {err:?}"
+        );
+
+        let mut cq_without_quality = base.clone();
+        cq_without_quality.video_rate_control = "cq".into();
+        cq_without_quality.video_quality = None;
+        let err = db.save_transcode_preset(&cq_without_quality).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Validation(ref m) if m == "cq rate control needs a quality value"),
             "got {err:?}"
         );
 
@@ -7202,6 +7630,6 @@ mod tests {
         // Rejected rows never reach the database.
         let hevc = db.get_transcode_preset("hevc").unwrap().unwrap();
         assert_eq!(hevc.sw_video_encoder, "libx264");
-        assert_eq!(hevc.hw_video_tier, "balanced");
+        assert_eq!(hevc.sw_video_preset, "veryfast");
     }
 }
