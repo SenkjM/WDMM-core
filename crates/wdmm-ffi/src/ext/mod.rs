@@ -8,6 +8,7 @@
 //! per capability means the cut-over slices never edit the same file.
 
 pub mod backup_probe;
+pub mod crypto;
 pub mod cue;
 pub mod sync_codec;
 pub mod tags;

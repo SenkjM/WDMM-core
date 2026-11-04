@@ -16,6 +16,9 @@
 mod backup;
 pub use backup::*;
 
+mod vault_crypto;
+pub use vault_crypto::*;
+
 pub mod cover;
 pub use cover::{
     build_cover_section, detect_image_kind, manga_cover_stem, music_cover_stem,

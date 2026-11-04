@@ -456,76 +456,14 @@ pub(crate) fn ptr_to_str(p: *const c_char) -> Option<&'static str> {
     })
 }
 
-fn ptr_to_bytes(p: *const u8, len: usize) -> Option<Vec<u8>> {
-    if p.is_null() || len == 0 {
-        return None;
-    }
-    Some(unsafe { std::slice::from_raw_parts(p, len).to_vec() })
-}
-
 // ── Crypto FFI ────────────────────────────────────────────────────────────────
+//
+// The legacy `wdmm_crypto_encrypt` / `wdmm_crypto_decrypt` probes are gone: they
+// had no Dart callers and used a different (600k-round) wire format. Credential
+// fields now travel through `ext::crypto` (`wdmm_vault_crypto_*`) and
+// `wdmm_sync::vault_crypto`, which is the single AESGCMv1 implementation.
 
 use base64::prelude::*;
-use wdmm_crypto::CredentialVault;
-
-/// Encrypt `data` bytes with AES-256-GCM using `passphrase`.
-///
-/// Returns base64-encoded ciphertext as an owned `FfiString`, or
-/// `"error:<message>"` on failure. Caller must free the result.
-///
-/// # Safety
-/// `passphrase` must be a valid null-terminated UTF-8 C string.
-/// `data` must point to `data_len` readable bytes (or be null).
-#[no_mangle]
-pub extern "C" fn wdmm_crypto_encrypt(
-    passphrase: *const c_char,
-    data: *const u8,
-    data_len: usize,
-) -> FfiString {
-    let pass = match ptr_to_str(passphrase) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid passphrase pointer"),
-    };
-    let bytes = match ptr_to_bytes(data, data_len) {
-        Some(b) => b,
-        None => return FfiString::from("error:null data"),
-    };
-    match CredentialVault::encrypt(&bytes, pass) {
-        Ok(enc) => FfiString::from(BASE64_STANDARD.encode(&enc)),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
-
-/// Decrypt base64-encoded ciphertext with `passphrase`.
-///
-/// Returns the plaintext bytes as a UTF-8 string (best-effort; binary payloads
-/// should use the dedicated bytes API coming in a later round). Returns
-/// `"error:<message>"` on failure. Caller must free the result.
-///
-/// # Safety
-/// Both pointers must be valid null-terminated UTF-8 C strings.
-#[no_mangle]
-pub extern "C" fn wdmm_crypto_decrypt(
-    passphrase: *const c_char,
-    data_b64: *const c_char,
-) -> FfiString {
-    let pass = match ptr_to_str(passphrase) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid passphrase pointer"),
-    };
-    let b64 = match ptr_to_str(data_b64) {
-        Some(s) => s,
-        None => return FfiString::from("error:null data_b64 pointer"),
-    };
-    let encrypted = match BASE64_STANDARD.decode(b64) {
-        Ok(b) => b,
-        Err(e) => return FfiString::from(format!("error:base64 decode: {e}")),
-    };
-    match CredentialVault::decrypt(&encrypted, pass) {
-        Ok(plain) => FfiString::from(String::from_utf8_lossy(&plain).to_string()),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
 
 // ── Sync FFI ─────────────────────────────────────────────────────────────────
 

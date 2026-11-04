@@ -106,107 +106,42 @@ fn looks_like_json(raw: &[u8]) -> bool {
 }
 
 /// AESGCMv1 field decrypt helper (matching Android CredentialVaultCrypto).
+///
+/// Wire format and KDF live in [`crate::vault_crypto`]; this keeps the legacy
+/// `Option` shape restore paths expect (wrong passphrase / damaged → `None`).
 fn try_decrypt_aesgcmv1(encoded: &str, passphrase: &str) -> Option<String> {
-    const PREFIX: &str = "AESGCMv1:";
-    if !encoded.starts_with(PREFIX) {
+    if !crate::vault_crypto::is_encrypted(encoded) {
         return Some(encoded.to_string());
     }
     if passphrase.is_empty() {
         return None;
     }
-    let b64 = &encoded[PREFIX.len()..];
-    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()?;
-    if raw.len() < 16 + 12 + 16 {
-        return None;
-    }
-    let salt = &raw[0..16];
-    let nonce_bytes = &raw[16..28];
-    let rest = &raw[28..];
-    let mac = &rest[rest.len() - 16..];
-    let ct = &rest[..rest.len() - 16];
-
-    use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Nonce};
-    use pbkdf2::pbkdf2_hmac;
-    use sha2::Sha256;
-
-    let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, 120_000, &mut key);
-    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let mut ciphertext_with_mac = ct.to_vec();
-    ciphertext_with_mac.extend_from_slice(mac);
-    let plaintext = cipher.decrypt(nonce, ciphertext_with_mac.as_slice()).ok()?;
-    String::from_utf8(plaintext).ok()
+    crate::vault_crypto::decrypt_field(encoded, passphrase).ok()
 }
 
 /// AESGCMv1 field encrypt helper (matching Android CredentialVaultCrypto).
+///
+/// An empty passphrase or empty plaintext stays plaintext (legacy backup
+/// behaviour); otherwise [`crate::vault_crypto`] is the single implementation.
 fn encrypt_aesgcmv1(plaintext: &str, passphrase: &str) -> SyncResult<String> {
-    const PREFIX: &str = "AESGCMv1:";
     if passphrase.is_empty() || plaintext.is_empty() {
         return Ok(plaintext.to_string());
     }
-
-    use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Nonce};
-    use pbkdf2::pbkdf2_hmac;
-    use rand::RngCore;
-    use sha2::Sha256;
-
-    let mut salt = [0u8; 16];
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-
-    let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt, 120_000, &mut key);
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| SyncError::Other(format!("aesgcm init: {e}")))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| SyncError::Other(format!("aesgcm encrypt: {e}")))?;
-
-    // Wire: salt16|nonce12|ciphertext|mac16
-    let mut raw = Vec::with_capacity(16 + 12 + ciphertext.len());
-    raw.extend_from_slice(&salt);
-    raw.extend_from_slice(&nonce_bytes);
-    raw.extend_from_slice(&ciphertext);
-
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw);
-    Ok(format!("{PREFIX}{b64}"))
+    crate::vault_crypto::encrypt_field_sync(plaintext, passphrase)
 }
 
-/// Envelope encrypt (unchanged).
+/// Envelope encrypt: `WDMMEN01 | salt16 | nonce12 | ciphertext | tag16`.
+///
+/// Shares the AES-GCM wire with [`crate::vault_crypto`] (120 000 PBKDF2 rounds).
 pub fn envelope_encrypt(plaintext: &[u8], passphrase: &str) -> SyncResult<Vec<u8>> {
     if passphrase.is_empty() {
         return Ok(plaintext.to_vec());
     }
-    // Reuse CredentialVault wire (salt|nonce|ct) but prefix WDMMEN01 and use 120k iters.
-    // Implement locally to match Android iteration count (vault uses 600k).
-    use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Nonce};
-    use pbkdf2::pbkdf2_hmac;
-    use rand::RngCore;
-    use sha2::Sha256;
-
-    let mut salt = [0u8; 16];
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt, PBKDF2_ITERS_ENVELOPE, &mut key);
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| SyncError::Other(format!("encrypt: {e}")))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ct = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| SyncError::Other(format!("encrypt: {e}")))?;
-    let mut out = Vec::with_capacity(8 + 16 + 12 + ct.len());
+    let wire = crate::vault_crypto::seal(plaintext, passphrase, PBKDF2_ITERS_ENVELOPE)
+        .map_err(SyncError::Other)?;
+    let mut out = Vec::with_capacity(8 + wire.len());
     out.extend_from_slice(MAGIC_EN);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ct);
+    out.extend_from_slice(&wire);
     Ok(out)
 }
 
@@ -220,21 +155,7 @@ pub fn envelope_decrypt(data: &[u8], passphrase: &str) -> SyncResult<Vec<u8>> {
     if passphrase.is_empty() {
         return Err(SyncError::Other("err.backupEncryptedNeedPassphrase".into()));
     }
-    use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Nonce};
-    use pbkdf2::pbkdf2_hmac;
-    use sha2::Sha256;
-
-    let salt = &data[8..24];
-    let nonce_bytes = &data[24..36];
-    let ciphertext = &data[36..];
-    let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, PBKDF2_ITERS_ENVELOPE, &mut key);
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| SyncError::Other(format!("decrypt: {e}")))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    cipher
-        .decrypt(nonce, ciphertext)
+    crate::vault_crypto::open(&data[8..], passphrase, PBKDF2_ITERS_ENVELOPE)
         .map_err(|_| SyncError::Other("backup decrypt failed (bad passphrase?)".into()))
 }
 
