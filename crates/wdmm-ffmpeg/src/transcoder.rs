@@ -1041,13 +1041,20 @@ fn encode_grid(source_rate: AVRational, configured_rate: AVRational, seg_secs: u
 /// encoder, and `AV_CODEC_FLAG_GLOBAL_HEADER` makes it emit AVCC extradata in
 /// `codecpar` so the MPEG-TS muxer can insert `h264_mp4toannexb`.
 ///
+/// `bitrate` is always applied: `mediacodecenc.c` only forwards a `bitrate` key
+/// to the platform `MediaFormat` when `avctx->bit_rate` is non-zero, so leaving
+/// it unset does not mean "automatic" — it hands quality to the codec's default,
+/// which is far below what a 1080p stream needs. The caller passes the value
+/// from [`plan_video_encode`], so an unset `video_max_bitrate` still produces a
+/// resolution-derived bitrate (and the preset's tier scales it).
+///
 /// Returns the opened context plus the pixel format, or a diagnostic string
 /// describing the last failure (caller falls back to libx264 and reports it).
 unsafe fn open_hw_video_encoder(
     tag: &str,
     hw_name: &str,
     codec: *const AVCodec,
-    preset: &wdmm_core::models::TranscodePreset,
+    bitrate: i64,
     width: c_int,
     height: c_int,
     framerate: AVRational,
@@ -1067,13 +1074,11 @@ unsafe fn open_hw_video_encoder(
         codctx_set_framerate(ctx, framerate);
         codctx_set_gop_size(ctx, gop);
         codctx_set_max_b_frames(ctx, 0);
-        if let Some(br) = preset.video_max_bitrate {
-            codctx_set_bit_rate(ctx, br as i64);
-        }
+        codctx_set_bit_rate(ctx, bitrate);
         codctx_set_flags(ctx, codctx_flags(ctx) | AV_CODEC_FLAG_GLOBAL_HEADER);
         let ret = avcodec_open2(ctx, codec, std::ptr::null_mut());
         diag::log(format!(
-            "{tag} transcode avcodec_open2(hw video encoder {hw_name} pix_fmt={} gop={gop} max_b_frames=0) rc={ret}",
+            "{tag} transcode avcodec_open2(hw video encoder {hw_name} pix_fmt={} gop={gop} bitrate={bitrate} max_b_frames=0) rc={ret}",
             pix_fmt_name(pix_fmt)
         ));
         if ret >= 0 {
@@ -1536,11 +1541,21 @@ unsafe fn hw_video_encoder_available(
         ));
         return false;
     }
+    // Probe with the same bitrate the real session would use, at 720p30: an
+    // encoder that only accepts a sane bitrate range must not fail here and
+    // then succeed (or vice versa) during the actual cast.
+    let probe_bitrate = i64::from(target_video_bitrate_for_tier(
+        preset,
+        1280,
+        720,
+        30.0,
+        &preset.hw_video_tier,
+    ));
     match open_hw_video_encoder(
         tag,
         &preset.hw_video_encoder,
         codec,
-        preset,
+        probe_bitrate,
         1280,
         720,
         AVRational::new(30, 1),
@@ -3165,7 +3180,14 @@ fn run_transcode(
                     ));
                 } else {
                     match open_hw_video_encoder(
-                        tag, hw_name, hw_codec, preset, out_w, out_h, framerate, video_gop,
+                        tag,
+                        hw_name,
+                        hw_codec,
+                        planned.bitrate,
+                        out_w,
+                        out_h,
+                        framerate,
+                        video_gop,
                     ) {
                         Ok((ctx, pix_fmt)) => {
                             v_enc_ctx = ctx;
