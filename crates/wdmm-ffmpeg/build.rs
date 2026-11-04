@@ -2,9 +2,10 @@
 //!
 //! Links against the FFmpeg shared libraries when the `ffmpeg` Cargo feature
 //! is enabled. The FFI surface in `src/sys.rs` is hand-rolled against the
-//! FFmpeg 7.1 ABI (struct offsets verified via a compile-time offset probe
-//! against the 7.1 headers on x86_64; arm64 is identical because both are
-//! LP64). No headers or pkg-config needed at build time.
+//! FFmpeg 9.0 ABI (struct offsets verified with clang
+//! `-fdump-record-layouts` against the 9.0.2 headers on arm64 and x86_64;
+//! both are LP64 so the layouts agree). No headers or pkg-config needed at
+//! build time.
 //!
 //! `WDMM_FFMPEG_LIB_DIR` adds an extra library search path (Android NDK
 //! cross-build uses this to point at the per-ABI jniLibs staging dir).

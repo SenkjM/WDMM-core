@@ -239,11 +239,13 @@ pub fn segment_gop_size(fps_num: i32, fps_den: i32, seg_secs: u32) -> i32 {
 mod tests {
     use super::*;
 
-    // Codec ids used by the tests (AVCodecID values).
+    // Codec ids used by the tests (AVCodecID values). Video ids shift across
+    // libav major versions (FFmpeg 9.0: HEVC 173→172, VP9 167→166,
+    // AV1 226→222); re-verify on every libav bump.
     const H264: u32 = 27;
-    const VP9: u32 = 167;
-    const HEVC: u32 = 173;
-    const AV1: u32 = 226;
+    const VP9: u32 = 166;
+    const HEVC: u32 = 172;
+    const AV1: u32 = 222;
     const MPEG2: u32 = 2;
     const MP3: u32 = 86017;
     const AAC: u32 = 86018;

@@ -149,7 +149,7 @@ pub fn probe_url(url: &str) -> FfmpegResult<ProbeResult> {
         let mut subs = Vec::new();
         let mut fmt_name = String::new();
 
-        // FFmpeg 7.1 LP64 AVFormatContext: av_class @0, iformat @8, oformat @16,
+        // FFmpeg 9.0 LP64 AVFormatContext: av_class @0, iformat @8, oformat @16,
         // priv_data @24, pb @32. `iformat` is `*const AVInputFormat`; its first
         // field is `const char *name`.
         let iformat_ptr = *(fmt_ctx as *const u8).add(8).cast::<*const *const c_char>();

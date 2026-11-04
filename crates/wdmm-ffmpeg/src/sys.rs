@@ -1,8 +1,9 @@
-//! Hand-rolled FFI bindings for FFmpeg 7.1 (x86_64 / arm64 LP64).
+//! Hand-rolled FFI bindings for FFmpeg 9.0 (x86_64 / arm64 LP64).
 //!
 //! Struct field offsets were verified by compiling a C offset-probe against the
-//! FFmpeg 7.1 source headers on x86_64. arm64 is identical (both LP64).
-//! armeabi-v7a (ILP32, 32-bit pointers) is NOT supported.
+//! FFmpeg n9.0.2 source headers on x86_64 (and the n9.0.2 arm64-v8a build with
+//! `llvm-nm`). arm64 is identical (both LP64). armeabi-v7a (ILP32, 32-bit
+//! pointers) is NOT supported.
 //!
 //! Large opaque types (AVFormatContext, AVCodecContext, AVFrame, …) are
 //! declared as zero-sized markers; fields are accessed via pointer arithmetic
@@ -74,7 +75,7 @@ pub const AV_CODEC_ID_H264: AVCodecID = 27;
 pub const AV_CODEC_ID_AAC: AVCodecID = 86018;
 pub const AV_CODEC_ID_MP3: AVCodecID = 86017;
 
-// Pixel/sample format values (FFmpeg 7.1).
+// Pixel/sample format values (FFmpeg 9.0; unchanged since 7.1).
 pub const AV_PIX_FMT_YUV420P: AVPixelFormat = 0;
 /// `AV_PIX_FMT_NV12` — the MediaCodec ByteBuffer semi-planar format.
 pub const AV_PIX_FMT_NV12: AVPixelFormat = 23;
@@ -91,7 +92,11 @@ pub const AV_CODEC_FLAG_GLOBAL_HEADER: c_int = 1 << 22;
 /// across the GOP boundary). The HLS muxer cuts copy/encode streams only on
 /// keyframes, so a closed GOP is what makes an encoded segment independently
 /// decodable from its first frame.
-pub const AV_CODEC_FLAG_CLOSED_GOP: c_int = 1 << 1;
+///
+/// `avcodec.h` defines this as `(1U << 31)`, i.e. the sign bit of the `int`
+/// `flags` field. That value is easy to mis-transcribe: `1 << 1` (avoids the
+/// shift-overflow warning) is `AV_CODEC_FLAG_QSCALE`, not a GOP flag.
+pub const AV_CODEC_FLAG_CLOSED_GOP: c_int = c_int::MIN;
 
 /// `AVINDEX_KEYFRAME` — the low bits of `AVIndexEntry::flags_and_size` mark an
 /// index entry as a keyframe.
@@ -186,11 +191,14 @@ pub unsafe fn normalized_layout(layout: *const AVChannelLayout) -> AVChannelLayo
     out
 }
 
-// ── AVCodecParameters (176 bytes, LP64) ──────────────────────────────────────
+// ── AVCodecParameters (184 bytes, LP64, FFmpeg 9.0) ─────────────────────────
 // codec_type=0(4), codec_id=4(4), _gap=8(36),
 // format=44(4), bit_rate=48(8), _gap=56(16),
 // width=72(4), height=76(4), _gap=80(48),
-// ch_layout=128(24), sample_rate=152(4), _tail=156(20).
+// ch_layout=128(24), sample_rate=152(4), _tail=156(28).
+//
+// FFmpeg 8.0 added alpha_mode/color fields after sample_rate; size grew
+// 176→184 but every field this crate reads kept its offset.
 
 #[repr(C)]
 pub struct AVCodecParameters {
@@ -205,12 +213,15 @@ pub struct AVCodecParameters {
     _gap2: [u8; 48],                // +80 (48)
     pub ch_layout: AVChannelLayout, // +128 (24)
     pub sample_rate: c_int,         // +152 (4)
-    _tail: [u8; 20],                // +156 (20)
-} // sizeof=176 ✓
+    _tail: [u8; 28],                // +156 (28)
+} // sizeof=184 ✓ (FFmpeg 9.0)
 
-// ── AVStream (232 bytes, LP64) ────────────────────────────────────────────────
+// ── AVStream (216 bytes, LP64, FFmpeg 9.0) ──────────────────────────────────
 // _avclass=0(8), index=8(4), id=12(4), codecpar=16(8),
-// _opaque=24(8), time_base=32(8), start_time=40(8), duration=48(8), _tail=56(176).
+// _opaque=24(8), time_base=32(8), start_time=40(8), duration=48(8),
+// nb_frames=56(8), disposition=64(4), discard=68(4), sample_aspect_ratio=72(8),
+// metadata=80(8), avg_frame_rate=88(8), attached_pic=96(104), event_flags=200(4),
+// r_frame_rate=204(8), pts_wrap_bits=212(4).
 
 #[repr(C)]
 pub struct AVStream {
@@ -223,11 +234,11 @@ pub struct AVStream {
     pub start_time: i64,                  // +40 (8)
     pub duration: i64,                    // +48 (8)
     /// nb_frames (i64 @ +56) … discard/sample_aspect_ratio/metadata/avg_frame_rate/
-    /// attached_pic/side_data/nb_side_data/event_flags
-    _gap0: [u8; 160], // +56  .. +216
-    pub r_frame_rate: AVRational,         // +216 (8)
-    _tail: [u8; 8],                       // +224 (8)
-} // sizeof=232 ✓
+    /// attached_pic/side_data/nb_side_data/event_flags.
+    _gap0: [u8; 148], // +56  .. +204
+    pub r_frame_rate: AVRational,         // +204 (8)
+    _tail: [u8; 4],                       // +212 (4)
+} // sizeof=216 ✓ (FFmpeg 9.0; 7.1 was 232 with r_frame_rate @216)
 
 // ── AVPacket (104 bytes, LP64) ────────────────────────────────────────────────
 // _buf=0(8), pts=8(8), dts=16(8), data=24(8),
@@ -329,7 +340,7 @@ pub struct AVSubtitleRect {
 
 // ── Field accessors for opaque types (pointer arithmetic, verified offsets) ───
 
-// AVFormatContext: sizeof=472
+// AVFormatContext: sizeof=480 (FFmpeg 9.0; the fields below did not move)
 /// nb_streams (u32 @ +44)
 #[inline]
 pub unsafe fn fmtctx_nb_streams(c: *const AVFormatContext) -> u32 {
@@ -361,19 +372,19 @@ pub unsafe fn codctx_set_time_base(c: *mut AVCodecContext, v: AVRational) {
 pub unsafe fn codctx_set_bit_rate(c: *mut AVCodecContext, v: i64) {
     *(c as *mut u8).add(56).cast() = v;
 }
-/// width (i32 @ +116), height (i32 @ +120)
+/// width (i32 @ +112), height (i32 @ +116) — FFmpeg 9.0 added `delay @108`.
 #[inline]
 pub unsafe fn codctx_set_width(c: *mut AVCodecContext, v: c_int) {
-    *(c as *mut u8).add(116).cast() = v;
+    *(c as *mut u8).add(112).cast() = v;
 }
 #[inline]
 pub unsafe fn codctx_set_height(c: *mut AVCodecContext, v: c_int) {
-    *(c as *mut u8).add(120).cast() = v;
+    *(c as *mut u8).add(116).cast() = v;
 }
-/// pix_fmt (i32 @ +140)
+/// pix_fmt (i32 @ +136)
 #[inline]
 pub unsafe fn codctx_set_pix_fmt(c: *mut AVCodecContext, v: c_int) {
-    *(c as *mut u8).add(140).cast() = v;
+    *(c as *mut u8).add(136).cast() = v;
 }
 /// gop_size (i32 @ +332), max_b_frames (i32 @ +200)
 #[inline]
@@ -423,7 +434,8 @@ pub unsafe fn codctx_set_framerate(c: *mut AVCodecContext, v: AVRational) {
     *(c as *mut u8).add(100).cast() = v;
 }
 
-// AVFrame: sizeof=440
+// AVFrame: sizeof=424 (FFmpeg 9.0; 7.1 was 440 with sample_rate@192,
+// hw_frames_ctx@352, ch_layout@408)
 /// width(i32@+104), height(i32@+108), nb_samples(i32@+112), format(i32@+116)
 #[inline]
 pub unsafe fn frame_width(f: *const AVFrame) -> c_int {
@@ -447,7 +459,7 @@ pub unsafe fn frame_pts(f: *const AVFrame) -> i64 {
 }
 #[inline]
 pub unsafe fn frame_sample_rate(f: *const AVFrame) -> c_int {
-    *(f as *const u8).add(192).cast()
+    *(f as *const u8).add(180).cast()
 }
 /// data[plane] (*mut u8 @ +plane*8)
 #[inline]
@@ -459,10 +471,10 @@ pub unsafe fn frame_data(f: *const AVFrame, plane: usize) -> *mut u8 {
 pub unsafe fn frame_linesize(f: *const AVFrame, plane: usize) -> c_int {
     *(f as *const u8).add(64 + plane * 4).cast()
 }
-/// ch_layout (AVChannelLayout @ +408)
+/// ch_layout (AVChannelLayout @ +384)
 #[inline]
 pub unsafe fn frame_ch_layout(f: *const AVFrame) -> *const AVChannelLayout {
-    (f as *const u8).add(408).cast()
+    (f as *const u8).add(384).cast()
 }
 /// extended_data (uint8_t ** @ +96) — planar audio planes live here
 #[inline]
@@ -492,15 +504,15 @@ pub unsafe fn frame_set_pts(f: *mut AVFrame, v: i64) {
 }
 #[inline]
 pub unsafe fn frame_set_sample_rate(f: *mut AVFrame, v: c_int) {
-    *(f as *mut u8).add(192).cast() = v;
+    *(f as *mut u8).add(180).cast() = v;
 }
 #[inline]
 pub unsafe fn frame_set_ch_layout(f: *mut AVFrame, v: AVChannelLayout) {
-    *(f as *mut u8).add(408).cast() = v;
+    *(f as *mut u8).add(384).cast() = v;
 }
 
-// AVStream helpers (offsets verified against FFmpeg 7.1 libavformat/avformat.h).
-/// `r_frame_rate` (AVRational @ +216 / +220). `+56` is `nb_frames`, not a rate.
+// AVStream helpers (offsets verified against FFmpeg 9.0 libavformat/avformat.h).
+/// `r_frame_rate` (AVRational @ +204 / +208). `+56` is `nb_frames`, not a rate.
 #[inline]
 pub unsafe fn stream_r_frame_rate(s: *const AVStream) -> AVRational {
     (*s).r_frame_rate
@@ -804,10 +816,10 @@ pub fn av_err2str(errnum: c_int) -> String {
 
 // ── Hardware decode / device bindings (MediaCodec) ───────────────────────────
 //
-// Everything below was verified against the FFmpeg n7.1.5 headers with the NDK
+// Everything below was verified against the FFmpeg n9.0.2 headers with the NDK
 // clang record-layout dump (`-target aarch64-linux-android24 -Xclang
 // -fdump-record-layouts`) and, for the enum values, by compiling a small probe
-// TU that prints `AV_HWDEVICE_TYPE_MEDIACODEC` / `AV_PIX_FMT_*` / the
+// TU that emits `AV_HWDEVICE_TYPE_MEDIACODEC` / `AV_PIX_FMT_*` / the
 // `AV_CODEC_HW_CONFIG_METHOD_*` and `AV_HWFRAME_TRANSFER_DIRECTION_*`
 // constants (LP64 — identical layout on x86_64 and arm64).
 
@@ -834,18 +846,19 @@ pub const AV_HWFRAME_TRANSFER_DIRECTION_TO: AVHWFrameTransferDirection = 1;
 pub const AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX: c_int = 1 << 0;
 
 /// `AVBufferRef` (libavutil/buffer.h), sizeof = 24 with LP64:
-/// `AVBuffer *buffer @0`, `uint8_t *data @8`, `int size @16` (+4 tail pad).
+/// `AVBuffer *buffer @0`, `uint8_t *data @8`, `size_t size @16`.
 #[repr(C)]
 pub struct AVBufferRef {
     pub buffer: *mut c_void, // +0
     pub data: *mut u8,       // +8
-    pub size: c_int,         // +16
+    pub size: usize,         // +16 (size_t)
 }
 
 /// `AVCodecHWConfig` (libavcodec/codec.h), sizeof = 12:
 /// `enum AVPixelFormat pix_fmt @0`, `int methods @4`,
-/// `enum AVHWDeviceType device_type @8`. FFmpeg 7.1 has **no** `flags` field
-/// here (older 4.x layouts did — do not copy stale offsets from the web).
+/// `enum AVHWDeviceType device_type @8`. FFmpeg 9.0 (like 7.1) has **no**
+/// `flags` field here (older 4.x layouts did — do not copy stale offsets from
+/// the web).
 #[repr(C)]
 pub struct AVCodecHWConfig {
     pub pix_fmt: AVPixelFormat,      // +0 (4)
@@ -892,10 +905,10 @@ pub unsafe fn codctx_hw_device_ctx(c: *const AVCodecContext) -> *mut AVBufferRef
 pub unsafe fn codctx_set_hw_device_ctx(c: *mut AVCodecContext, v: *mut AVBufferRef) {
     *(c as *mut u8).add(560).cast() = v;
 }
-/// `AVBufferRef *hw_frames_ctx` on AVFrame @ +352 (sizeof(AVFrame) = 440).
+/// `AVBufferRef *hw_frames_ctx` on AVFrame @ +328 (sizeof(AVFrame) = 424).
 #[inline]
 pub unsafe fn frame_hw_frames_ctx(f: *const AVFrame) -> *mut AVBufferRef {
-    *(f as *const u8).add(352).cast()
+    *(f as *const u8).add(328).cast()
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -922,4 +935,144 @@ extern "C" {
 
     // hw config probing
     pub fn avcodec_get_hw_config(codec: *const AVCodec, index: c_int) -> *const AVCodecHWConfig;
+}
+
+// ── ABI layout assertions ─────────────────────────────────────────────────────
+//
+// These pin the hand-written FFmpeg 9.0 layouts the accessors above rely on. A
+// libav bump that moves a field must fail here instead of silently reading the
+// wrong bytes at runtime. Keep them in sync with the clang
+// `-fdump-record-layouts` audit (`docs/`/`.tmp/audit/sys-offsets-audit.md`) for
+// the next major version.
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn mirrored_struct_sizes_match_ffmpeg_9() {
+        assert_eq!(size_of::<AVRational>(), 8);
+        assert_eq!(size_of::<AVChannelLayout>(), 24);
+        assert_eq!(size_of::<AVCodecParameters>(), 184);
+        assert_eq!(size_of::<AVStream>(), 216);
+        assert_eq!(size_of::<AVPacket>(), 104);
+        assert_eq!(size_of::<AVSubtitle>(), 32);
+        assert_eq!(size_of::<AVIndexEntry>(), 24);
+        assert_eq!(size_of::<AVDictionaryEntry>(), 16);
+        assert_eq!(size_of::<AVCodecHWConfig>(), 12);
+        assert_eq!(size_of::<AVBufferRef>(), 24);
+    }
+
+    #[test]
+    fn public_field_offsets_match_ffmpeg_9() {
+        assert_eq!(offset_of!(AVCodecParameters, codec_type), 0);
+        assert_eq!(offset_of!(AVCodecParameters, codec_id), 4);
+        assert_eq!(offset_of!(AVCodecParameters, format), 44);
+        assert_eq!(offset_of!(AVCodecParameters, bit_rate), 48);
+        assert_eq!(offset_of!(AVCodecParameters, width), 72);
+        assert_eq!(offset_of!(AVCodecParameters, height), 76);
+        assert_eq!(offset_of!(AVCodecParameters, ch_layout), 128);
+        assert_eq!(offset_of!(AVCodecParameters, sample_rate), 152);
+
+        assert_eq!(offset_of!(AVStream, index), 8);
+        assert_eq!(offset_of!(AVStream, id), 12);
+        assert_eq!(offset_of!(AVStream, codecpar), 16);
+        assert_eq!(offset_of!(AVStream, time_base), 32);
+        assert_eq!(offset_of!(AVStream, start_time), 40);
+        assert_eq!(offset_of!(AVStream, duration), 48);
+        assert_eq!(offset_of!(AVStream, r_frame_rate), 204);
+
+        assert_eq!(offset_of!(AVPacket, pts), 8);
+        assert_eq!(offset_of!(AVPacket, dts), 16);
+        assert_eq!(offset_of!(AVPacket, data), 24);
+        assert_eq!(offset_of!(AVPacket, size), 32);
+        assert_eq!(offset_of!(AVPacket, stream_index), 36);
+        assert_eq!(offset_of!(AVPacket, flags), 40);
+        assert_eq!(offset_of!(AVPacket, duration), 64);
+        assert_eq!(offset_of!(AVPacket, pos), 72);
+        assert_eq!(offset_of!(AVPacket, time_base), 96);
+
+        assert_eq!(offset_of!(AVIndexEntry, pos), 0);
+        assert_eq!(offset_of!(AVIndexEntry, timestamp), 8);
+        assert_eq!(offset_of!(AVIndexEntry, flags_and_size), 16);
+        assert_eq!(offset_of!(AVIndexEntry, min_distance), 20);
+
+        assert_eq!(offset_of!(AVDictionaryEntry, key), 0);
+        assert_eq!(offset_of!(AVDictionaryEntry, value), 8);
+
+        assert_eq!(offset_of!(AVCodecHWConfig, pix_fmt), 0);
+        assert_eq!(offset_of!(AVCodecHWConfig, methods), 4);
+        assert_eq!(offset_of!(AVCodecHWConfig, device_type), 8);
+
+        assert_eq!(offset_of!(AVBufferRef, buffer), 0);
+        assert_eq!(offset_of!(AVBufferRef, data), 8);
+        assert_eq!(offset_of!(AVBufferRef, size), 16);
+    }
+
+    #[test]
+    fn opaque_accessors_write_the_9_0_offsets() {
+        // AVCodecContext: 9.0 added `int delay @108` before the frame fields, so
+        // width/height/pix_fmt moved (116/120/140 → 112/116/136).
+        let mut cod = [0u8; 864];
+        let c = cod.as_mut_ptr().cast::<AVCodecContext>();
+        unsafe {
+            codctx_set_width(c, 1920);
+            codctx_set_height(c, 1080);
+            codctx_set_pix_fmt(c, AV_PIX_FMT_NV12);
+        }
+        assert_eq!(i32::from_ne_bytes(cod[112..116].try_into().unwrap()), 1920);
+        assert_eq!(i32::from_ne_bytes(cod[116..120].try_into().unwrap()), 1080);
+        assert_eq!(
+            i32::from_ne_bytes(cod[136..140].try_into().unwrap()),
+            AV_PIX_FMT_NV12
+        );
+
+        // AVFrame: sample_rate @180, hw_frames_ctx @328, ch_layout @384.
+        let mut frame = [0u8; 424];
+        let f = frame.as_mut_ptr().cast::<AVFrame>();
+        let layout = AVChannelLayout {
+            order: 1,
+            nb_channels: 2,
+            _u: 3,
+            _opaque: 0,
+        };
+        unsafe {
+            frame_set_sample_rate(f, 48_000);
+            frame_set_ch_layout(f, layout);
+            frame_set_format(f, AV_PIX_FMT_MEDIACODEC);
+            assert!(frame_hw_frames_ctx(f).is_null());
+        }
+        assert_eq!(
+            i32::from_ne_bytes(frame[180..184].try_into().unwrap()),
+            48_000
+        );
+        assert_eq!(i32::from_ne_bytes(frame[384..388].try_into().unwrap()), 1);
+        assert_eq!(i32::from_ne_bytes(frame[388..392].try_into().unwrap()), 2);
+        assert_eq!(
+            i32::from_ne_bytes(frame[116..120].try_into().unwrap()),
+            AV_PIX_FMT_MEDIACODEC
+        );
+
+        // AVStream.r_frame_rate lives in the mirrored struct (@204), not a helper
+        // offset.
+        let mut stream = [0u8; 216];
+        let s = stream.as_mut_ptr().cast::<AVStream>();
+        unsafe {
+            (*s).r_frame_rate = AVRational {
+                num: 24_000,
+                den: 1_001,
+            }
+        };
+        assert_eq!(unsafe { stream_r_frame_rate(s) }.num, 24_000);
+    }
+
+    #[test]
+    fn constants_match_ffmpeg_9() {
+        // AV_CODEC_FLAG_CLOSED_GOP is (1U << 31); `1 << 1` would be QSCALE.
+        assert_eq!(AV_CODEC_FLAG_CLOSED_GOP, i32::MIN);
+        assert_eq!(AV_CODEC_FLAG_GLOBAL_HEADER, 1 << 22);
+        assert_eq!(AV_PIX_FMT_MEDIACODEC, 164);
+        assert_eq!(AV_HWDEVICE_TYPE_MEDIACODEC, 10);
+        assert_eq!(AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, 1);
+    }
 }

@@ -156,7 +156,9 @@ pub fn all_builtin_presets() -> [TranscodePreset; 5] {
 /// in the cheap hybrid mode instead of a full re-encode.
 pub fn is_mpegts_video_copy_compatible(codec_id: u32) -> bool {
     use crate::sys::AV_CODEC_ID_H264;
-    const AV_CODEC_ID_HEVC: u32 = 173;
+    // AVCodecID values shift across libav major versions: FFmpeg 9.0 renumbered
+    // several video codecs (HEVC 173→172). Re-verify on every libav bump.
+    const AV_CODEC_ID_HEVC: u32 = 172;
     const AV_CODEC_ID_MPEG2: u32 = 2;
 
     matches!(codec_id, v if v == AV_CODEC_ID_H264
@@ -182,13 +184,15 @@ mod tests {
     use super::*;
     use crate::sys::{AV_CODEC_ID_AAC, AV_CODEC_ID_H264, AV_CODEC_ID_MP3};
 
-    // FFmpeg 7.1 AVCodecID values not modelled in `sys`.
-    const AV_CODEC_ID_HEVC: u32 = 173;
+    // AVCodecID values not modelled in `sys`. They shift across libav major
+    // versions (FFmpeg 9.0: HEVC 173→172, VP9 167→166, AV1 226→222); re-verify
+    // on every libav bump.
+    const AV_CODEC_ID_HEVC: u32 = 172;
     const AV_CODEC_ID_MPEG2: u32 = 2;
     const AV_CODEC_ID_OPUS: u32 = 86076;
     const AV_CODEC_ID_FLAC: u32 = 86028;
-    const AV_CODEC_ID_VP9: u32 = 167;
-    const AV_CODEC_ID_AV1: u32 = 226;
+    const AV_CODEC_ID_VP9: u32 = 166;
+    const AV_CODEC_ID_AV1: u32 = 222;
     const AV_CODEC_ID_AC3: u32 = 86019;
     const AV_CODEC_ID_EAC3: u32 = 86056;
 

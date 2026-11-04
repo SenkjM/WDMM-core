@@ -62,8 +62,9 @@ use crate::sys::{
     AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P,
 };
 
-/// `AV_CODEC_ID_HEVC` (libavcodec/codec_id.h).
-pub const AV_CODEC_ID_HEVC: AVCodecID = 173;
+/// `AV_CODEC_ID_HEVC` (libavcodec/codec_id.h). FFmpeg 9.0 renumbered it from
+/// 173 (7.x) to 172, so this must track the linked major version.
+pub const AV_CODEC_ID_HEVC: AVCodecID = 172;
 
 /// mediacodec decoder name for H.264, NUL-terminated for the C API.
 const H264_MEDIACODEC: &[u8] = b"h264_mediacodec\0";
