@@ -49,6 +49,13 @@ pub const AV_NOPTS_VALUE: i64 = i64::MIN;
 pub const AVERROR_EAGAIN: c_int = -11;
 /// `AVERROR_EOF` — end of stream.
 pub const AVERROR_EOF: c_int = -541_478_725;
+/// `AVERROR_INPUT_CHANGED` — the decoded frame no longer matches the source
+/// description libswresample was configured with (`FFERRTAG(0x01,'g','n','c')`).
+/// The resampler returns it before converting anything, so the frame is still
+/// available for a retry after a reconfigure.
+pub const AVERROR_INPUT_CHANGED: c_int = -1_668_179_713;
+/// `AVERROR_OUTPUT_CHANGED` — the output frame no longer matches the resampler.
+pub const AVERROR_OUTPUT_CHANGED: c_int = -1_668_179_714;
 
 /// `avio_open` flag: write-only.
 pub const AVIO_FLAG_WRITE: c_int = 2;
@@ -72,6 +79,8 @@ pub const AV_PIX_FMT_YUV420P: AVPixelFormat = 0;
 /// `AV_PIX_FMT_NV12` — the MediaCodec ByteBuffer semi-planar format.
 pub const AV_PIX_FMT_NV12: AVPixelFormat = 23;
 pub const AV_SAMPLE_FMT_FLTP: AVSampleFormat = 8;
+/// `AV_SAMPLE_FMT_NONE` — sentinel for an undecided sample format.
+pub const AV_SAMPLE_FMT_NONE: AVSampleFormat = -1;
 pub const AV_SAMPLE_FMT_S16P: AVSampleFormat = 6;
 
 /// `AV_CODEC_FLAG_GLOBAL_HEADER` — put extradata in `codecpar` instead of the
@@ -110,13 +119,22 @@ impl AVRational {
 // order=0(4), nb_channels=4(4), u=8(8 union mask|ptr), opaque=16(8).
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct AVChannelLayout {
     pub order: c_int,       // +0  AVChannelOrder
     pub nb_channels: c_int, // +4
     _u: u64,                // +8  union (channel mask for NATIVE order)
     _opaque: u64,           // +16 custom channel-map pointer (usually 0)
 } // sizeof=24 ✓
+
+/// `AV_CHANNEL_ORDER_UNSPEC` — the container did not describe the channel order
+/// (legacy AVI/PCM/AC-3 streams report `channel_layout=unknown`). libswresample
+/// normalises such a layout to a default one when configuring, then rejects the
+/// raw `UNSPEC` frames with `AVERROR_INPUT_CHANGED`, so callers must hand it the
+/// same normalised layout in both places.
+pub const AV_CHANNEL_ORDER_UNSPEC: c_int = 0;
+/// `AV_CHANNEL_ORDER_NATIVE` — layout described by an `AV_CH_LAYOUT_*` mask.
+pub const AV_CHANNEL_ORDER_NATIVE: c_int = 1;
 
 impl AVChannelLayout {
     /// Stereo (AV_CHANNEL_ORDER_NATIVE, mask = FL|FR = 3).
@@ -137,6 +155,35 @@ impl AVChannelLayout {
             _opaque: 0,
         }
     }
+
+    /// `AVChannelOrder` of this layout.
+    pub fn order(&self) -> c_int {
+        self.order
+    }
+
+    /// Native channel mask (only meaningful for `AV_CHANNEL_ORDER_NATIVE`).
+    pub fn native_mask(&self) -> u64 {
+        self._u
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+/// Copy `layout` into a layout libav can convert: an `UNSPEC` layout is replaced
+/// by the default native layout for the same channel count.
+///
+/// # Safety
+///
+/// `layout` must be null or point to a valid [`AVChannelLayout`].
+pub unsafe fn normalized_layout(layout: *const AVChannelLayout) -> AVChannelLayout {
+    let mut out = if layout.is_null() {
+        AVChannelLayout::default()
+    } else {
+        *layout
+    };
+    if out.order == AV_CHANNEL_ORDER_UNSPEC && out.nb_channels > 0 {
+        av_channel_layout_default(&mut out, out.nb_channels);
+    }
+    out
 }
 
 // ── AVCodecParameters (176 bytes, LP64) ──────────────────────────────────────
@@ -685,6 +732,8 @@ extern "C" {
     ) -> c_int;
     pub fn swr_init(s: *mut SwrContext) -> c_int;
     pub fn swr_free(s: *mut *mut SwrContext);
+    /// Fill `ch_layout` with the default native layout for `nb_channels`.
+    pub fn av_channel_layout_default(ch_layout: *mut AVChannelLayout, nb_channels: c_int);
     pub fn swr_convert_frame(
         swr: *mut SwrContext,
         output: *mut AVFrame,

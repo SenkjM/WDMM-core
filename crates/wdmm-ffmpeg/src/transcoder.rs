@@ -42,6 +42,12 @@ const MS_TB: AVRational = AVRational::new(1, 1000);
 /// How often (~ms of wall time) to emit a progress diagnostic line.
 const PROGRESS_LOG_EVERY_MS: i64 = 2_000;
 
+/// How many times one decoded audio frame may be retried after the resampler
+/// reports that the source description changed. A legacy AVI typically flips
+/// once (unspecified → concrete channel layout); the cap only stops a source
+/// that changes on every frame from spinning.
+const MAX_AUDIO_RECONFIGURES: u32 = 8;
+
 // ── Remux decision (pure logic lives in `crate::plan`, host-testable) ──────
 
 use crate::plan::{
@@ -1404,6 +1410,147 @@ unsafe fn open_audio_encoder(
     Ok((enc_ctx, codec_display_name(codec_id)))
 }
 
+/// Repairs timestamps for sources that do not carry per-packet time.
+///
+/// AVI stores a frame index instead of a pts, so an H.264 stream in AVI reaches
+/// the muxer with `AV_NOPTS_VALUE` on every packet and `av_interleaved_write_frame`
+/// answers EINVAL (`Invalid argument`). Such a stream is given a synthetic clock
+/// taken from the packet duration (copy) or the encoder frame rate (transcode);
+/// real timestamps are always kept, and an encoder input is nudged forward when
+/// the source repeats or rewinds its clock.
+struct TimestampRepair {
+    /// Nominal distance between two timestamps, in the output time base.
+    step: i64,
+    /// Where the synthetic clock starts: the point this run begins at, so a
+    /// seeked run keeps the container timeline instead of restarting at zero.
+    seed: i64,
+    /// Shift applied to real timestamps so the first one lands on `seed`.
+    offset: Option<i64>,
+    last: Option<i64>,
+}
+
+impl TimestampRepair {
+    const fn new() -> Self {
+        Self {
+            step: 0,
+            seed: 0,
+            offset: None,
+            last: None,
+        }
+    }
+
+    /// Synthetic clock that begins at `seed` output ticks.
+    const fn seeded(seed: i64) -> Self {
+        Self {
+            step: 0,
+            seed,
+            offset: None,
+            last: None,
+        }
+    }
+
+    /// Remember the frame length so a gap can be filled with the right step.
+    fn observe_step(&mut self, step: i64) {
+        if step > 0 {
+            self.step = step;
+        }
+    }
+
+    /// Continue the synthetic clock from the last known timestamp.
+    fn fill_missing(&mut self) -> i64 {
+        let step = self.step.max(1);
+        let next = self.last.map(|last| last + step).unwrap_or(self.seed);
+        self.last = Some(next);
+        next
+    }
+
+    /// How far a real timestamp has to move for the run to start at `seed`.
+    ///
+    /// Streams of one file disagree about where a seek left them: a container
+    /// without per-packet time answers `0` for audio while the video packets
+    /// still report the scan position. One anchor per run is what keeps the two
+    /// tracks in step; a run that starts at zero keeps the container clock
+    /// verbatim.
+    fn align_offset(&mut self, raw: i64) -> i64 {
+        if self.seed == 0 {
+            return 0;
+        }
+        match self.offset {
+            Some(offset) => offset,
+            None => {
+                let offset = self.seed - raw;
+                self.offset = Some(offset);
+                offset
+            }
+        }
+    }
+
+    /// Record a real timestamp so a later gap continues from it.
+    fn note(&mut self, timestamp: i64) {
+        if timestamp != AV_NOPTS_VALUE {
+            self.last = Some(timestamp);
+        }
+    }
+
+    /// Timestamp for an encoder input frame: fills gaps and makes the sequence
+    /// strictly increasing (libx264 warns about non-monotonic pts and the muxer
+    /// rejects it).
+    fn repair_monotonic(&mut self, mut raw: i64) -> i64 {
+        if raw != AV_NOPTS_VALUE {
+            raw = raw.saturating_add(self.align_offset(raw));
+        }
+        let step = self.step.max(1);
+        let next = match self.last {
+            None if raw == AV_NOPTS_VALUE => self.seed,
+            None => raw.max(self.seed),
+            Some(last) if raw == AV_NOPTS_VALUE || raw <= last => last + step,
+            Some(_) => raw,
+        };
+        self.last = Some(next);
+        next
+    }
+}
+
+/// Output ticks corresponding to the media position where this run starts.
+///
+/// A run that begins mid-file (a seek) has to stamp its frames on the container
+/// timeline: a source without per-packet time would otherwise start at zero and
+/// drift away from the audio track, which is seeded from the same offset.
+unsafe fn run_start_ticks(
+    out_ctx: *mut AVFormatContext,
+    out_idx: i32,
+    start_offset_secs: f64,
+) -> i64 {
+    if out_idx < 0 || out_ctx.is_null() {
+        return 0;
+    }
+    let streams = fmtctx_streams(out_ctx);
+    if streams.is_null() {
+        return 0;
+    }
+    start_ticks_in(
+        (*(*streams.add(out_idx as usize))).time_base,
+        start_offset_secs,
+    )
+}
+
+/// Same as [`run_start_ticks`], for callers that already know the time base
+/// (the encoder's, before the muxer rescales).
+unsafe fn start_ticks_in(time_base: AVRational, start_offset_secs: f64) -> i64 {
+    if start_offset_secs <= 0.01 {
+        return 0;
+    }
+    if time_base.num <= 0 || time_base.den <= 0 {
+        return 0;
+    }
+    let micros = (start_offset_secs * 1_000_000.0).round() as i64;
+    av_rescale_q(micros, AVRational::new(1, 1_000_000), time_base)
+}
+
+/// How far the first decoded frame may sit from the run's start position before
+/// its timestamp is treated as a container restart rather than a real clock.
+const AUDIO_ANCHOR_TOLERANCE_SECS: f64 = 3.0;
+
 /// Audio transcode pipeline: swresample context plus a sample FIFO.
 ///
 /// swresample hands back whatever sample count the decoder produced (FLAC emits
@@ -1429,8 +1576,16 @@ struct AudioPipeline {
     /// Decoder time_base of the audio stream, used to reseat `next_pts` on the
     /// first decoded frame. Zero means "unknown" and keeps `start_samples`.
     dec_tb: AVRational,
-    /// First decoded frame described the source format; later frames must match.
-    source_configured: bool,
+    ///
+    /// Source description the resampler was last configured for; a mid-run
+    /// change is logged when the resampler is rebuilt for it. `in_layout` is the
+    /// normalised copy (see `normalized_layout`) that both the configuration and
+    /// every converted frame carry: legacy containers report an `UNSPEC` layout
+    /// that libswresample would otherwise reject on every single frame.
+    in_format: c_int,
+    in_rate: c_int,
+    in_channels: c_int,
+    in_layout: AVChannelLayout,
 }
 
 impl Default for AudioPipeline {
@@ -1444,7 +1599,10 @@ impl Default for AudioPipeline {
             next_pts: 0,
             start_samples: 0,
             dec_tb: AVRational::new(0, 1),
-            source_configured: false,
+            in_format: AV_SAMPLE_FMT_NONE,
+            in_rate: 0,
+            in_channels: 0,
+            in_layout: AVChannelLayout::default(),
         }
     }
 }
@@ -1476,21 +1634,28 @@ impl AudioPipeline {
         self.dec_tb = tb;
     }
 
-    /// Lazily configure swresample/FIFO from the first decoded frame.
-    unsafe fn ensure(
+    /// Configure swresample for `dec_frame`'s source format and, on the first
+    /// call, allocate the re-chunking FIFO.
+    ///
+    /// Called again when a frame no longer matches: legacy containers do not
+    /// store a channel layout, so decoders may report "unspecified" first and a
+    /// concrete layout later, and some streams switch sample format mid-file.
+    unsafe fn configure(
         &mut self,
         a_enc_ctx: *mut AVCodecContext,
         dec_frame: *mut AVFrame,
     ) -> FfmpegResult<()> {
-        if self.source_configured {
-            return Ok(());
+        if !self.swr.is_null() {
+            swr_free(&mut self.swr);
         }
+        let src_layout = normalized_layout(frame_ch_layout(dec_frame));
+        self.in_layout = src_layout;
         let ret = swr_alloc_set_opts2(
             &mut self.swr,
             &self.layout,
             AV_SAMPLE_FMT_FLTP,
             self.sample_rate,
-            frame_ch_layout(dec_frame),
+            &src_layout,
             frame_format(dec_frame) as AVSampleFormat,
             frame_sample_rate(dec_frame),
             0,
@@ -1503,33 +1668,87 @@ impl AudioPipeline {
         if ret < 0 {
             return Err(ffmpeg_err("swr_init", ret));
         }
-        self.frame_size = codctx_frame_size(a_enc_ctx);
-        if self.frame_size <= 0 {
-            // Encoders without a fixed frame size never need re-chunking; any
-            // positive value makes `drain` a pass-through of what the FIFO has.
-            self.frame_size = 1;
-        }
-        self.fifo = av_audio_fifo_alloc(
-            AV_SAMPLE_FMT_FLTP,
-            self.layout.nb_channels,
-            self.frame_size * 4,
-        );
+        self.in_format = frame_format(dec_frame);
+        self.in_rate = frame_sample_rate(dec_frame);
+        self.in_channels = (*frame_ch_layout(dec_frame)).nb_channels;
         if self.fifo.is_null() {
-            return Err(FfmpegError::Probe(
-                "av_audio_fifo_alloc returned null".into(),
-            ));
+            self.frame_size = codctx_frame_size(a_enc_ctx);
+            if self.frame_size <= 0 {
+                // Encoders without a fixed frame size never need re-chunking;
+                // any positive value makes `drain` a pass-through of what the
+                // FIFO has.
+                self.frame_size = 1;
+            }
+            self.fifo = av_audio_fifo_alloc(
+                AV_SAMPLE_FMT_FLTP,
+                self.layout.nb_channels,
+                self.frame_size * 4,
+            );
+            if self.fifo.is_null() {
+                return Err(FfmpegError::Probe(
+                    "av_audio_fifo_alloc returned null".into(),
+                ));
+            }
+            // Align the audio clock with the container timeline: the first frame
+            // after a mid-file seek carries the source pts, and everything after
+            // it is `frame_size` samples apart, so the whole run stays in step
+            // with the copied video packets. A reconfigure must not redo this —
+            // the FIFO already holds samples counted from that anchor.
+            let first_pts = frame_pts(dec_frame);
+            if first_pts != AV_NOPTS_VALUE && self.dec_tb.den > 0 && self.sample_rate > 0 {
+                let from_source =
+                    av_rescale_q(first_pts, self.dec_tb, AVRational::new(1, self.sample_rate));
+                // Containers without per-packet time restart their clock at zero
+                // after a seek (AVI reports 0 while the video packets still carry
+                // the scan position). Only follow the source clock when it agrees
+                // with the position this run was asked to start at; otherwise the
+                // seeded anchor is the only reliable one, and following the reset
+                // would put audio at zero against video at the seek point.
+                let tolerance = (f64::from(self.sample_rate) * AUDIO_ANCHOR_TOLERANCE_SECS) as i64;
+                if (from_source - self.start_samples).abs() <= tolerance {
+                    self.next_pts = from_source;
+                }
+                diag::log(format!(
+                    "audio clock: source={from_source} seed={} -> next_pts={}",
+                    self.start_samples, self.next_pts
+                ));
+            }
         }
-        // Align the audio clock with the container timeline: the first frame
-        // after a mid-file seek carries the source pts, and everything after it
-        // is `frame_size` samples apart, so the whole run stays in step with the
-        // copied video packets.
-        let first_pts = frame_pts(dec_frame);
-        if first_pts != AV_NOPTS_VALUE && self.dec_tb.den > 0 && self.sample_rate > 0 {
-            self.next_pts =
-                av_rescale_q(first_pts, self.dec_tb, AVRational::new(1, self.sample_rate));
-        }
-        self.source_configured = true;
         Ok(())
+    }
+
+    /// Convert whatever the old resampler still holds into the FIFO before it is
+    /// freed, so a reconfigure does not clip the tail of the previous format.
+    unsafe fn flush_delay(&mut self) -> FfmpegResult<()> {
+        if self.swr.is_null() || self.fifo.is_null() {
+            return Ok(());
+        }
+        loop {
+            let mut conv = av_frame_alloc();
+            if conv.is_null() {
+                return Ok(());
+            }
+            frame_set_format(conv, AV_SAMPLE_FMT_FLTP);
+            frame_set_sample_rate(conv, self.sample_rate);
+            frame_set_ch_layout(conv, self.layout);
+            let ret = swr_convert_frame(self.swr, conv, std::ptr::null());
+            if ret < 0 {
+                av_frame_free(&mut conv);
+                return Ok(());
+            }
+            let samples = frame_nb_samples(conv);
+            if samples <= 0 {
+                av_frame_free(&mut conv);
+                return Ok(());
+            }
+            let written = av_audio_fifo_write(self.fifo, frame_extended_data(conv).cast(), samples);
+            av_frame_free(&mut conv);
+            if written < samples {
+                return Err(FfmpegError::Probe(format!(
+                    "av_audio_fifo_write accepted {written} of {samples} samples while flushing the resampler"
+                )));
+            }
+        }
     }
 
     /// Resample one decoded frame, queue it, and mux every complete output frame.
@@ -1542,38 +1761,72 @@ impl AudioPipeline {
         out_a_idx: i32,
         job: &mut JobCtx<'_>,
     ) -> FfmpegResult<()> {
-        self.ensure(a_enc_ctx, dec_frame)?;
-        let mut conv = av_frame_alloc();
-        if conv.is_null() {
-            return Err(FfmpegError::Probe(
-                "av_frame_alloc(resampled) returned null".into(),
-            ));
+        if self.swr.is_null() || self.fifo.is_null() {
+            self.configure(a_enc_ctx, dec_frame)?;
         }
-        // `swr_convert_frame()` re-validates the output frame against the context
-        // it was initialised with (`config_changed()` compares format,
-        // sample_rate and layout, returning AVERROR_OUTPUT_CHANGED otherwise). A
-        // bare frame leaves format=NONE/sample_rate=0/empty layout, so describe
-        // the target here; with linesize[0] == 0 swresample allocates the buffer
-        // and fills in nb_samples itself.
-        frame_set_format(conv, AV_SAMPLE_FMT_FLTP);
-        frame_set_sample_rate(conv, self.sample_rate);
-        frame_set_ch_layout(conv, self.layout);
-        let ret = swr_convert_frame(self.swr, conv, dec_frame);
-        if ret < 0 {
-            av_frame_free(&mut conv);
-            return Err(ffmpeg_err("swr_convert_frame", ret));
-        }
-        let samples = frame_nb_samples(conv);
-        if samples > 0 {
-            let written = av_audio_fifo_write(self.fifo, frame_extended_data(conv).cast(), samples);
-            if written < samples {
-                av_frame_free(&mut conv);
-                return Err(FfmpegError::Probe(format!(
-                    "av_audio_fifo_write accepted {written} of {samples} samples"
-                )));
+        let mut attempt = 0u32;
+        loop {
+            // libswresample compares the *whole* channel layout, not just the
+            // channel count, so give it the normalised layout it was configured
+            // with; an `UNSPEC` source would otherwise be rejected forever.
+            frame_set_ch_layout(dec_frame, self.in_layout);
+            let mut conv = av_frame_alloc();
+            if conv.is_null() {
+                return Err(FfmpegError::Probe(
+                    "av_frame_alloc(resampled) returned null".into(),
+                ));
             }
+            // `swr_convert_frame()` re-validates the output frame against the
+            // context it was initialised with (`config_changed()` compares
+            // format, sample_rate and layout, returning AVERROR_OUTPUT_CHANGED
+            // otherwise), and it re-validates the *input* the same way — a frame
+            // whose source description moved on is rejected with
+            // AVERROR_INPUT_CHANGED before anything is converted, which leaves the
+            // frame untouched for a retry. A bare frame leaves
+            // format=NONE/sample_rate=0/empty layout, so describe the target here;
+            // with linesize[0] == 0 swresample allocates the buffer and fills in
+            // nb_samples itself.
+            frame_set_format(conv, AV_SAMPLE_FMT_FLTP);
+            frame_set_sample_rate(conv, self.sample_rate);
+            frame_set_ch_layout(conv, self.layout);
+            let ret = swr_convert_frame(self.swr, conv, dec_frame);
+            if ret < 0 {
+                av_frame_free(&mut conv);
+                let source_changed = ret == AVERROR_INPUT_CHANGED || ret == AVERROR_OUTPUT_CHANGED;
+                if source_changed && attempt < MAX_AUDIO_RECONFIGURES {
+                    attempt += 1;
+                    diag::log(format!(
+                        "audio resampler reconfigured ({}) after a source change: fmt {}→{} rate {}→{} layout {}/{}→{}/{}",
+                        av_err2str(ret),
+                        self.in_format,
+                        frame_format(dec_frame),
+                        self.in_rate,
+                        frame_sample_rate(dec_frame),
+                        self.in_layout.order(),
+                        self.in_layout.native_mask(),
+                        (*frame_ch_layout(dec_frame)).order(),
+                        (*frame_ch_layout(dec_frame)).native_mask()
+                    ));
+                    self.flush_delay()?;
+                    self.configure(a_enc_ctx, dec_frame)?;
+                    continue;
+                }
+                return Err(ffmpeg_err("swr_convert_frame", ret));
+            }
+            let samples = frame_nb_samples(conv);
+            if samples > 0 {
+                let written =
+                    av_audio_fifo_write(self.fifo, frame_extended_data(conv).cast(), samples);
+                if written < samples {
+                    av_frame_free(&mut conv);
+                    return Err(FfmpegError::Probe(format!(
+                        "av_audio_fifo_write accepted {written} of {samples} samples"
+                    )));
+                }
+            }
+            av_frame_free(&mut conv);
+            break;
         }
-        av_frame_free(&mut conv);
         self.drain(a_enc_ctx, out_pkt, out_ctx, out_a_idx, job, false)
     }
 
@@ -1647,7 +1900,10 @@ impl AudioPipeline {
         if !self.swr.is_null() {
             swr_free(&mut self.swr);
         }
-        self.source_configured = false;
+        self.in_format = AV_SAMPLE_FMT_NONE;
+        self.in_rate = 0;
+        self.in_channels = 0;
+        self.in_layout = AVChannelLayout::default();
     }
 }
 
@@ -1705,6 +1961,7 @@ unsafe fn copy_packet_to_muxer(
     out_ctx: *mut AVFormatContext,
     out_idx: i32,
     job: &mut JobCtx<'_>,
+    stamps: &mut TimestampRepair,
 ) -> FfmpegResult<()> {
     let sps = fmtctx_streams(out_ctx);
     let out_st = *sps.add(out_idx as usize);
@@ -1715,6 +1972,26 @@ unsafe fn copy_packet_to_muxer(
     }
     av_packet_rescale_ts(pkt, (*in_st).time_base, (*out_st).time_base);
     (*pkt).pos = -1;
+
+    // Legacy containers may leave the timestamps unset; a muxer cannot place such
+    // a packet (`EINVAL`), so give it the next slot of a synthetic clock.
+    stamps.observe_step((*pkt).duration);
+    if (*pkt).pts == AV_NOPTS_VALUE {
+        let pts = stamps.fill_missing();
+        (*pkt).pts = pts;
+        if (*pkt).dts == AV_NOPTS_VALUE {
+            (*pkt).dts = pts;
+        }
+    } else {
+        let offset = stamps.align_offset((*pkt).pts);
+        if offset != 0 {
+            (*pkt).pts = (*pkt).pts.saturating_add(offset);
+            if (*pkt).dts != AV_NOPTS_VALUE {
+                (*pkt).dts = (*pkt).dts.saturating_add(offset);
+            }
+        }
+        stamps.note((*pkt).pts);
+    }
 
     // Capture before the write consumes the packet.
     let pts = (*pkt).pts;
@@ -2072,6 +2349,13 @@ fn run_remux(
         if a_idx >= 0 {
             audio.set_source_time_base((*(*streams_ptr.add(a_idx as usize))).time_base);
         }
+        // Containers without per-packet time (AVI) need a synthetic clock, one per
+        // stream so video and audio keep their own cadence; a seeked run starts
+        // that clock at the seek point.
+        let mut video_stamps =
+            TimestampRepair::seeded(run_start_ticks(out_ctx, out_v_idx, start_offset_secs));
+        let mut audio_stamps =
+            TimestampRepair::seeded(run_start_ticks(out_ctx, out_a_idx, start_offset_secs));
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -2140,7 +2424,12 @@ fn run_remux(
                 av_packet_unref(pkt);
                 continue;
             }
-            let res = copy_packet_to_muxer(pkt, in_st, out_ctx, out_idx, &mut job);
+            let stamps = if in_st_idx == v_idx as usize {
+                &mut video_stamps
+            } else {
+                &mut audio_stamps
+            };
+            let res = copy_packet_to_muxer(pkt, in_st, out_ctx, out_idx, &mut job, stamps);
             av_packet_unref(pkt);
             if let Err(e) = res {
                 write_error = Some(e);
@@ -2901,6 +3190,24 @@ fn run_transcode(
         let mut job = JobCtx::new(tag, telemetry, segment_dir);
         let mut fatal: Option<FfmpegError> = None;
         let mut decode_errors_logged = 0u32;
+        // A source without timestamps (AVI) would hand the encoder
+        // `AV_NOPTS_VALUE`; the encoder then propagates it and the muxer rejects
+        // the packet. Give the encoder a monotonic clock instead.
+        let mut video_stamps = TimestampRepair::seeded(if v_enc_ctx.is_null() {
+            0
+        } else {
+            start_ticks_in(codctx_time_base(v_enc_ctx), start_offset_secs)
+        });
+        if !v_enc_ctx.is_null() {
+            let fr = codctx_framerate(v_enc_ctx);
+            if fr.num > 0 && fr.den > 0 {
+                video_stamps.observe_step(av_rescale_q(
+                    1,
+                    AVRational::new(fr.den, fr.num),
+                    codctx_time_base(v_enc_ctx),
+                ));
+            }
+        }
 
         'decode: loop {
             if cancel.load(Ordering::Relaxed) {
@@ -3087,11 +3394,15 @@ fn run_transcode(
                         }
                         frame_set_pts(
                             enc_vframe,
-                            av_rescale_q(
-                                frame_pts(frame),
-                                video_dec_tb,
-                                codctx_time_base(v_enc_ctx),
-                            ),
+                            video_stamps.repair_monotonic(if frame_pts(frame) == AV_NOPTS_VALUE {
+                                AV_NOPTS_VALUE
+                            } else {
+                                av_rescale_q(
+                                    frame_pts(frame),
+                                    video_dec_tb,
+                                    codctx_time_base(v_enc_ctx),
+                                )
+                            }),
                         );
                         if let Err(e) = encode_and_write(
                             v_enc_ctx,
@@ -3240,6 +3551,11 @@ unsafe fn encode_and_write(
         }
         (*out_pkt).stream_index = out_stream_idx;
         av_packet_rescale_ts(out_pkt, enc_tb, (*out_st).time_base);
+        // A hardware encoder can emit packets without a decode timestamp; the
+        // muxer needs one to interleave, so fall back to the presentation time.
+        if (*out_pkt).dts == AV_NOPTS_VALUE {
+            (*out_pkt).dts = (*out_pkt).pts;
+        }
 
         // Capture before the write consumes the packet.
         let pts = (*out_pkt).pts;
@@ -3348,4 +3664,74 @@ pub fn fit_dimensions(
     }
     // Round to even (required by most H.264 encoders)
     ((w as i32 + 1) & !1, (h as i32 + 1) & !1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TimestampRepair, AV_NOPTS_VALUE};
+
+    #[test]
+    fn timestamp_repair_fills_a_missing_clock_from_the_packet_duration() {
+        let mut stamps = TimestampRepair::new();
+        stamps.observe_step(3_600);
+        for expected in [0, 3_600, 7_200] {
+            assert_eq!(stamps.fill_missing(), expected);
+        }
+    }
+
+    #[test]
+    fn timestamp_repair_continues_from_a_real_timestamp() {
+        let mut stamps = TimestampRepair::new();
+        stamps.observe_step(1_200);
+        stamps.note(48_000);
+        assert_eq!(stamps.fill_missing(), 49_200);
+    }
+
+    #[test]
+    fn timestamp_repair_ignores_a_missing_timestamp_when_noting() {
+        let mut stamps = TimestampRepair::new();
+        stamps.observe_step(900);
+        stamps.note(AV_NOPTS_VALUE);
+        assert_eq!(stamps.fill_missing(), 0);
+    }
+
+    #[test]
+    fn timestamp_repair_keeps_a_monotonic_encoder_clock() {
+        let mut stamps = TimestampRepair::new();
+        stamps.observe_step(3_000);
+        assert_eq!(stamps.repair_monotonic(AV_NOPTS_VALUE), 0);
+        assert_eq!(stamps.repair_monotonic(AV_NOPTS_VALUE), 3_000);
+        // A real timestamp ahead of the synthetic clock is kept as-is.
+        assert_eq!(stamps.repair_monotonic(9_000), 9_000);
+        // A repeat or a rewind is nudged forward instead of being passed on.
+        assert_eq!(stamps.repair_monotonic(9_000), 12_000);
+        assert_eq!(stamps.repair_monotonic(500), 15_000);
+    }
+
+    #[test]
+    fn timestamp_repair_aligns_a_seeked_run_on_one_anchor() {
+        // Leftovers from a real file: video reports the scan position, audio
+        // reports zero for the same seek.
+        let mut video = TimestampRepair::seeded(360_000);
+        let mut audio = TimestampRepair::seeded(360_000);
+        assert_eq!(video.repair_monotonic(368_100), 360_000);
+        assert_eq!(video.repair_monotonic(368_400), 360_300);
+        assert_eq!(audio.fill_missing(), 360_000);
+        assert_eq!(audio.fill_missing(), 360_000 + audio.step.max(1));
+    }
+
+    #[test]
+    fn timestamp_repair_keeps_the_container_clock_when_the_run_starts_at_zero() {
+        let mut stamps = TimestampRepair::seeded(0);
+        assert_eq!(stamps.repair_monotonic(6_000), 6_000);
+        assert_eq!(stamps.repair_monotonic(6_006), 6_006);
+    }
+
+    #[test]
+    fn timestamp_repair_starts_a_positive_clock_at_the_first_real_timestamp() {
+        let mut stamps = TimestampRepair::new();
+        stamps.observe_step(1_000);
+        assert_eq!(stamps.repair_monotonic(7_500), 7_500);
+        assert_eq!(stamps.repair_monotonic(AV_NOPTS_VALUE), 8_500);
+    }
 }
