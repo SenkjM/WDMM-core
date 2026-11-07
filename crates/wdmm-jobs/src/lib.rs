@@ -46,6 +46,18 @@ pub trait ProgressSink: Send + Sync {
     fn units(&self, done: u32, total: Option<u32>);
     /// Diagnostic note (goes to the diag log, not the UI).
     fn note(&self, message: &str);
+
+    /// The task now has a local file worth remembering (`local_path` column).
+    ///
+    /// Jobs call this **before** any step that can outlive the process — the
+    /// platform hand-off in particular — so a restart can tell the file is
+    /// already there instead of downloading it again. Persisted immediately,
+    /// not on the progress throttle.
+    fn local_path(&self, _path: &str) {}
+
+    /// Terminal result payload (`result_json` column), for jobs that report a
+    /// follow-up target but still need the row to say `Completed`.
+    fn result(&self, _json: &str) {}
 }
 
 /// No-op sink for tests and for contexts that do not need progress.
@@ -87,7 +99,10 @@ impl JobOutcome {
 pub struct JobPaths {
     /// Flutter `getApplicationDocumentsDirectory()`.
     pub app_docs: PathBuf,
-    /// Flutter `getApplicationCacheDirectory()` — the media cache root.
+    /// Flutter `getApplicationSupportDirectory()` — **not** the cache
+    /// directory: `CacheService` keeps `music_cache/` and `manga_cache/` under
+    /// support so the OS does not evict them. `wdmm_queue_set_paths` must pass
+    /// the support path here.
     pub cache_root: PathBuf,
     /// Directory holding scan/manga-build payload envelopes.
     pub payload_dir: PathBuf,

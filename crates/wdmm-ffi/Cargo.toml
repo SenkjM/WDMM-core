@@ -20,12 +20,14 @@ wdmm-drivers = { workspace = true }
 wdmm-dlna    = { workspace = true }
 wdmm-proxy   = { workspace = true }
 wdmm-ffmpeg  = { workspace = true }
+wdmm-jobs    = { workspace = true }
 wdmm-openapi = { workspace = true }
 wdmm-queue   = { workspace = true }
 wdmm-storage = { workspace = true }
 wdmm-sync    = { workspace = true }
 wdmm-text    = { workspace = true }
 tokio        = { workspace = true }
+async-trait  = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 uuid         = { workspace = true }
@@ -39,4 +41,3 @@ lofty        = { workspace = true }
 [dev-dependencies]
 reqwest     = { workspace = true }
 rusqlite    = { workspace = true }
-async-trait = { workspace = true }

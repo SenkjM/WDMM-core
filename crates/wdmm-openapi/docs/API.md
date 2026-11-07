@@ -39,7 +39,7 @@ KV-store key under which the bearer token is persisted in `LibraryDatabase`.
 ### `struct ApiServer`
 A running server. `Drop` / `.stop()` shuts it down.
 
-### `async fn ApiServer::start(config: ServerConfig, db: Arc<LibraryDatabase>, queue: Arc<TaskQueue>) -> ApiResult<Self>`
+### `async fn ApiServer::start(config: ServerConfig, db: Arc<LibraryDatabase>, media_link: Option<MediaLinkFn>) -> ApiResult<Self>`
 Create and start the server. `port = 0` assigns an ephemeral port (read back via `port()`).
 
 Token resolution: reuse the persisted DB token if present; else seed from

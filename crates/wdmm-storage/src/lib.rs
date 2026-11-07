@@ -1,4 +1,4 @@
-//! `wdmm-storage` — rusqlite library DB (schema v8, music + manga library).
+//! `wdmm-storage` — rusqlite library DB (schema v17, music + manga library).
 //!
 //! Schema v1 (Round 4): base tables.
 //! Schema v2 (Round 5): artists/albums tables, extended `tracks` columns,
@@ -17,6 +17,11 @@
 //! Schema v9 (Round 12): `rev` column on `tracks` for library sync merge.
 //! Schema v10: `cover_state` (0=Unknown,1=None,2=Present) on tracks/mangas/cue_slices;
 //!   removes `cover_relpath` (mangas) and `cover_path` (cue_slices).
+//! Schema v11–v16: see the migration blocks in [`LibraryDatabase::open`]
+//!   (transcode presets, media links, remux modes).
+//! Schema v17: durable task queue (`queue_tasks`, `queue_batches`) + cache access
+//!   index (`cache_entries`, `cache_groups`) owned by `wdmm-queue`; replaces the
+//!   old in-process stub and Dart's `cache_index.db`.
 
 #![forbid(unsafe_code)]
 
@@ -26,8 +31,8 @@ use std::sync::Mutex;
 use thiserror::Error as ThisError;
 use uuid::Uuid;
 
-use wdmm_core::models::{CloudAccount, LibraryAlbum, LibraryArtist, LibraryTrack};
 pub use wdmm_core::models::TranscodePreset;
+use wdmm_core::models::{CloudAccount, LibraryAlbum, LibraryArtist, LibraryTrack};
 
 #[derive(Debug, ThisError)]
 pub enum StorageError {
@@ -153,15 +158,15 @@ pub struct MediaLinkRow {
 
 fn media_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaLinkRow> {
     Ok(MediaLinkRow {
-        id:           row.get(0)?,
-        account_id:   row.get(1)?,
-        remote_path:  row.get(2)?,
-        kind:         row.get(3)?,
-        proxy_token:  row.get(4)?,
-        ttl_secs:     row.get::<_, i64>(5)? as u64,
-        expires_at:   row.get(6)?,
-        revoked:      row.get::<_, i64>(7)? != 0,
-        created_at:   row.get(8)?,
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        remote_path: row.get(2)?,
+        kind: row.get(3)?,
+        proxy_token: row.get(4)?,
+        ttl_secs: row.get::<_, i64>(5)? as u64,
+        expires_at: row.get(6)?,
+        revoked: row.get::<_, i64>(7)? != 0,
+        created_at: row.get(8)?,
     })
 }
 
@@ -399,6 +404,147 @@ pub struct LibraryDatabase {
     conn: Mutex<Connection>,
 }
 
+// ── Queue + cache index rows (schema v17) ────────────────────────────────────
+//
+// `wdmm-storage` deliberately keeps these as plain column strings instead of
+// depending on `wdmm-queue`: the queue crate converts to/from its domain enums,
+// so the DDL is the only place that knows the column names (one authority for
+// both sides). `u64` counters are stored as SQLite INTEGER, i.e. `i64`; the
+// queue clamps them back on read.
+
+/// One persisted [`wdmm_queue::model::QueueTask`] row.
+///
+/// Field order matches [`QUEUE_TASK_COLUMNS`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueTaskRow {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub source_name: String,
+    pub remote_path: String,
+    pub file_name: String,
+    pub account_id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub local_path: Option<String>,
+    pub local_uri: Option<String>,
+    pub error_message: Option<String>,
+    pub progress: f64,
+    pub progress_mode: String,
+    pub bytes_total: Option<i64>,
+    pub bytes_done: i64,
+    pub units_total: Option<i64>,
+    pub units_done: i64,
+    pub attempts: i64,
+    pub attempts_cap: Option<i64>,
+    pub next_retry_at: Option<i64>,
+    pub batch_id: String,
+    pub cache_group_id: Option<String>,
+    pub target: String,
+    pub priority: i64,
+    pub payload_path: Option<String>,
+    pub result_json: Option<String>,
+    pub remote_size: Option<i64>,
+    pub remote_modified: Option<i64>,
+}
+
+/// The canonical `queue_tasks` column list, shared by every SELECT/INSERT.
+pub const QUEUE_TASK_COLUMNS: &str = "id, kind, status, source_name, remote_path, file_name, \
+     account_id, created_at, updated_at, local_path, local_uri, error_message, progress, \
+     progress_mode, bytes_total, bytes_done, units_total, units_done, attempts, attempts_cap, \
+     next_retry_at, batch_id, cache_group_id, target, priority, payload_path, result_json, \
+     remote_size, remote_modified";
+
+impl QueueTaskRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            status: row.get(2)?,
+            source_name: row.get(3)?,
+            remote_path: row.get(4)?,
+            file_name: row.get(5)?,
+            account_id: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+            local_path: row.get(9)?,
+            local_uri: row.get(10)?,
+            error_message: row.get(11)?,
+            progress: row.get(12)?,
+            progress_mode: row.get(13)?,
+            bytes_total: row.get(14)?,
+            bytes_done: row.get(15)?,
+            units_total: row.get(16)?,
+            units_done: row.get(17)?,
+            attempts: row.get(18)?,
+            attempts_cap: row.get(19)?,
+            next_retry_at: row.get(20)?,
+            batch_id: row.get(21)?,
+            cache_group_id: row.get(22)?,
+            target: row.get(23)?,
+            priority: row.get(24)?,
+            payload_path: row.get(25)?,
+            result_json: row.get(26)?,
+            remote_size: row.get(27)?,
+            remote_modified: row.get(28)?,
+        })
+    }
+}
+
+/// One persisted [`wdmm_queue::model::QueueBatch`] row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueBatchRow {
+    pub id: String,
+    pub kind: String,
+    pub origin: String,
+    pub silent: bool,
+    pub expected_total: Option<i64>,
+    pub created_at: i64,
+    pub closed_at: Option<i64>,
+    pub label: Option<String>,
+}
+
+impl QueueBatchRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            origin: row.get(2)?,
+            silent: row.get::<_, i64>(3)? != 0,
+            expected_total: row.get(4)?,
+            created_at: row.get(5)?,
+            closed_at: row.get(6)?,
+            label: row.get(7)?,
+        })
+    }
+}
+
+/// One `cache_entries` row: best-effort LRU bookkeeping for a cache file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheEntryRow {
+    pub path: String,
+    pub kind: String,
+    pub size: i64,
+    pub accessed_at: i64,
+    pub created_at: i64,
+    pub account_id: Option<String>,
+    pub remote_path: Option<String>,
+}
+
+impl CacheEntryRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            path: row.get(0)?,
+            kind: row.get(1)?,
+            size: row.get(2)?,
+            accessed_at: row.get(3)?,
+            created_at: row.get(4)?,
+            account_id: row.get(5)?,
+            remote_path: row.get(6)?,
+        })
+    }
+}
+
 impl LibraryDatabase {
     /// Open or create the library database.
     ///
@@ -494,13 +640,8 @@ impl LibraryDatabase {
                 deleted_at INTEGER NOT NULL
             );
 
-            -- ── Queue tasks (stub — state managed in-process by wdmm-queue) ───
-            CREATE TABLE IF NOT EXISTS queue_tasks (
-                id      TEXT PRIMARY KEY,
-                kind    TEXT NOT NULL,
-                status  TEXT NOT NULL,
-                created INTEGER NOT NULL
-            );
+            -- Queue tables live in the v17 migration below (they replaced the
+            -- old in-process stub; see `queue-in-rust.md` §3).
 
             -- ── Playlists (Round 4) ───────────────────────────────────────────
             CREATE TABLE IF NOT EXISTS playlists (
@@ -626,8 +767,14 @@ impl LibraryDatabase {
         )?;
 
         // Seed schema version rows for v1 and v2.
-        conn.execute("INSERT OR IGNORE INTO _schema_version (version) VALUES (1)", [])?;
-        conn.execute("INSERT OR IGNORE INTO _schema_version (version) VALUES (2)", [])?;
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_version (version) VALUES (1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_version (version) VALUES (2)",
+            [],
+        )?;
 
         // ── v3 migration: fix user_folders columns + create user_folder_items ──
         let current_ver: i64 = conn.query_row(
@@ -639,9 +786,8 @@ impl LibraryDatabase {
             // Rename old 'created' → 'created_at'. On fresh DBs the DDL
             // above already uses created_at, so the RENAME will fail and the
             // error is silently discarded (idempotent).
-            let _ = conn.execute_batch(
-                "ALTER TABLE user_folders RENAME COLUMN created TO created_at;",
-            );
+            let _ =
+                conn.execute_batch("ALTER TABLE user_folders RENAME COLUMN created TO created_at;");
             // Add sort_order column. Silently discarded if already present.
             let _ = conn.execute_batch(
                 "ALTER TABLE user_folders ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;",
@@ -1558,6 +1704,121 @@ impl LibraryDatabase {
             ))?;
         }
 
+        // ── v17 migration: durable queue + cache access index ────────────────
+        //
+        // The queue state machine moved out of Dart and into `wdmm-queue`; the
+        // old `queue_tasks` stub only ever held Dart-shaped columns and the live
+        // rows were in Dart's KV store (`queue_task_*`), which is discarded by
+        // user decision (contract `queue-in-rust.md` §3). The cache access index
+        // replaces Dart's separate `cache_index.db`:
+        //
+        //   * `cache_entries` — one row per cache file, `accessed_at` drives LRU
+        //     eviction/expiry, `size` removes a stat() per candidate;
+        //   * `cache_groups`  — `(group_id, path)` membership for CUE albums.
+        //
+        // Both cache tables are best-effort bookkeeping (rebuildable), so they
+        // are recreated here instead of migrated. The legacy KV keys are purged
+        // in the same transaction so a restart can never replay stale Dart rows.
+        if current_ver < 17 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+
+                DROP TABLE IF EXISTS queue_tasks;
+                DROP TABLE IF EXISTS queue_batches;
+
+                CREATE TABLE queue_tasks (
+                    id              TEXT PRIMARY KEY,
+                    kind            TEXT NOT NULL,
+                    status          TEXT NOT NULL,
+                    source_name     TEXT NOT NULL,
+                    remote_path     TEXT NOT NULL,
+                    file_name       TEXT NOT NULL,
+                    account_id      TEXT NOT NULL,
+                    created_at      INTEGER NOT NULL,
+                    updated_at      INTEGER NOT NULL,
+                    local_path      TEXT,
+                    local_uri       TEXT,
+                    error_message   TEXT,
+                    progress        REAL NOT NULL DEFAULT 0,
+                    progress_mode   TEXT NOT NULL,
+                    bytes_total     INTEGER,
+                    bytes_done      INTEGER NOT NULL DEFAULT 0,
+                    units_total     INTEGER,
+                    units_done      INTEGER NOT NULL DEFAULT 0,
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    attempts_cap    INTEGER,
+                    next_retry_at   INTEGER,
+                    batch_id        TEXT NOT NULL,
+                    cache_group_id  TEXT,
+                    target          TEXT NOT NULL,
+                    priority        INTEGER NOT NULL DEFAULT 0,
+                    payload_path    TEXT,
+                    result_json     TEXT,
+                    remote_size     INTEGER,
+                    remote_modified INTEGER
+                );
+
+                CREATE INDEX queue_tasks_batch
+                    ON queue_tasks (batch_id);
+                CREATE INDEX queue_tasks_status
+                    ON queue_tasks (status, priority DESC, created_at ASC);
+                -- One in-flight row per logical task (mirrors the queue's dedupe key).
+                CREATE UNIQUE INDEX queue_tasks_dedupe
+                    ON queue_tasks (account_id, remote_path, kind, target)
+                    WHERE status NOT IN ('completed', 'partial', 'failed', 'cancelled');
+
+                CREATE TABLE queue_batches (
+                    id             TEXT PRIMARY KEY,
+                    kind           TEXT NOT NULL,
+                    origin         TEXT NOT NULL,
+                    silent         INTEGER NOT NULL DEFAULT 0,
+                    expected_total INTEGER,
+                    created_at     INTEGER NOT NULL,
+                    closed_at      INTEGER,
+                    label          TEXT
+                );
+
+                -- The old library-side `cache_groups` (members BLOB from the
+                -- sqflite era) cannot be mapped to paths without the cache path
+                -- rules (they live in `wdmm-jobs`); membership is rebuilt when
+                -- the CUE album is cached again.
+                DROP TABLE IF EXISTS cache_entries;
+                DROP TABLE IF EXISTS cache_groups;
+
+                CREATE TABLE cache_entries (
+                    path        TEXT PRIMARY KEY,
+                    kind        TEXT NOT NULL,
+                    size        INTEGER NOT NULL,
+                    accessed_at INTEGER NOT NULL,
+                    created_at  INTEGER NOT NULL,
+                    account_id  TEXT,
+                    remote_path TEXT
+                );
+
+                CREATE INDEX cache_entries_kind
+                    ON cache_entries (kind);
+                CREATE INDEX cache_entries_accessed
+                    ON cache_entries (accessed_at);
+
+                CREATE TABLE cache_groups (
+                    group_id TEXT NOT NULL,
+                    path     TEXT NOT NULL,
+                    PRIMARY KEY (group_id, path)
+                );
+
+                -- One-shot purge of the Dart queue snapshot (ids index + rows).
+                DELETE FROM kv_store
+                 WHERE substr(key, 1, 11) = 'queue_task_'
+                    OR substr(key, 1, 12) = 'queue_batch_';
+
+                INSERT OR IGNORE INTO _schema_version (version) VALUES (17);
+
+                COMMIT;
+                "#,
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1565,11 +1826,11 @@ impl LibraryDatabase {
 
     pub fn schema_version(&self) -> StorageResult<i64> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.query_row(
-            "SELECT MAX(version) FROM _schema_version",
-            [],
-            |row| row.get(0),
-        )?)
+        Ok(
+            conn.query_row("SELECT MAX(version) FROM _schema_version", [], |row| {
+                row.get(0)
+            })?,
+        )
     }
 
     // ── Tracks ────────────────────────────────────────────────────────────────
@@ -1930,12 +2191,20 @@ impl LibraryDatabase {
                     .as_ref()
                     .and_then(|aa| {
                         let t = aa.trim();
-                        if t.is_empty() { None } else { Some(t) }
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
                     })
                     .or_else(|| {
                         track.artist.as_ref().and_then(|a| {
                             let t = a.trim();
-                            if t.is_empty() { None } else { Some(t) }
+                            if t.is_empty() {
+                                None
+                            } else {
+                                Some(t)
+                            }
                         })
                     })
                     .unwrap_or("");
@@ -1947,13 +2216,7 @@ impl LibraryDatabase {
                      VALUES (?1, ?2, ?3, ?4, NULL, ?5)
                      ON CONFLICT(id) DO UPDATE SET
                        year = COALESCE(excluded.year, albums.year)",
-                    params![
-                        &id,
-                        trimmed_title,
-                        &artist_id,
-                        &track.year,
-                        now.timestamp()
-                    ],
+                    params![&id, trimmed_title, &artist_id, &track.year, now.timestamp()],
                 )?;
                 Some(id)
             } else {
@@ -2131,8 +2394,9 @@ impl LibraryDatabase {
 
     pub fn get_album(&self, id: &str) -> StorageResult<Option<LibraryAlbum>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, title, artist_id, year, art_url, created_at FROM albums WHERE id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist_id, year, art_url, created_at FROM albums WHERE id = ?1",
+        )?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(LibraryAlbum {
@@ -2150,8 +2414,9 @@ impl LibraryDatabase {
 
     pub fn list_albums(&self) -> StorageResult<Vec<LibraryAlbum>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, title, artist_id, year, art_url, created_at FROM albums ORDER BY title")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist_id, year, art_url, created_at FROM albums ORDER BY title",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(LibraryAlbum {
                 id: row.get(0)?,
@@ -2319,7 +2584,10 @@ impl LibraryDatabase {
 
     /// Dump all KV pairs (for backup).
     pub fn list_kv(&self) -> StorageResult<Vec<(String, String)>> {
-        let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         let mut stmt = conn.prepare("SELECT key, value FROM kv_store ORDER BY key")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
@@ -2333,6 +2601,441 @@ impl LibraryDatabase {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM kv_store WHERE key = ?1", params![key])?;
         Ok(())
+    }
+
+    /// Delete every legacy Dart queue key (`queue_task_ids`, `queue_task_<id>`,
+    /// `queue_batch_ids`, `queue_batch_<id>`). The v17 migration does this once;
+    /// `wdmm-queue` calls it again on every start so a re-installed old build
+    /// cannot replay its snapshot. Idempotent.
+    pub fn queue_purge_legacy_kv(&self) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM kv_store
+              WHERE substr(key, 1, 11) = 'queue_task_'
+                 OR substr(key, 1, 12) = 'queue_batch_'",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    // ── Queue persistence (schema v17) ───────────────────────────────────────
+
+    /// Insert or fully replace one task row. The scheduler writes a full row on
+    /// every state transition (≤ 1 write per 500 ms per task while running).
+    pub fn queue_upsert_task(&self, t: &QueueTaskRow) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let updates = QUEUE_TASK_COLUMNS
+            .split(", ")
+            .map(|c| format!("{c}=excluded.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
+            &format!(
+                "INSERT INTO queue_tasks ({QUEUE_TASK_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+                 ON CONFLICT(id) DO UPDATE SET {updates}"
+            ),
+            params![
+                t.id,
+                t.kind,
+                t.status,
+                t.source_name,
+                t.remote_path,
+                t.file_name,
+                t.account_id,
+                t.created_at,
+                t.updated_at,
+                t.local_path,
+                t.local_uri,
+                t.error_message,
+                t.progress,
+                t.progress_mode,
+                t.bytes_total,
+                t.bytes_done,
+                t.units_total,
+                t.units_done,
+                t.attempts,
+                t.attempts_cap,
+                t.next_retry_at,
+                t.batch_id,
+                t.cache_group_id,
+                t.target,
+                t.priority,
+                t.payload_path,
+                t.result_json,
+                t.remote_size,
+                t.remote_modified,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn queue_get_task(&self, id: &str) -> StorageResult<Option<QueueTaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUE_TASK_COLUMNS} FROM queue_tasks WHERE id = ?1"
+        ))?;
+        Ok(stmt
+            .query_row(params![id], QueueTaskRow::from_row)
+            .optional()?)
+    }
+
+    /// Every task in scheduling order (`created_at`, then id as tie-break).
+    pub fn queue_list_tasks(&self) -> StorageResult<Vec<QueueTaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUE_TASK_COLUMNS} FROM queue_tasks ORDER BY created_at ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map([], QueueTaskRow::from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn queue_list_tasks_for_batch(&self, batch_id: &str) -> StorageResult<Vec<QueueTaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUE_TASK_COLUMNS} FROM queue_tasks WHERE batch_id = ?1
+              ORDER BY created_at ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map(params![batch_id], QueueTaskRow::from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// In-flight lookup for enqueue dedupe (`account_id` + `remote_path`).
+    pub fn queue_find_by_remote(
+        &self,
+        account_id: &str,
+        remote_path: &str,
+    ) -> StorageResult<Vec<QueueTaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUE_TASK_COLUMNS} FROM queue_tasks
+              WHERE account_id = ?1 AND remote_path = ?2
+              ORDER BY created_at ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map(params![account_id, remote_path], QueueTaskRow::from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn queue_delete_task(&self, id: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM queue_tasks WHERE id = ?1", params![id])?)
+    }
+
+    /// Bulk delete inside one transaction (batch pruning / clear_all).
+    pub fn queue_delete_tasks(&self, ids: &[String]) -> StorageResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare("DELETE FROM queue_tasks WHERE id = ?1")?;
+            for id in ids {
+                n += stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Delete every task row (queue `clear_all`).
+    pub fn queue_delete_all_tasks(&self) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM queue_tasks", [])?)
+    }
+
+    pub fn queue_upsert_batch(&self, b: &QueueBatchRow) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO queue_batches
+                 (id, kind, origin, silent, expected_total, created_at, closed_at, label)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                b.id,
+                b.kind,
+                b.origin,
+                b.silent as i64,
+                b.expected_total,
+                b.created_at,
+                b.closed_at,
+                b.label,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn queue_get_batch(&self, id: &str) -> StorageResult<Option<QueueBatchRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, origin, silent, expected_total, created_at, closed_at, label
+               FROM queue_batches WHERE id = ?1",
+        )?;
+        Ok(stmt
+            .query_row(params![id], QueueBatchRow::from_row)
+            .optional()?)
+    }
+
+    pub fn queue_list_batches(&self) -> StorageResult<Vec<QueueBatchRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, origin, silent, expected_total, created_at, closed_at, label
+               FROM queue_batches ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], QueueBatchRow::from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn queue_delete_batch(&self, id: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM queue_batches WHERE id = ?1", params![id])?)
+    }
+
+    pub fn queue_delete_all_batches(&self) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM queue_batches", [])?)
+    }
+
+    // ── Cache access index (schema v17; replaces Dart `cache_index.db`) ──────
+    //
+    // Best-effort bookkeeping, never a source of truth: a row for a file that
+    // vanished is swept lazily, and a live file without a row falls back to its
+    // mtime. `kind` matches Dart `CacheKind.name` ("audio" / "video" / "manga").
+
+    /// Record (or refresh) a cache file: full upsert including `size`.
+    pub fn cache_put_entry(&self, e: &CacheEntryRow) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_entries
+                 (path, kind, size, accessed_at, created_at, account_id, remote_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                e.path,
+                e.kind,
+                e.size,
+                e.accessed_at,
+                e.created_at,
+                e.account_id,
+                e.remote_path,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a read. Inserts a `size = 0` row when the path is not indexed yet
+    /// (a first read must never be lost); existing rows only bump `accessed_at`
+    /// and keep their known size.
+    pub fn cache_touch(&self, path: &str, kind: &str, accessed_at: i64) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cache_entries (path, kind, size, accessed_at, created_at)
+             VALUES (?1, ?2, 0, ?3, ?3)
+             ON CONFLICT(path) DO UPDATE SET accessed_at = excluded.accessed_at",
+            params![path, kind, accessed_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn cache_get_entry(&self, path: &str) -> StorageResult<Option<CacheEntryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, kind, size, accessed_at, created_at, account_id, remote_path
+               FROM cache_entries WHERE path = ?1",
+        )?;
+        Ok(stmt
+            .query_row(params![path], CacheEntryRow::from_row)
+            .optional()?)
+    }
+
+    pub fn cache_accessed_at(&self, path: &str) -> StorageResult<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT accessed_at FROM cache_entries WHERE path = ?1",
+                params![path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// All entries, oldest access first (LRU scan order).
+    pub fn cache_list_entries(&self) -> StorageResult<Vec<CacheEntryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, kind, size, accessed_at, created_at, account_id, remote_path
+               FROM cache_entries ORDER BY accessed_at ASC, path ASC",
+        )?;
+        let rows = stmt.query_map([], CacheEntryRow::from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Every entry of one kind, oldest access first. Cleanup passes read this
+    /// once instead of querying per file.
+    pub fn cache_list_entries_by_kind(&self, kind: &str) -> StorageResult<Vec<CacheEntryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, kind, size, accessed_at, created_at, account_id, remote_path
+               FROM cache_entries WHERE kind = ?1 ORDER BY accessed_at ASC, path ASC",
+        )?;
+        let rows = stmt.query_map(params![kind], CacheEntryRow::from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Least-recently-used entries, oldest first (eviction candidate list).
+    pub fn cache_lru(&self, limit: usize) -> StorageResult<Vec<CacheEntryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, kind, size, accessed_at, created_at, account_id, remote_path
+               FROM cache_entries ORDER BY accessed_at ASC, path ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], CacheEntryRow::from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn cache_total_size(&self) -> StorageResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM cache_entries",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn cache_total_size_by_kind(&self, kind: &str) -> StorageResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM cache_entries WHERE kind = ?1",
+            params![kind],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn cache_delete_entry(&self, path: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM cache_entries WHERE path = ?1", params![path])?)
+    }
+
+    /// Bulk forget inside one transaction.
+    pub fn cache_delete_entries(&self, paths: &[String]) -> StorageResult<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare("DELETE FROM cache_entries WHERE path = ?1")?;
+            for path in paths {
+                n += stmt.execute(params![path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    pub fn cache_forget_kind(&self, kind: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM cache_entries WHERE kind = ?1", params![kind])?)
+    }
+
+    /// Add `paths` to a cache group, keeping existing membership (idempotent).
+    pub fn cache_bind_group(&self, group_id: &str, paths: &[String]) -> StorageResult<()> {
+        if group_id.is_empty() || paths.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR IGNORE INTO cache_groups (group_id, path) VALUES (?1, ?2)")?;
+            for path in paths {
+                if path.is_empty() {
+                    continue;
+                }
+                stmt.execute(params![group_id, path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn cache_group_paths(&self, group_id: &str) -> StorageResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT path FROM cache_groups WHERE group_id = ?1 ORDER BY path ASC")?;
+        let rows = stmt.query_map(params![group_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Group ids a cache file belongs to (delete/evict keeps groups consistent).
+    pub fn cache_groups_for_path(&self, path: &str) -> StorageResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT group_id FROM cache_groups WHERE path = ?1 ORDER BY group_id")?;
+        let rows = stmt.query_map(params![path], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// All groups as `(group_id, paths)` ordered by group id.
+    pub fn cache_list_groups(&self) -> StorageResult<Vec<(String, Vec<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT group_id, path FROM cache_groups ORDER BY group_id ASC, path ASC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for row in rows {
+            let (group_id, path) = row?;
+            match out.last_mut() {
+                Some((last_id, paths)) if *last_id == group_id => paths.push(path),
+                _ => out.push((group_id, vec![path])),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn cache_delete_group(&self, group_id: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM cache_groups WHERE group_id = ?1",
+            params![group_id],
+        )?)
     }
 
     // ── Transcode presets (B3.5, schema v16) ─────────────────────────────────
@@ -2449,10 +3152,7 @@ impl LibraryDatabase {
             None => return Ok(()),
             Some(_) => {}
         }
-        conn.execute(
-            "DELETE FROM transcode_presets WHERE id = ?1",
-            params![id],
-        )?;
+        conn.execute("DELETE FROM transcode_presets WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -2467,9 +3167,15 @@ impl LibraryDatabase {
               expires_at, revoked, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                link.id, link.account_id, link.remote_path, link.kind,
-                link.proxy_token, link.ttl_secs as i64, link.expires_at,
-                link.revoked as i64, link.created_at,
+                link.id,
+                link.account_id,
+                link.remote_path,
+                link.kind,
+                link.proxy_token,
+                link.ttl_secs as i64,
+                link.expires_at,
+                link.revoked as i64,
+                link.created_at,
             ],
         )?;
         Ok(())
@@ -2613,16 +3319,10 @@ impl LibraryDatabase {
         }
 
         // ── Open old DB read-only ─────────────────────────────────────────────
-        let old = Connection::open_with_flags(
-            old_db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| {
-            StorageError::Database(format!(
-                "cannot open old db {}: {e}",
-                old_db_path.display()
-            ))
-        })?;
+        let old = Connection::open_with_flags(old_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| {
+                StorageError::Database(format!("cannot open old db {}: {e}", old_db_path.display()))
+            })?;
 
         let now = chrono::Utc::now().timestamp();
 
@@ -2636,10 +3336,9 @@ impl LibraryDatabase {
         // Core `LibraryTrack.account_id` field (the Core column name is unchanged).
         let tracks: Vec<wdmm_core::models::LibraryTrack> = if imported {
             Vec::new()
-        } else if let (Some(source_col), Some(id_col)) = (
-            tracks_source_column(&old),
-            tracks_id_column(&old),
-        ) {
+        } else if let (Some(source_col), Some(id_col)) =
+            (tracks_source_column(&old), tracks_id_column(&old))
+        {
             // Build the projection only from columns that actually exist.
             let cols = table_columns(&old, "tracks").unwrap_or_default();
             let has = |c: &str| cols.iter().any(|x| x == c);
@@ -2648,9 +3347,17 @@ impl LibraryDatabase {
             let artist_expr = if has("artist") { "artist" } else { "NULL" };
             let size_expr = if has("size") { "size" } else { "0" };
             let modified_expr = if has("modified") { "modified" } else { "NULL" };
-            let duration_expr = if has("duration_ms") { "duration_ms" } else { "0" };
+            let duration_expr = if has("duration_ms") {
+                "duration_ms"
+            } else {
+                "0"
+            };
             let album_expr = if has("album") { "album" } else { "NULL" };
-            let album_artist_expr = if has("album_artist") { "album_artist" } else { "NULL" };
+            let album_artist_expr = if has("album_artist") {
+                "album_artist"
+            } else {
+                "NULL"
+            };
             let rev_expr = if has("rev") { "rev" } else { "0" };
 
             let has_cover_path = has("cover_path");
@@ -2729,12 +3436,19 @@ impl LibraryDatabase {
                         .unwrap_or_else(chrono::Utc::now);
                     let updated_at = chrono::DateTime::from_timestamp(updated_ts, 0)
                         .unwrap_or_else(chrono::Utc::now);
-                    Ok(Playlist { id, name, created_at, updated_at })
+                    Ok(Playlist {
+                        id,
+                        name,
+                        created_at,
+                        updated_at,
+                    })
                 })
                 .map_err(|e| StorageError::Database(format!("playlists query: {e}")))?;
 
             let mut out = Vec::new();
-            for p in rows.flatten() { out.push(p) }
+            for p in rows.flatten() {
+                out.push(p)
+            }
             out
         };
 
@@ -2764,7 +3478,9 @@ impl LibraryDatabase {
                 .map_err(|e| StorageError::Database(format!("playlist_entries query: {e}")))?;
 
             let mut out = Vec::new();
-            for e in rows.flatten() { out.push(e) }
+            for e in rows.flatten() {
+                out.push(e)
+            }
             out
         };
 
@@ -2897,7 +3613,10 @@ impl LibraryDatabase {
         let mut by_playlist: std::collections::HashMap<String, Vec<PlaylistEntry>> =
             std::collections::HashMap::new();
         for e in entries {
-            by_playlist.entry(e.playlist_id.clone()).or_default().push(e);
+            by_playlist
+                .entry(e.playlist_id.clone())
+                .or_default()
+                .push(e);
         }
         for (pid, mut ents) in by_playlist {
             ents.sort_by_key(|e| e.position);
@@ -3012,11 +3731,7 @@ impl LibraryDatabase {
 
     /// Move a folder to a new parent. `new_parent_id = None / "" / "root"`
     /// places it under the virtual root. Rejects moves that would form a cycle.
-    pub fn move_user_folder(
-        &self,
-        id: &str,
-        new_parent_id: Option<&str>,
-    ) -> StorageResult<()> {
+    pub fn move_user_folder(&self, id: &str, new_parent_id: Option<&str>) -> StorageResult<()> {
         let normalized = normalize_parent(new_parent_id);
         let conn = self.conn.lock().unwrap();
         // Cycle guard: new parent must not be the folder itself or a descendant.
@@ -3077,10 +3792,7 @@ impl LibraryDatabase {
     }
 
     /// List items in a folder. `folder_id = "root"` is valid (virtual root).
-    pub fn list_user_folder_items(
-        &self,
-        folder_id: &str,
-    ) -> StorageResult<Vec<UserFolderItem>> {
+    pub fn list_user_folder_items(&self, folder_id: &str) -> StorageResult<Vec<UserFolderItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT folder_id, ref_kind, ref_key, sort_order, added_at
@@ -3284,10 +3996,21 @@ impl LibraryDatabase {
               remote_missing, page_turn, rev, updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
-                &m.id, &m.source_name, &m.remote_path, &m.title,
-                &m.author, &m.series, &m.volume, &m.chapter_number,
-                m.page_count, m.cover_state, &m.format, m.remote_missing,
-                &m.page_turn, m.rev, &m.updated_at,
+                &m.id,
+                &m.source_name,
+                &m.remote_path,
+                &m.title,
+                &m.author,
+                &m.series,
+                &m.volume,
+                &m.chapter_number,
+                m.page_count,
+                m.cover_state,
+                &m.format,
+                m.remote_missing,
+                &m.page_turn,
+                m.rev,
+                &m.updated_at,
             ],
         )?;
         Ok(())
@@ -3406,7 +4129,9 @@ impl LibraryDatabase {
             })
         })?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
@@ -3414,7 +4139,10 @@ impl LibraryDatabase {
     pub fn replace_pages(&self, manga_id: &str, pages: &[MangaPage]) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM manga_pages WHERE manga_id = ?1", params![manga_id])?;
+        tx.execute(
+            "DELETE FROM manga_pages WHERE manga_id = ?1",
+            params![manga_id],
+        )?;
         for p in pages {
             tx.execute(
                 "INSERT INTO manga_pages (manga_id, page_index, rel_path) VALUES (?1, ?2, ?3)",
@@ -3468,7 +4196,9 @@ impl LibraryDatabase {
             })
         })?;
         let mut out = Vec::new();
-        for r in rows { out.push(r?); }
+        for r in rows {
+            out.push(r?);
+        }
         Ok(out)
     }
 
@@ -3582,7 +4312,11 @@ impl LibraryDatabase {
         conn.execute(
             "INSERT OR REPLACE INTO manga_progress (manga_id, page_index, updated_at)
              VALUES (?1, ?2, ?3)",
-            params![&progress.manga_id, progress.page_index, &progress.updated_at],
+            params![
+                &progress.manga_id,
+                progress.page_index,
+                &progress.updated_at
+            ],
         )?;
         Ok(())
     }
@@ -3598,7 +4332,10 @@ impl LibraryDatabase {
         let mut out = Vec::new();
         for r in rows {
             let title = r?;
-            out.push(SeriesTag { id: series_id_for_title(&title), title });
+            out.push(SeriesTag {
+                id: series_id_for_title(&title),
+                title,
+            });
         }
         Ok(out)
     }
@@ -3684,10 +4421,7 @@ impl LibraryDatabase {
         tx.execute("DELETE FROM manga_pages", [])?;
         tx.execute("DELETE FROM mangas", [])?;
         tx.execute("DELETE FROM deleted_mangas", [])?;
-        tx.execute(
-            "DELETE FROM sync_state WHERE remote_key LIKE 'manga:%'",
-            [],
-        )?;
+        tx.execute("DELETE FROM sync_state WHERE remote_key LIKE 'manga:%'", [])?;
 
         tx.commit()?;
         Ok(())
@@ -3771,11 +4505,7 @@ impl LibraryDatabase {
     }
 
     /// Delete a CUE album and its slices (CASCADE handles slices).
-    pub fn delete_cue_album(
-        &self,
-        source_name: &str,
-        cue_remote_path: &str,
-    ) -> StorageResult<()> {
+    pub fn delete_cue_album(&self, source_name: &str, cue_remote_path: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM cue_albums WHERE source_name = ?1 AND cue_remote_path = ?2",
@@ -4072,11 +4802,7 @@ impl LibraryDatabase {
         Ok(())
     }
 
-    pub fn clear_deleted_track(
-        &self,
-        source_name: &str,
-        remote_path: &str,
-    ) -> StorageResult<()> {
+    pub fn clear_deleted_track(&self, source_name: &str, remote_path: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM deleted_tracks WHERE source_name = ?1 AND remote_path = ?2",
@@ -4156,9 +4882,8 @@ impl LibraryDatabase {
 
     pub fn tombstoned_remote_paths(&self, source_name: &str) -> StorageResult<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT remote_path FROM deleted_tracks WHERE source_name = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT remote_path FROM deleted_tracks WHERE source_name = ?1")?;
         let rows = stmt.query_map(params![source_name], |row| row.get(0))?;
         let mut result = Vec::new();
         for r in rows {
@@ -4236,24 +4961,16 @@ impl LibraryDatabase {
         dest: &LibraryDatabase,
     ) -> StorageResult<CompareReport> {
         // ── Open old DB read-only ─────────────────────────────────────────────
-        let old = Connection::open_with_flags(
-            old_db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| {
-            StorageError::Database(format!(
-                "cannot open old db {}: {e}",
-                old_db_path.display()
-            ))
-        })?;
+        let old = Connection::open_with_flags(old_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| {
+                StorageError::Database(format!("cannot open old db {}: {e}", old_db_path.display()))
+            })?;
 
         let tracks_diff = compare_tracks(&old, dest)?;
         let deleted_tracks_diff = compare_deleted_tracks(&old, dest)?;
         let sync_state_diff = compare_sync_state(&old, dest)?;
 
-        let ok = tracks_diff.is_ok()
-            && deleted_tracks_diff.is_ok()
-            && sync_state_diff.is_ok();
+        let ok = tracks_diff.is_ok() && deleted_tracks_diff.is_ok() && sync_state_diff.is_ok();
 
         Ok(CompareReport {
             tracks: tracks_diff,
@@ -4335,21 +5052,21 @@ fn ts_to_dt(ts: i64) -> StorageResult<DateTime<Utc>> {
 /// Map a rusqlite `Row` (15-column manga select) to a [`Manga`].
 fn row_to_manga(row: &rusqlite::Row<'_>) -> rusqlite::Result<Manga> {
     Ok(Manga {
-        id:             row.get(0)?,
-        source_name:    row.get(1)?,
-        remote_path:    row.get(2)?,
-        title:          row.get(3)?,
-        author:         row.get(4)?,
-        series:         row.get(5)?,
-        volume:         row.get(6)?,
+        id: row.get(0)?,
+        source_name: row.get(1)?,
+        remote_path: row.get(2)?,
+        title: row.get(3)?,
+        author: row.get(4)?,
+        series: row.get(5)?,
+        volume: row.get(6)?,
         chapter_number: row.get(7)?,
-        page_count:     row.get(8)?,
-        cover_state:    row.get(9)?,
-        format:         row.get(10)?,
+        page_count: row.get(8)?,
+        cover_state: row.get(9)?,
+        format: row.get(10)?,
         remote_missing: row.get(11)?,
-        page_turn:      row.get(12)?,
-        rev:            row.get(13)?,
-        updated_at:     row.get(14)?,
+        page_turn: row.get(12)?,
+        rev: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -4490,10 +5207,7 @@ fn basename_of(remote_path: &str) -> String {
         .to_string()
 }
 
-fn compare_tracks(
-    old: &Connection,
-    dest: &LibraryDatabase,
-) -> StorageResult<TableDiff> {
+fn compare_tracks(old: &Connection, dest: &LibraryDatabase) -> StorageResult<TableDiff> {
     use std::collections::{HashMap, HashSet};
 
     // Read sqflite tracks
@@ -4514,7 +5228,8 @@ fn compare_tracks(
             let mut has_source_name = false;
             let mut has_account_id = false;
             {
-                let mut stmt = old.prepare("PRAGMA table_info(tracks)")
+                let mut stmt = old
+                    .prepare("PRAGMA table_info(tracks)")
                     .map_err(|e| StorageError::Database(format!("PRAGMA table_info: {e}")))?;
                 let rows = stmt.query_map([], |row| {
                     let col_name: String = row.get(1)?;
@@ -4545,7 +5260,8 @@ fn compare_tracks(
                 });
             };
 
-            let mut stmt = old.prepare(sql)
+            let mut stmt = old
+                .prepare(sql)
                 .map_err(|e| StorageError::Database(format!("tracks prepare: {e}")))?;
 
             let rows = stmt
@@ -4571,7 +5287,7 @@ fn compare_tracks(
     let right_map: HashMap<String, (String, String, i64)> = {
         let conn = dest.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT remote_path, account_id, title, COALESCE(duration_ms, 0) FROM tracks"
+            "SELECT remote_path, account_id, title, COALESCE(duration_ms, 0) FROM tracks",
         )?;
         let rows = stmt.query_map([], |row| {
             let remote_path: String = row.get(0)?;
@@ -4615,10 +5331,7 @@ fn compare_tracks(
     })
 }
 
-fn compare_deleted_tracks(
-    old: &Connection,
-    dest: &LibraryDatabase,
-) -> StorageResult<TableDiff> {
+fn compare_deleted_tracks(old: &Connection, dest: &LibraryDatabase) -> StorageResult<TableDiff> {
     use std::collections::{HashMap, HashSet};
 
     // Read sqflite deleted_tracks
@@ -4635,9 +5348,7 @@ fn compare_deleted_tracks(
             HashMap::new()
         } else {
             let mut stmt = old
-                .prepare(
-                    "SELECT source_name, remote_path, rev, pushed FROM deleted_tracks"
-                )
+                .prepare("SELECT source_name, remote_path, rev, pushed FROM deleted_tracks")
                 .map_err(|e| StorageError::Database(format!("deleted_tracks prepare: {e}")))?;
 
             let rows = stmt
@@ -4697,10 +5408,7 @@ fn compare_deleted_tracks(
     })
 }
 
-fn compare_sync_state(
-    old: &Connection,
-    dest: &LibraryDatabase,
-) -> StorageResult<TableDiff> {
+fn compare_sync_state(old: &Connection, dest: &LibraryDatabase) -> StorageResult<TableDiff> {
     use std::collections::{HashMap, HashSet};
 
     // Read sqflite sync_state
@@ -4717,9 +5425,7 @@ fn compare_sync_state(
             HashMap::new()
         } else {
             let mut stmt = old
-                .prepare(
-                    "SELECT remote_key, last_seq, base_up_to, parts FROM sync_state"
-                )
+                .prepare("SELECT remote_key, last_seq, base_up_to, parts FROM sync_state")
                 .map_err(|e| StorageError::Database(format!("sync_state prepare: {e}")))?;
 
             let rows = stmt
@@ -4743,9 +5449,8 @@ fn compare_sync_state(
     // Read Core sync_state
     let right_map: HashMap<String, (i64, i64, String)> = {
         let conn = dest.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT remote_key, last_seq, base_up_to, parts FROM sync_state"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT remote_key, last_seq, base_up_to, parts FROM sync_state")?;
         let rows = stmt.query_map([], |row| {
             let remote_key: String = row.get(0)?;
             let last_seq: i64 = row.get(1)?;
@@ -4797,7 +5502,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
     }
 
     #[test]
@@ -4857,21 +5562,33 @@ mod tests {
         db.upsert_manga(&mk(1, "nas", "/m/a.cbz", "cbz")).unwrap();
         assert_eq!(db.list_mangas().unwrap().len(), 2);
         // 'images' format is exempt from the unique constraint
-        db.upsert_manga(&mk(3, "nas", "/m/b.cbz", "images")).unwrap();
+        db.upsert_manga(&mk(3, "nas", "/m/b.cbz", "images"))
+            .unwrap();
         assert_eq!(db.list_mangas().unwrap().len(), 3);
 
         // pages replace
         let pages = vec![
-            MangaPage { manga_id: "m-1".into(), page_index: 0, rel_path: "p0.jpg".into() },
-            MangaPage { manga_id: "m-1".into(), page_index: 1, rel_path: "p1.jpg".into() },
+            MangaPage {
+                manga_id: "m-1".into(),
+                page_index: 0,
+                rel_path: "p0.jpg".into(),
+            },
+            MangaPage {
+                manga_id: "m-1".into(),
+                page_index: 1,
+                rel_path: "p1.jpg".into(),
+            },
         ];
         db.replace_pages("m-1", &pages).unwrap();
         assert_eq!(db.list_pages("m-1").unwrap().len(), 2);
-        db.replace_pages("m-1", &[MangaPage {
-            manga_id: "m-1".into(),
-            page_index: 0,
-            rel_path: "only.jpg".into(),
-        }])
+        db.replace_pages(
+            "m-1",
+            &[MangaPage {
+                manga_id: "m-1".into(),
+                page_index: 0,
+                rel_path: "only.jpg".into(),
+            }],
+        )
         .unwrap();
         assert_eq!(db.list_pages("m-1").unwrap().len(), 1);
 
@@ -4916,9 +5633,15 @@ mod tests {
         // images format → key is the manga id (surrogate; not path-bound)
         assert_eq!(manga_sync_key("abc-id", "images", "nas", "/m/a"), "abc-id");
         // cbz format → source + NUL + normalized path
-        assert_eq!(manga_sync_key("x", "cbz", "nas", "/m/a.cbz"), "nas\x00/m/a.cbz");
+        assert_eq!(
+            manga_sync_key("x", "cbz", "nas", "/m/a.cbz"),
+            "nas\x00/m/a.cbz"
+        );
         // path normalization is applied for container formats
-        assert_eq!(manga_sync_key("x", "pdf", "nas", "//m\\a.pdf"), "nas\x00/m/a.pdf");
+        assert_eq!(
+            manga_sync_key("x", "pdf", "nas", "//m\\a.pdf"),
+            "nas\x00/m/a.pdf"
+        );
     }
 
     #[test]
@@ -4966,7 +5689,8 @@ mod tests {
     fn manga_deleted_unpushed_mark_clear() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
         // rev=1 cbz row → sync_key = "nas\0/m/a.cbz"
-        db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1)).unwrap();
+        db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1))
+            .unwrap();
         db.delete_manga("m-1").unwrap();
 
         // list_deleted_mangas
@@ -5037,7 +5761,8 @@ mod tests {
     #[test]
     fn manga_deleted_images_format_sync_key_is_id() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        db.upsert_manga(&mk_manga(2, "nas", "/m/img", "images", 2)).unwrap();
+        db.upsert_manga(&mk_manga(2, "nas", "/m/img", "images", 2))
+            .unwrap();
         db.delete_manga("m-2").unwrap();
         let all = db.list_deleted_mangas().unwrap();
         assert_eq!(all.len(), 1);
@@ -5063,7 +5788,8 @@ mod tests {
     fn upsert_progress_preserves_timestamp() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
         // manga_progress has a FK → mangas(id); insert the parent row first.
-        db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1)).unwrap();
+        db.upsert_manga(&mk_manga(1, "nas", "/m/a.cbz", "cbz", 1))
+            .unwrap();
 
         let p1 = MangaProgress {
             manga_id: "m-1".into(),
@@ -5205,10 +5931,34 @@ mod tests {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
 
         let tracks = [
-            ("t1", "Yesterday", Some("The Beatles"), Some("Abbey Road"), None),
-            ("t2", "Tomorrow Never Knows", Some("The Beatles"), Some("Revolver"), None),
-            ("t3", "Daydream", Some("Beatles Solo"), Some("Solo Album"), Some("John Lennon")),
-            ("t4", "Abbey Road Medley", Some("Various"), Some("Covers"), None),
+            (
+                "t1",
+                "Yesterday",
+                Some("The Beatles"),
+                Some("Abbey Road"),
+                None,
+            ),
+            (
+                "t2",
+                "Tomorrow Never Knows",
+                Some("The Beatles"),
+                Some("Revolver"),
+                None,
+            ),
+            (
+                "t3",
+                "Daydream",
+                Some("Beatles Solo"),
+                Some("Solo Album"),
+                Some("John Lennon"),
+            ),
+            (
+                "t4",
+                "Abbey Road Medley",
+                Some("Various"),
+                Some("Covers"),
+                None,
+            ),
         ];
         for (id, title, artist, album, album_artist) in tracks {
             db.upsert_track(&LibraryTrack {
@@ -5237,7 +5987,11 @@ mod tests {
 
         // Album match
         let r = db.search_tracks("abbey").unwrap();
-        assert_eq!(r.len(), 2, "should find album 'Abbey Road' and title 'Abbey Road Medley'");
+        assert_eq!(
+            r.len(),
+            2,
+            "should find album 'Abbey Road' and title 'Abbey Road Medley'"
+        );
 
         // Album artist match
         let r = db.search_tracks("lennon").unwrap();
@@ -5745,7 +6499,10 @@ mod tests {
         let ss = dest.get_sync_state("library:y").unwrap().unwrap();
         assert_eq!(ss.last_seq, 5);
         // v6 flag now set.
-        assert_eq!(dest.load_kv("sqflite_imported_v6").unwrap().as_deref(), Some("1"));
+        assert_eq!(
+            dest.load_kv("sqflite_imported_v6").unwrap().as_deref(),
+            Some("1")
+        );
 
         // Third call: full no-op, all zero.
         let summary2 = LibraryDatabase::import_from_sqflite(&old_path, &dest).unwrap();
@@ -5795,7 +6552,10 @@ mod tests {
         assert!(!summary.already_done);
         assert_eq!(summary.deleted_tracks, 0);
         assert_eq!(summary.sync_state, 0);
-        assert_eq!(dest.load_kv("sqflite_imported_v6").unwrap().as_deref(), Some("1"));
+        assert_eq!(
+            dest.load_kv("sqflite_imported_v6").unwrap().as_deref(),
+            Some("1")
+        );
 
         let _ = fs::remove_file(&old_path);
     }
@@ -5808,7 +6568,10 @@ mod tests {
 
         // Virtual root is empty initially.
         assert!(db.list_user_folder_children(None).unwrap().is_empty());
-        assert!(db.list_user_folder_children(Some("root")).unwrap().is_empty());
+        assert!(db
+            .list_user_folder_children(Some("root"))
+            .unwrap()
+            .is_empty());
         assert!(db.list_user_folder_children(Some("")).unwrap().is_empty());
 
         // Create two root-level folders.
@@ -5836,7 +6599,10 @@ mod tests {
 
         // Move f3 from under f1 to under f2.
         db.move_user_folder(&f3.id, Some(&f2.id)).unwrap();
-        assert!(db.list_user_folder_children(Some(&f1.id)).unwrap().is_empty());
+        assert!(db
+            .list_user_folder_children(Some(&f1.id))
+            .unwrap()
+            .is_empty());
         assert_eq!(db.list_user_folder_children(Some(&f2.id)).unwrap().len(), 1);
 
         // Move to virtual root using "" sentinel.
@@ -5891,7 +6657,8 @@ mod tests {
         assert_eq!(folder_items[0].ref_key, "alb-001");
 
         // Remove item from root.
-        db.remove_user_folder_item("root", "track", "sha1abc").unwrap();
+        db.remove_user_folder_item("root", "track", "sha1abc")
+            .unwrap();
         assert!(db.list_user_folder_items("root").unwrap().is_empty());
 
         // Delete folder — items inside are cleaned up too.
@@ -5933,7 +6700,7 @@ mod tests {
             UserFolder {
                 id: "f-root-1".to_string(),
                 name: "Music".to_string(),
-                parent_id: None,          // virtual root
+                parent_id: None, // virtual root
                 sort_order: 0,
                 created_at: ts1,
             },
@@ -5966,7 +6733,11 @@ mod tests {
 
         // Verify folders are present via list_all_user_folders.
         let all_folders = db.list_all_user_folders().unwrap();
-        assert_eq!(all_folders.len(), 2, "expected 2 folders after first replace");
+        assert_eq!(
+            all_folders.len(),
+            2,
+            "expected 2 folders after first replace"
+        );
         let music = all_folders.iter().find(|f| f.id == "f-root-1").unwrap();
         assert_eq!(music.name, "Music");
         assert!(music.parent_id.is_none(), "Music should be at virtual root");
@@ -5980,8 +6751,12 @@ mod tests {
         // Verify items via list_all_user_folder_items.
         let all_items = db.list_all_user_folder_items().unwrap();
         assert_eq!(all_items.len(), 2, "expected 2 items after first replace");
-        assert!(all_items.iter().any(|i| i.folder_id == "root" && i.ref_key == "sha1-abc"));
-        assert!(all_items.iter().any(|i| i.folder_id == "f-child-1" && i.ref_key == "alb-001"));
+        assert!(all_items
+            .iter()
+            .any(|i| i.folder_id == "root" && i.ref_key == "sha1-abc"));
+        assert!(all_items
+            .iter()
+            .any(|i| i.folder_id == "f-child-1" && i.ref_key == "alb-001"));
 
         // parent_id "root" sentinel normalises to NULL via replace.
         let folders_root = vec![UserFolder {
@@ -6001,8 +6776,14 @@ mod tests {
 
         // ── Wipe: replace with empty sets ─────────────────────────────────────
         db.replace_user_folders(&[], &[]).unwrap();
-        assert!(db.list_all_user_folders().unwrap().is_empty(), "folders should be empty after wipe");
-        assert!(db.list_all_user_folder_items().unwrap().is_empty(), "items should be empty after wipe");
+        assert!(
+            db.list_all_user_folders().unwrap().is_empty(),
+            "folders should be empty after wipe"
+        );
+        assert!(
+            db.list_all_user_folder_items().unwrap().is_empty(),
+            "items should be empty after wipe"
+        );
 
         // ── Second snapshot replaces first ────────────────────────────────────
         let folders2 = vec![UserFolder {
@@ -6112,21 +6893,24 @@ mod tests {
 
         // Remaining slices
         assert_eq!(
-            db.remaining_slices_for_cue("nas", "/music/album.cue").unwrap(),
+            db.remaining_slices_for_cue("nas", "/music/album.cue")
+                .unwrap(),
             2
         );
 
         // Delete one slice
         assert_eq!(db.delete_cue_slice("slice-001").unwrap(), 1);
         assert_eq!(
-            db.remaining_slices_for_cue("nas", "/music/album.cue").unwrap(),
+            db.remaining_slices_for_cue("nas", "/music/album.cue")
+                .unwrap(),
             1
         );
 
         // Delete album (cascades to remaining slice)
         db.delete_cue_album("nas", "/music/album.cue").unwrap();
         assert_eq!(
-            db.remaining_slices_for_cue("nas", "/music/album.cue").unwrap(),
+            db.remaining_slices_for_cue("nas", "/music/album.cue")
+                .unwrap(),
             0
         );
     }
@@ -6200,17 +6984,20 @@ mod tests {
 
         // Verify remaining_slices works
         assert_eq!(
-            db.remaining_slices_for_cue("test-source", "/path/album.cue").unwrap(),
+            db.remaining_slices_for_cue("test-source", "/path/album.cue")
+                .unwrap(),
             1
         );
 
         // Delete and verify
         db.delete_cue_slice("slice-test-001").unwrap();
         assert_eq!(
-            db.remaining_slices_for_cue("test-source", "/path/album.cue").unwrap(),
+            db.remaining_slices_for_cue("test-source", "/path/album.cue")
+                .unwrap(),
             0
         );
-        db.delete_cue_album("test-source", "/path/album.cue").unwrap();
+        db.delete_cue_album("test-source", "/path/album.cue")
+            .unwrap();
     }
 
     #[test]
@@ -6325,7 +7112,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -6858,7 +7645,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -7178,7 +7965,8 @@ mod tests {
         // Build a schema-v9 database by hand (cover_relpath / cover_path as TEXT).
         {
             let conn = Connection::open(&path).expect("create v9 db");
-            conn.execute_batch(r#"
+            conn.execute_batch(
+                r#"
                 CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER PRIMARY KEY);
                 INSERT OR IGNORE INTO _schema_version VALUES (9);
 
@@ -7295,25 +8083,52 @@ mod tests {
                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, '', '', 0
                 );
-            "#).expect("seed v9 db");
+            "#,
+            )
+            .expect("seed v9 db");
         }
 
         // Open through LibraryDatabase — triggers v10 migration.
         let db = LibraryDatabase::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 16, "schema must reach v16");
+        assert_eq!(db.schema_version().unwrap(), 17, "schema must reach v17");
 
         let mangas = db.list_mangas().unwrap();
         let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");
 
-        assert_eq!(find("mg-with").cover_state, 2,  "non-empty cover_relpath → present(2)");
-        assert_eq!(find("mg-null").cover_state, 0,  "NULL cover_relpath → unknown(0)");
-        assert_eq!(find("mg-empty").cover_state, 0, "empty cover_relpath → unknown(0)");
+        assert_eq!(
+            find("mg-with").cover_state,
+            2,
+            "non-empty cover_relpath → present(2)"
+        );
+        assert_eq!(
+            find("mg-null").cover_state,
+            0,
+            "NULL cover_relpath → unknown(0)"
+        );
+        assert_eq!(
+            find("mg-empty").cover_state,
+            0,
+            "empty cover_relpath → unknown(0)"
+        );
 
         let slices = db.list_cue_slices_for_cue("cue-v10").unwrap();
-        let find_sl = |id: &str| slices.iter().find(|s| s.music_id == id).expect("slice not found");
+        let find_sl = |id: &str| {
+            slices
+                .iter()
+                .find(|s| s.music_id == id)
+                .expect("slice not found")
+        };
 
-        assert_eq!(find_sl("sl-with").cover_state, 2, "non-empty cover_path → present(2)");
-        assert_eq!(find_sl("sl-null").cover_state, 0, "NULL cover_path → unknown(0)");
+        assert_eq!(
+            find_sl("sl-with").cover_state,
+            2,
+            "non-empty cover_path → present(2)"
+        );
+        assert_eq!(
+            find_sl("sl-null").cover_state,
+            0,
+            "NULL cover_path → unknown(0)"
+        );
     }
 
     /// import_from_sqflite maps a non-empty `cover_path` column to cover_state=2.
@@ -7363,11 +8178,29 @@ mod tests {
         LibraryDatabase::import_from_sqflite(&path, &dest).unwrap();
 
         let tracks = dest.list_tracks().unwrap();
-        let find = |id: &str| tracks.iter().find(|t| t.id == id).expect("track not found").clone();
+        let find = |id: &str| {
+            tracks
+                .iter()
+                .find(|t| t.id == id)
+                .expect("track not found")
+                .clone()
+        };
 
-        assert_eq!(find("t-cov").cover_state,   2, "non-empty cover_path → present(2)");
-        assert_eq!(find("t-none").cover_state,  0, "NULL cover_path → unknown(0)");
-        assert_eq!(find("t-empty").cover_state, 0, "empty cover_path → unknown(0)");
+        assert_eq!(
+            find("t-cov").cover_state,
+            2,
+            "non-empty cover_path → present(2)"
+        );
+        assert_eq!(
+            find("t-none").cover_state,
+            0,
+            "NULL cover_path → unknown(0)"
+        );
+        assert_eq!(
+            find("t-empty").cover_state,
+            0,
+            "empty cover_path → unknown(0)"
+        );
     }
 
     /// cover_state survives upsert→get roundtrip for tracks, slices, mangas; setters work.
@@ -7387,10 +8220,18 @@ mod tests {
             ..Default::default()
         };
         db.upsert_track(&track).unwrap();
-        assert_eq!(db.get_track("cs-t1").unwrap().unwrap().cover_state, 2, "track upsert should keep cover_state=2");
+        assert_eq!(
+            db.get_track("cs-t1").unwrap().unwrap().cover_state,
+            2,
+            "track upsert should keep cover_state=2"
+        );
 
         db.set_track_cover_state("cs-t1", 1).unwrap();
-        assert_eq!(db.get_track("cs-t1").unwrap().unwrap().cover_state, 1, "set_track_cover_state(1) should work");
+        assert_eq!(
+            db.get_track("cs-t1").unwrap().unwrap().cover_state,
+            1,
+            "set_track_cover_state(1) should work"
+        );
 
         // CueSlice
         let album = CueAlbum {
@@ -7419,12 +8260,24 @@ mod tests {
             ..Default::default()
         };
         db.upsert_cue_slice(&slice).unwrap();
-        let got_sl = db.get_cue_slice_by_source_path("nas", "/m/cs_t1.virt").unwrap().unwrap();
-        assert_eq!(got_sl.cover_state, 2, "slice upsert should keep cover_state=2");
+        let got_sl = db
+            .get_cue_slice_by_source_path("nas", "/m/cs_t1.virt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got_sl.cover_state, 2,
+            "slice upsert should keep cover_state=2"
+        );
 
         db.set_cue_slice_cover_state("cs-sl1", 0).unwrap();
-        let got_sl2 = db.get_cue_slice_by_source_path("nas", "/m/cs_t1.virt").unwrap().unwrap();
-        assert_eq!(got_sl2.cover_state, 0, "set_cue_slice_cover_state(0) should work");
+        let got_sl2 = db
+            .get_cue_slice_by_source_path("nas", "/m/cs_t1.virt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got_sl2.cover_state, 0,
+            "set_cue_slice_cover_state(0) should work"
+        );
 
         // Manga
         let manga = Manga {
@@ -7432,7 +8285,10 @@ mod tests {
             source_name: "nas".into(),
             remote_path: "/m/cs.cbz".into(),
             title: "CS Manga".into(),
-            author: None, series: None, volume: None, chapter_number: None,
+            author: None,
+            series: None,
+            volume: None,
+            chapter_number: None,
             page_count: 5,
             cover_state: 2,
             format: "cbz".into(),
@@ -7442,10 +8298,18 @@ mod tests {
             updated_at: now.clone(),
         };
         db.upsert_manga(&manga).unwrap();
-        assert_eq!(db.get_manga("cs-mg1").unwrap().unwrap().cover_state, 2, "manga upsert should keep cover_state=2");
+        assert_eq!(
+            db.get_manga("cs-mg1").unwrap().unwrap().cover_state,
+            2,
+            "manga upsert should keep cover_state=2"
+        );
 
         db.set_manga_cover_state("cs-mg1", 0).unwrap();
-        assert_eq!(db.get_manga("cs-mg1").unwrap().unwrap().cover_state, 0, "set_manga_cover_state(0) should work");
+        assert_eq!(
+            db.get_manga("cs-mg1").unwrap().unwrap().cover_state,
+            0,
+            "set_manga_cover_state(0) should work"
+        );
     }
 
     // ── v13 three-layer preset migration / CRUD tests ────────────────────────
@@ -7512,10 +8376,14 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
 
         let all = db.list_transcode_presets().unwrap();
-        assert_eq!(all.len(), 4, "two built-ins + two migrated user rows: {all:?}");
+        assert_eq!(
+            all.len(),
+            4,
+            "two built-ins + two migrated user rows: {all:?}"
+        );
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, ["h264", "hevc", "my-h264", "my-mpeg2"]);
@@ -7657,7 +8525,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -7788,12 +8656,14 @@ mod tests {
                 .collect();
             assert_eq!(columns.len(), 21, "v15 table has 21 columns: {columns:?}");
             assert!(
-                !columns.iter().any(|c| c == "hw_video_options" || c == "sw_video_options"),
+                !columns
+                    .iter()
+                    .any(|c| c == "hw_video_options" || c == "sw_video_options"),
                 "v15 drops both advanced-option columns: {columns:?}"
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -7911,7 +8781,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -8087,5 +8957,339 @@ mod tests {
         let hevc = db.get_transcode_preset("hevc").unwrap().unwrap();
         assert_eq!(hevc.sw_video_encoder, "libx264");
         assert_eq!(hevc.sw_video_preset, "veryfast");
+    }
+}
+
+#[cfg(test)]
+mod v17_queue_cache_tests {
+    use super::*;
+
+    fn open_temp(tag: &str) -> (std::path::PathBuf, LibraryDatabase) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("wdmm_{tag}_{}.db", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&path);
+        let db = LibraryDatabase::open(&path).expect("open temp db");
+        (path, db)
+    }
+
+    fn task_row(id: &str) -> QueueTaskRow {
+        QueueTaskRow {
+            id: id.into(),
+            kind: "download_cache".into(),
+            status: "pending".into(),
+            source_name: "nas".into(),
+            remote_path: format!("/music/{id}.flac"),
+            file_name: format!("{id}.flac"),
+            account_id: "acc-1".into(),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_100,
+            local_path: Some(format!("/cache/{id}.flac")),
+            local_uri: None,
+            error_message: None,
+            progress: 0.25,
+            progress_mode: "bytes".into(),
+            bytes_total: Some(1_000),
+            bytes_done: 250,
+            units_total: None,
+            units_done: 0,
+            attempts: 1,
+            attempts_cap: Some(5),
+            next_retry_at: None,
+            batch_id: "batch-1".into(),
+            cache_group_id: None,
+            target: "cache".into(),
+            priority: 3,
+            payload_path: None,
+            result_json: None,
+            remote_size: Some(1_000),
+            remote_modified: Some(1_699_000_000),
+        }
+    }
+
+    fn batch_row(id: &str) -> QueueBatchRow {
+        QueueBatchRow {
+            id: id.into(),
+            kind: "download".into(),
+            origin: "user".into(),
+            silent: false,
+            expected_total: Some(2),
+            created_at: 1_700_000_000_000,
+            closed_at: None,
+            label: Some("Album".into()),
+        }
+    }
+
+    /// A v16 database keeps Dart's queue snapshot in the KV store and the old
+    /// `queue_tasks` stub; v17 must replace both with the durable tables and
+    /// purge the snapshot in the same open().
+    #[test]
+    fn migrate_v17_creates_queue_and_cache_tables() {
+        use rusqlite::Connection;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("wdmm_migrate_v17_test_{}.db", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).expect("create v16 db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE _schema_version (version INTEGER PRIMARY KEY);
+                INSERT INTO _schema_version VALUES (16);
+
+                CREATE TABLE queue_tasks (
+                    id      TEXT PRIMARY KEY,
+                    kind    TEXT NOT NULL,
+                    status  TEXT NOT NULL,
+                    created INTEGER NOT NULL
+                );
+                INSERT INTO queue_tasks VALUES ('old', 'download_cache', 'pending', 1);
+
+                CREATE TABLE kv_store (
+                    key        TEXT PRIMARY KEY,
+                    value      TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO kv_store VALUES
+                    ('queue_task_ids', '["old"]', 1),
+                    ('queue_task_old', '{"id":"old"}', 1),
+                    ('queue_batch_ids', '["b1"]', 1),
+                    ('queue_batch_b1', '{"id":"b1"}', 1),
+                    ('openapi_token', 'keep-me', 1);
+
+                -- sqflite-era CUE membership (members blob) from the Dart index.
+                CREATE TABLE cache_groups (
+                    group_id   TEXT PRIMARY KEY,
+                    members    TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO cache_groups VALUES ('cue1', 'a', 'now');
+                "#,
+            )
+            .expect("seed v16 db");
+        }
+
+        let db = LibraryDatabase::open(&path).expect("open db and migrate");
+        assert_eq!(db.schema_version().unwrap(), 17);
+
+        {
+            let conn = db.conn.lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(queue_tasks)").unwrap();
+            let columns: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(columns.len(), 29, "v17 queue_tasks columns: {columns:?}");
+            assert!(columns.iter().any(|c| c == "batch_id"));
+            assert!(columns.iter().any(|c| c == "next_retry_at"));
+            assert!(!columns.iter().any(|c| c == "created"), "{columns:?}");
+
+            let mut stmt = conn.prepare("PRAGMA table_info(cache_groups)").unwrap();
+            let columns: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(columns, ["group_id", "path"]);
+
+            // The old stub rows are gone and the index exists.
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM queue_tasks", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+            let idx: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                      AND name IN ('queue_tasks_batch', 'queue_tasks_status',
+                                   'cache_entries_kind', 'cache_entries_accessed')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 4);
+        }
+
+        // Legacy queue keys purged, unrelated KV untouched.
+        let keys: Vec<String> = db.list_kv().unwrap().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["openapi_token"]);
+        assert_eq!(
+            db.load_kv("openapi_token").unwrap().as_deref(),
+            Some("keep-me")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn queue_task_rows_round_trip() {
+        let (path, db) = open_temp("queue_tasks");
+        let _ = std::fs::remove_file(&path);
+
+        let mut t = task_row("t1");
+        db.queue_upsert_task(&t).unwrap();
+        assert_eq!(db.queue_get_task("t1").unwrap().as_ref(), Some(&t));
+
+        // Upsert keeps the primary key and replaces every column.
+        t.status = "completed".into();
+        t.progress = 1.0;
+        t.bytes_done = 1_000;
+        db.queue_upsert_task(&t).unwrap();
+        let got = db.queue_get_task("t1").unwrap().unwrap();
+        assert_eq!(got.status, "completed");
+        assert_eq!(got.bytes_done, 1_000);
+
+        let mut t2 = task_row("t2");
+        t2.created_at = 1_700_000_000_001;
+        t2.remote_path = "/other/x.mp3".into();
+        t2.account_id = "acc-2".into();
+        db.queue_upsert_task(&t2).unwrap();
+
+        let all = db.queue_list_tasks().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "t1");
+        assert_eq!(all[1].id, "t2");
+
+        let by_remote = db.queue_find_by_remote("acc-1", "/music/t1.flac").unwrap();
+        assert_eq!(by_remote.len(), 1);
+        assert_eq!(by_remote[0].id, "t1");
+        assert!(db
+            .queue_find_by_remote("acc-2", "/music/t1.flac")
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(db.queue_delete_task("t2").unwrap(), 1);
+        assert!(db.queue_get_task("t2").unwrap().is_none());
+        assert_eq!(db.queue_delete_tasks(&["t1".into()]).unwrap(), 1);
+        assert!(db.queue_list_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn queue_batch_rows_round_trip() {
+        let (path, db) = open_temp("queue_batches");
+        let _ = std::fs::remove_file(&path);
+
+        let mut b = batch_row("b1");
+        db.queue_upsert_batch(&b).unwrap();
+        assert_eq!(db.queue_get_batch("b1").unwrap().as_ref(), Some(&b));
+
+        b.closed_at = Some(1_700_000_001_000);
+        b.silent = true;
+        db.queue_upsert_batch(&b).unwrap();
+        let got = db.queue_get_batch("b1").unwrap().unwrap();
+        assert_eq!(got.closed_at, Some(1_700_000_001_000));
+        assert!(got.silent);
+
+        db.queue_upsert_batch(&batch_row("b2")).unwrap();
+        let all = db.queue_list_batches().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(db.queue_delete_batch("b1").unwrap(), 1);
+        assert_eq!(db.queue_delete_all_batches().unwrap(), 1);
+        assert!(db.queue_list_batches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_kv_purge_is_idempotent() {
+        let (path, db) = open_temp("legacy_kv");
+        let _ = std::fs::remove_file(&path);
+
+        db.save_kv("queue_task_ids", "[]").unwrap();
+        db.save_kv("queue_task_abc", "{}").unwrap();
+        db.save_kv("queue_batch_x", "{}").unwrap();
+        db.save_kv("api-token", "t").unwrap();
+
+        assert_eq!(db.queue_purge_legacy_kv().unwrap(), 3);
+        assert_eq!(db.queue_purge_legacy_kv().unwrap(), 0);
+        assert_eq!(db.load_kv("api-token").unwrap().as_deref(), Some("t"));
+    }
+
+    fn entry(path: &str, kind: &str, size: i64, accessed_at: i64) -> CacheEntryRow {
+        CacheEntryRow {
+            path: path.into(),
+            kind: kind.into(),
+            size,
+            accessed_at,
+            created_at: accessed_at - 10,
+            account_id: Some("acc-1".into()),
+            remote_path: Some("/remote/x".into()),
+        }
+    }
+
+    #[test]
+    fn cache_entries_register_touch_and_lru() {
+        let (path, db) = open_temp("cache_entries");
+        let _ = std::fs::remove_file(&path);
+
+        db.cache_put_entry(&entry("/c/a.flac", "audio", 100, 10))
+            .unwrap();
+        db.cache_put_entry(&entry("/c/b.flac", "audio", 200, 20))
+            .unwrap();
+        db.cache_put_entry(&entry("/c/v.mkv", "video", 300, 5))
+            .unwrap();
+
+        // A read of an unknown path creates a size-less row.
+        db.cache_touch("/c/new.flac", "audio", 30).unwrap();
+        let got = db.cache_get_entry("/c/new.flac").unwrap().unwrap();
+        assert_eq!(got.size, 0);
+        assert_eq!(got.accessed_at, 30);
+
+        // A read of a known path only bumps accessed_at and keeps the size.
+        db.cache_touch("/c/b.flac", "audio", 40).unwrap();
+        let got = db.cache_get_entry("/c/b.flac").unwrap().unwrap();
+        assert_eq!(got.size, 200);
+        assert_eq!(got.accessed_at, 40);
+        assert_eq!(db.cache_accessed_at("/c/b.flac").unwrap(), Some(40));
+
+        assert_eq!(db.cache_total_size().unwrap(), 600);
+        assert_eq!(db.cache_total_size_by_kind("audio").unwrap(), 300);
+
+        // LRU order: oldest access first.
+        let lru = db.cache_lru(2).unwrap();
+        assert_eq!(
+            lru.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            ["/c/v.mkv", "/c/a.flac"]
+        );
+        let audio = db.cache_list_entries_by_kind("audio").unwrap();
+        assert_eq!(
+            audio.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            ["/c/a.flac", "/c/new.flac", "/c/b.flac"]
+        );
+
+        assert_eq!(db.cache_delete_entry("/c/v.mkv").unwrap(), 1);
+        assert_eq!(
+            db.cache_delete_entries(&["/c/a.flac".into(), "/c/missing".into()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.cache_forget_kind("audio").unwrap(), 2);
+        assert_eq!(db.cache_total_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn cache_groups_keep_membership() {
+        let (path, db) = open_temp("cache_groups");
+        let _ = std::fs::remove_file(&path);
+
+        db.cache_bind_group("cue1", &["/c/1.flac".into(), "/c/2.flac".into()])
+            .unwrap();
+        // Idempotent merge, empty ids/paths ignored.
+        db.cache_bind_group("cue1", &["/c/2.flac".into(), "/c/3.flac".into(), "".into()])
+            .unwrap();
+        db.cache_bind_group("", &["/c/x.flac".into()]).unwrap();
+        db.cache_bind_group("cue2", &[]).unwrap();
+
+        assert_eq!(
+            db.cache_group_paths("cue1").unwrap(),
+            ["/c/1.flac", "/c/2.flac", "/c/3.flac"]
+        );
+        assert_eq!(db.cache_groups_for_path("/c/2.flac").unwrap(), ["cue1"]);
+
+        let groups = db.cache_list_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "cue1");
+        assert_eq!(groups[0].1.len(), 3);
+
+        assert_eq!(db.cache_delete_group("cue1").unwrap(), 3);
+        assert!(db.cache_group_paths("cue1").unwrap().is_empty());
     }
 }

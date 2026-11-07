@@ -13,7 +13,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use wdmm_openapi::{ApiServer, BindMode, ServerConfig};
-use wdmm_queue::TaskQueue;
 use wdmm_storage::LibraryDatabase;
 
 #[tokio::main]
@@ -38,7 +37,6 @@ async fn main() {
         LibraryDatabase::open(Path::new(&db_path))
             .expect("failed to open library database"),
     );
-    let queue = Arc::new(TaskQueue::new());
 
     let config = ServerConfig {
         bind_mode,
@@ -52,9 +50,9 @@ async fn main() {
     println!("Smoke-test examples:");
     println!("  curl http://127.0.0.1:{port}/health");
     println!("  curl -H 'Authorization: Bearer {}' http://127.0.0.1:{port}/v1/accounts", config.token);
-    println!("  curl -H 'Authorization: Bearer {}' http://127.0.0.1:{port}/v1/tasks", config.token);
+    println!("  curl -H 'Authorization: Bearer {}' http://127.0.0.1:{port}/v1/media/link", config.token);
 
-    let server = ApiServer::start(config, db, queue, None)
+    let server = ApiServer::start(config, db, None)
         .await
         .expect("failed to start API server");
 

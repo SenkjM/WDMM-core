@@ -8,6 +8,10 @@
 //! Field ordering of [`QueueTask`] mirrors its JSON form; the stored DDL in
 //! `wdmm-storage` (schema v17) uses the same names.
 
+// The wire format uses snake_case names; `from_str` here is a deliberate
+// counterpart to `as_str` rather than the `FromStr` trait.
+#![allow(clippy::should_implement_trait)]
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -275,6 +279,7 @@ pub struct QueueTask {
 }
 
 impl QueueTask {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         kind: TaskKind,

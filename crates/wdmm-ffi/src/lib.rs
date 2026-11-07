@@ -5,7 +5,7 @@
 //! - All functions are `extern "C"` `#[no_mangle]`.
 //! - Strings are returned as `FfiString` (owned, caller must free via
 //!   [`wdmm_ffi_free_string`]).
-//! - Queue status is returned as JSON (small, easy to decode in Dart/C#).
+//! - Queue commands/queries are JSON in / JSON out (see `queue_api.rs`).
 //! - The OpenAPI server is started/stopped via a module-level Tokio runtime
 //!   so it keeps running across FFI calls.
 
@@ -17,11 +17,12 @@ use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use tokio::runtime::Runtime;
-use wdmm_queue::TaskQueue;
 use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase};
 
 mod dlna_session;
 pub(crate) mod ext;
+mod queue_api;
+mod queue_runner;
 
 // ── Runtime singleton ─────────────────────────────────────────────────────────
 
@@ -69,147 +70,6 @@ pub extern "C" fn wdmm_version() -> FfiString {
 #[no_mangle]
 pub extern "C" fn wdmm_hello() -> FfiString {
     FfiString::from("Hello from WDMM Rust core!")
-}
-
-// ── Queue status ──────────────────────────────────────────────────────────────
-
-/// Module-level Arc queue — shared between FFI operations and the OpenAPI server.
-static QUEUE: OnceLock<std::sync::Arc<TaskQueue>> = OnceLock::new();
-
-/// Global queue reference (created lazily; shared with `global_queue_arc()`).
-fn global_queue() -> &'static TaskQueue {
-    QUEUE.get_or_init(|| std::sync::Arc::new(TaskQueue::new()))
-}
-
-/// Owned Arc clone of the global queue, for passing to `ApiServer::start`.
-fn global_queue_arc() -> std::sync::Arc<TaskQueue> {
-    std::sync::Arc::clone(QUEUE.get_or_init(|| std::sync::Arc::new(TaskQueue::new())))
-}
-
-/// Return queue tasks as a JSON array.
-///
-/// Returned string is owned — caller must pass it to [`wdmm_ffi_free_string`].
-///
-/// Schema per task:
-/// ```json
-/// {"id":"…","kind":"…","status":"…","progress":0.5,"total_bytes":1000,
-///  "transferred_bytes":500,"error":null}
-/// ```
-#[no_mangle]
-pub extern "C" fn wdmm_queue_status_json() -> FfiString {
-    let tasks = rt().block_on(global_queue().list());
-    let arr: Vec<_> = tasks
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "id":                 t.id,
-                "kind":               format!("{:?}", t.kind),
-                "status":             format!("{:?}", t.status),
-                "progress":           t.progress,
-                "total_bytes":        t.total_bytes,
-                "transferred_bytes":  t.transferred_bytes,
-                "error":              t.error,
-            })
-        })
-        .collect();
-    FfiString::from(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
-}
-
-/// Cancel a task by id. Returns `"ok"` on success, `"not_found"` if the id is
-/// unknown, or an error message otherwise.
-///
-/// `task_id` must be a valid UTF-8 null-terminated C string.
-/// Returns an owned `FfiString`; caller must free it.
-#[no_mangle]
-pub extern "C" fn wdmm_queue_cancel(task_id: *const c_char) -> FfiString {
-    let id = match ptr_to_str(task_id) {
-        Some(s) => s,
-        None => return FfiString::from("invalid utf-8"),
-    };
-    let result = rt().block_on(global_queue().cancel(id));
-    match result {
-        Ok(()) => FfiString::ok(),
-        Err(wdmm_queue::QueueError::NotFound(_)) => FfiString::from("not_found"),
-        Err(e) => FfiString::from(e.to_string()),
-    }
-}
-
-/// Enqueue a new download task from JSON.
-///
-/// Expected JSON shape (all fields optional except `id` and `kind`):
-/// ```json
-/// {
-///   "id":          "uuid-...",
-///   "kind":        "download_track",
-///   "remote_path": "/Music/foo.mp3",
-///   "local_path":  "/data/.../foo.mp3",
-///   "total_bytes": 5000000
-/// }
-/// ```
-///
-/// Returns `"ok"` on success, `"error:<message>"` on failure.
-/// `json` must be a valid null-terminated UTF-8 C string.
-///
-/// ## Feature flag
-/// This function is always available via FFI. On the Dart side, it is gated
-/// by `kRustQueueEnabled` (default `false`). Flip the flag to `true` in
-/// settings to route single-file downloads through the Rust `SerialPump`.
-/// The Dart `_pump` loop remains active while the flag is `false`.
-#[no_mangle]
-pub extern "C" fn wdmm_queue_enqueue(json: *const c_char) -> FfiString {
-    let s = match ptr_to_str(json) {
-        Some(s) => s,
-        None => return FfiString::from("error:null json pointer"),
-    };
-    let v: serde_json::Value = match serde_json::from_str(s) {
-        Ok(v) => v,
-        Err(e) => return FfiString::from(format!("error:json parse: {e}")),
-    };
-    let id = match v["id"].as_str() {
-        Some(id) => id.to_string(),
-        None => return FfiString::from("error:missing 'id'"),
-    };
-    let kind_str = v["kind"].as_str().unwrap_or("download_track");
-    let kind = match kind_str {
-        "download_track"    => wdmm_core::models::TaskKind::DownloadTrack,
-        "download_playlist" => wdmm_core::models::TaskKind::DownloadPlaylist,
-        "upload_file"       => wdmm_core::models::TaskKind::UploadFile,
-        "backup"            => wdmm_core::models::TaskKind::Backup,
-        "sync_credentials"  => wdmm_core::models::TaskKind::SyncCredentials,
-        "sync_library"      => wdmm_core::models::TaskKind::SyncLibrary,
-        "sync_playlists"    => wdmm_core::models::TaskKind::SyncPlaylists,
-        "sync_manga"        => wdmm_core::models::TaskKind::SyncManga,
-        _                   => wdmm_core::models::TaskKind::Other,
-    };
-    let task = wdmm_core::models::QueueTask {
-        id,
-        kind,
-        status: wdmm_core::models::TaskStatus::Pending,
-        progress: 0.0,
-        total_bytes: v["total_bytes"].as_u64().unwrap_or(0),
-        transferred_bytes: 0,
-        created: chrono::Utc::now(),
-        updated: chrono::Utc::now(),
-        attempts: 0,
-        error: None,
-        remote_path: v["remote_path"].as_str().map(Into::into),
-        local_path: v["local_path"].as_str().map(Into::into),
-    };
-    match rt().block_on(global_queue().enqueue(task)) {
-        Ok(()) => FfiString::ok(),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
-
-/// Return the number of pending tasks.
-#[no_mangle]
-pub extern "C" fn wdmm_queue_pending_count() -> i32 {
-    rt().block_on(async {
-        global_queue()
-            .list_by_status(wdmm_core::models::TaskStatus::Pending)
-            .await
-            .len() as i32
-    })
 }
 
 // ── OpenAPI server ────────────────────────────────────────────────────────────
@@ -394,9 +254,8 @@ pub extern "C" fn wdmm_openapi_start(port: u16) -> FfiString {
         return FfiString::from(s.token().to_string());
     }
 
-    // Share the same Arc<LibraryDatabase> + Arc<TaskQueue> as the rest of the FFI.
+    // Share the same Arc<LibraryDatabase> as the rest of the FFI.
     let db = std::sync::Arc::clone(global_library_db());
-    let queue = global_queue_arc();
 
     // Resolve the bearer token (file 0600 → KV → generate).
     let token = resolve_api_token(&db);
@@ -407,7 +266,7 @@ pub extern "C" fn wdmm_openapi_start(port: u16) -> FfiString {
         token: token.clone(),
     };
 
-    match rt().block_on(ApiServer::start(config, db, queue, Some(build_media_link_fn()))) {
+    match rt().block_on(ApiServer::start(config, db, Some(build_media_link_fn()))) {
         Ok(server) => {
             *guard = Some(server);
             FfiString::from(token)
@@ -4775,23 +4634,6 @@ pub extern "C" fn wdmm_account_delete(id: *const c_char) -> FfiString {
     }
 }
 
-
-// ── Queue concurrency FFI ─────────────────────────────────────────────────────
-
-/// Return the current queue concurrency limit (1–8).
-#[no_mangle]
-pub extern "C" fn wdmm_queue_get_concurrency() -> i32 {
-    global_queue().concurrency() as i32
-}
-
-/// Set the queue concurrency limit. `n` is clamped to `1..=8`.
-/// Returns `"ok"`. Caller must free the result.
-#[no_mangle]
-pub extern "C" fn wdmm_queue_set_concurrency(n: i32) -> FfiString {
-    global_queue().set_concurrency(n.max(1) as usize);
-    FfiString::ok()
-}
-
 // ── JSON → model helpers ──────────────────────────────────────────────────────
 
 fn json_to_track(v: &serde_json::Value) -> Result<wdmm_core::models::LibraryTrack, String> {
@@ -5314,18 +5156,6 @@ mod tests {
     }
 
     #[test]
-    fn queue_status_empty() {
-        let _guard = global_test_lock().lock().unwrap();
-        // Queue is a global singleton — may contain tasks from other tests.
-        // Only verify it parses as a JSON array.
-        let s = wdmm_queue_status_json();
-        let json = unsafe { CStr::from_ptr(s.ptr) }.to_str().unwrap();
-        let v: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert!(v.is_array(), "expected JSON array, got: {json}");
-        wdmm_ffi_free_string(s);
-    }
-
-    #[test]
     fn openapi_start_stop() {
         let _guard = global_test_lock().lock().unwrap();
         // port 0 → OS assigns a free port
@@ -5343,16 +5173,6 @@ mod tests {
         wdmm_ffi_free_string(r);
         assert_eq!(wdmm_openapi_is_running(), 0);
         assert_eq!(wdmm_openapi_port(), -1);
-    }
-
-    #[test]
-    fn queue_cancel_not_found() {
-        let _guard = global_test_lock().lock().unwrap();
-        let id = CString::new("nonexistent").unwrap();
-        let result = wdmm_queue_cancel(id.as_ptr());
-        let s = unsafe { CStr::from_ptr(result.ptr) }.to_str().unwrap();
-        assert_eq!(s, "not_found");
-        wdmm_ffi_free_string(result);
     }
 
     #[test]
@@ -5529,37 +5349,6 @@ mod tests {
         wdmm_ffi_free_string(r);
 
         let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn queue_enqueue_and_status() {
-        let _guard = global_test_lock().lock().unwrap();
-        // Enqueue a download_track task
-        let json = CString::new(
-            r#"{"id":"qtest-001","kind":"download_track","remote_path":"/m/test.mp3","total_bytes":500000}"#
-        ).unwrap();
-        let r = wdmm_queue_enqueue(json.as_ptr());
-        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
-        assert_eq!(s, "ok", "enqueue failed: {s}");
-        wdmm_ffi_free_string(r);
-
-        // Verify it shows up in status
-        let s = wdmm_queue_status_json();
-        let json_str = unsafe { CStr::from_ptr(s.ptr) }.to_str().unwrap();
-        let arr: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        let found = arr.as_array().unwrap().iter().any(|t| t["id"] == "qtest-001");
-        assert!(found, "enqueued task not in status: {json_str}");
-        wdmm_ffi_free_string(s);
-
-        // Pending count must be at least 1
-        assert!(wdmm_queue_pending_count() >= 1);
-
-        // Cancel it
-        let id = CString::new("qtest-001").unwrap();
-        let r = wdmm_queue_cancel(id.as_ptr());
-        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
-        assert_eq!(s, "ok");
-        wdmm_ffi_free_string(r);
     }
 
     #[test]
@@ -6675,37 +6464,6 @@ mod tests {
         let after = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
         wdmm_ffi_free_string(r);
         assert_eq!(after, "null");
-    }
-
-    // ── Queue concurrency FFI tests ──────────────────────────────────────────
-
-    #[test]
-    fn queue_concurrency_ffi() {
-        let _guard = global_test_lock().lock().unwrap();
-        // get default
-        let initial = wdmm_queue_get_concurrency();
-        assert!(initial >= 1, "default concurrency must be >= 1");
-
-        // set to 3
-        let r = wdmm_queue_set_concurrency(3);
-        let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap();
-        assert_eq!(s, "ok", "set_concurrency failed: {s}");
-        wdmm_ffi_free_string(r);
-        assert_eq!(wdmm_queue_get_concurrency(), 3);
-
-        // clamp: 0 → 1
-        let r = wdmm_queue_set_concurrency(0);
-        wdmm_ffi_free_string(r);
-        assert_eq!(wdmm_queue_get_concurrency(), 1);
-
-        // clamp: 100 → 8
-        let r = wdmm_queue_set_concurrency(100);
-        wdmm_ffi_free_string(r);
-        assert_eq!(wdmm_queue_get_concurrency(), 8);
-
-        // restore initial
-        let r = wdmm_queue_set_concurrency(initial);
-        wdmm_ffi_free_string(r);
     }
 
     // ── Deleted tracks FFI tests ─────────────────────────────────────────────

@@ -112,50 +112,6 @@ pub struct UserFolder {
     pub created: DateTime<Utc>,
 }
 
-/// Queue task status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskStatus {
-    Pending,
-    Active,
-    Completed,
-    Failed,
-    Cancelled,
-    Partial, // partial failure for batch tasks
-}
-
-/// Task kind enumeration — aligns with Dart `TaskKind` (9 types).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskKind {
-    DownloadTrack,
-    DownloadPlaylist,
-    UploadFile,
-    Backup,
-    SyncCredentials,
-    SyncLibrary,
-    SyncPlaylists,
-    SyncManga,
-    Other,
-}
-
-/// A download/upload task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueTask {
-    pub id: String,
-    pub kind: TaskKind,
-    pub status: TaskStatus,
-    pub progress: f32,       // 0.0..=1.0
-    pub total_bytes: u64,
-    pub transferred_bytes: u64,
-    pub created: DateTime<Utc>,
-    pub updated: DateTime<Utc>,
-    pub attempts: u32,       // retry attempts
-    pub error: Option<String>, // last error message
-    pub remote_path: Option<String>, // source path
-    pub local_path: Option<String>,  // destination path
-}
-
 // ── Transcode presets (B3.5, schema v16) ─────────────────────────────────────
 
 /// Hardware (MediaCodec) video encoders a preset may select in

@@ -22,7 +22,6 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::sync::{oneshot, RwLock};
 use wdmm_core::models::{CloudAccount, LibraryTrack};
-use wdmm_queue::TaskQueue;
 use wdmm_storage::{LibraryDatabase, Playlist, PlaylistEntry};
 
 #[derive(Debug, Error)]
@@ -154,7 +153,6 @@ fn resolve_token(db: &LibraryDatabase) -> String {
 struct AppState {
     config: Arc<ServerConfig>,
     db: Arc<LibraryDatabase>,
-    queue: Arc<TaskQueue>,
     /// Current bearer token — updated in-place on rotate.
     token: Arc<tokio::sync::RwLock<String>>,
     /// Optional callback for `POST /v1/media/link` (None → 501).
@@ -165,14 +163,12 @@ impl AppState {
     fn new(
         config: Arc<ServerConfig>,
         db: Arc<LibraryDatabase>,
-        queue: Arc<TaskQueue>,
         token: String,
         media_link: Option<MediaLinkFn>,
     ) -> Self {
         Self {
             config,
             db,
-            queue,
             token: Arc::new(tokio::sync::RwLock::new(token)),
             media_link,
         }
@@ -293,67 +289,6 @@ async fn delete_account(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-    }
-}
-
-/// GET /v1/tasks — list all queue tasks.
-async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {
-    let tasks = state.queue.list().await;
-    let view: Vec<_> = tasks
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "id": t.id,
-                "kind": format!("{:?}", t.kind),
-                "status": format!("{:?}", t.status),
-                "progress": t.progress,
-                "total_bytes": t.total_bytes,
-                "transferred_bytes": t.transferred_bytes,
-                "error": t.error,
-                "created": t.created,
-                "updated": t.updated,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({ "tasks": view }))
-}
-
-/// POST /v1/tasks/:id/cancel
-async fn cancel_task(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    match state.queue.cancel(&id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(wdmm_queue::QueueError::NotFound(_)) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-/// GET /v1/tasks/:id — get a single task.
-async fn get_task(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let tasks = state.queue.list().await;
-    match tasks.into_iter().find(|t| t.id == id) {
-        Some(t) => Json(serde_json::json!({
-            "id": t.id,
-            "kind": format!("{:?}", t.kind),
-            "status": format!("{:?}", t.status),
-            "progress": t.progress,
-            "total_bytes": t.total_bytes,
-            "transferred_bytes": t.transferred_bytes,
-            "error": t.error,
-            "created": t.created,
-            "updated": t.updated,
-        }))
-        .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -647,9 +582,6 @@ fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/accounts", get(list_accounts).post(create_account))
         .route("/v1/accounts/:id", delete(delete_account))
-        .route("/v1/tasks", get(list_tasks))
-        .route("/v1/tasks/:id", get(get_task))
-        .route("/v1/tasks/:id/cancel", post(cancel_task))
         .route("/v1/token", get(get_token))
         .route("/v1/token/rotate", post(rotate_token))
         // ── Library: tracks ───────────────────────────────────────────────────
@@ -691,7 +623,6 @@ impl ApiServer {
     pub async fn start(
         config: ServerConfig,
         db: Arc<LibraryDatabase>,
-        queue: Arc<TaskQueue>,
         media_link: Option<MediaLinkFn>,
     ) -> ApiResult<Self> {
         let addr = format!(
@@ -725,7 +656,6 @@ impl ApiServer {
         let state = AppState::new(
             Arc::new(ServerConfig { token: token.clone(), ..config.clone() }),
             db,
-            queue,
             token.clone(),
             media_link,
         );
@@ -780,18 +710,15 @@ impl ApiServer {
 mod tests {
     use super::*;
     use std::path::Path;
-    use wdmm_core::models::TaskKind;
-    use wdmm_queue::TaskQueue;
 
     async fn start_test_server() -> (ApiServer, reqwest::Client, String) {
         let db = Arc::new(LibraryDatabase::open(Path::new(":memory:")).unwrap());
-        let queue = Arc::new(TaskQueue::new());
         let config = ServerConfig {
             bind_mode: BindMode::Local,
             port: 0,
             token: "test-token".into(),
         };
-        let server = ApiServer::start(config, db, queue, None).await.unwrap();
+        let server = ApiServer::start(config, db, None).await.unwrap();
         let base = format!("http://127.0.0.1:{}", server.port());
         let client = reqwest::Client::new();
         (server, client, base)
@@ -877,71 +804,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tasks_crud() {
-        use wdmm_core::models::TaskStatus;
-        let db = Arc::new(LibraryDatabase::open(Path::new(":memory:")).unwrap());
-        let queue = Arc::new(TaskQueue::new());
-
-        // Pre-populate a task
-        queue.enqueue(wdmm_core::models::QueueTask {
-            id: "t1".into(),
-            kind: TaskKind::DownloadTrack,
-            status: TaskStatus::Pending,
-            progress: 0.0,
-            total_bytes: 1000,
-            transferred_bytes: 0,
-            created: chrono::Utc::now(),
-            updated: chrono::Utc::now(),
-            attempts: 0,
-            error: None,
-            remote_path: Some("/music/x.mp3".into()),
-            local_path: None,
-        }).await.unwrap();
-
-        let config = ServerConfig {
-            bind_mode: BindMode::Local,
-            port: 0,
-            token: "tok2".into(),
-        };
-        let server = ApiServer::start(config, db, Arc::clone(&queue), None).await.unwrap();
-        let base = format!("http://127.0.0.1:{}", server.port());
-        let client = reqwest::Client::new();
-
-        let tasks: serde_json::Value = client.get(format!("{base}/v1/tasks"))
-            .bearer_auth("tok2")
-            .send().await.unwrap()
-            .json().await.unwrap();
-        assert_eq!(tasks["tasks"].as_array().unwrap().len(), 1);
-
-        // Get single task
-        let task: serde_json::Value = client.get(format!("{base}/v1/tasks/t1"))
-            .bearer_auth("tok2")
-            .send().await.unwrap()
-            .json().await.unwrap();
-        assert_eq!(task["id"], "t1");
-
-        // Cancel
-        assert_eq!(
-            client.post(format!("{base}/v1/tasks/t1/cancel"))
-                .bearer_auth("tok2")
-                .send().await.unwrap().status(),
-            204
-        );
-
-        server.stop().await;
-    }
-
-    #[tokio::test]
     async fn token_persists_across_restart() {
         // First server: pass a known token, which must be persisted to the DB.
         let db = Arc::new(LibraryDatabase::open(Path::new(":memory:")).unwrap());
-        let queue = Arc::new(TaskQueue::new());
         let config = ServerConfig {
             bind_mode: BindMode::Local,
             port: 0,
             token: "persist-me-123".into(),
         };
-        let server = ApiServer::start(config, Arc::clone(&db), Arc::clone(&queue), None)
+        let server = ApiServer::start(config, Arc::clone(&db), None)
             .await
             .unwrap();
         server.stop().await;
@@ -958,7 +829,7 @@ mod tests {
             port: 0,
             token: String::new(),
         };
-        let server2 = ApiServer::start(config2, db, queue, None).await.unwrap();
+        let server2 = ApiServer::start(config2, db, None).await.unwrap();
         let base = format!("http://127.0.0.1:{}", server2.port());
         let client = reqwest::Client::new();
 
@@ -975,13 +846,12 @@ mod tests {
     #[tokio::test]
     async fn token_rotate_invalidates_old_token() {
         let db = Arc::new(LibraryDatabase::open(Path::new(":memory:")).unwrap());
-        let queue = Arc::new(TaskQueue::new());
         let config = ServerConfig {
             bind_mode: BindMode::Local,
             port: 0,
             token: "old-tok".into(),
         };
-        let server = ApiServer::start(config, db, queue, None).await.unwrap();
+        let server = ApiServer::start(config, db, None).await.unwrap();
         let base = format!("http://127.0.0.1:{}", server.port());
         let client = reqwest::Client::new();
 
