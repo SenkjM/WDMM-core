@@ -55,10 +55,11 @@ pub enum TaskKind {
     MangaBuild,
     MangaPack,
     Upload,
+    CoverRefresh,
 }
 
 impl TaskKind {
-    pub const ALL: [TaskKind; 10] = [
+    pub const ALL: [TaskKind; 11] = [
         TaskKind::DownloadCache,
         TaskKind::DownloadPublic,
         TaskKind::Scan,
@@ -69,6 +70,7 @@ impl TaskKind {
         TaskKind::MangaBuild,
         TaskKind::MangaPack,
         TaskKind::Upload,
+        TaskKind::CoverRefresh,
     ];
 
     /// Stable wire/storage name (snake_case, matches the Dart `TaskKind.storageKey`).
@@ -84,6 +86,7 @@ impl TaskKind {
             TaskKind::MangaBuild => "manga_build",
             TaskKind::MangaPack => "manga_pack",
             TaskKind::Upload => "upload",
+            TaskKind::CoverRefresh => "cover_refresh",
         }
     }
 
@@ -99,6 +102,7 @@ impl TaskKind {
             "manga_build" => TaskKind::MangaBuild,
             "manga_pack" => TaskKind::MangaPack,
             "upload" => TaskKind::Upload,
+            "cover_refresh" => TaskKind::CoverRefresh,
             _ => return None,
         })
     }
@@ -113,6 +117,7 @@ impl TaskKind {
                 | TaskKind::MatchRemote
                 | TaskKind::MangaScrape
                 | TaskKind::MangaBuild
+                | TaskKind::CoverRefresh
         )
     }
 }
@@ -464,7 +469,10 @@ impl QueueBatch {
 pub fn batch_kind_for(kind: TaskKind) -> BatchKind {
     match kind {
         TaskKind::DownloadCache | TaskKind::DownloadPublic => BatchKind::Download,
-        TaskKind::Scan | TaskKind::RetagCloud | TaskKind::MatchRemote => BatchKind::Scan,
+        TaskKind::Scan
+        | TaskKind::RetagCloud
+        | TaskKind::MatchRemote
+        | TaskKind::CoverRefresh => BatchKind::Scan,
         TaskKind::MangaScrape | TaskKind::MangaCache | TaskKind::MangaBuild | TaskKind::MangaPack => {
             BatchKind::Manga
         }

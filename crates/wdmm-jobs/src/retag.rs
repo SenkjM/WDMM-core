@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use wdmm_queue::model::TaskKind;
+use serde::Deserialize;
+use wdmm_queue::model::{QueueTask, TaskKind};
 use wdmm_queue::policy::FailureCategory;
 
 use crate::cache_paths::normalize_source_name;
@@ -35,29 +36,164 @@ impl Job for RetagCloudJob {
     }
 }
 
+/// One entry of the batch payload written by the settings action:
+/// `[{"path","name","source"}]`. `source` is the account display name the row
+/// belongs to; it falls back to the task's own source when omitted.
+#[derive(Debug, Clone, Deserialize)]
+struct RetagEntry {
+    path: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    source: String,
+}
+
 /// Full job body (test seam: the missing-flag store is injectable).
+///
+/// A task is either a single retag (`remote_path`/`file_name`) or a batch whose
+/// payload sidecar lists the rows to re-read; both run through the same shared
+/// ingest path, and a batch keeps going after a failed item like `scan` does.
 pub async fn run_retag(ctx: &JobCtx, store: &dyn RemoteMissingStore) -> JobOutcome {
     if ctx.cancelled() {
         return JobOutcome::Cancelled;
     }
 
-    let source_name = normalize_source_name(&ctx.task.source_name);
-    if source_name.is_empty() {
-        return failed(
-            format!("err.sourceUnbound|{}", ctx.task.source_name),
-            FailureCategory::State,
-        );
+    let entries = match load_entries(ctx) {
+        Ok(entries) => entries,
+        Err(error) => return failed(error, FailureCategory::Other),
+    };
+    let total = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    ctx.progress.units(0, Some(total));
+
+    let mut failed_items: Vec<serde_json::Value> = Vec::new();
+    let mut first_error: Option<(String, FailureCategory)> = None;
+    let mut done = 0_u32;
+
+    for entry in &entries {
+        if ctx.cancelled() {
+            return JobOutcome::Cancelled;
+        }
+        let item = item_ctx(ctx, entry);
+        let source_name = normalize_source_name(&item.task.source_name);
+        if source_name.is_empty() {
+            let error = format!("err.sourceUnbound|{}", item.task.source_name);
+            if first_error.is_none() {
+                first_error = Some((error.clone(), FailureCategory::State));
+            }
+            failed_items.push(serde_json::json!({ "path": entry.path, "error": error }));
+        } else {
+            let result = ingest_retag(&item).await;
+            if ctx.cancelled() {
+                return JobOutcome::Cancelled;
+            }
+            match finish_retag(&item, store, &source_name, result) {
+                JobOutcome::Completed => {}
+                JobOutcome::Cancelled => return JobOutcome::Cancelled,
+                JobOutcome::Failed { error, category } => {
+                    ctx.progress
+                        .note(&format!("retag failed: {}: {error}", entry.path));
+                    if first_error.is_none() {
+                        first_error = Some((error.clone(), category));
+                    }
+                    failed_items.push(serde_json::json!({ "path": entry.path, "error": error }));
+                }
+                JobOutcome::Partial { .. } => {
+                    // One item cannot produce a partial outcome; treat it as a
+                    // failure so the batch accounting stays honest.
+                    let error = format!("err.retag.partial|{}", entry.path);
+                    if first_error.is_none() {
+                        first_error = Some((error.clone(), FailureCategory::Other));
+                    }
+                    failed_items.push(serde_json::json!({ "path": entry.path, "error": error }));
+                }
+            }
+        }
+        done = done.saturating_add(1);
+        ctx.progress.units(done, Some(total));
     }
 
-    // Dart sets `unitsTotal = 1` before touching the network, so a retry bar
-    // never jumps from 0 to full.
-    ctx.progress.units(0, Some(1));
-
-    let result = ingest_retag(ctx).await;
-    if ctx.cancelled() {
-        return JobOutcome::Cancelled;
+    let failed_count = u32::try_from(failed_items.len()).unwrap_or(u32::MAX);
+    let ok = total.saturating_sub(failed_count);
+    if failed_items.is_empty() {
+        JobOutcome::Completed
+    } else if ok == 0 {
+        let (error, category) = first_error
+            .unwrap_or_else(|| ("err.retag.failed".to_string(), FailureCategory::Other));
+        JobOutcome::Failed { error, category }
+    } else {
+        JobOutcome::Partial {
+            result: serde_json::json!({ "ok": ok, "failed": failed_items }),
+        }
     }
-    finish_retag(ctx, store, &source_name, result)
+}
+
+fn load_entries(ctx: &JobCtx) -> Result<Vec<RetagEntry>, String> {
+    if let Some(raw) = ctx
+        .task
+        .payload_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let path = payload_file(ctx, raw);
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("err.retag.payload|{}: {error}", path.display()))?;
+        let entries: Vec<RetagEntry> = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("err.retag.payloadJson|{}: {error}", path.display()))?;
+        let entries: Vec<RetagEntry> = entries
+            .into_iter()
+            .filter(|entry| !entry.path.trim().is_empty())
+            .collect();
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
+    Ok(vec![RetagEntry {
+        path: ctx.task.remote_path.clone(),
+        name: ctx.task.file_name.clone(),
+        source: String::new(),
+    }])
+}
+
+/// `payload_path` is relative to `<app docs>/queue_payloads` unless it is an
+/// absolute path that still exists (same rule as `scan.rs`).
+fn payload_file(ctx: &JobCtx, raw: &str) -> std::path::PathBuf {
+    let candidate = std::path::PathBuf::from(raw);
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    let joined = ctx.paths.payload_dir.join(raw);
+    if joined.exists() {
+        joined
+    } else if candidate.exists() {
+        candidate
+    } else {
+        joined
+    }
+}
+
+/// A per-item view of the same run: only the identity fields differ, so the
+/// shared ingest path writes the row under the item's own account.
+fn item_ctx(ctx: &JobCtx, entry: &RetagEntry) -> JobCtx {
+    let source_name = if entry.source.trim().is_empty() {
+        ctx.task.source_name.clone()
+    } else {
+        entry.source.clone()
+    };
+    JobCtx {
+        task: QueueTask {
+            source_name,
+            remote_path: entry.path.clone(),
+            file_name: entry.name.clone(),
+            ..ctx.task.clone()
+        },
+        cancel: ctx.cancel.clone(),
+        progress: Arc::clone(&ctx.progress),
+        platform: Arc::clone(&ctx.platform),
+        db: Arc::clone(&ctx.db),
+        vfs: Arc::clone(&ctx.vfs),
+        paths: ctx.paths.clone(),
+    }
 }
 
 /// Apply a finished ingest attempt: success revives the row (and its playlist
@@ -83,7 +219,6 @@ pub fn finish_retag(
                 ctx.progress
                     .note(&format!("retag clear playlist missing: {error}"));
             }
-            ctx.progress.units(1, Some(1));
             JobOutcome::Completed
         }
         Err(error) => {

@@ -13,6 +13,7 @@
 
 pub mod cache_paths;
 pub mod cbz;
+pub mod cover;
 pub mod download;
 pub mod ingest;
 pub mod manga;
@@ -187,6 +188,10 @@ impl JobRegistry {
         registry.register(&[TaskKind::Upload], Arc::new(upload::UploadJob));
         registry.register(&[TaskKind::Scan], Arc::new(scan::ScanJob));
         registry.register(&[TaskKind::RetagCloud], Arc::new(retag::RetagCloudJob));
+        registry.register(
+            &[TaskKind::CoverRefresh],
+            Arc::new(cover::CoverRefreshJob),
+        );
         registry.register(
             &[TaskKind::MatchRemote],
             Arc::new(match_remote::MatchRemoteJob),

@@ -860,6 +860,26 @@ fn cover_bytes(tag: &Tag) -> Option<Vec<u8>> {
 
 // ── sidecar covers ──────────────────────────────────────────────────────────
 
+/// Probe a remote file for a cover without touching the library row.
+///
+/// Returns `Ok(Some(bytes))` when embedded or sidecar art is available,
+/// `Ok(None)` when the read succeeded and the source has none, and `Err` when
+/// the read itself failed. Callers must not treat the error path as "no cover":
+/// a network blip would then permanently downgrade the row.
+pub(crate) async fn probe_cover(
+    ctx: &JobCtx,
+    remote_path: &str,
+    size: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut tags = read_remote_tags(ctx, remote_path, size).await?;
+    if tags.cover.is_none() {
+        if let Some(cover) = sidecar_cover(ctx, remote_path).await {
+            tags.cover = Some(cover);
+        }
+    }
+    Ok(tags.cover)
+}
+
 async fn sidecar_cover(ctx: &JobCtx, remote_path: &str) -> Option<Vec<u8>> {
     let enabled = ctx
         .db
