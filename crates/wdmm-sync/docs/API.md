@@ -68,8 +68,11 @@ locally are pulled.
 ## Playlist sync engine
 
 ### `struct PlaylistSyncEngine`
-Syncs `Playlist` + `PlaylistEntry` sets to/from `{remote_dir}/playlists/{id}.json`.
-One file per playlist. Tombstones/deletion packages are out of scope (Round 4).
+Syncs `Playlist` + `PlaylistEntry` sets to/from `{remote_dir}/playlists/{id}.json`
+(one `WDMMPL01` document per playlist) plus `WDMMPD01` deletion packs. Each id
+is reconciled by revision: a tombstone newer than the live document wins, a peer
+edit newer than the tombstone brings the playlist back, and tombstones survive
+180 days before they are garbage collected.
 
 ### `fn PlaylistSyncEngine::new(db: Arc<LibraryDatabase>, driver: Arc<dyn WdmmVfs>, remote_dir: impl Into<String>) -> Self`
 
@@ -83,15 +86,30 @@ Implements `SyncEngine`. Strategy:
 
 ## Aggregate trigger
 
-### `async fn run_sync_all(db: Arc<LibraryDatabase>, driver: Arc<dyn WdmmVfs>, remote_dir: &str) -> SyncResult<serde_json::Value>`
-Run credential + library + playlist sync in sequence. Entry point called by
-`wdmm_ffi::wdmm_sync_trigger`.
+### `pub enum SyncMode { Incremental, Full }`
 
-Returns a JSON summary:
+`SyncMode::parse` / `as_str` use the wire values `"incremental"` / `"full"`.
+
+### `async fn run_sync(db, driver, remote_dir, mode: SyncMode, cover_roots: Option<CoverRoots>) -> SyncResult<serde_json::Value>`
+
+Run credential + library + manga + playlist sync and return the contract summary.
+Entry point called by `wdmm_ffi::wdmm_sync_run`.
+
 ```json
 {
-  "credentials": {"total": N, "pushed": N, "pulled": N, "conflict": N},
-  "library":     {"total": N, "pushed": N, "pulled": N, "conflict": N},
-  "playlists":   {"total": N, "pushed": N, "pulled": N, "conflict": N}
+  "ok": true,
+  "mode": "incremental",
+  "conflicts": N,
+  "entities": {
+    "credentials": {"total": N, "pushed": N, "pulled": N, "conflicts": N},
+    "library":     {"total": N, "pushed": N, "pulled": N, "conflicts": N},
+    "manga":       {"total": N, "pushed": N, "pulled": N, "conflicts": N},
+    "playlists":   {"total": N, "pushed": N, "pulled": N, "conflicts": N}
+  }
 }
 ```
+
+### `async fn run_sync_all(...)` / `async fn run_sync_full(...)`
+
+Engine-level passes kept for tests and one-mode callers; `run_sync` dispatches to
+them and wraps their summaries.

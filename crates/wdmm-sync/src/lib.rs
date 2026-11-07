@@ -971,7 +971,7 @@ impl SyncEngine for PlaylistSyncEngine {
 
 /// Run credential + library sync in sequence and return a JSON summary.
 ///
-/// This is the single entry point the FFI `wdmm_sync_trigger` calls.
+/// Engine-level pass behind [`run_sync`], the single FFI entry point.
 pub async fn run_sync_all(
     db: Arc<LibraryDatabase>,
     driver: Arc<dyn WdmmVfs>,
@@ -1007,7 +1007,7 @@ pub async fn run_sync_all(
 }
 
 /// Run a **full** sync (base-shard rebuild for music + manga) and return a JSON
-/// summary. This is the entry point the FFI `wdmm_sync_full` calls.
+/// summary. Full-rebuild pass behind [`run_sync`], the single FFI entry point.
 ///
 /// Each engine's `sync_full` adopts every cloud row, then rewrites the whole
 /// library as fresh base shards (compacting away old segments + tombstones) and
@@ -1050,6 +1050,71 @@ pub async fn run_sync_full(
         "library":     summarize(&lib),
         "manga":       summarize(&manga),
         "playlists":   summarize(&pl),
+    }))
+}
+
+// ── single entry point ────────────────────────────────────────────────────────
+
+/// Mode of an aggregate sync run ([`run_sync`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// One pass over the deltas (cursor driven).
+    Incremental,
+    /// Reconcile everything, then rebuild the base shards.
+    Full,
+}
+
+impl SyncMode {
+    /// Parse the wire value (`"incremental"` / `"full"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "incremental" => Some(Self::Incremental),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    /// Wire value used by the FFI and the summary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incremental => "incremental",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Run credentials + music library + manga + playlists and return the contract
+/// summary `{"ok":true,"mode":"…","conflicts":N,"entities":{…}}`.
+///
+/// This is the only aggregate entry point: the FFI exposes it as
+/// `wdmm_sync_run(json)` and the app never calls the per-mode passes directly.
+pub async fn run_sync(
+    db: Arc<LibraryDatabase>,
+    driver: Arc<dyn WdmmVfs>,
+    remote_dir: &str,
+    mode: SyncMode,
+    cover_roots: Option<CoverRoots>,
+) -> SyncResult<serde_json::Value> {
+    let entities = match mode {
+        SyncMode::Incremental => {
+            run_sync_all(Arc::clone(&db), Arc::clone(&driver), remote_dir).await?
+        }
+        SyncMode::Full => run_sync_full(db, driver, remote_dir, cover_roots).await?,
+    };
+    let conflicts = entities
+        .as_object()
+        .map(|by_entity| {
+            by_entity
+                .values()
+                .filter_map(|entity| entity.get("conflicts").and_then(|value| value.as_u64()))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    Ok(serde_json::json!({
+        "ok": true,
+        "mode": mode.as_str(),
+        "conflicts": conflicts,
+        "entities": entities,
     }))
 }
 

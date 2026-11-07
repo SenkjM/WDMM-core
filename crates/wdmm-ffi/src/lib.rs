@@ -410,77 +410,60 @@ pub(crate) fn read_account_content(account_id_str: &str, path: &str) -> Result<V
     }
 }
 
-/// Trigger an incremental sync (credentials + library + manga + playlists).
+/// Run the aggregate sync through the single Core entry point.
 ///
-/// Parameters (all null-terminated UTF-8 C strings):
-/// - `account_id`: Cloud account ID looked up in the process-global library DB.
-/// - `remote_dir`: Remote sync root directory (e.g. `"/wdmm_sync"`).
+/// `json` is a null-terminated UTF-8 payload:
+/// `{"account_id":"…","remote_dir":"/wdmm_sync","mode":"incremental"|"full","with_covers":false}`.
+/// `remote_dir` defaults to `"/wdmm_sync"`, `mode` to `"incremental"`.
 ///
-/// Returns a JSON summary (see [`wdmm_sync::run_sync_all`]) or
-/// `"error:<message>"`. Caller must free the result.
-///
-/// # Safety
-/// All pointer parameters must be valid null-terminated UTF-8 C strings.
-#[no_mangle]
-pub extern "C" fn wdmm_sync_trigger(
-    account_id: *const c_char,
-    remote_dir: *const c_char,
-) -> FfiString {
-    let account_id_str = match ptr_to_str(account_id) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid account_id"),
-    };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
-    let driver = match driver_for_account(account_id_str) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    let db = std::sync::Arc::clone(global_library_db());
-    let result = rt().block_on(wdmm_sync::run_sync_all(db, driver, dir));
-    match result {
-        Ok(summary) => FfiString::from(summary.to_string()),
-        Err(e) => FfiString::from(format!("error:{e}")),
-    }
-}
-
-/// Full-rebuild sync — credentials + music library + manga + playlists.
-///
-/// Parameters (all null-terminated UTF-8 C strings):
-/// - `account_id`:  Cloud account ID looked up in the process-global library DB.
-/// - `remote_dir`:  Remote sync root directory (e.g. `"/wdmm_sync"`).
-/// - `with_covers`: nonzero to embed cover blobs in the rebuilt base shards
-///   (using cover roots from [`wdmm_covers_configure`]); `0` omits covers.
-///
-/// Returns a JSON summary (see [`wdmm_sync::run_sync_full`]) or
-/// `"error:<message>"`. Caller must free the result.
+/// Returns `{"ok":true,"mode":"…","conflicts":N,"entities":{…}}` or
+/// `"error:<message>"`. The caller owns the result string.
 ///
 /// # Safety
-/// All pointer parameters must be valid null-terminated UTF-8 C strings.
+/// `json` must be a valid null-terminated UTF-8 C string.
 #[no_mangle]
-pub extern "C" fn wdmm_sync_full(
-    account_id: *const c_char,
-    remote_dir: *const c_char,
-    with_covers: c_int,
-) -> FfiString {
-    let account_id_str = match ptr_to_str(account_id) {
-        Some(s) => s,
-        None => return FfiString::from("error:invalid account_id"),
+pub extern "C" fn wdmm_sync_run(json: *const c_char) -> FfiString {
+    let payload = match ptr_to_str(json) {
+        Some(value) => value,
+        None => return FfiString::from("error:invalid payload"),
     };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
-    let cover_roots = if with_covers != 0 {
+    let parsed: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(value) => value,
+        Err(error) => return FfiString::from(format!("error:invalid payload: {error}")),
+    };
+    let account_id = match parsed.get("account_id").and_then(serde_json::Value::as_str) {
+        Some(value) if !value.is_empty() => value,
+        _ => return FfiString::from("error:missing account_id"),
+    };
+    let remote_dir = parsed
+        .get("remote_dir")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("/wdmm_sync");
+    let mode_wire = parsed
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("incremental");
+    let mode = match wdmm_sync::SyncMode::parse(mode_wire) {
+        Some(value) => value,
+        None => return FfiString::from(format!("error:unknown mode: {mode_wire}")),
+    };
+    let cover_roots = if parsed
+        .get("with_covers")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
         global_cover_roots().lock().unwrap().clone()
     } else {
         None
     };
-    let driver = match driver_for_account(account_id_str) {
-        Ok(d) => d,
-        Err(e) => return e,
+    let driver = match driver_for_account(account_id) {
+        Ok(value) => value,
+        Err(error) => return error,
     };
     let db = std::sync::Arc::clone(global_library_db());
-    let result = rt().block_on(wdmm_sync::run_sync_full(db, driver, dir, cover_roots));
-    match result {
+    match rt().block_on(wdmm_sync::run_sync(db, driver, remote_dir, mode, cover_roots)) {
         Ok(summary) => FfiString::from(summary.to_string()),
-        Err(e) => FfiString::from(format!("error:{e}")),
+        Err(error) => FfiString::from(format!("error:{error}")),
     }
 }
 
