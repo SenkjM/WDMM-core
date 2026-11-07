@@ -27,6 +27,7 @@ pub use cover::{
 };
 
 pub mod wmp;
+pub(crate) mod protocol;
 mod library_shard;
 mod library_music;
 pub use library_music::LibrarySyncEngine;

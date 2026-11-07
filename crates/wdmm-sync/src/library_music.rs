@@ -13,82 +13,26 @@ use crate::cover::CoverRoots;
 use crate::library_shard::{
     self, track_identity_key, TombRecord, WMP_KIND_BASE, WMP_KIND_SEG,
 };
+use crate::protocol::{self, BaseShardEntry, IndexPartEntry, ManifestBase, ShardStore};
 use crate::{
     join_path, SyncAction, SyncEngine, SyncError, SyncOutcome, SyncResult,
 };
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::info;
 use wdmm_core::models::LibraryTrack;
 use wdmm_core::rev_clock::RevClock;
-use wdmm_drivers::{WdmmVfs, DriverError};
-use wdmm_storage::{LibraryDatabase, SyncState};
+use wdmm_drivers::WdmmVfs;
+use wdmm_storage::LibraryDatabase;
+
+pub use crate::protocol::SyncManifest as LibraryManifest;
 
 const FORMAT: &str = "wmp_library_index";
 const FORMAT_VERSION: i64 = 1;
-const INDEX_NAME: &str = "index.json";
 const SHARD_PREFIX: &str = "lib-";
-const SEGMENT_PREFIX: &str = "seg-";
-const TOMB_PREFIX: &str = "del-";
 pub const DEFAULT_TRACKS_PER_SHARD: usize = 500;
 const CURSOR_PREFIX: &str = "library:";
-
-/// Keeps shard names unique inside one process when two writes share a stamp.
-static PART_SEQ: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BaseShardEntry {
-    pub file: String,
-    pub count: i64,
-    pub bytes: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct IndexPartEntry {
-    pub file: String,
-    pub from: i64,
-    pub to: i64,
-    pub count: i64,
-    pub bytes: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LibraryManifest {
-    pub format: String,
-    #[serde(rename = "formatVersion")]
-    pub format_version: i64,
-    pub base: ManifestBase,
-    #[serde(default)]
-    pub segments: Vec<IndexPartEntry>,
-    #[serde(default)]
-    pub tombstones: Vec<IndexPartEntry>,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ManifestBase {
-    #[serde(rename = "upTo")]
-    pub up_to: i64,
-    #[serde(default)]
-    pub shards: Vec<BaseShardEntry>,
-}
-
-impl Default for LibraryManifest {
-    fn default() -> Self {
-        Self {
-            format: FORMAT.into(),
-            format_version: FORMAT_VERSION,
-            base: ManifestBase::default(),
-            segments: vec![],
-            tombstones: vec![],
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct CloudLibrary {
@@ -142,78 +86,14 @@ fn merge_cloud_parts(
     }
 }
 
-struct DriverStore {
-    driver: Arc<dyn WdmmVfs>,
-}
-
-impl DriverStore {
-    async fn read(&self, path: &str) -> SyncResult<Option<Vec<u8>>> {
-        match self.driver.get_content(path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(DriverError::NotFound(_)) => Ok(None),
-            Err(e) => Err(SyncError::from(e)),
-        }
-    }
-    async fn write(&self, path: &str, data: &[u8]) -> SyncResult<()> {
-        self.driver.put_content(path, data).await?;
-        Ok(())
-    }
-    async fn ensure_dir(&self, path: &str) -> SyncResult<()> {
-        match self.driver.mkdir(path).await {
-            Ok(()) => Ok(()),
-            Err(DriverError::Network(_)) => Ok(()),
-            Err(e) => Err(SyncError::from(e)),
-        }
-    }
-    async fn remove(&self, path: &str) -> SyncResult<()> {
-        match self.driver.remove(path).await {
-            Ok(()) => Ok(()),
-            Err(DriverError::NotFound(_)) => Ok(()),
-            Err(e) => Err(SyncError::from(e)),
-        }
-    }
-    async fn list_files(&self, dir: &str) -> SyncResult<Vec<String>> {
-        match self.driver.list(dir).await {
-            Ok(items) => Ok(items.into_iter().filter(|i| !i.is_dir).map(|i| i.name).collect()),
-            Err(DriverError::NotFound(_)) => Ok(vec![]),
-            Err(e) => Err(SyncError::from(e)),
-        }
-    }
-}
-
 fn music_dir(remote_dir: &str) -> String {
     join_path(remote_dir, "library/music")
-}
-
-fn part_name(prefix: &str, rev: i64, device: &str) -> String {
-    let stamp = if rev > 0 {
-        rev
-    } else {
-        chrono::Utc::now().timestamp_millis()
-    };
-    // Shard files are immutable and must never share a name. The old name came
-    // from `rev` alone, so two devices writing at the same rev picked the same
-    // file and one delta was silently lost.
-    let tag: String = device
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(8)
-        .collect();
-    let nanos = chrono::Utc::now().timestamp_subsec_nanos();
-    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}{stamp}-{tag}-{nanos:08x}{seq:04x}.wdmm")
-}
-
-fn device_id(db: &LibraryDatabase) -> String {
-    // Persisted in KV (key `wdmm_device_id`); generated as a UUID v4 on first use.
-    // Shared with the manga engine so the `deviceId` shard field is stable per device.
-    wdmm_storage::device_id_or_generate(db)
 }
 
 /// Music library sync engine (replaces toy library.json).
 pub struct LibrarySyncEngine {
     db: Arc<LibraryDatabase>,
-    store: DriverStore,
+    store: ShardStore,
     remote_dir: String,
     cover_roots: Option<CoverRoots>,
     device: String,
@@ -226,10 +106,10 @@ impl LibrarySyncEngine {
         remote_dir: impl Into<String>,
         cover_roots: Option<CoverRoots>,
     ) -> Self {
-        let device = device_id(&db);
+        let device = protocol::device_id(&db);
         Self {
             db,
-            store: DriverStore { driver },
+            store: ShardStore { driver },
             remote_dir: remote_dir.into(),
             cover_roots,
             device,
@@ -241,7 +121,7 @@ impl LibrarySyncEngine {
     }
 
     fn index_path(&self) -> String {
-        join_path(&self.dir(), INDEX_NAME)
+        join_path(&self.dir(), protocol::INDEX_NAME)
     }
 
     fn cursor_key(&self) -> String {
@@ -250,7 +130,7 @@ impl LibrarySyncEngine {
 
     async fn read_manifest(&self) -> SyncResult<LibraryManifest> {
         match self.store.read(&self.index_path()).await? {
-            None => Ok(LibraryManifest::default()),
+            None => Ok(LibraryManifest::empty(FORMAT, FORMAT_VERSION)),
             Some(bytes) => {
                 let v: serde_json::Value = serde_json::from_slice(&bytes)?;
                 let found = v.get("format").and_then(|x| x.as_str());
@@ -366,7 +246,7 @@ impl LibrarySyncEngine {
             if listed.contains(file.as_str()) || skip_files.contains(&file) {
                 continue;
             }
-            if !file.starts_with(SEGMENT_PREFIX) && !file.starts_with(TOMB_PREFIX) {
+            if !file.starts_with(protocol::SEGMENT_PREFIX) && !file.starts_with(protocol::TOMB_PREFIX) {
                 continue;
             }
             let Some(bytes) = self.store.read(&join_path(&self.dir(), &file)).await? else {
@@ -374,7 +254,7 @@ impl LibrarySyncEngine {
             };
             read_parts.insert(file.clone());
             let decoded = library_shard::decode_library_shard(&bytes)?;
-            if file.starts_with(TOMB_PREFIX) {
+            if file.starts_with(protocol::TOMB_PREFIX) {
                 tomb_parts.push(decoded.tombstones);
             } else {
                 if let Some(roots) = &self.cover_roots {
@@ -404,7 +284,7 @@ impl LibrarySyncEngine {
         let to = *revs.iter().max().unwrap_or(&0);
         let dev = self.device.clone();
         let bytes = library_shard::encode_track_shard(WMP_KIND_SEG, &dev, from, to, changed, None)?;
-        let file = part_name(SEGMENT_PREFIX, from, &self.device);
+        let file = protocol::part_name(protocol::SEGMENT_PREFIX, from, &self.device);
         self.store.ensure_dir(&self.dir()).await?;
         self.store
             .write(&join_path(&self.dir(), &file), &bytes)
@@ -430,7 +310,7 @@ impl LibrarySyncEngine {
         let to = *revs.iter().max().unwrap_or(&0);
         let dev = self.device.clone();
         let bytes = library_shard::encode_tomb_shard(&dev, from, to, tombs)?;
-        let file = part_name(TOMB_PREFIX, from, &self.device);
+        let file = protocol::part_name(protocol::TOMB_PREFIX, from, &self.device);
         self.store.ensure_dir(&self.dir()).await?;
         self.store
             .write(&join_path(&self.dir(), &file), &bytes)
@@ -523,13 +403,7 @@ impl LibrarySyncEngine {
     }
 
     fn load_cursor(&self) -> SyncResult<(i64, i64, HashMap<String, i64>)> {
-        match self.db.get_sync_state(&self.cursor_key())? {
-            None => Ok((0, 0, HashMap::new())),
-            Some(s) => {
-                let parts: HashMap<String, i64> = serde_json::from_str(&s.parts).unwrap_or_default();
-                Ok((s.last_seq, s.base_up_to, parts))
-            }
-        }
+        protocol::load_cursor(&self.db, &self.cursor_key())
     }
 
     fn save_cursor(
@@ -539,51 +413,14 @@ impl LibrarySyncEngine {
         read_parts: &HashSet<String>,
         highest_local_rev: i64,
     ) -> SyncResult<()> {
-        let mut parts = cursor_parts.clone();
-        for name in read_parts {
-            let to = manifest
-                .segments
-                .iter()
-                .find(|s| &s.file == name)
-                .map(|s| s.to)
-                .or_else(|| {
-                    manifest
-                        .tombstones
-                        .iter()
-                        .find(|t| &t.file == name)
-                        .map(|t| t.to)
-                })
-                .unwrap_or(0);
-            parts.insert(name.clone(), to);
-        }
-        for s in manifest.segments.iter().chain(manifest.tombstones.iter()) {
-            if parts.contains_key(&s.file) {
-                continue;
-            }
-            if read_parts.is_empty() && s.to <= highest_local_rev {
-                continue;
-            }
-            if s.to <= highest_local_rev {
-                parts.insert(s.file.clone(), s.to);
-            }
-        }
-        let mut last_seq = highest_local_rev;
-        for &rev in parts.values() {
-            if rev > last_seq {
-                last_seq = rev;
-            }
-        }
-        if manifest.base.up_to > last_seq {
-            last_seq = manifest.base.up_to;
-        }
-        self.db.save_sync_state(&SyncState {
-            remote_key: self.cursor_key(),
-            last_seq,
-            base_up_to: manifest.base.up_to,
-            parts: serde_json::to_string(&parts).unwrap_or_else(|_| "{}".into()),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        })?;
-        Ok(())
+        protocol::save_cursor(
+            &self.db,
+            &self.cursor_key(),
+            manifest,
+            cursor_parts,
+            read_parts,
+            highest_local_rev,
+        )
     }
 
     fn local_by_key(&self) -> SyncResult<HashMap<String, LibraryTrack>> {
@@ -619,7 +456,7 @@ impl LibrarySyncEngine {
             .collect();
         missing.sort();
 
-        let index_name = INDEX_NAME.to_string();
+        let index_name = protocol::INDEX_NAME.to_string();
         let mut orphans: Vec<String> = remote_files.iter()
             .filter(|f| *f != &index_name && !referenced.contains(*f))
             .cloned()
@@ -1066,7 +903,7 @@ fn all_keys(
 
 #[cfg(test)]
 mod shard_name_tests {
-    use super::part_name;
+    use crate::protocol::part_name;
 
     #[test]
     fn shard_names_are_unique_per_write() {
