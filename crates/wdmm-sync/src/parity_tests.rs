@@ -941,3 +941,43 @@ async fn library_full_sync_keeps_unsynced_local_edits() {
     assert_eq!(got.rev, 150);
     assert_eq!(got.title, "v2");
 }
+
+/// A remote index from another format must fail loudly. The old behaviour
+/// treated it as an empty manifest, so the next full sync rebuilt the library
+/// from local rows only and wiped the other device's data.
+#[tokio::test]
+async fn library_sync_rejects_unknown_index_format() {
+    let driver = Arc::new(MockDriver::new());
+    driver.files.lock().await.insert(
+        "/sync/library/music/index.json".to_string(),
+        br#"{"format":"another-app","formatVersion":1}"#.to_vec(),
+    );
+    let db = tmp_db();
+    let err = LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
+        .sync_incremental()
+        .await
+        .expect_err("an unknown index format must not be treated as empty");
+    assert!(
+        matches!(err, crate::SyncError::RemoteFormatUnsupported { .. }),
+        "{err}"
+    );
+}
+
+/// The same guard for the manga entity.
+#[tokio::test]
+async fn manga_sync_rejects_unknown_index_format() {
+    let driver = Arc::new(MockDriver::new());
+    driver.files.lock().await.insert(
+        "/sync/library/manga/index.json".to_string(),
+        br#"{"format":"another-app","formatVersion":1}"#.to_vec(),
+    );
+    let db = tmp_db();
+    let err = MangaLibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
+        .sync_incremental()
+        .await
+        .expect_err("an unknown index format must not be treated as empty");
+    assert!(
+        matches!(err, crate::SyncError::RemoteFormatUnsupported { .. }),
+        "{err}"
+    );
+}

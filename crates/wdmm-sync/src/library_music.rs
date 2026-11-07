@@ -253,8 +253,19 @@ impl LibrarySyncEngine {
             None => Ok(LibraryManifest::default()),
             Some(bytes) => {
                 let v: serde_json::Value = serde_json::from_slice(&bytes)?;
-                if v.get("format").and_then(|x| x.as_str()) != Some(FORMAT) {
-                    return Ok(LibraryManifest::default());
+                let found = v.get("format").and_then(|x| x.as_str());
+                if found != Some(FORMAT) {
+                    return Err(SyncError::RemoteFormatUnsupported {
+                        found: found.map(str::to_string),
+                        expected: FORMAT.into(),
+                    });
+                }
+                let version = v.get("formatVersion").and_then(|x| x.as_i64()).unwrap_or(0);
+                if version > FORMAT_VERSION {
+                    return Err(SyncError::RemoteFormatUnsupported {
+                        found: Some(format!("{FORMAT} v{version}")),
+                        expected: format!("{FORMAT} v{FORMAT_VERSION}"),
+                    });
                 }
                 Ok(serde_json::from_value(v)?)
             }

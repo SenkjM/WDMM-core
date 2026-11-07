@@ -61,6 +61,15 @@ pub enum SyncError {
     #[error("conflict: local rev {local} vs remote rev {remote}")]
     Conflict { local: u64, remote: u64 },
 
+    /// The remote index was written by a newer or different format. Silently
+    /// treating it as empty (the old behaviour) made one device wipe the other
+    /// device's library on the next full sync, so this fails loudly instead.
+    #[error("remote index format {found:?} is not supported (expected {expected})")]
+    RemoteFormatUnsupported {
+        found: Option<String>,
+        expected: String,
+    },
+
     #[error("other: {0}")]
     Other(String),
 }
