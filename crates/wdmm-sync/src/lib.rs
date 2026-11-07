@@ -983,30 +983,42 @@ pub async fn run_sync_all(
     let cred = CredentialSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
         .sync_incremental()
         .await?;
-    let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, None)
-        .sync_incremental()
-        .await?;
-    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, None)
-        .sync_incremental()
-        .await?;
+    let sharded = entities::registry::run_sharded_entities(
+        Arc::clone(&db),
+        Arc::clone(&driver),
+        remote_dir,
+        None,
+        SyncMode::Incremental,
+    )
+    .await?;
     let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
         .sync_incremental()
         .await?;
-    let summarize = |outcomes: &[SyncOutcome]| {
-        let (pushed, pulled, conflict) = outcomes.iter().fold((0, 0, 0), |(p, l, c), o| match o.action {
-            SyncAction::Pushed => (p + 1, l, c),
-            SyncAction::Pulled => (p, l + 1, c),
-            SyncAction::Conflict => (p, l, c + 1),
-            SyncAction::NoChange => (p, l, c),
-        });
-        serde_json::json!({ "total": outcomes.len(), "pushed": pushed, "pulled": pulled, "conflicts": conflict })
-    };
-    Ok(serde_json::json!({
-        "credentials": summarize(&cred),
-        "library":     summarize(&lib),
-        "manga":       summarize(&manga),
-        "playlists":   summarize(&pl),
-    }))
+    Ok(aggregate_summary(&cred, sharded, &pl))
+}
+
+/// Build the aggregate JSON: the single-document engines plus every sharded one.
+fn aggregate_summary(
+    credentials: &[SyncOutcome],
+    sharded: Vec<entities::registry::ShardedSummary>,
+    playlists: &[SyncOutcome],
+) -> serde_json::Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert(
+        "credentials".into(),
+        entities::registry::summarize(credentials),
+    );
+    for entity in sharded {
+        summary.insert(
+            entity.key.into(),
+            entities::registry::summarize(&entity.outcomes),
+        );
+    }
+    summary.insert(
+        "playlists".into(),
+        entities::registry::summarize(playlists),
+    );
+    serde_json::Value::Object(summary)
 }
 
 /// Run a **full** sync (base-shard rebuild for music + manga) and return a JSON
@@ -1030,30 +1042,18 @@ pub async fn run_sync_full(
     let cred = CredentialSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
         .sync_full()
         .await?;
-    let lib = LibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, cover_roots.clone())
-        .sync_full()
-        .await?;
-    let manga = MangaLibrarySyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir, cover_roots)
-        .sync_full()
-        .await?;
+    let sharded = entities::registry::run_sharded_entities(
+        Arc::clone(&db),
+        Arc::clone(&driver),
+        remote_dir,
+        cover_roots,
+        SyncMode::Full,
+    )
+    .await?;
     let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
         .sync_full()
         .await?;
-    let summarize = |outcomes: &[SyncOutcome]| {
-        let (pushed, pulled, conflict) = outcomes.iter().fold((0, 0, 0), |(p, l, c), o| match o.action {
-            SyncAction::Pushed => (p + 1, l, c),
-            SyncAction::Pulled => (p, l + 1, c),
-            SyncAction::Conflict => (p, l, c + 1),
-            SyncAction::NoChange => (p, l, c),
-        });
-        serde_json::json!({ "total": outcomes.len(), "pushed": pushed, "pulled": pulled, "conflicts": conflict })
-    };
-    Ok(serde_json::json!({
-        "credentials": summarize(&cred),
-        "library":     summarize(&lib),
-        "manga":       summarize(&manga),
-        "playlists":   summarize(&pl),
-    }))
+    Ok(aggregate_summary(&cred, sharded, &pl))
 }
 
 // ── single entry point ────────────────────────────────────────────────────────
