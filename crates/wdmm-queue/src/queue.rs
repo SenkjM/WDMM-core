@@ -32,6 +32,11 @@ pub struct EnqueueRequest {
     pub cache_group_id: Option<String>,
     /// JSON sidecar for scan/manga-build tasks.
     pub payload: Option<String>,
+    /// Local source path, for tasks that operate on a file that already exists
+    /// (uploads from a SAF copy, and `manga:<id>` markers).
+    pub local_path: Option<String>,
+    /// Local content URI for tasks the platform must materialise first.
+    pub local_uri: Option<String>,
     pub remote_size: Option<u64>,
     pub remote_modified: Option<i64>,
     pub queued_while_foreground: bool,
@@ -67,6 +72,8 @@ impl EnqueueRequest {
             priority: 0,
             cache_group_id: None,
             payload: None,
+            local_path: None,
+            local_uri: None,
             remote_size: None,
             remote_modified: None,
             queued_while_foreground: false,
@@ -436,6 +443,8 @@ impl QueueState {
         );
         task.priority = req.priority;
         task.cache_group_id = req.cache_group_id.clone();
+        task.local_path = req.local_path.clone();
+        task.local_uri = req.local_uri.clone();
         task.remote_size = req.remote_size;
         task.remote_modified = req.remote_modified;
         task.queued_while_foreground = req.queued_while_foreground;

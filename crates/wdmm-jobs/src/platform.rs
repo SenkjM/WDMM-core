@@ -30,6 +30,7 @@ fn next_request_id() -> String {
 pub enum PlatformAction {
     /// Save a finished temp file into the user-picked SAF tree.
     SaveToTree {
+        tree_uri: String,
         temp_path: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +125,7 @@ mod tests {
         });
         let reply = client
             .request(PlatformAction::SaveToTree {
+                tree_uri: "content://tree/primary%3ADownload".into(),
                 temp_path: "/tmp/a.flac".into(),
                 name: "a.flac".into(),
                 mime: Some("audio/flac".into()),

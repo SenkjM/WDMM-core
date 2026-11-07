@@ -19,6 +19,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase};
 
+mod cache_api;
 mod dlna_session;
 pub(crate) mod ext;
 mod queue_api;
@@ -3053,6 +3054,23 @@ fn global_library_db() -> &'static std::sync::Arc<LibraryDatabase> {
     LIBRARY_DB
         .get()
         .expect("BUG: wdmm_library_init must be called before any library operations")
+}
+
+/// Like [`global_library_db`], but returns `None` before `wdmm_library_init`.
+///
+/// FFI entry points that may be reached before the Dart side has initialised the
+/// library must use this instead: panicking inside `extern "C"` aborts the
+/// process in release builds (`panic = "abort"`), so an uninitialised database
+/// has to become a normal `err.notInitialized` reply.
+pub(crate) fn try_global_library_db() -> Option<&'static std::sync::Arc<LibraryDatabase>> {
+    #[cfg(test)]
+    {
+        Some(global_library_db())
+    }
+    #[cfg(not(test))]
+    {
+        LIBRARY_DB.get()
+    }
 }
 
 /// Initialise the library database at a custom path.

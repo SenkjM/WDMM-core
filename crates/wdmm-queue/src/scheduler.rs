@@ -186,9 +186,11 @@ fn finalize(
     };
     if let Some(task) = &task {
         handle.persist_task(task);
-        // The scan/build sidecar is only kept for partial results (the UI may
-        // still show them); every other terminal state drops it.
-        if status != TaskStatus::Partial && task.payload_path.is_some() {
+        // Keep the sidecar until the task actually succeeded: a failed or
+        // cancelled task can be retried, and jobs that read the enqueue payload
+        // (scan's unit list, the public download's `tree_uri`) need it to still
+        // be there. `remove` / `clear` / silent pruning delete it explicitly.
+        if status == TaskStatus::Completed && task.payload_path.is_some() {
             let _ = handle.inner.store.delete_payload(&task_id);
         }
         handle.emit_terminal(task);

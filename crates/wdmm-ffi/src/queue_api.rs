@@ -123,7 +123,13 @@ fn init_queue(app_docs: &str, cache_root: &str) -> Result<Value, String> {
     }
 
     let paths = JobPaths::new(app_docs, cache_root);
-    let db = Arc::clone(crate::global_library_db());
+    // `global_library_db` panics when the library has not been initialised, and a
+    // panic across `extern "C"` aborts the process (release uses panic=abort).
+    // The queue may legitimately be wired before the DB in some start-up orders,
+    // so report it as a normal error instead.
+    let Some(db) = crate::try_global_library_db().cloned() else {
+        return Err("err.notInitialized|call wdmm_library_init first".to_string());
+    };
     let store: Arc<dyn TaskStore> =
         Arc::new(DbStore::new(Arc::clone(&db), paths.payload_dir.clone()));
     let runner = Arc::new(production_runner(Arc::clone(&db), paths.clone()));
@@ -140,7 +146,7 @@ fn init_queue(app_docs: &str, cache_root: &str) -> Result<Value, String> {
     });
 
     // User ruled the legacy KV queue rows are discarded (contract §3/§A5).
-    let legacy_purged = match crate::global_library_db().queue_purge_legacy_kv() {
+    let legacy_purged = match db.queue_purge_legacy_kv() {
         Ok(count) => count,
         Err(error) => {
             eprintln!("[queue] legacy KV purge failed: {error}");
@@ -335,6 +341,11 @@ fn enqueue_request(value: &Value, default_kind: Option<TaskKind>) -> Result<Enqu
     };
     req.remote_size = value["remote_size"].as_u64();
     req.remote_modified = value["remote_modified"].as_i64();
+    // Tasks that consume an already-local file (uploads from a SAF copy) or a
+    // library marker (`manga:<id>`) carry their source on the row itself; the
+    // jobs read `task.local_path` / `task.local_uri`, not the enqueue payload.
+    req.local_path = opt_string(value, &["local_path", "localPath"]);
+    req.local_uri = opt_string(value, &["local_uri", "localUri"]);
     req.queued_while_foreground = opt_bool(value, &["queued_while_foreground"]).unwrap_or(false);
     req.dedupe = opt_bool(value, &["dedupe"]).unwrap_or(true);
     req.expected_total = value["expected_total"].as_u64().map(|n| n as u32);

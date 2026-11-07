@@ -12,12 +12,13 @@
 //!
 //! ## Differences from the Dart executor (documented for the migration)
 //!
-//! * `TaskTarget` has no gallery/downloads split. Gallery vs Downloads is
-//!   inferred from the file extension (video/image → gallery, everything else
-//!   → Downloads) — the same mapping the Dart UI used when it called
-//!   `enqueueGallery` / `enqueueToDownloads`. `PlatformAction::SaveToTree` (a
-//!   user-picked SAF directory) is not reachable until the model carries the
-//!   destination.
+//! * `TaskTarget` has no gallery/downloads split. A non-empty `tree_uri` in the
+//!   enqueue payload sidecar (`task.payload_path`, JSON `{"tree_uri": "…"}`)
+//!   routes the file to the user-picked SAF directory via
+//!   `PlatformAction::SaveToTree`; without it, video/image files go to the
+//!   gallery and everything else to Downloads — the same mapping the Dart UI
+//!   used when it called `enqueueGallery` / `enqueueToDownloads`. A malformed or
+//!   missing payload is treated as "no custom directory", never as a failure.
 //! * Cache index bookkeeping uses the schema-v17 API that landed in T1
 //!   (`cache_put_entry` / `cache_bind_group`) rather than a single
 //!   `cache_register`; `kind` is Dart's `CacheKind.music.name` = `"music"`.
@@ -152,7 +153,9 @@ async fn run_public(ctx: &JobCtx) -> JobOutcome {
     // dies while the bridge waits, the retry finds a complete file above.
     ctx.progress.local_path(&final_path.to_string_lossy());
 
-    let (action, action_name) = public_action(&ctx.task.file_name, &final_path);
+    let tree_uri = payload_tree_uri(ctx).await;
+    let (action, action_name) =
+        public_action(&ctx.task.file_name, &final_path, tree_uri.as_deref());
     ctx.progress
         .note(&format!("awaiting platform: {action_name}"));
     match ctx.platform.request(action).await {
@@ -194,6 +197,29 @@ fn public_final_file(part: &Path) -> std::path::PathBuf {
 
 async fn completed_size(path: &Path) -> Option<u64> {
     fs::metadata(path).await.ok().map(|meta| meta.len())
+}
+
+/// Read the optional `{"tree_uri": "content://…"}` enqueue payload sidecar.
+///
+/// The queue stores the enqueue `payload` string in a sidecar and leaves only
+/// `task.payload_path` on the row. A missing path, unreadable file, malformed
+/// JSON, non-string or blank value all mean "no custom directory", so the
+/// caller falls back to the gallery/Downloads routing without failing the job.
+async fn payload_tree_uri(ctx: &JobCtx) -> Option<String> {
+    let path = ctx
+        .task
+        .payload_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let body = fs::read_to_string(path).await.ok()?;
+    let payload: Value = serde_json::from_str(&body).ok()?;
+    let uri = payload.get("tree_uri")?.as_str()?.trim();
+    if uri.is_empty() {
+        None
+    } else {
+        Some(uri.to_string())
+    }
 }
 
 /// Stream `ctx.task.remote_path` into `dest` (a `.part` path), resuming from
@@ -368,13 +394,29 @@ fn local_failure(context: &str, error: std::io::Error) -> JobOutcome {
 
 /// Choose the platform action for a finished public download.
 ///
-/// Video/image files go to the gallery (MediaStore), everything else to the
-/// public Downloads collection. `SaveToTree` (user-picked SAF folder) needs a
-/// destination the task model does not carry yet.
-fn public_action(file_name: &str, tmp: &Path) -> (PlatformAction, &'static str) {
+/// A non-empty `tree_uri` (custom SAF directory from the enqueue payload) wins
+/// over the media routing: everything is written into that tree. Otherwise
+/// video/image files go to the gallery (MediaStore) and everything else to the
+/// public Downloads collection.
+fn public_action(
+    file_name: &str,
+    tmp: &Path,
+    tree_uri: Option<&str>,
+) -> (PlatformAction, &'static str) {
     let temp_path = tmp.display().to_string();
     let name = file_name.to_string();
     let mime = Some(gallery_mime_for(file_name));
+    if let Some(tree_uri) = tree_uri.map(str::trim).filter(|uri| !uri.is_empty()) {
+        return (
+            PlatformAction::SaveToTree {
+                tree_uri: tree_uri.to_string(),
+                temp_path,
+                name,
+                mime,
+            },
+            "save_to_tree",
+        );
+    }
     if is_gallery_extension(file_name) {
         (
             PlatformAction::SaveToGallery {
@@ -818,7 +860,7 @@ mod tests {
         dir: tempfile::TempDir,
     }
 
-    async fn public_run(file_name: &str, reply: Value) -> PublicRun {
+    async fn public_run(file_name: &str, reply: Value, payload: Option<&str>) -> PublicRun {
         let dir = tempfile::tempdir().unwrap();
         let vfs = Arc::new(FakeVfs::new(pattern_data(4096)));
         let (client, mut rx) = crate::PlatformClient::channel(4);
@@ -829,9 +871,15 @@ mod tests {
             action
         });
         let progress = Arc::new(Recorder::default());
+        let mut public_task = task(TaskKind::DownloadPublic, "t-public", file_name);
+        if let Some(body) = payload {
+            let sidecar = dir.path().join("queue-payload.json");
+            std::fs::write(&sidecar, body).unwrap();
+            public_task.payload_path = Some(sidecar.display().to_string());
+        }
         let ctx = build_ctx(
             dir.path(),
-            task(TaskKind::DownloadPublic, "t-public", file_name),
+            public_task,
             vfs.clone(),
             client,
             progress.clone(),
@@ -859,6 +907,7 @@ mod tests {
         let run = public_run(
             "clip.MP4",
             serde_json::json!({"ok": true, "uri": "content://media/1"}),
+            None,
         )
         .await;
         assert!(matches!(run.outcome, JobOutcome::Completed), "{:?}", run.outcome);
@@ -887,6 +936,7 @@ mod tests {
         let run = public_run(
             "archive.bin",
             serde_json::json!({"ok": true, "path": "/storage/emulated/0/Download/a.bin"}),
+            None,
         )
         .await;
         assert!(matches!(run.outcome, JobOutcome::Completed), "{:?}", run.outcome);
@@ -899,6 +949,7 @@ mod tests {
         let run = public_run(
             "clip.mp4",
             serde_json::json!({"ok": false, "error": "err.diskFull"}),
+            None,
         )
         .await;
         match run.outcome {
@@ -917,6 +968,7 @@ mod tests {
         let run = public_run(
             "clip.mp4",
             serde_json::json!({"ok": false, "safInvalid": true}),
+            None,
         )
         .await;
         match run.outcome {
@@ -924,6 +976,105 @@ mod tests {
             ref other => panic!("expected failure, got {other:?}"),
         }
         assert_eq!(run.final_size, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn public_tree_uri_routes_to_save_to_tree() {
+        let tree_uri = "content://com.android.externalstorage.documents/tree/primary%3ADownload";
+        let payload = format!(r#"{{"tree_uri":"{tree_uri}"}}"#);
+        let run = public_run(
+            "clip.mp4",
+            serde_json::json!({"ok": true, "uri": "content://tree/document/1"}),
+            Some(payload.as_str()),
+        )
+        .await;
+        assert!(matches!(run.outcome, JobOutcome::Completed), "{:?}", run.outcome);
+        match run.action {
+            PlatformAction::SaveToTree {
+                ref tree_uri,
+                ref temp_path,
+                ref name,
+                ref mime,
+            } => {
+                assert_eq!(tree_uri, "content://com.android.externalstorage.documents/tree/primary%3ADownload");
+                assert_eq!(name, "clip.mp4");
+                assert_eq!(mime.as_deref(), Some("video/mp4"));
+                assert_eq!(
+                    std::path::PathBuf::from(temp_path),
+                    run.final_path,
+                    "tree save must use the renamed final file"
+                );
+            }
+            ref other => panic!("expected SaveToTree, got {other:?}"),
+        }
+        assert_eq!(run.final_size, None, "tree hand-off owns the copy now");
+
+        // The Dart bridge reads these exact params keys for `save_to_tree`.
+        let params = serde_json::to_value(&run.action).unwrap();
+        assert_eq!(params["action"], "save_to_tree");
+        assert_eq!(params["tree_uri"], tree_uri);
+        assert!(params.get("temp_path").is_some());
+        assert!(params.get("name").is_some());
+        assert!(params.get("mime").is_some());
+    }
+
+    #[tokio::test]
+    async fn public_payload_without_tree_uri_keeps_media_routing() {
+        let run = public_run(
+            "clip.mp4",
+            serde_json::json!({"ok": true, "uri": "content://media/2"}),
+            Some(r#"{"batch":"nightly"}"#),
+        )
+        .await;
+        assert!(matches!(run.outcome, JobOutcome::Completed), "{:?}", run.outcome);
+        assert!(matches!(run.action, PlatformAction::SaveToGallery { .. }));
+    }
+
+    #[tokio::test]
+    async fn public_malformed_payload_falls_back_without_failing() {
+        for body in [
+            "not json at all",
+            r#"{"tree_uri":"   "}"#,
+            r#"{"tree_uri":42}"#,
+            r#"["tree_uri"]"#,
+        ] {
+            let run = public_run(
+                "clip.mp4",
+                serde_json::json!({"ok": true, "uri": "content://media/3"}),
+                Some(body),
+            )
+            .await;
+            assert!(
+                matches!(run.outcome, JobOutcome::Completed),
+                "{body}: {:?}",
+                run.outcome
+            );
+            assert!(
+                matches!(run.action, PlatformAction::SaveToGallery { .. }),
+                "{body}: {:?}",
+                run.action
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_tree_saf_invalid_maps_to_custom_dir_error() {
+        let payload = r#"{"tree_uri":"content://tree/primary%3ADownload"}"#;
+        let run = public_run(
+            "clip.mp4",
+            serde_json::json!({"ok": false, "safInvalid": true}),
+            Some(payload),
+        )
+        .await;
+        match run.outcome {
+            JobOutcome::Failed { error, .. } => assert_eq!(error, "err.customDirInvalid"),
+            ref other => panic!("expected failure, got {other:?}"),
+        }
+        assert!(
+            matches!(run.action, PlatformAction::SaveToTree { .. }),
+            "the failing action must be the tree save"
+        );
+        assert_eq!(run.final_size, Some(4096), "failed tree save keeps the payload");
     }
 
     #[tokio::test]
