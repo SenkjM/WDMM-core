@@ -413,15 +413,28 @@ impl LibrarySyncEngine {
             format: FORMAT.into(),
             format_version: FORMAT_VERSION,
             base: ManifestBase {
-                up_to: max_rev,
+                // Tombstoned deletions count as consumed by the base too, so a
+                // rebuild never lets the cursor go backwards past them.
+                up_to: max_rev.max(
+                    previous
+                        .tombstones
+                        .iter()
+                        .map(|part| part.to)
+                        .max()
+                        .unwrap_or(0),
+                ),
                 shards: shards.clone(),
             },
             segments: vec![],
-            tombstones: vec![],
+            // §3.2: a rebuild must never drop tombstones — they are the only
+            // evidence that a row was deleted on some device, and losing them
+            // resurrects deleted tracks on the next full sync.
+            tombstones: previous.tombstones.clone(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
         self.write_manifest(manifest.clone()).await?;
-        // best-effort delete old parts
+        // best-effort delete old parts (base shards + segments are folded into
+        // the new base; tombstone files are preserved).
         let keep: HashSet<String> = shards.iter().map(|s| s.file.clone()).collect();
         for old in previous
             .base
@@ -429,7 +442,6 @@ impl LibrarySyncEngine {
             .iter()
             .map(|s| &s.file)
             .chain(previous.segments.iter().map(|s| &s.file))
-            .chain(previous.tombstones.iter().map(|s| &s.file))
         {
             if keep.contains(old) {
                 continue;
@@ -605,84 +617,129 @@ impl SyncEngine for LibrarySyncEngine {
             cursor_parts.keys().cloned().collect()
         };
         let (cloud, read_parts) = self.read_cloud(&manifest, &skip).await?;
-        let remote_by_key: HashMap<String, LibraryTrack> = cloud
-            .tracks
-            .iter()
-            .map(|t| (track_identity_key(&t.account_id, &t.remote_path), t.clone()))
-            .collect();
+        let remote_by_key = remote_map(&cloud);
+
+        // Parts this device already consumed are not re-read, so the remote view
+        // can be incomplete. A clean row that is absent from that partial view
+        // is only proven deleted when its revision lies above everything the
+        // skipped parts could contain.
+        let mut skipped_through = 0i64;
+        if !skip.is_empty() {
+            for shard in &manifest.base.shards {
+                if skip.contains(&shard.file) {
+                    skipped_through = skipped_through.max(manifest.base.up_to);
+                }
+            }
+            for segment in &manifest.segments {
+                if skip.contains(&segment.file) {
+                    skipped_through = skipped_through.max(segment.to);
+                }
+            }
+        }
 
         let local_map = self.local_by_key()?;
-        let mut to_upload = Vec::new();
-        for (key, t) in &local_map {
-            if let Some(r) = remote_by_key.get(key) {
-                if t.rev > r.rev {
-                    to_upload.push(t.clone());
+        let synced_by_id = self.db.list_track_synced_revs()?;
+
+        // §3.1 reconciliation: decided from `synced_rev` per row, never from the
+        // global cursor. A dirty row (`rev > synced_rev`) is data the remote has
+        // not seen; a clean row (`rev == synced_rev`) missing remotely is a
+        // remote deletion, even after the tombstone has been GC'd.
+        let mut to_upload: Vec<LibraryTrack> = Vec::new();
+        let mut to_adopt: Vec<LibraryTrack> = Vec::new();
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut conflicts = 0usize;
+
+        for key in all_keys(&local_map, &remote_by_key, &cloud.tombs) {
+            let local = local_map.get(&key);
+            let remote = remote_by_key.get(&key);
+            let tomb = cloud.tombs.get(&key).copied();
+            let Some(l) = local else {
+                if let Some(r) = remote {
+                    to_adopt.push(r.clone());
                 }
                 continue;
-            }
-            if t.rev > last_seq && (cursor_parts.is_empty() || t.rev > base_up_to) {
-                to_upload.push(t.clone());
-            }
-        }
-
-        let mut to_adopt = Vec::new();
-        for t in &cloud.tracks {
-            let key = track_identity_key(&t.account_id, &t.remote_path);
-            if cloud.tombs.contains_key(&key) {
-                // still in tracks means tomb didn't win; ok
-            }
-            match local_map.get(&key) {
-                None => to_adopt.push(t.clone()),
-                Some(l) if t.rev > l.rev => to_adopt.push(t.clone()),
-                _ => {}
-            }
-        }
-
-        // Apply cloud tombs to local (peer deletion) — required for Core parity tests.
-        for (key, &tomb_rev) in &cloud.tombs {
-            if let Some(local) = local_map.get(key) {
-                if tomb_rev >= local.rev {
-                    let _ = self.db.delete_track(&local.id);
-                    outcomes.push(SyncOutcome {
-                        entity_id: local.id.clone(),
-                        action: SyncAction::Pulled,
-                        rev: RevClock::new(tomb_rev.max(1) as u64),
-                    });
+            };
+            let synced = synced_by_id.get(&l.id).copied().unwrap_or(0);
+            let dirty = l.rev > synced;
+            match remote {
+                Some(r) if r.rev > l.rev => {
+                    if dirty {
+                        conflicts += 1;
+                    }
+                    to_adopt.push(r.clone());
                 }
+                Some(r) if r.rev < l.rev => {
+                    if dirty {
+                        to_upload.push(l.clone());
+                    }
+                }
+                Some(_) => {}
+                None => match tomb {
+                    Some(tomb_rev) if tomb_rev >= l.rev => {
+                        if dirty {
+                            conflicts += 1;
+                        }
+                        to_delete.push(l.id.clone());
+                    }
+                    Some(_) => {
+                        if dirty {
+                            to_upload.push(l.clone());
+                        }
+                    }
+                    None if dirty => to_upload.push(l.clone()),
+                    None if synced > 0 => {
+                        // Only an absence proven by a complete read counts as a
+                        // remote deletion; a row that could sit inside a part
+                        // skipped by the cursor stays untouched.
+                        if l.rev > skipped_through {
+                            to_delete.push(l.id.clone());
+                        }
+                    }
+                    None => to_upload.push(l.clone()),
+                },
             }
         }
 
+        let mut confirmed: HashMap<String, i64> = HashMap::new();
         for t in &to_adopt {
             self.db.upsert_track(t)?;
+            confirmed.insert(t.id.clone(), t.rev);
             outcomes.push(SyncOutcome {
                 entity_id: t.id.clone(),
                 action: SyncAction::Pulled,
                 rev: RevClock::new(t.rev.max(1) as u64),
             });
         }
+        for id in &to_delete {
+            self.db.delete_track(id)?;
+            outcomes.push(SyncOutcome {
+                entity_id: id.clone(),
+                action: SyncAction::Pulled,
+                rev: RevClock::ZERO,
+            });
+        }
 
+        // Publish local deletions that the remote has not seen yet.
         let pending = self.db.list_unpushed_deleted_tracks()?;
-        let mut resurrected = HashSet::new();
+        let mut superseded = Vec::new();
         let mut to_publish = Vec::new();
         for row in &pending {
             let key = track_identity_key(&row.source_name, &row.remote_path);
-            // Skip: cloud already has a tomb at >= our rev — republishing is redundant.
             if cloud.tombs.get(&key).copied().unwrap_or(0) >= row.rev && row.rev > 0 {
-                resurrected.insert(row.rev); // mark pushed, skip re-publish
+                superseded.push(row.rev);
                 continue;
             }
             if let Some(live) = local_map.get(&key) {
                 if live.rev > row.rev {
-                    resurrected.insert(row.rev);
+                    superseded.push(row.rev);
                     continue;
                 }
             }
-            // also check just-adopted
             if let Some(live) = to_adopt.iter().find(|t| {
                 track_identity_key(&t.account_id, &t.remote_path) == key
             }) {
                 if live.rev > row.rev {
-                    resurrected.insert(row.rev);
+                    superseded.push(row.rev);
                     continue;
                 }
             }
@@ -694,21 +751,8 @@ impl SyncEngine for LibrarySyncEngine {
                 sync_key: None, // music never writes syncKey
             });
         }
-        if !resurrected.is_empty() {
-            let revs: Vec<i64> = resurrected.iter().copied().collect();
-            // mark pushed so they don't reappear; Android clearTombstones
-            let _ = self.db.mark_deleted_tracks_pushed(&revs);
-        }
-
-        if to_upload.is_empty() && to_publish.is_empty() {
-            let highest = to_adopt.iter().map(|t| t.rev).fold(last_seq, i64::max);
-            let latest = self.read_manifest().await?;
-            self.save_cursor(&latest, &cursor_parts, &read_parts, highest)?;
-            info!(
-                "library shard sync: no upload (adopted={})",
-                to_adopt.len()
-            );
-            return Ok(outcomes);
+        if !superseded.is_empty() {
+            let _ = self.db.mark_deleted_tracks_pushed(&superseded);
         }
 
         if !to_publish.is_empty() {
@@ -726,6 +770,8 @@ impl SyncEngine for LibrarySyncEngine {
         if !to_upload.is_empty() {
             self.append_delta(&to_upload).await?;
             for t in &to_upload {
+                // Confirmed only after the remote write succeeded.
+                confirmed.insert(t.id.clone(), t.rev);
                 outcomes.push(SyncOutcome {
                     entity_id: t.id.clone(),
                     action: SyncAction::Pushed,
@@ -733,15 +779,26 @@ impl SyncEngine for LibrarySyncEngine {
                 });
             }
         }
+        self.db.set_track_synced_revs(&confirmed)?;
 
-        let highest = to_upload.iter().map(|t| t.rev).fold(last_seq, i64::max);
+        // Keep the HLC high-water mark above everything we have seen, so a
+        // later local write can never be older than a row we just pulled.
+        let seen = to_adopt
+            .iter()
+            .chain(to_upload.iter())
+            .map(|t| t.rev)
+            .fold(last_seq, i64::max);
+        let _ = self.db.observe_rev(seen);
+
         let latest = self.read_manifest().await?;
-        self.save_cursor(&latest, &cursor_parts, &read_parts, highest)?;
+        self.save_cursor(&latest, &cursor_parts, &read_parts, seen)?;
         info!(
-            "library shard sync: adopted={} tombs={} uploaded={}",
+            "library shard sync: adopted={} deleted_local={} tombs={} uploaded={} conflicts={}",
             to_adopt.len(),
+            to_delete.len(),
             to_publish.len(),
-            to_upload.len()
+            to_upload.len(),
+            conflicts
         );
         Ok(outcomes)
     }
@@ -749,58 +806,169 @@ impl SyncEngine for LibrarySyncEngine {
     async fn sync_full(&self) -> SyncResult<Vec<SyncOutcome>> {
         let mut outcomes = Vec::new();
         let manifest = self.read_manifest().await?;
-        let (cloud, _) = self.read_cloud(&manifest, &HashSet::new()).await?;
+        let (cloud, read_parts) = self.read_cloud(&manifest, &HashSet::new()).await?;
+        let remote_by_key = remote_map(&cloud);
         let local_map = self.local_by_key()?;
-
-        // Hoist once — not per cloud track.
+        let synced_by_id = self.db.list_track_synced_revs()?;
         let pending_tombs = self.db.list_unpushed_deleted_tracks()?;
 
-        for t in &cloud.tracks {
-            let key = track_identity_key(&t.account_id, &t.remote_path);
-            if cloud.tombs.get(&key).copied().unwrap_or(0) >= t.rev && cloud.tombs.contains_key(&key) {
-                // shouldn't be in tracks if tomb won; skip
-                continue;
-            }
-            // Never resurrect a track that has a local unpushed tombstone.
-            let locally_tombstoned = pending_tombs.iter().any(|d| {
-                d.source_name == t.account_id && d.remote_path == t.remote_path && d.rev >= t.rev
-            });
-            if locally_tombstoned {
-                continue;
-            }
-            match local_map.get(&key) {
-                None => {
-                    self.db.upsert_track(t)?;
-                    outcomes.push(SyncOutcome {
-                        entity_id: t.id.clone(),
-                        action: SyncAction::Pulled,
-                        rev: RevClock::new(t.rev.max(1) as u64),
-                    });
+        // Full sync = reconcile first, then rebuild the base from the merged
+        // live set. It is *not* "the remote mirrors this device": a remote
+        // deletion is applied locally and tombstones are never dropped.
+        let mut merged: HashMap<String, LibraryTrack> = local_map.clone();
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut conflicts = 0usize;
+
+        for key in all_keys(&local_map, &remote_by_key, &cloud.tombs) {
+            let local = local_map.get(&key);
+            let remote = remote_by_key.get(&key);
+            let tomb = cloud.tombs.get(&key).copied();
+            match (local, remote) {
+                (Some(l), Some(r)) if r.rev > l.rev => {
+                    let synced = synced_by_id.get(&l.id).copied().unwrap_or(0);
+                    if l.rev > synced {
+                        conflicts += 1;
+                    }
+                    merged.insert(key.clone(), r.clone());
                 }
-                Some(l) if t.rev > l.rev => {
-                    self.db.upsert_track(t)?;
-                    outcomes.push(SyncOutcome {
-                        entity_id: t.id.clone(),
-                        action: SyncAction::Pulled,
-                        rev: RevClock::new(t.rev.max(1) as u64),
+                (Some(_), Some(_)) => {}
+                (Some(l), None) => match tomb {
+                    Some(tomb_rev) if tomb_rev >= l.rev => {
+                        let synced = synced_by_id.get(&l.id).copied().unwrap_or(0);
+                        if l.rev > synced {
+                            conflicts += 1;
+                        }
+                        merged.remove(&key);
+                        to_delete.push(l.id.clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        let synced = synced_by_id.get(&l.id).copied().unwrap_or(0);
+                        if l.rev == synced && synced > 0 {
+                            merged.remove(&key);
+                            to_delete.push(l.id.clone());
+                        }
+                    }
+                },
+                (None, Some(r)) => {
+                    let locally_tombstoned = pending_tombs.iter().any(|d| {
+                        d.source_name == r.account_id
+                            && d.remote_path == r.remote_path
+                            && d.rev >= r.rev
                     });
+                    if !locally_tombstoned {
+                        merged.insert(key.clone(), r.clone());
+                    }
                 }
-                _ => {}
+                (None, None) => {}
             }
         }
 
-        // Refresh local after adopt
-        let tracks = self.db.list_tracks()?;
-        // Filter out tracks that have local unpushed tombs? Android uses _library.tracks after adopt
-        // which already excludes deleted. Our list_tracks returns live rows only.
+        for id in &to_delete {
+            self.db.delete_track(id)?;
+            outcomes.push(SyncOutcome {
+                entity_id: id.clone(),
+                action: SyncAction::Pulled,
+                rev: RevClock::ZERO,
+            });
+        }
+
+        let mut tracks: Vec<LibraryTrack> = merged.into_values().collect();
+        tracks.sort_by(|a, b| a.id.cmp(&b.id));
         let written = self.rebuild(&tracks, DEFAULT_TRACKS_PER_SHARD).await?;
+        // The rebuilt base is the authoritative copy of every kept row, so all
+        // of them are now confirmed on the remote.
+        let confirmed: HashMap<String, i64> =
+            tracks.iter().map(|t| (t.id.clone(), t.rev)).collect();
+        self.db.set_track_synced_revs(&confirmed)?;
+
+        // Publish deletions that the remote has not seen yet (tombstones are
+        // part of the merged state, so they must survive the rebuild).
+        let mut superseded = Vec::new();
+        let mut to_publish = Vec::new();
+        for row in &pending_tombs {
+            let key = track_identity_key(&row.source_name, &row.remote_path);
+            if cloud.tombs.get(&key).copied().unwrap_or(0) >= row.rev && row.rev > 0 {
+                superseded.push(row.rev);
+                continue;
+            }
+            if let Some(live) = tracks.iter().find(|t| {
+                track_identity_key(&t.account_id, &t.remote_path) == key
+            }) {
+                if live.rev > row.rev {
+                    superseded.push(row.rev);
+                    continue;
+                }
+            }
+            to_publish.push(TombRecord {
+                source_name: row.source_name.clone(),
+                remote_path: row.remote_path.clone(),
+                rev: row.rev,
+                deleted_at: row.deleted_at.clone(),
+                sync_key: None,
+            });
+        }
+        if !superseded.is_empty() {
+            let _ = self.db.mark_deleted_tracks_pushed(&superseded);
+        }
+        if !to_publish.is_empty() {
+            self.append_tombstones(&to_publish).await?;
+            let revs: Vec<i64> = to_publish.iter().map(|t| t.rev).collect();
+            self.db.mark_deleted_tracks_pushed(&revs)?;
+            for t in &to_publish {
+                outcomes.push(SyncOutcome {
+                    entity_id: format!("tomb:{}|{}", t.source_name, t.remote_path),
+                    action: SyncAction::Pushed,
+                    rev: RevClock::new(t.rev.max(1) as u64),
+                });
+            }
+        }
+
         let _ = self.db.purge_deleted_tracks_up_to(written.base.up_to)?;
-        let _ = self.db.clear_sync_state(Some(CURSOR_PREFIX))?;
+        let highest = tracks
+            .iter()
+            .map(|t| t.rev)
+            .chain(to_publish.iter().map(|t| t.rev))
+            .fold(written.base.up_to, i64::max);
+        let _ = self.db.observe_rev(highest);
+        let latest = self.read_manifest().await?;
+        let mut tomb_parts: HashMap<String, i64> = HashMap::new();
+        for part in &latest.tombstones {
+            tomb_parts.insert(part.file.clone(), part.to);
+        }
+        self.save_cursor(&latest, &tomb_parts, &read_parts, highest)?;
         outcomes.push(SyncOutcome {
             entity_id: "library-rebuild".into(),
             action: SyncAction::Pushed,
             rev: RevClock::new(written.base.up_to.max(1) as u64),
         });
+        info!(
+            "library full sync: rebuilt={} deleted_local={} tombs_published={} conflicts={}",
+            tracks.len(),
+            to_delete.len(),
+            to_publish.len(),
+            conflicts
+        );
         Ok(outcomes)
     }
+}
+
+fn remote_map(cloud: &CloudLibrary) -> HashMap<String, LibraryTrack> {
+    cloud
+        .tracks
+        .iter()
+        .map(|t| (track_identity_key(&t.account_id, &t.remote_path), t.clone()))
+        .collect()
+}
+
+fn all_keys(
+    local: &HashMap<String, LibraryTrack>,
+    remote: &HashMap<String, LibraryTrack>,
+    tombs: &HashMap<String, i64>,
+) -> HashSet<String> {
+    let mut keys: HashSet<String> = HashSet::new();
+    keys.extend(local.keys().cloned());
+    keys.extend(remote.keys().cloned());
+    keys.extend(tombs.keys().cloned());
+    keys
 }

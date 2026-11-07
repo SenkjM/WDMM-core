@@ -22,17 +22,26 @@
 //! Schema v17: durable task queue (`queue_tasks`, `queue_batches`) + cache access
 //!   index (`cache_entries`, `cache_groups`) owned by `wdmm-queue`; replaces the
 //!   old in-process stub and Dart's `cache_index.db`.
+//! Schema v18: per-row `synced_rev` on `tracks` / `mangas` / `playlists`
+//!   (last revision confirmed on the remote) — the sync engines reconcile with
+//!   it instead of guessing from the global cursor, so a local row that was
+//!   never synced always gets pushed and a clean row missing remotely is a
+//!   remote deletion. `rev` itself becomes an HLC clock (`next_rev`).
 
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use thiserror::Error as ThisError;
 use uuid::Uuid;
 
 pub use wdmm_core::models::TranscodePreset;
 use wdmm_core::models::{CloudAccount, LibraryAlbum, LibraryArtist, LibraryTrack};
+
+/// KV key holding the revision high-water mark (`next_rev` / `observe_rev`).
+const REV_WATERMARK_KEY: &str = "library_rev_watermark";
 
 #[derive(Debug, ThisError)]
 pub enum StorageError {
@@ -1819,6 +1828,33 @@ impl LibraryDatabase {
             )?;
         }
 
+        // ── v18 migration: per-row `synced_rev` + HLC revision clock ──────────
+        // `synced_rev` is the local row's `rev` as last confirmed on the remote.
+        // The sync engines use it to tell "dirty, must push" from "clean, so a
+        // missing remote row means deleted remotely". It never goes over the
+        // wire and never appears in the shard payloads.
+        if current_ver < 18 {
+            conn.execute_batch("BEGIN;")?;
+            // `ALTER TABLE ... ADD COLUMN` has no `IF NOT EXISTS`; ignore
+            // "duplicate column name" so a half-migrated DB converges instead of
+            // refusing to open.
+            for statement in [
+                "ALTER TABLE tracks ADD COLUMN synced_rev INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE mangas ADD COLUMN synced_rev INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE playlists ADD COLUMN synced_rev INTEGER NOT NULL DEFAULT 0;",
+            ] {
+                if let Err(error) = conn.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        return Err(StorageError::from(error));
+                    }
+                }
+            }
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO _schema_version (version) VALUES (18); COMMIT;",
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1840,6 +1876,11 @@ impl LibraryDatabase {
         // Derive artist_id and album_id from text fields if present
         let (artist_id, album_id) = self.ensure_aggregates_for_track(track)?;
 
+        // `INSERT OR REPLACE` rewrites every column; `synced_rev` is local
+        // bookkeeping and must survive a local edit, otherwise the row would
+        // look "never synced" and be re-pushed on every sync.
+        let synced_rev = self.track_synced_rev(&track.id)?;
+
         let now = Utc::now().timestamp();
         let modified_ts = track.modified.map(|dt| dt.timestamp());
         let conn = self.conn.lock().unwrap();
@@ -1847,8 +1888,8 @@ impl LibraryDatabase {
             "INSERT OR REPLACE INTO tracks
              (id, title, artist, remote_path, account_id, size, modified, created_at,
               album_id, artist_id, duration_ms, genre, track_number, disc_number, year, mime_type,
-              album, album_artist, rev, cover_state)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16, ?17,?18,?19,?20)",
+              album, album_artist, rev, cover_state, synced_rev)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, ?9,?10,?11,?12,?13,?14,?15,?16, ?17,?18,?19,?20,?21)",
             params![
                 &track.id,
                 &track.title,
@@ -1870,6 +1911,7 @@ impl LibraryDatabase {
                 &track.album_artist,
                 track.rev,
                 track.cover_state,
+                synced_rev,
             ],
         )?;
         drop(conn);
@@ -4892,6 +4934,146 @@ impl LibraryDatabase {
         Ok(result)
     }
 
+    // ── Revision clock + sync bookkeeping (v18) ───────────────────────────────
+
+    /// Strictly increasing revision for library rows (a hybrid logical clock).
+    ///
+    /// `rev = max(now_millis, high_water + 1)` with the high-water mark persisted
+    /// in `kv_store`: a wall clock that jumps backwards (or two writes in the
+    /// same millisecond) can no longer make a newer row look older than an older
+    /// one — that was §2.7 of the sync-correctness contract.
+    pub fn next_rev(&self) -> StorageResult<i64> {
+        let now = Utc::now().timestamp_millis();
+        let rev = now.max(self.rev_high_water()? + 1);
+        self.save_kv(REV_WATERMARK_KEY, &rev.to_string())?;
+        Ok(rev)
+    }
+
+    /// Raise the revision high-water mark to a revision received from another
+    /// device, so subsequently generated local revisions stay strictly greater.
+    pub fn observe_rev(&self, rev: i64) -> StorageResult<()> {
+        if rev > 0 && rev > self.rev_high_water()? {
+            self.save_kv(REV_WATERMARK_KEY, &rev.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn rev_high_water(&self) -> StorageResult<i64> {
+        Ok(self
+            .load_kv(REV_WATERMARK_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// The `rev` a track had when it was last confirmed on the remote.
+    /// `0` means "never synced".
+    pub fn track_synced_rev(&self, id: &str) -> StorageResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT synced_rev FROM tracks WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0))
+        .map_err(StorageError::from)
+    }
+
+    /// Every live track's `synced_rev`, keyed by row id (one query per sync).
+    pub fn list_track_synced_revs(&self) -> StorageResult<HashMap<String, i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, synced_rev FROM tracks")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, rev) = row?;
+            out.insert(id, rev);
+        }
+        Ok(out)
+    }
+
+    pub fn set_track_synced_rev(&self, id: &str, rev: i64) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tracks SET synced_rev = ?1 WHERE id = ?2",
+            params![rev, id],
+        )?;
+        Ok(())
+    }
+
+    /// Batch form used by the sync engines (single transaction).
+    pub fn set_track_synced_revs(&self, revs: &HashMap<String, i64>) -> StorageResult<()> {
+        if revs.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for (id, rev) in revs {
+            tx.execute(
+                "UPDATE tracks SET synced_rev = ?1 WHERE id = ?2",
+                params![rev, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The `rev` a manga had when it was last confirmed on the remote.
+    pub fn manga_synced_rev(&self, id: &str) -> StorageResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT synced_rev FROM mangas WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0))
+        .map_err(StorageError::from)
+    }
+
+    /// Every live manga's `synced_rev`, keyed by row id.
+    pub fn list_manga_synced_revs(&self) -> StorageResult<HashMap<String, i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, synced_rev FROM mangas")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, rev) = row?;
+            out.insert(id, rev);
+        }
+        Ok(out)
+    }
+
+    pub fn set_manga_synced_rev(&self, id: &str, rev: i64) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE mangas SET synced_rev = ?1 WHERE id = ?2",
+            params![rev, id],
+        )?;
+        Ok(())
+    }
+
+    /// Batch form used by the manga sync engine (single transaction).
+    pub fn set_manga_synced_revs(&self, revs: &HashMap<String, i64>) -> StorageResult<()> {
+        if revs.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for (id, rev) in revs {
+            tx.execute(
+                "UPDATE mangas SET synced_rev = ?1 WHERE id = ?2",
+                params![rev, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // ── Sync state (v6 cursors) ───────────────────────────────────────────────
 
     pub fn get_sync_state(&self, remote_key: &str) -> StorageResult<Option<SyncState>> {
@@ -5502,7 +5684,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
     }
 
     #[test]
@@ -7112,7 +7294,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -7645,7 +7827,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -8090,7 +8272,7 @@ mod tests {
 
         // Open through LibraryDatabase — triggers v10 migration.
         let db = LibraryDatabase::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 17, "schema must reach v17");
+        assert_eq!(db.schema_version().unwrap(), 18, "schema must reach v18");
 
         let mangas = db.list_mangas().unwrap();
         let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");
@@ -8376,7 +8558,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
 
         let all = db.list_transcode_presets().unwrap();
         assert_eq!(
@@ -8525,7 +8707,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -8663,7 +8845,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -8781,7 +8963,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -9070,7 +9252,7 @@ mod v17_queue_cache_tests {
         }
 
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
 
         {
             let conn = db.conn.lock().unwrap();
@@ -9291,5 +9473,55 @@ mod v17_queue_cache_tests {
 
         assert_eq!(db.cache_delete_group("cue1").unwrap(), 3);
         assert!(db.cache_group_paths("cue1").unwrap().is_empty());
+    }
+}
+
+
+#[cfg(test)]
+mod rev_clock_tests {
+    use super::*;
+
+    #[test]
+    fn next_rev_is_monotonic_and_observes_remote_revs() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let first = db.next_rev().unwrap();
+        let second = db.next_rev().unwrap();
+        assert!(second > first, "revisions must strictly increase");
+        db.observe_rev(9_000_000_000).unwrap();
+        let third = db.next_rev().unwrap();
+        assert!(
+            third > 9_000_000_000,
+            "an adopted remote rev must raise the watermark"
+        );
+    }
+
+    #[test]
+    fn synced_rev_survives_upserts() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        db.insert_track(&LibraryTrack {
+            id: "t1".into(),
+            title: "T".into(),
+            remote_path: "/m/t1.mp3".into(),
+            account_id: "nas".into(),
+            rev: 700,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(db.track_synced_rev("t1").unwrap(), 0);
+        db.set_track_synced_rev("t1", 700).unwrap();
+        assert_eq!(db.track_synced_rev("t1").unwrap(), 700);
+        assert_eq!(
+            db.list_track_synced_revs().unwrap().get("t1").copied(),
+            Some(700)
+        );
+        let mut row = db.get_track("t1").unwrap().unwrap();
+        row.title = "T2".into();
+        row.rev = 800;
+        db.upsert_track(&row).unwrap();
+        assert_eq!(
+            db.track_synced_rev("t1").unwrap(),
+            700,
+            "upsert must not clear synced_rev"
+        );
     }
 }

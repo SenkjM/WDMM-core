@@ -283,7 +283,10 @@ async fn upsert_single(
             .filter(|year| *year > 0)
             .or_else(|| old.and_then(|track| track.year)),
         mime_type: old.and_then(|track| track.mime_type.clone()),
-        rev: now_millis(),
+        rev: ctx
+            .db
+            .next_rev()
+            .map_err(|error| format!("err.storage.rev|{remote_path}: {error}"))?,
         cover_state,
     };
 
@@ -358,7 +361,10 @@ async fn ingest_cue_sheet(
     let cover = cue_cover(ctx, audio).await;
     let ranges = cue_clip_ranges(&sheet.tracks);
     let now = iso8601_now();
-    let rev = now_millis();
+    let rev = ctx
+        .db
+        .next_rev()
+        .map_err(|error| format!("err.storage.rev|{cue_remote_path}: {error}"))?;
     let cache_group = thumbs::cue_cache_group_id(source, cue_remote_path);
     let cue_id = thumbs::cue_id_for(source, cue_remote_path);
     let track_total = i64::try_from(sheet.tracks.len()).unwrap_or(i64::MAX);
@@ -598,7 +604,10 @@ fn refresh_cue_covers(
         match thumbs::write_thumb_at(bytes, &dest, COVER_THUMB_SIZE) {
             Ok(()) => {
                 slice.cover_state = 2;
-                slice.rev = now_millis();
+                slice.rev = ctx
+                    .db
+                    .next_rev()
+                    .map_err(|error| format!("err.storage.rev|{virtual_path}: {error}"))?;
                 slice.last_tag_read_at = iso8601_now();
                 ctx.db
                     .upsert_cue_slice(&slice)

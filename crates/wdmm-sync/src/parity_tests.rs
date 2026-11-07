@@ -687,9 +687,10 @@ async fn manga_sync_legacy_loose_image_skip() {
     );
 }
 
-/// Scenario 14: sync_full clears all pending deleted_mangas and the manga cursor.
+/// Scenario 14 (P1a): sync_full publishes pending tombstones, keeps them in the
+/// database + manifest, and clears only the cursor.
 #[tokio::test]
-async fn manga_sync_full_rebuild_clears_tombs_and_cursor() {
+async fn manga_sync_full_rebuild_keeps_tombs_and_clears_cursor() {
     let driver = Arc::new(MockDriver::new());
     let db = tmp_db();
 
@@ -718,10 +719,16 @@ async fn manga_sync_full_rebuild_clears_tombs_and_cursor() {
 
     engine.sync_full().await.unwrap();
 
-    // sync_full calls clear_all_deleted_mangas.
+    // Pending tombstones are published (pushed=1) but never dropped: they are
+    // the only proof of the deletion for devices that sync later.
     assert!(
         db.list_unpushed_deleted_mangas().unwrap().is_empty(),
-        "sync_full must clear all pending deleted_mangas"
+        "sync_full must publish pending tombstones"
+    );
+    assert_eq!(
+        db.list_deleted_mangas().unwrap().len(),
+        1,
+        "sync_full must keep the tombstone row"
     );
 
     // sync_full calls clear_sync_state(Some(\"manga:\")).
@@ -729,4 +736,141 @@ async fn manga_sync_full_rebuild_clears_tombs_and_cursor() {
         db.get_sync_state("manga:/sync").unwrap().is_none(),
         "sync_full must clear the manga cursor state"
     );
+}
+
+/// P1a: a full sync applies cloud tombstones and never deletes the tombstone
+/// parts (previously a rebuild resurrected every remotely deleted track).
+#[tokio::test]
+async fn library_full_sync_keeps_tombstones_and_does_not_resurrect() {
+    let driver = Arc::new(MockDriver::new());
+    let path = "/music/deleted.mp3";
+    let id = wdmm_core::identity::track_identity(path);
+
+    let db_a = tmp_db();
+    db_a.insert_track(&LibraryTrack {
+        id: id.clone(),
+        title: "Gone".into(),
+        remote_path: path.into(),
+        account_id: "nas".into(),
+        rev: 100,
+        ..Default::default()
+    })
+    .unwrap();
+    let engine_a = LibrarySyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync", None);
+    engine_a.sync_incremental().await.unwrap();
+
+    // Device A deletes the track and publishes a tombstone at rev=200.
+    db_a.delete_track(&id).unwrap();
+    db_a.upsert_deleted_track(&wdmm_storage::DeletedTrack {
+        source_name: "nas".into(),
+        remote_path: path.into(),
+        rev: 200,
+        deleted_at: "2026-11-07T00:00:00Z".into(),
+        pushed: 0,
+    })
+    .unwrap();
+    engine_a.sync_incremental().await.unwrap();
+    assert!(
+        driver
+            .files
+            .lock()
+            .await
+            .keys()
+            .any(|k| k.contains("/sync/library/music/del-")),
+        "A must publish a tombstone part"
+    );
+
+    // Device B still has the clean row; a FULL sync must honour the tombstone.
+    let db_b = tmp_db();
+    db_b.insert_track(&LibraryTrack {
+        id: id.clone(),
+        title: "Gone".into(),
+        remote_path: path.into(),
+        account_id: "nas".into(),
+        rev: 100,
+        ..Default::default()
+    })
+    .unwrap();
+    db_b.set_track_synced_rev(&id, 100).unwrap();
+    let engine_b = LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None);
+    engine_b.sync_full().await.unwrap();
+    assert!(
+        db_b.get_track(&id).unwrap().is_none(),
+        "full sync must apply the cloud tombstone"
+    );
+
+    // The tombstone part and its manifest entry survive the rebuild.
+    let files = driver.files.lock().await;
+    assert!(
+        files
+            .keys()
+            .any(|k| k.contains("/sync/library/music/del-")),
+        "rebuild must not delete tombstone parts"
+    );
+    let index = files
+        .get("/sync/library/music/index.json")
+        .expect("index.json must exist");
+    let manifest: crate::library_music::LibraryManifest =
+        serde_json::from_slice(index).unwrap();
+    assert_eq!(
+        manifest.tombstones.len(),
+        1,
+        "manifest must still reference the tombstone"
+    );
+    drop(files);
+
+    // A fresh device must also see the deletion.
+    let db_c = tmp_db();
+    LibrarySyncEngine::new(Arc::clone(&db_c), driver.clone(), "/sync", None)
+        .sync_full()
+        .await
+        .unwrap();
+    assert!(
+        db_c.get_track(&id).unwrap().is_none(),
+        "fresh device must not resurrect a deleted track"
+    );
+}
+
+/// P1a: a full sync folds unsynced local edits into the rebuilt base.
+#[tokio::test]
+async fn library_full_sync_keeps_unsynced_local_edits() {
+    let driver = Arc::new(MockDriver::new());
+    let path = "/music/edited.mp3";
+    let id = wdmm_core::identity::track_identity(path);
+
+    let db = tmp_db();
+    db.insert_track(&LibraryTrack {
+        id: id.clone(),
+        title: "v1".into(),
+        remote_path: path.into(),
+        account_id: "nas".into(),
+        rev: 100,
+        ..Default::default()
+    })
+    .unwrap();
+    let engine = LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None);
+    engine.sync_incremental().await.unwrap();
+
+    // Local edit not yet pushed.
+    let mut row = db.get_track(&id).unwrap().unwrap();
+    row.title = "v2".into();
+    row.rev = 150;
+    db.upsert_track(&row).unwrap();
+
+    engine.sync_full().await.unwrap();
+    assert_eq!(
+        db.track_synced_rev(&id).unwrap(),
+        150,
+        "the rebuilt base is authoritative, so the row is clean afterwards"
+    );
+
+    // A peer pulling the rebuilt base sees the edit.
+    let peer = tmp_db();
+    LibrarySyncEngine::new(Arc::clone(&peer), driver.clone(), "/sync", None)
+        .sync_incremental()
+        .await
+        .unwrap();
+    let got = peer.get_track(&id).unwrap().unwrap();
+    assert_eq!(got.rev, 150);
+    assert_eq!(got.title, "v2");
 }

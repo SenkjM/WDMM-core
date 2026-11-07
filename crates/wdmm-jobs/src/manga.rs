@@ -1175,7 +1175,15 @@ fn save_draft(
         format: draft.format.clone(),
         remote_missing: previous.as_ref().map(|row| row.remote_missing).unwrap_or(0),
         page_turn: previous.and_then(|row| row.page_turn),
-        rev: 1,
+        rev: match db.next_rev() {
+            Ok(rev) => rev,
+            Err(error) => {
+                return Err(failed(
+                    format!("err.storage.rev|{error}"),
+                    FailureCategory::State,
+                ))
+            }
+        },
         updated_at: now_rfc3339(),
     };
     if let Err(error) = db.upsert_manga(&row) {
