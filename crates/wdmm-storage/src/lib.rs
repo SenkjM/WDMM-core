@@ -1855,6 +1855,22 @@ impl LibraryDatabase {
             )?;
         }
 
+        if current_ver < 19 {
+            // Playlist deletions must outlive the playlist document: without a
+            // tombstone a peer that still has the row simply republishes it and
+            // the playlist comes back on every sync.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS deleted_playlists (
+                     id         TEXT PRIMARY KEY,
+                     deleted_at TEXT NOT NULL,
+                     pushed     INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO _schema_version (version) VALUES (19);
+                 COMMIT;",
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -2517,9 +2533,14 @@ impl LibraryDatabase {
     // ── Playlists (Round 4: full CRUD + entries per docs/10-PLAYLIST-FORMAT.md) ─
 
     /// Insert or replace a playlist row (caller controls `updated_at`).
+    ///
+    /// A live row supersedes a recorded deletion: recreating a playlist (or
+    /// adopting a newer copy from a peer) drops the tombstone, otherwise the
+    /// sync engine would delete it again on the next run.
     pub fn upsert_playlist(&self, playlist: &Playlist) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO playlists (id, name, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -2529,6 +2550,11 @@ impl LibraryDatabase {
                 playlist.updated_at.timestamp(),
             ],
         )?;
+        tx.execute(
+            "DELETE FROM deleted_playlists WHERE id = ?1",
+            params![&playlist.id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2568,11 +2594,93 @@ impl LibraryDatabase {
         Ok(out)
     }
 
+    /// Delete a playlist and remember the deletion for the sync engine.
+    ///
+    /// The row and the tombstone move in one transaction; deleting an id that
+    /// does not exist records nothing (a stray id must not delete a peer's
+    /// playlist).
     pub fn delete_playlist(&self, id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
-        // ON DELETE CASCADE removes entries.
+        let tx = conn.unchecked_transaction()?;
+        let existed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM playlists WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if existed {
+            tx.execute(
+                "INSERT OR REPLACE INTO deleted_playlists (id, deleted_at, pushed)
+                 VALUES (?1, ?2, 0)",
+                params![id, now_iso8601()],
+            )?;
+            // ON DELETE CASCADE removes the entries.
+            tx.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop a playlist row without recording a deletion.
+    ///
+    /// The sync engine applies a deletion that another device already
+    /// published; recording it again would make the tombstone bounce back.
+    pub fn delete_playlist_quietly(&self, id: &str) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Playlist deletions that still have to reach the remote snapshot.
+    ///
+    /// Returns `(playlist_id, deleted_at)` with RFC-3339 timestamps.
+    pub fn list_unpushed_deleted_playlists(&self) -> StorageResult<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, deleted_at FROM deleted_playlists WHERE pushed = 0")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every recorded playlist deletion, published or not.
+    pub fn list_deleted_playlists(&self) -> StorageResult<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, deleted_at FROM deleted_playlists")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_deleted_playlists_pushed(&self, ids: &[String]) -> StorageResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for id in ids {
+            tx.execute(
+                "UPDATE deleted_playlists SET pushed = 1 WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop published playlist tombstones older than `cutoff` (RFC-3339).
+    pub fn purge_deleted_playlists_before(&self, cutoff: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM deleted_playlists WHERE pushed = 1 AND deleted_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(removed)
     }
 
     /// Replace all entries for a playlist in one shot.
@@ -5257,6 +5365,11 @@ pub struct UserFolderItem {
     pub added_at: i64,
 }
 
+/// RFC-3339 timestamp with milliseconds, the format the sync documents use.
+fn now_iso8601() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 fn ts_to_dt(ts: i64) -> StorageResult<DateTime<Utc>> {
     DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.with_timezone(&Utc))
@@ -5716,7 +5829,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
     }
 
     #[test]
@@ -7326,7 +7439,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -7859,7 +7972,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -8304,7 +8417,7 @@ mod tests {
 
         // Open through LibraryDatabase — triggers v10 migration.
         let db = LibraryDatabase::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 18, "schema must reach v18");
+        assert_eq!(db.schema_version().unwrap(), 19, "schema must reach v19");
 
         let mangas = db.list_mangas().unwrap();
         let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");
@@ -8590,7 +8703,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
 
         let all = db.list_transcode_presets().unwrap();
         assert_eq!(
@@ -8739,7 +8852,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -8877,7 +8990,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -8995,7 +9108,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -9284,7 +9397,7 @@ mod v17_queue_cache_tests {
         }
 
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
-        assert_eq!(db.schema_version().unwrap(), 18);
+        assert_eq!(db.schema_version().unwrap(), 19);
 
         {
             let conn = db.conn.lock().unwrap();
