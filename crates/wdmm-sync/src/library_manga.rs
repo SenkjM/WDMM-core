@@ -20,6 +20,7 @@ use crate::{join_path, SyncAction, SyncEngine, SyncError, SyncOutcome, SyncResul
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::info;
 use wdmm_core::rev_clock::RevClock;
@@ -36,6 +37,9 @@ const SHARD_PREFIX: &str = "lib-";
 const SEGMENT_PREFIX: &str = "seg-";
 const TOMB_PREFIX: &str = "del-";
 const CURSOR_PREFIX: &str = "manga:";
+
+/// Keeps shard names unique inside one process when two writes share a stamp.
+static PART_SEQ: AtomicU64 = AtomicU64::new(0);
 const PROGRESS_NAME: &str = "progress.json";
 const FORMAT_PROGRESS: &str = "wmp_manga_progress";
 const FORMAT_VERSION_PROGRESS: i64 = 1;
@@ -188,10 +192,19 @@ fn manga_dir(remote_dir: &str) -> String {
     join_path(remote_dir, "library/manga")
 }
 
-fn part_name(prefix: &str, rev: i64) -> String {
+fn part_name(prefix: &str, rev: i64, device: &str) -> String {
     let stamp = if rev > 0 { rev } else { chrono::Utc::now().timestamp_millis() };
-    let rand = (stamp.wrapping_mul(1103515245).wrapping_add(12345).unsigned_abs()) % 0xFFFFFF;
-    format!("{prefix}{stamp}-{rand:06x}.wdmm")
+    // Shard files are immutable and must never share a name. The old name came
+    // from `rev` alone, so two devices writing at the same rev picked the same
+    // file and one delta was silently lost.
+    let tag: String = device
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let nanos = chrono::Utc::now().timestamp_subsec_nanos();
+    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}{stamp}-{tag}-{nanos:08x}{seq:04x}.wdmm")
 }
 
 fn device_id(db: &LibraryDatabase) -> String {
@@ -208,6 +221,7 @@ pub struct MangaLibrarySyncEngine {
     store: DriverStore,
     remote_dir: String,
     cover_roots: Option<CoverRoots>,
+    device: String,
 }
 
 impl MangaLibrarySyncEngine {
@@ -217,11 +231,13 @@ impl MangaLibrarySyncEngine {
         remote_dir: impl Into<String>,
         cover_roots: Option<CoverRoots>,
     ) -> Self {
+        let device = device_id(&db);
         Self {
             db,
             store: DriverStore { driver },
             remote_dir: remote_dir.into(),
             cover_roots,
+            device,
         }
     }
 
@@ -303,6 +319,50 @@ impl MangaLibrarySyncEngine {
                 tomb_parts.push(vec![]);
             }
         }
+        // A shard is written before the manifest that names it, so a peer can
+        // legitimately see a fresh `seg-*`/`del-*` the index does not list yet.
+        // Read those too: otherwise this device's cursor would treat the delta
+        // as consumed and the two sides would drift apart. Base shards are left
+        // for the next index read on purpose -- mixing two base generations is
+        // worse than one delayed sync.
+        let listed: HashSet<&str> = manifest
+            .base
+            .shards
+            .iter()
+            .map(|s| s.file.as_str())
+            .chain(manifest.segments.iter().map(|s| s.file.as_str()))
+            .chain(manifest.tombstones.iter().map(|s| s.file.as_str()))
+            .collect();
+        for file in self.store.list_files(&self.dir()).await? {
+            if listed.contains(file.as_str()) || skip_files.contains(&file) {
+                continue;
+            }
+            if !file.starts_with(SEGMENT_PREFIX) && !file.starts_with(TOMB_PREFIX) {
+                continue;
+            }
+            let Some(bytes) = self.store.read(&join_path(&self.dir(), &file)).await? else {
+                continue;
+            };
+            read_parts.insert(file.clone());
+            let decoded = decode_manga_shard(&bytes)?;
+            if file.starts_with(TOMB_PREFIX) {
+                tomb_parts.push(decoded.tombstones);
+            } else {
+                if let Some(roots) = &self.cover_roots {
+                    let cover_ids = apply_manga_cover_blobs(
+                        roots,
+                        &decoded.rows,
+                        &decoded.cover_indices,
+                        &decoded.covers,
+                    );
+                    for id in &cover_ids {
+                        let _ = self.db.set_manga_cover_state(id, 2);
+                    }
+                }
+                data_parts.push(decoded.rows);
+            }
+        }
+
         Ok((merge_manga_cloud_parts(&data_parts, &tomb_parts), read_parts))
     }
 
@@ -313,9 +373,9 @@ impl MangaLibrarySyncEngine {
         let revs: Vec<i64> = rows.iter().map(|r| r.manga.rev).collect();
         let from = *revs.iter().min().unwrap_or(&0);
         let to = *revs.iter().max().unwrap_or(&0);
-        let dev = device_id(&self.db);
+        let dev = self.device.clone();
         let bytes = encode_manga_shard(WMP_KIND_SEG, &dev, from, to, rows, None)?;
-        let file = part_name(SEGMENT_PREFIX, from);
+        let file = part_name(SEGMENT_PREFIX, from, &self.device);
         self.store.ensure_dir(&self.dir()).await?;
         self.store.write(&join_path(&self.dir(), &file), &bytes).await?;
         let mut latest = self.read_manifest().await?;
@@ -337,9 +397,9 @@ impl MangaLibrarySyncEngine {
         let revs: Vec<i64> = tombs.iter().map(|t| t.rev).collect();
         let from = *revs.iter().min().unwrap_or(&0);
         let to = *revs.iter().max().unwrap_or(&0);
-        let dev = device_id(&self.db);
+        let dev = self.device.clone();
         let bytes = encode_manga_tomb_shard(&dev, from, to, tombs)?;
-        let file = part_name(TOMB_PREFIX, from);
+        let file = part_name(TOMB_PREFIX, from, &self.device);
         self.store.ensure_dir(&self.dir()).await?;
         self.store.write(&join_path(&self.dir(), &file), &bytes).await?;
         let mut latest = self.read_manifest().await?;
@@ -362,7 +422,7 @@ impl MangaLibrarySyncEngine {
         let per = mangas_per_shard.clamp(50, 5000);
         let previous = self.read_manifest().await?;
         self.store.ensure_dir(&self.dir()).await?;
-        let dev = device_id(&self.db);
+        let dev = self.device.clone();
         let mut shards: Vec<BaseShardEntry> = Vec::new();
         let mut max_rev = 0i64;
         let slices: Vec<&[MangaSyncRow]> = if rows.is_empty() { vec![] } else { rows.chunks(per).collect() };

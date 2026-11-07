@@ -11,6 +11,73 @@ use wdmm_core::models::LibraryTrack;
 
 // ── Music ─────────────────────────────────────────────────────────────────────
 
+/// A `seg-*` shard written by a peer before it updated index.json must still be
+/// adopted: the manifest is eventually consistent, the shard is the truth.
+#[tokio::test]
+async fn library_sync_reads_unlisted_segment_shards() {
+    let driver = Arc::new(MockDriver::new());
+    let base_path = "/music/base.mp3";
+    let base_id = wdmm_core::identity::track_identity(base_path);
+    let db_seed = tmp_db();
+    db_seed
+        .insert_track(&LibraryTrack {
+            id: base_id.clone(),
+            title: "Base".into(),
+            remote_path: base_path.into(),
+            account_id: "nas".into(),
+            rev: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    LibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync", None)
+        .sync_incremental()
+        .await
+        .unwrap();
+
+    let peer_path = "/music/peer.mp3";
+    let peer_id = wdmm_core::identity::track_identity(peer_path);
+    let peer = LibraryTrack {
+        id: peer_id.clone(),
+        title: "Peer".into(),
+        remote_path: peer_path.into(),
+        account_id: "nas".into(),
+        rev: 200,
+        ..Default::default()
+    };
+    let bytes = crate::library_shard::encode_track_shard(
+        crate::library_shard::WMP_KIND_SEG,
+        "peerdevice",
+        200,
+        200,
+        std::slice::from_ref(&peer),
+        None,
+    )
+    .unwrap();
+    // Written but not listed in index.json, as when a peer dies right after the
+    // shard upload and before the manifest rewrite.
+    driver
+        .files
+        .lock()
+        .await
+        .insert("/sync/library/music/seg-200-peerdevi-000000010000.wdmm".to_string(), bytes);
+
+    let db_b = tmp_db();
+    let outcomes = LibrarySyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync", None)
+        .sync_incremental()
+        .await
+        .unwrap();
+
+    let adopted = db_b
+        .get_track(&peer_id)
+        .unwrap()
+        .expect("an unlisted shard must be adopted, not skipped");
+    assert_eq!(adopted.rev, 200);
+    assert!(
+        outcomes.iter().any(|o| o.action == crate::SyncAction::Pulled),
+        "adopting the discovered shard reports a pull"
+    );
+}
+
 /// Scenario 2: cloud rev=80 wins; B's stale rev=30 is not uploaded.
 #[tokio::test]
 async fn library_sync_higher_rev_wins() {
