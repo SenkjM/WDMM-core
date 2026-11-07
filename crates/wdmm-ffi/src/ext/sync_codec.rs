@@ -98,6 +98,8 @@ fn encode_vault(pointer: *const c_char) -> Result<Value, String> {
                 engine_updated_at: 0,
             })
             .collect(),
+        // The user vault codec has no tombstones; the sync engine owns those.
+        deleted: Vec::new(),
     };
     let bytes = document.encode();
     Ok(json!({

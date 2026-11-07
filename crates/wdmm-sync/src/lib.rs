@@ -269,10 +269,15 @@ impl CredentialSyncEngine {
         join_path(&self.remote_dir, wmp::ENGINE_ACCOUNTS_FILE_NAME)
     }
 
-    async fn fetch_remote(&self) -> SyncResult<Vec<wmp::VaultRecordDoc>> {
+    async fn fetch_remote(
+        &self,
+    ) -> SyncResult<(Vec<wmp::VaultRecordDoc>, Vec<wmp::VaultDeletionDoc>)> {
         match driver_read(&self.driver, &self.file_path()).await? {
-            None => Ok(vec![]),
-            Some(bytes) => Ok(wmp::VaultDocument::decode(&bytes)?.records),
+            None => Ok((vec![], vec![])),
+            Some(bytes) => {
+                let document = wmp::VaultDocument::decode(&bytes)?;
+                Ok((document.records, document.deleted))
+            }
         }
     }
 
@@ -296,22 +301,32 @@ impl CredentialSyncEngine {
     /// Adopt a remote record locally and remember the row's new clock, so the
     /// adoption does not look like a pending local edit on the next run.
     fn adopt_record(&self, record: &wmp::VaultRecordDoc) -> SyncResult<()> {
-        self.db.insert_account(&account_from_record(record))?;
-        let stamp = self.db.account_updated_at(&record.id)?;
-        self.mark_account_synced(&record.id, stamp)
+        let at = if record.engine_updated_at > 0 {
+            record.engine_updated_at
+        } else {
+            chrono::Utc::now().timestamp()
+        };
+        self.db
+            .insert_account_at(&account_from_record(record), at)?;
+        self.mark_account_synced(&record.id, at)
     }
 
     /// Overwrite the snapshot with the merged union.
     ///
     /// The union matters: the snapshot is one document, so writing only "local"
     /// rows would delete accounts another device just published.
-    async fn push_records(&self, records: Vec<wmp::VaultRecordDoc>) -> SyncResult<()> {
+    async fn push_records(
+        &self,
+        records: Vec<wmp::VaultRecordDoc>,
+        deleted: Vec<wmp::VaultDeletionDoc>,
+    ) -> SyncResult<()> {
         driver_ensure_dir(&self.driver, &self.remote_dir).await?;
         let document = wmp::VaultDocument {
-            format_version: 1,
+            format_version: 2,
             device_id: String::new(),
             created_at: wmp::now_iso8601(),
             records,
+            deleted,
         };
         driver_write(&self.driver, &self.file_path(), &document.encode()).await
     }
@@ -320,90 +335,197 @@ impl CredentialSyncEngine {
 #[async_trait]
 impl SyncEngine for CredentialSyncEngine {
     async fn sync_incremental(&self) -> SyncResult<Vec<SyncOutcome>> {
+        /// Published tombstones older than this are dropped; a device that was
+        /// offline for longer than this may republish a deleted account.
+        const ACCOUNT_TOMBSTONE_TTL_SECS: i64 = 180 * 24 * 60 * 60;
+
         let local = self.db.list_accounts()?;
-        let local_ids: HashSet<&str> = local.iter().map(|a| a.id.as_str()).collect();
-        let remote = self.fetch_remote().await?;
-        let remote_by_id: HashMap<&str, &wmp::VaultRecordDoc> =
-            remote.iter().map(|r| (r.id.as_str(), r)).collect();
+        let local_ids: HashSet<String> = local.iter().map(|a| a.id.clone()).collect();
+        let local_clocks = self.db.list_account_updated_at()?;
+        let local_tombs: HashMap<String, i64> =
+            self.db.list_deleted_accounts()?.into_iter().collect();
+        let unpushed: HashSet<String> = self
+            .db
+            .list_unpushed_deleted_accounts()?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let (remote, remote_deleted) = self.fetch_remote().await?;
+        let remote_by_id: HashMap<String, &wmp::VaultRecordDoc> =
+            remote.iter().map(|r| (r.id.clone(), r)).collect();
+        let remote_tombs: HashMap<String, i64> = remote_deleted
+            .iter()
+            .map(|d| (d.id.clone(), d.deleted_at))
+            .collect();
+
+        let mut ids: std::collections::BTreeSet<String> = local_ids.iter().cloned().collect();
+        ids.extend(remote_by_id.keys().cloned());
+        ids.extend(local_tombs.keys().cloned());
+        ids.extend(remote_tombs.keys().cloned());
 
         let mut outcomes = Vec::new();
-        let mut merged: BTreeMap<String, wmp::VaultRecordDoc> =
-            remote.iter().map(|r| (r.id.clone(), r.clone())).collect();
+        let mut merged: BTreeMap<String, wmp::VaultRecordDoc> = remote
+            .iter()
+            .map(|r| (r.id.clone(), r.clone()))
+            .collect();
+        let mut merged_deleted: std::collections::BTreeMap<String, i64> =
+            remote_tombs.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut published: Vec<String> = Vec::new();
 
-        // Pull remote-only accounts first. `insert_account` stamps `updated_at`
-        // with "now", so remember that stamp as synced: otherwise the pull
-        // itself would look like a pending edit and bounce straight back.
-        for record in &remote {
-            if local_ids.contains(record.id.as_str()) {
-                continue;
-            }
-            self.adopt_record(record)?;
-            outcomes.push(SyncOutcome {
-                entity_id: record.id.clone(),
-                action: SyncAction::Pulled,
-                rev: RevClock::new(record.engine_updated_at.max(1) as u64),
-            });
-        }
+        for id in ids {
+            let local_account = local.iter().find(|a| a.id == id);
+            let remote_record = remote_by_id.get(&id).copied();
+            let local_tomb = local_tombs.get(&id).copied();
+            let remote_tomb = remote_tombs.get(&id).copied();
+            let local_at = local_clocks.get(&id).copied().unwrap_or(0);
+            let synced_at = self.account_synced_at(&id)?;
 
-        // Re-read the clocks: the pulls above bumped `updated_at`.
-        let local_clocks = self.db.list_account_updated_at()?;
-
-        for account in &local {
-            let local_at = local_clocks.get(&account.id).copied().unwrap_or(0);
-            let synced_at = self.account_synced_at(&account.id)?;
-            let remote_at = remote_by_id
-                .get(account.id.as_str())
-                .map(|r| r.engine_updated_at)
-                .unwrap_or(0);
-
-            // Last write wins on the real per-row clock. A clean row is only
-            // republished when the remote copy vanished: without account
-            // tombstones a missing row means "the snapshot was rebuilt", not
-            // "another device deleted it".
-            if remote_at > local_at {
-                if local_at > synced_at {
-                    info!(
-                        "credential sync conflict: {} kept the remote revision ({} < {})",
-                        account.id, local_at, remote_at
-                    );
+            match (local_account, remote_record) {
+                (Some(account), Some(record)) => {
+                    let remote_at = record.engine_updated_at;
+                    // A tombstone newer than both the row and its record is
+                    // the live authority: the document file still carries the
+                    // record because tombstones and records are separate.
+                    if let Some(tomb) = remote_tomb {
+                        if tomb >= local_at && tomb >= remote_at {
+                            self.db.delete_account_quietly(&id)?;
+                            outcomes.push(SyncOutcome {
+                                entity_id: id.clone(),
+                                action: SyncAction::Pulled,
+                                rev: RevClock::new(tomb.max(1) as u64),
+                            });
+                            continue;
+                        }
+                    }
+                    if remote_at > local_at {
+                        if local_at > synced_at {
+                            info!(
+                                "credential sync conflict: {} kept the remote revision ({} < {})",
+                                id, local_at, remote_at
+                            );
+                        }
+                        self.adopt_record(record)?;
+                        merged_deleted.remove(&id);
+                        outcomes.push(SyncOutcome {
+                            entity_id: id.clone(),
+                            action: SyncAction::Pulled,
+                            rev: RevClock::new(remote_at.max(1) as u64),
+                        });
+                        continue;
+                    }
+                    if local_at > 0 && local_at <= synced_at {
+                        outcomes.push(SyncOutcome {
+                            entity_id: id.clone(),
+                            action: SyncAction::NoChange,
+                            rev: RevClock::new(local_at.max(1) as u64),
+                        });
+                        continue;
+                    }
+                    let stamp = if local_at > 0 {
+                        local_at
+                    } else {
+                        chrono::Utc::now().timestamp()
+                    };
+                    merged.insert(id.clone(), account_to_record(account, stamp));
+                    merged_deleted.remove(&id);
+                    self.mark_account_synced(&id, stamp)?;
+                    outcomes.push(SyncOutcome {
+                        entity_id: id.clone(),
+                        action: SyncAction::Pushed,
+                        rev: RevClock::new(stamp.max(1) as u64),
+                    });
                 }
-                self.adopt_record(remote_by_id[account.id.as_str()])?;
-                outcomes.push(SyncOutcome {
-                    entity_id: account.id.clone(),
-                    action: SyncAction::Pulled,
-                    rev: RevClock::new(remote_at.max(1) as u64),
-                });
-                continue;
+                (Some(account), None) => {
+                    // The row is live locally; a remote tombstone only wins
+                    // when it is not older than the row.
+                    if let Some(tomb) = remote_tomb {
+                        if tomb >= local_at {
+                            self.db.delete_account_quietly(&id)?;
+                            outcomes.push(SyncOutcome {
+                                entity_id: id.clone(),
+                                action: SyncAction::Pulled,
+                                rev: RevClock::new(tomb.max(1) as u64),
+                            });
+                            continue;
+                        }
+                    }
+                    let stamp = if local_at > 0 {
+                        local_at
+                    } else {
+                        chrono::Utc::now().timestamp()
+                    };
+                    merged.insert(id.clone(), account_to_record(account, stamp));
+                    merged_deleted.remove(&id);
+                    if local_tomb.is_some() {
+                        published.push(id.clone());
+                        merged_deleted.remove(&id);
+                    }
+                    self.mark_account_synced(&id, stamp)?;
+                    outcomes.push(SyncOutcome {
+                        entity_id: id.clone(),
+                        action: SyncAction::Pushed,
+                        rev: RevClock::new(stamp.max(1) as u64),
+                    });
+                }
+                (None, Some(record)) => {
+                    let remote_at = record.engine_updated_at;
+                    // A deletion this device recorded wins unless the peer
+                    // recreated the account after it.
+                    if let Some(tomb) = local_tomb {
+                        if tomb >= remote_at {
+                            merged_deleted.insert(id.clone(), tomb);
+                            published.push(id.clone());
+                            outcomes.push(SyncOutcome {
+                                entity_id: id.clone(),
+                                action: SyncAction::Pushed,
+                                rev: RevClock::new(tomb.max(1) as u64),
+                            });
+                            continue;
+                        }
+                    }
+                    if let Some(tomb) = remote_tomb {
+                        if tomb >= remote_at {
+                            continue;
+                        }
+                    }
+                    self.adopt_record(record)?;
+                    merged_deleted.remove(&id);
+                    outcomes.push(SyncOutcome {
+                        entity_id: id.clone(),
+                        action: SyncAction::Pulled,
+                        rev: RevClock::new(remote_at.max(1) as u64),
+                    });
+                }
+                (None, None) => {
+                    if let Some(tomb) = local_tomb {
+                        merged_deleted.insert(id.clone(), tomb);
+                        published.push(id.clone());
+                        if unpushed.contains(&id) || remote_tomb != Some(tomb) {
+                            outcomes.push(SyncOutcome {
+                                entity_id: id.clone(),
+                                action: SyncAction::Pushed,
+                                rev: RevClock::new(tomb.max(1) as u64),
+                            });
+                        }
+                    }
+                }
             }
-
-            if remote_at > 0 && local_at <= synced_at {
-                outcomes.push(SyncOutcome {
-                    entity_id: account.id.clone(),
-                    action: SyncAction::NoChange,
-                    rev: RevClock::new(local_at.max(1) as u64),
-                });
-                continue;
-            }
-
-            let stamp = if local_at > 0 {
-                local_at
-            } else {
-                chrono::Utc::now().timestamp()
-            };
-            merged.insert(account.id.clone(), account_to_record(account, stamp));
-            let clock = self.db.account_updated_at(&account.id)?;
-            self.mark_account_synced(&account.id, clock)?;
-            outcomes.push(SyncOutcome {
-                entity_id: account.id.clone(),
-                action: SyncAction::Pushed,
-                rev: RevClock::new(stamp.max(1) as u64),
-            });
         }
 
-        // Publish the union, never just the local slice: the snapshot is a
-        // single document and dropping the rows another device published is
-        // data loss.
-        self.push_records(merged.into_values().collect()).await?;
+        // Publish records + tombstones together: the snapshot is a single
+        // document, so dropping either half loses a peer's change.
+        self.push_records(
+            merged.into_values().collect(),
+            merged_deleted
+                .into_iter()
+                .map(|(id, deleted_at)| wmp::VaultDeletionDoc { id, deleted_at })
+                .collect(),
+        )
+        .await?;
+        self.db.mark_deleted_accounts_pushed(&published)?;
+        self.db.purge_deleted_accounts_before(
+            chrono::Utc::now().timestamp() - ACCOUNT_TOMBSTONE_TTL_SECS,
+        )?;
 
         info!(
             "credential sync: {} local, {} remote, {} outcomes",
@@ -1134,6 +1256,112 @@ mod tests {
         assert!(
             second.iter().all(|o| o.action != SyncAction::Pushed),
             "clean rows must not republish: {second:?}"
+        );
+    }
+
+    fn account(id: &str, name: &str) -> CloudAccount {
+        CloudAccount {
+            id: id.into(),
+            provider_type: "webdav".into(),
+            display_name: name.into(),
+            base_url: Some(format!("https://{id}.local/dav/")),
+            credentials_encrypted: vec![1, 2, 3],
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_deletion_propagates_and_stays_deleted() {
+        let db = tmp_db();
+        let driver = Arc::new(MockDriver::new());
+        db.insert_account(&account("acc1", "One")).unwrap();
+        db.insert_account(&account("acc2", "Two")).unwrap();
+        let engine = CredentialSyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        engine.sync_incremental().await.unwrap();
+
+        let db2 = tmp_db();
+        let engine2 = CredentialSyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync");
+        engine2.sync_incremental().await.unwrap();
+        assert!(db2.get_account("acc2").unwrap().is_some());
+
+        // Device A deletes acc2: the row is gone but a tombstone remains.
+        db.delete_account("acc2").unwrap();
+        assert_eq!(db.list_unpushed_deleted_accounts().unwrap().len(), 1);
+        let outcomes = engine.sync_incremental().await.unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|o| o.entity_id == "acc2" && o.action == SyncAction::Pushed));
+        assert!(db.list_unpushed_deleted_accounts().unwrap().is_empty());
+
+        let snapshot = wmp::VaultDocument::decode(
+            &driver.get_content("/sync/accounts.wdmcv").await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.deleted.len(), 1);
+        assert_eq!(snapshot.deleted[0].id, "acc2");
+
+        // Device B applies the tombstone instead of republishing its row.
+        engine2.sync_incremental().await.unwrap();
+        assert!(db2.get_account("acc2").unwrap().is_none());
+        let snapshot = wmp::VaultDocument::decode(
+            &driver.get_content("/sync/accounts.wdmcv").await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.deleted.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            vec!["acc2"],
+            "the tombstone must survive a peer sync"
+        );
+        engine2.sync_incremental().await.unwrap();
+        assert!(
+            db2.get_account("acc2").unwrap().is_none(),
+            "a deleted account must not come back on the next run"
+        );
+
+        let purged = db
+            .purge_deleted_accounts_before(chrono::Utc::now().timestamp() + 86_400)
+            .unwrap();
+        assert_eq!(purged, 1);
+        assert!(db.list_deleted_accounts().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn credential_recreated_after_deletion_wins() {
+        let db = tmp_db();
+        let driver = Arc::new(MockDriver::new());
+        db.insert_account(&account("acc1", "One")).unwrap();
+        db.insert_account(&account("acc2", "Two")).unwrap();
+        let engine = CredentialSyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        engine.sync_incremental().await.unwrap();
+
+        let db2 = tmp_db();
+        let engine2 = CredentialSyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync");
+        engine2.sync_incremental().await.unwrap();
+
+        db.delete_account("acc2").unwrap();
+        engine.sync_incremental().await.unwrap();
+        engine2.sync_incremental().await.unwrap();
+        assert!(db2.get_account("acc2").unwrap().is_none());
+
+        // Device B recreates the account *after* the deletion clock.
+        let later = chrono::Utc::now().timestamp() + 5;
+        db2.insert_account_at(&account("acc2", "Two again"), later)
+            .unwrap();
+        engine2.sync_incremental().await.unwrap();
+        let snapshot = wmp::VaultDocument::decode(
+            &driver.get_content("/sync/accounts.wdmcv").await.unwrap(),
+        )
+        .unwrap();
+        assert!(
+            snapshot.deleted.iter().all(|d| d.id != "acc2"),
+            "a newer live record supersedes the tombstone"
+        );
+
+        engine.sync_incremental().await.unwrap();
+        let restored = db.get_account("acc2").unwrap().expect("account must return");
+        assert_eq!(restored.display_name, "Two again");
+        assert!(
+            db.list_deleted_accounts().unwrap().is_empty(),
+            "adopting the record must clear the local tombstone"
         );
     }
 

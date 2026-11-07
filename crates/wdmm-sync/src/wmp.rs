@@ -24,6 +24,8 @@ pub const SEC_MANGA_LIBRARY: u8 = 13;
 pub const SEC_USER_FOLDERS: u8 = 14;
 pub const SEC_MANGA_COVERS: u8 = 15;
 pub const SEC_DMR_PREFS: u8 = 16;
+/// Account deletion tombstones carried inside a vault document.
+pub const SEC_ACCOUNT_DELETIONS: u8 = 17;
 
 /// Container magic prefixes.
 pub const MAGIC_BK: &[u8; 8] = b"WDMMBK01";  // backup
@@ -409,8 +411,11 @@ pub const VAULT_TAG_DRIVER_CONFIG: u8 = 9;
 /// Additive tag: per-account epoch-seconds clock, used by the sync engine only.
 /// Dart's vault codec has no such tag and ignores it.
 pub const VAULT_TAG_ENGINE_UPDATED_AT: u8 = 10;
+/// Additive tag: epoch seconds when the account was deleted.
+pub const VAULT_TAG_DELETED_AT: u8 = 11;
 const VAULT_RECORD_INT_TAGS: &[u8] =
     &[VAULT_TAG_PASSWORD_ENCRYPTED, VAULT_TAG_ENGINE_UPDATED_AT];
+const VAULT_DELETION_INT_TAGS: &[u8] = &[VAULT_TAG_DELETED_AT];
 
 // Playlist entry tags (`WmpPlaylistEntry`).
 pub const PLAYLIST_TAG_MUSIC_ID: u8 = 1;
@@ -558,6 +563,39 @@ impl VaultRecordDoc {
     }
 }
 
+/// One account tombstone inside a credential vault document.
+///
+/// The vault is a single document, so a deleted account is not simply missing:
+/// a peer that did not see the deletion would republish its row. The tombstone
+/// is the durable "this id is gone" statement; a live record at a later clock
+/// supersedes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultDeletionDoc {
+    pub id: String,
+    /// Epoch seconds when the owning device deleted the account.
+    pub deleted_at: i64,
+}
+
+impl VaultDeletionDoc {
+    fn to_record(&self) -> BTreeMap<u8, RecordValue> {
+        let mut rec = BTreeMap::new();
+        push_str(&mut rec, VAULT_TAG_ID, &self.id);
+        push_int(
+            &mut rec,
+            VAULT_TAG_DELETED_AT,
+            self.deleted_at.max(0) as u64,
+        );
+        rec
+    }
+
+    fn from_record(rec: &BTreeMap<u8, RecordValue>) -> Self {
+        Self {
+            id: record_str(rec, VAULT_TAG_ID),
+            deleted_at: record_int(rec, VAULT_TAG_DELETED_AT).unwrap_or(0),
+        }
+    }
+}
+
 /// A credential vault document (`WDMMCV01`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VaultDocument {
@@ -565,6 +603,8 @@ pub struct VaultDocument {
     pub device_id: String,
     pub created_at: String,
     pub records: Vec<VaultRecordDoc>,
+    /// Account tombstones; absent in documents written before v2.
+    pub deleted: Vec<VaultDeletionDoc>,
 }
 
 impl VaultDocument {
@@ -589,13 +629,23 @@ impl VaultDocument {
         let rows: Vec<BTreeMap<u8, RecordValue>> =
             self.records.iter().map(VaultRecordDoc::to_record).collect();
         let credentials_raw = encode_records(&rows, VAULT_RECORD_INT_TAGS);
-        build_wmp_container(
-            &[
-                (SEC_META, meta_raw, Codec::Deflate),
-                (SEC_CREDENTIALS, credentials_raw, Codec::Deflate),
-            ],
-            MAGIC_CV,
-        )
+        let mut sections = vec![
+            (SEC_META, meta_raw, Codec::Deflate),
+            (SEC_CREDENTIALS, credentials_raw, Codec::Deflate),
+        ];
+        if !self.deleted.is_empty() {
+            let tombstones: Vec<BTreeMap<u8, RecordValue>> = self
+                .deleted
+                .iter()
+                .map(VaultDeletionDoc::to_record)
+                .collect();
+            sections.push((
+                SEC_ACCOUNT_DELETIONS,
+                encode_records(&tombstones, VAULT_DELETION_INT_TAGS),
+                Codec::Deflate,
+            ));
+        }
+        build_wmp_container(&sections, MAGIC_CV)
     }
 
     /// Decode a `WDMMCV01` container.
@@ -615,11 +665,19 @@ impl VaultDocument {
                 .map(VaultRecordDoc::from_record)
                 .collect(),
         };
+        let deleted = match sections.get(&SEC_ACCOUNT_DELETIONS) {
+            None => Vec::new(),
+            Some(raw) => decode_records(raw, VAULT_DELETION_INT_TAGS)?
+                .iter()
+                .map(VaultDeletionDoc::from_record)
+                .collect(),
+        };
         Ok(Self {
             format_version: record_int(&meta, META_FORMAT_VERSION).unwrap_or(1).max(1) as u32,
             device_id: record_str(&meta, META_DEVICE_ID),
             created_at: record_str(&meta, META_CREATED_AT),
             records,
+            deleted,
         })
     }
 }
@@ -995,6 +1053,7 @@ mod document_tests {
             format_version: 2,
             device_id: "dev-1".into(),
             created_at: "2026-01-02T03:04:05.000Z".into(),
+            deleted: Vec::new(),
             records: vec![
                 VaultRecordDoc {
                     id: "acc-1".into(),

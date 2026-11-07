@@ -1871,6 +1871,22 @@ impl LibraryDatabase {
             )?;
         }
 
+        if current_ver < 20 {
+            // Same reason as `deleted_playlists`: a peer that still holds the
+            // account row republishes it, so a deletion only sticks when it is
+            // recorded as a tombstone and carried on the wire.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS deleted_accounts (
+                     id         TEXT PRIMARY KEY,
+                     deleted_at INTEGER NOT NULL,
+                     pushed     INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO _schema_version (version) VALUES (20);
+                 COMMIT;",
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -2094,22 +2110,53 @@ impl LibraryDatabase {
     // ── Accounts ──────────────────────────────────────────────────────────────
 
     pub fn insert_account(&self, account: &CloudAccount) -> StorageResult<()> {
-        let now = Utc::now().timestamp();
+        self.insert_account_at(account, Utc::now().timestamp())
+    }
+
+    /// Insert or replace an account with an explicit change clock.
+    ///
+    /// Adopting a peer record must keep the peer's `engine_updated_at`, or the
+    /// very next sync would read the row as a fresh local edit and push it
+    /// back.
+    pub fn insert_account_at(
+        &self,
+        account: &CloudAccount,
+        updated_at: i64,
+    ) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO accounts (id, provider_type, display_name, base_url, credentials_encrypted, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                &account.id,
-                &account.provider_type,
-                &account.display_name,
-                &account.base_url,
-                &account.credentials_encrypted,
-                now,
-                now,
-            ],
-        )?;
-        Ok(())
+        conn.execute_batch("BEGIN;")?;
+        let result = (|| -> StorageResult<()> {
+            conn.execute(
+                "INSERT OR REPLACE INTO accounts (id, provider_type, display_name, base_url, credentials_encrypted, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    &account.id,
+                    &account.provider_type,
+                    &account.display_name,
+                    &account.base_url,
+                    &account.credentials_encrypted,
+                    updated_at,
+                    updated_at,
+                ],
+            )?;
+            // A live row supersedes a deletion tombstone, exactly like
+            // `upsert_playlist`.
+            conn.execute(
+                "DELETE FROM deleted_accounts WHERE id = ?1",
+                params![&account.id],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
     }
 
     pub fn get_account(&self, id: &str) -> StorageResult<Option<CloudAccount>> {
@@ -2156,6 +2203,40 @@ impl LibraryDatabase {
     }
 
     pub fn delete_account(&self, id: &str) -> StorageResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN;")?;
+        let result = (|| -> StorageResult<()> {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                conn.execute(
+                    "INSERT OR REPLACE INTO deleted_accounts (id, deleted_at, pushed)
+                     VALUES (?1, ?2, 0)",
+                    params![id, now],
+                )?;
+            }
+            conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove an account because a peer deleted it: no local tombstone, the
+    /// remote one is authoritative and already published.
+    pub fn delete_account_quietly(&self, id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
         Ok(())
@@ -2191,6 +2272,54 @@ impl LibraryDatabase {
             clocks.insert(id, stamp);
         }
         Ok(clocks)
+    }
+
+    /// Every account tombstone as `(id, deleted_at epoch seconds)`.
+    pub fn list_deleted_accounts(&self) -> StorageResult<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, deleted_at FROM deleted_accounts")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut tombs = Vec::new();
+        for row in rows {
+            tombs.push(row?);
+        }
+        Ok(tombs)
+    }
+
+    pub fn list_unpushed_deleted_accounts(&self) -> StorageResult<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, deleted_at FROM deleted_accounts WHERE pushed = 0")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut tombs = Vec::new();
+        for row in rows {
+            tombs.push(row?);
+        }
+        Ok(tombs)
+    }
+
+    pub fn mark_deleted_accounts_pushed(&self, ids: &[String]) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("UPDATE deleted_accounts SET pushed = 1 WHERE id = ?1")?;
+        for id in ids {
+            stmt.execute(params![id])?;
+        }
+        Ok(())
+    }
+
+    /// Drop published tombstones older than `cutoff` (epoch seconds).
+    pub fn purge_deleted_accounts_before(&self, cutoff: i64) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM deleted_accounts WHERE pushed = 1 AND deleted_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(changed)
     }
 
     /// Patch the stored credentials for an account in-place (token refresh).
@@ -5829,7 +5958,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
     }
 
     #[test]
@@ -7439,7 +7568,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -7972,7 +8101,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -8417,7 +8546,7 @@ mod tests {
 
         // Open through LibraryDatabase — triggers v10 migration.
         let db = LibraryDatabase::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19, "schema must reach v19");
+        assert_eq!(db.schema_version().unwrap(), 20, "schema must reach v20");
 
         let mangas = db.list_mangas().unwrap();
         let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");
@@ -8703,7 +8832,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
 
         let all = db.list_transcode_presets().unwrap();
         assert_eq!(
@@ -8852,7 +8981,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -8990,7 +9119,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -9108,7 +9237,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -9397,7 +9526,7 @@ mod v17_queue_cache_tests {
         }
 
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), 20);
 
         {
             let conn = db.conn.lock().unwrap();
