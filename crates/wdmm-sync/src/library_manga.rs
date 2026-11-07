@@ -18,23 +18,21 @@ use crate::library_shard::{TombRecord, WMP_KIND_BASE, WMP_KIND_SEG};
 use crate::protocol::{
     self, BaseShardEntry, IndexPartEntry, ManifestBase, ShardStore, SyncManifest as LibraryManifest,
 };
-use crate::{join_path, SyncAction, SyncEngine, SyncError, SyncOutcome, SyncResult};
+use crate::{join_path, SyncEngine, SyncError, SyncOutcome, SyncResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::info;
-use wdmm_core::rev_clock::RevClock;
 use wdmm_drivers::WdmmVfs;
 use wdmm_storage::{
     manga_id_for_remote, manga_sync_key, normalize_manga_remote_path, LibraryDatabase, MangaPage,
     MangaProgress,
 };
 
-const FORMAT: &str = "wmp_manga_library_index";
-const FORMAT_VERSION: i64 = 1;
+pub(crate) const FORMAT: &str = "wmp_manga_library_index";
+pub(crate) const FORMAT_VERSION: i64 = 1;
 const SHARD_PREFIX: &str = "lib-";
-const CURSOR_PREFIX: &str = "manga:";
+pub(crate) const CURSOR_PREFIX: &str = "manga:";
 const PROGRESS_NAME: &str = "progress.json";
 const FORMAT_PROGRESS: &str = "wmp_manga_progress";
 const FORMAT_VERSION_PROGRESS: i64 = 1;
@@ -79,10 +77,10 @@ impl Default for ProgressDoc {
 // ── Cloud state ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
-struct CloudManga {
-    rows: Vec<MangaSyncRow>,
+pub(crate) struct CloudManga {
+    pub(crate) rows: Vec<MangaSyncRow>,
     /// sync_key → highest tomb rev seen
-    tombs: HashMap<String, i64>,
+    pub(crate) tombs: HashMap<String, i64>,
 }
 
 /// Resolve the merge key for a tombstone: prefer stored `sync_key`, else container rule.
@@ -147,7 +145,7 @@ fn manga_dir(remote_dir: &str) -> String {
 }
 
 pub struct MangaLibrarySyncEngine {
-    db: Arc<LibraryDatabase>,
+    pub(crate) db: Arc<LibraryDatabase>,
     store: ShardStore,
     remote_dir: String,
     cover_roots: Option<CoverRoots>,
@@ -183,7 +181,7 @@ impl MangaLibrarySyncEngine {
         format!("{CURSOR_PREFIX}{}", self.remote_dir)
     }
 
-    async fn read_manifest(&self) -> SyncResult<LibraryManifest> {
+    pub(crate) async fn read_manifest(&self) -> SyncResult<LibraryManifest> {
         match self.store.read(&self.index_path()).await? {
             None => Ok(LibraryManifest::empty(FORMAT, FORMAT_VERSION)),
             Some(bytes) => {
@@ -207,7 +205,7 @@ impl MangaLibrarySyncEngine {
         }
     }
 
-    async fn write_manifest(&self, mut m: LibraryManifest) -> SyncResult<()> {
+    pub(crate) async fn write_manifest(&self, mut m: LibraryManifest) -> SyncResult<()> {
         m.updated_at = chrono::Utc::now().to_rfc3339();
         m.format = FORMAT.into();
         m.format_version = FORMAT_VERSION;
@@ -216,7 +214,7 @@ impl MangaLibrarySyncEngine {
         self.store.write(&self.index_path(), &bytes).await
     }
 
-    async fn read_cloud(
+    pub(crate) async fn read_cloud(
         &self,
         manifest: &LibraryManifest,
         skip_files: &HashSet<String>,
@@ -307,7 +305,7 @@ impl MangaLibrarySyncEngine {
         Ok((merge_manga_cloud_parts(&data_parts, &tomb_parts), read_parts))
     }
 
-    async fn append_delta(&self, rows: &[MangaSyncRow]) -> SyncResult<LibraryManifest> {
+    pub(crate) async fn append_delta(&self, rows: &[MangaSyncRow]) -> SyncResult<LibraryManifest> {
         if rows.is_empty() {
             return self.read_manifest().await;
         }
@@ -331,7 +329,7 @@ impl MangaLibrarySyncEngine {
         Ok(latest)
     }
 
-    async fn append_tombstones(&self, tombs: &[TombRecord]) -> SyncResult<LibraryManifest> {
+    pub(crate) async fn append_tombstones(&self, tombs: &[TombRecord]) -> SyncResult<LibraryManifest> {
         if tombs.is_empty() {
             return self.read_manifest().await;
         }
@@ -355,7 +353,7 @@ impl MangaLibrarySyncEngine {
         Ok(latest)
     }
 
-    async fn rebuild(
+    pub(crate) async fn rebuild(
         &self,
         rows: &[MangaSyncRow],
         mangas_per_shard: usize,
@@ -418,11 +416,11 @@ impl MangaLibrarySyncEngine {
         Ok(manifest)
     }
 
-    fn load_cursor(&self) -> SyncResult<(i64, i64, HashMap<String, i64>)> {
+    pub(crate) fn load_cursor(&self) -> SyncResult<(i64, i64, HashMap<String, i64>)> {
         protocol::load_cursor(&self.db, &self.cursor_key())
     }
 
-    fn save_cursor(
+    pub(crate) fn save_cursor(
         &self,
         manifest: &LibraryManifest,
         cursor_parts: &HashMap<String, i64>,
@@ -439,15 +437,10 @@ impl MangaLibrarySyncEngine {
         )
     }
 
-    fn local_by_key(&self) -> SyncResult<HashMap<String, wdmm_storage::Manga>> {
-        let local = self.db.list_mangas()?;
-        Ok(local
-            .into_iter()
-            .map(|m| {
-                let key = manga_sync_key(&m.id, &m.format, &m.source_name, &m.remote_path);
-                (key, m)
-            })
-            .collect())
+    /// Forget the saved cursor (a full rebuild replaced every base shard).
+    pub(crate) fn reset_cursor(&self) -> SyncResult<()> {
+        self.db.clear_sync_state(Some(CURSOR_PREFIX))?;
+        Ok(())
     }
 
     /// Audit the remote manga library.
@@ -529,7 +522,7 @@ impl MangaLibrarySyncEngine {
         Ok(deleted)
     }
 
-    fn row_with_pages(db: &LibraryDatabase, m: &wdmm_storage::Manga) -> SyncResult<MangaSyncRow> {
+    pub(crate) fn row_with_pages(db: &LibraryDatabase, m: &wdmm_storage::Manga) -> SyncResult<MangaSyncRow> {
         let pages = if m.format == "images" {
             db.list_pages(&m.id)?
                 .into_iter()
@@ -548,7 +541,7 @@ impl MangaLibrarySyncEngine {
     ///
     /// Returns `false` for legacy loose-image rows whose id is derived from the
     /// remote path: those are re-scanned rather than synced as entities.
-    fn adopt_row(db: &LibraryDatabase, row: &MangaSyncRow) -> SyncResult<bool> {
+    pub(crate) fn adopt_row(db: &LibraryDatabase, row: &MangaSyncRow) -> SyncResult<bool> {
         if row.manga.format == "images" {
             let expected = manga_id_for_remote(&row.manga.source_name, &row.manga.remote_path);
             if row.manga.id == expected {
@@ -582,7 +575,7 @@ impl MangaLibrarySyncEngine {
     }
 
     /// Merge reading progress against `progress.json` (LWW per mangaId).
-    async fn sync_progress(&self) -> SyncResult<()> {
+    pub(crate) async fn sync_progress(&self) -> SyncResult<()> {
         let path = join_path(&self.dir(), PROGRESS_NAME);
         let remote_doc: ProgressDoc = match self.store.read(&path).await? {
             None => ProgressDoc::default(),
@@ -666,388 +659,10 @@ impl MangaLibrarySyncEngine {
 #[async_trait]
 impl SyncEngine for MangaLibrarySyncEngine {
     async fn sync_incremental(&self) -> SyncResult<Vec<SyncOutcome>> {
-        let mut outcomes = Vec::new();
-        let manifest = self.read_manifest().await?;
-        let (last_seq, base_up_to, cursor_parts) = self.load_cursor()?;
-
-        // If remote base advanced past our cursor, re-read everything.
-        let skip: HashSet<String> = if manifest.base.up_to > base_up_to {
-            HashSet::new()
-        } else {
-            cursor_parts.keys().cloned().collect()
-        };
-        let (cloud, read_parts) = self.read_cloud(&manifest, &skip).await?;
-
-        // Consumed parts are not re-read, so the remote view may be incomplete.
-        let mut skipped_through = 0i64;
-        if !skip.is_empty() {
-            for shard in &manifest.base.shards {
-                if skip.contains(&shard.file) {
-                    skipped_through = skipped_through.max(manifest.base.up_to);
-                }
-            }
-            for segment in &manifest.segments {
-                if skip.contains(&segment.file) {
-                    skipped_through = skipped_through.max(segment.to);
-                }
-            }
-        }
-
-        let remote_by_key = manga_row_map(&cloud.rows);
-        let local_map = self.local_by_key()?;
-        let synced_by_id = self.db.list_manga_synced_revs()?;
-
-        // §3.1 reconciliation: `synced_rev` says whether a row is clean (its rev
-        // is what the remote already has) or dirty (local edits not yet pushed).
-        let mut to_upload: Vec<wdmm_storage::Manga> = Vec::new();
-        let mut to_adopt: Vec<MangaSyncRow> = Vec::new();
-        let mut to_delete: Vec<String> = Vec::new();
-        let mut conflicts = 0usize;
-        let mut conflict_ids: Vec<(String, i64)> = Vec::new();
-
-        let mut keys: HashSet<String> = local_map.keys().cloned().collect();
-        keys.extend(remote_by_key.keys().cloned());
-        keys.extend(cloud.tombs.keys().cloned());
-
-        for key in keys {
-            let local = local_map.get(&key);
-            let remote = remote_by_key.get(&key);
-            let tomb = cloud.tombs.get(&key).copied();
-            let Some(m) = local else {
-                if let Some(r) = remote {
-                    to_adopt.push(r.clone());
-                }
-                continue;
-            };
-            let synced = synced_by_id.get(&m.id).copied().unwrap_or(0);
-            let dirty = m.rev > synced;
-            match remote {
-                Some(r) if r.manga.rev > m.rev => {
-                    if dirty {
-                        conflicts += 1;
-                        conflict_ids.push((m.id.clone(), m.rev));
-                    }
-                    to_adopt.push(r.clone());
-                }
-                Some(r) if r.manga.rev < m.rev => {
-                    if dirty {
-                        to_upload.push(m.clone());
-                    }
-                }
-                Some(_) => {}
-                None => match tomb {
-                    Some(tomb_rev) if tomb_rev >= m.rev => {
-                        if dirty {
-                            conflicts += 1;
-                            conflict_ids.push((m.id.clone(), m.rev));
-                        }
-                        to_delete.push(m.id.clone());
-                    }
-                    Some(_) => {
-                        if dirty {
-                            to_upload.push(m.clone());
-                        }
-                    }
-                    None if dirty => to_upload.push(m.clone()),
-                    None if synced > 0 => {
-                        if m.rev > skipped_through {
-                            to_delete.push(m.id.clone());
-                        }
-                    }
-                    None => to_upload.push(m.clone()),
-                },
-            }
-        }
-
-        let mut confirmed: HashMap<String, i64> = HashMap::new();
-        for row in &to_adopt {
-            if !Self::adopt_row(&self.db, row)? {
-                continue;
-            }
-            confirmed.insert(row.manga.id.clone(), row.manga.rev);
-            outcomes.push(SyncOutcome {
-                entity_id: row.manga.id.clone(),
-                action: SyncAction::Pulled,
-                rev: RevClock::new(row.manga.rev.max(1) as u64),
-            });
-        }
-        for id in &to_delete {
-            self.db.delete_manga(id)?;
-            outcomes.push(SyncOutcome {
-                entity_id: id.clone(),
-                action: SyncAction::Pulled,
-                rev: RevClock::ZERO,
-            });
-        }
-
-        // Publish local unpushed deletions as tombstones.
-        let pending = self.db.list_unpushed_deleted_mangas()?;
-        let mut resurrected: Vec<i64> = Vec::new();
-        let mut to_publish: Vec<TombRecord> = Vec::new();
-        for row in &pending {
-            let key = &row.sync_key;
-            let tomb_rev = row.rev.unwrap_or(0);
-            if cloud.tombs.get(key).copied().unwrap_or(0) >= tomb_rev && tomb_rev > 0 {
-                resurrected.push(tomb_rev);
-                continue;
-            }
-            // Resurrected: a live local row with higher rev.
-            if let Some(live) = local_map.get(key) {
-                if live.rev > tomb_rev {
-                    if let Some(r) = row.rev {
-                        resurrected.push(r);
-                    }
-                    continue;
-                }
-            }
-            // Resurrected by an adopted row with a higher rev.
-            if let Some(adopted) = to_adopt
-                .iter()
-                .find(|r| manga_key_for_row(r) == *key)
-            {
-                if adopted.manga.rev > tomb_rev {
-                    if let Some(r) = row.rev {
-                        resurrected.push(r);
-                    }
-                    continue;
-                }
-            }
-            to_publish.push(TombRecord {
-                source_name: row.source_name.clone(),
-                remote_path: row.remote_path.clone(),
-                rev: tomb_rev,
-                deleted_at: row.deleted_at.clone(),
-                sync_key: Some(row.sync_key.clone()),
-            });
-        }
-        if !resurrected.is_empty() {
-            let _ = self.db.mark_deleted_mangas_pushed(&resurrected);
-        }
-
-        if !to_publish.is_empty() {
-            self.append_tombstones(&to_publish).await?;
-            let revs: Vec<i64> = to_publish.iter().map(|t| t.rev).collect();
-            self.db.mark_deleted_mangas_pushed(&revs)?;
-            for t in &to_publish {
-                outcomes.push(SyncOutcome {
-                    entity_id: format!("tomb:{}|{}", t.source_name, t.remote_path),
-                    action: SyncAction::Pushed,
-                    rev: RevClock::new(t.rev.max(1) as u64),
-                });
-            }
-        }
-        if !to_upload.is_empty() {
-            let mut rows: Vec<MangaSyncRow> = Vec::with_capacity(to_upload.len());
-            for m in &to_upload {
-                rows.push(Self::row_with_pages(&self.db, m)?);
-            }
-            self.append_delta(&rows).await?;
-            for r in &rows {
-                confirmed.insert(r.manga.id.clone(), r.manga.rev);
-                outcomes.push(SyncOutcome {
-                    entity_id: r.manga.id.clone(),
-                    action: SyncAction::Pushed,
-                    rev: RevClock::new(r.manga.rev.max(1) as u64),
-                });
-            }
-        }
-
-        // Only rows the remote confirmed may be marked clean.
-        self.db.set_manga_synced_revs(&confirmed)?;
-
-        let highest = to_upload
-            .iter()
-            .map(|m| m.rev)
-            .chain(to_adopt.iter().map(|r| r.manga.rev))
-            .fold(last_seq, i64::max);
-        let _ = self.db.observe_rev(highest);
-        let latest = self.read_manifest().await?;
-        self.save_cursor(&latest, &cursor_parts, &read_parts, highest)?;
-        self.sync_progress().await?;
-        info!(
-            "manga shard sync: adopted={} deleted_local={} tombs={} uploaded={} conflicts={}",
-            to_adopt.len(),
-            to_delete.len(),
-            to_publish.len(),
-            to_upload.len(),
-            conflicts
-        );
-        for (id, rev) in conflict_ids {
-            outcomes.push(SyncOutcome {
-                entity_id: id,
-                action: SyncAction::Conflict,
-                rev: RevClock::new(rev.max(1) as u64),
-            });
-        }
-        Ok(outcomes)
+        crate::engine::run_incremental(self).await
     }
 
     async fn sync_full(&self) -> SyncResult<Vec<SyncOutcome>> {
-        let mut outcomes = Vec::new();
-        let manifest = self.read_manifest().await?;
-        let (cloud, _) = self.read_cloud(&manifest, &HashSet::new()).await?;
-        let remote_by_key = manga_row_map(&cloud.rows);
-        let local_map = self.local_by_key()?;
-        let synced_by_id = self.db.list_manga_synced_revs()?;
-        let pending_local = self.db.list_unpushed_deleted_mangas()?;
-
-        let locally_tombstoned = |key: &str, rev: i64| -> bool {
-            pending_local
-                .iter()
-                .any(|d| d.sync_key == key && d.rev.unwrap_or(0) >= rev)
-        };
-
-        // §3.2: reconcile before rebuilding — the remote view is authoritative for
-        // rows it knows, remote absence deletes clean rows, and local unsynced
-        // edits survive as uploads contained in the rebuilt base.
-        let mut to_adopt: Vec<MangaSyncRow> = Vec::new();
-        let mut to_delete: Vec<String> = Vec::new();
-
-        let mut keys: HashSet<String> = local_map.keys().cloned().collect();
-        keys.extend(remote_by_key.keys().cloned());
-        keys.extend(cloud.tombs.keys().cloned());
-
-        for key in keys {
-            let local = local_map.get(&key);
-            let remote = remote_by_key.get(&key);
-            let tomb = cloud.tombs.get(&key).copied();
-            match (local, remote) {
-                (Some(m), Some(r)) => {
-                    if r.manga.rev > m.rev && !locally_tombstoned(&key, r.manga.rev) {
-                        to_adopt.push(r.clone());
-                    }
-                }
-                (Some(m), None) => {
-                    if let Some(tomb_rev) = tomb {
-                        if tomb_rev >= m.rev {
-                            to_delete.push(m.id.clone());
-                            continue;
-                        }
-                    }
-                    let synced = synced_by_id.get(&m.id).copied().unwrap_or(0);
-                    if synced > 0 && m.rev == synced {
-                        to_delete.push(m.id.clone());
-                    }
-                }
-                (None, Some(r)) => {
-                    if !locally_tombstoned(&key, r.manga.rev) {
-                        to_adopt.push(r.clone());
-                    }
-                }
-                (None, None) => {}
-            }
-        }
-
-        for row in &to_adopt {
-            if !Self::adopt_row(&self.db, row)? {
-                continue;
-            }
-            outcomes.push(SyncOutcome {
-                entity_id: row.manga.id.clone(),
-                action: SyncAction::Pulled,
-                rev: RevClock::new(row.manga.rev.max(1) as u64),
-            });
-        }
-        for id in &to_delete {
-            self.db.delete_manga(id)?;
-            outcomes.push(SyncOutcome {
-                entity_id: id.clone(),
-                action: SyncAction::Pulled,
-                rev: RevClock::ZERO,
-            });
-        }
-
-        // Rebuild from the merged live set; tombstones are preserved (§3.2).
-        let all_mangas = self.db.list_mangas()?;
-        let mut rows: Vec<MangaSyncRow> = Vec::with_capacity(all_mangas.len());
-        for m in &all_mangas {
-            rows.push(Self::row_with_pages(&self.db, m)?);
-        }
-        let written = self.rebuild(&rows, DEFAULT_MANGAS_PER_SHARD).await?;
-
-        // A base shard is the authoritative view: every row it carries is clean.
-        let mut confirmed: HashMap<String, i64> = HashMap::new();
-        for r in &rows {
-            confirmed.insert(r.manga.id.clone(), r.manga.rev);
-        }
-        self.db.set_manga_synced_revs(&confirmed)?;
-
-        // Publish local deletions that the remote has not seen yet.
-        let pending = self.db.list_unpushed_deleted_mangas()?;
-        let local_now: HashMap<String, i64> = self
-            .db
-            .list_mangas()?
-            .into_iter()
-            .map(|m| {
-                (
-                    manga_sync_key(&m.id, &m.format, &m.source_name, &m.remote_path),
-                    m.rev,
-                )
-            })
-            .collect();
-        let mut superseded: Vec<i64> = Vec::new();
-        let mut to_publish: Vec<TombRecord> = Vec::new();
-        for row in &pending {
-            let tomb_rev = row.rev.unwrap_or(0);
-            if cloud.tombs.get(&row.sync_key).copied().unwrap_or(0) >= tomb_rev && tomb_rev > 0 {
-                superseded.push(tomb_rev);
-                continue;
-            }
-            if local_now.get(&row.sync_key).copied().unwrap_or(0) > tomb_rev {
-                if let Some(r) = row.rev {
-                    superseded.push(r);
-                }
-                continue;
-            }
-            to_publish.push(TombRecord {
-                source_name: row.source_name.clone(),
-                remote_path: row.remote_path.clone(),
-                rev: tomb_rev,
-                deleted_at: row.deleted_at.clone(),
-                sync_key: Some(row.sync_key.clone()),
-            });
-        }
-        if !superseded.is_empty() {
-            let _ = self.db.mark_deleted_mangas_pushed(&superseded);
-        }
-        if !to_publish.is_empty() {
-            self.append_tombstones(&to_publish).await?;
-            let revs: Vec<i64> = to_publish.iter().map(|t| t.rev).collect();
-            self.db.mark_deleted_mangas_pushed(&revs)?;
-            for t in &to_publish {
-                outcomes.push(SyncOutcome {
-                    entity_id: format!("tomb:{}|{}", t.source_name, t.remote_path),
-                    action: SyncAction::Pushed,
-                    rev: RevClock::new(t.rev.max(1) as u64),
-                });
-            }
-        }
-
-        let highest = rows.iter().map(|r| r.manga.rev).fold(0, i64::max);
-        let _ = self.db.observe_rev(highest);
-        let _ = self.db.clear_sync_state(Some(CURSOR_PREFIX));
-        self.sync_progress().await?;
-        outcomes.push(SyncOutcome {
-            entity_id: "manga-rebuild".into(),
-            action: SyncAction::Pushed,
-            rev: RevClock::new(written.base.up_to.max(1) as u64),
-        });
-        Ok(outcomes)
+        crate::engine::run_full(self).await
     }
-}
-
-/// Sync key for a cloud row (`manga_sync_key` wrapped for readability).
-fn manga_key_for_row(row: &MangaSyncRow) -> String {
-    manga_sync_key(
-        &row.manga.id,
-        &row.manga.format,
-        &row.manga.source_name,
-        &row.manga.remote_path,
-    )
-}
-
-fn manga_row_map(rows: &[MangaSyncRow]) -> HashMap<String, MangaSyncRow> {
-    rows.iter()
-        .map(|r| (manga_key_for_row(r), r.clone()))
-        .collect()
 }
