@@ -403,6 +403,11 @@ impl SyncEngine for CredentialSyncEngine {
                                 "credential sync conflict: {} kept the remote revision ({} < {})",
                                 id, local_at, remote_at
                             );
+                            outcomes.push(SyncOutcome {
+                                entity_id: id.clone(),
+                                action: SyncAction::Conflict,
+                                rev: RevClock::new(local_at.max(1) as u64),
+                            });
                         }
                         self.adopt_record(record)?;
                         merged_deleted.remove(&id);
@@ -991,7 +996,7 @@ pub async fn run_sync_all(
             SyncAction::Conflict => (p, l, c + 1),
             SyncAction::NoChange => (p, l, c),
         });
-        serde_json::json!({ "total": outcomes.len(), "pushed": pushed, "pulled": pulled, "conflict": conflict })
+        serde_json::json!({ "total": outcomes.len(), "pushed": pushed, "pulled": pulled, "conflicts": conflict })
     };
     Ok(serde_json::json!({
         "credentials": summarize(&cred),
@@ -1038,7 +1043,7 @@ pub async fn run_sync_full(
             SyncAction::Conflict => (p, l, c + 1),
             SyncAction::NoChange => (p, l, c),
         });
-        serde_json::json!({ "total": outcomes.len(), "pushed": pushed, "pulled": pulled, "conflict": conflict })
+        serde_json::json!({ "total": outcomes.len(), "pushed": pushed, "pulled": pulled, "conflicts": conflict })
     };
     Ok(serde_json::json!({
         "credentials": summarize(&cred),

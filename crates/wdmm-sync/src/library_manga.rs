@@ -799,6 +799,7 @@ impl SyncEngine for MangaLibrarySyncEngine {
         let mut to_adopt: Vec<MangaSyncRow> = Vec::new();
         let mut to_delete: Vec<String> = Vec::new();
         let mut conflicts = 0usize;
+        let mut conflict_ids: Vec<(String, i64)> = Vec::new();
 
         let mut keys: HashSet<String> = local_map.keys().cloned().collect();
         keys.extend(remote_by_key.keys().cloned());
@@ -820,6 +821,7 @@ impl SyncEngine for MangaLibrarySyncEngine {
                 Some(r) if r.manga.rev > m.rev => {
                     if dirty {
                         conflicts += 1;
+                        conflict_ids.push((m.id.clone(), m.rev));
                     }
                     to_adopt.push(r.clone());
                 }
@@ -833,6 +835,7 @@ impl SyncEngine for MangaLibrarySyncEngine {
                     Some(tomb_rev) if tomb_rev >= m.rev => {
                         if dirty {
                             conflicts += 1;
+                            conflict_ids.push((m.id.clone(), m.rev));
                         }
                         to_delete.push(m.id.clone());
                     }
@@ -965,6 +968,13 @@ impl SyncEngine for MangaLibrarySyncEngine {
             to_upload.len(),
             conflicts
         );
+        for (id, rev) in conflict_ids {
+            outcomes.push(SyncOutcome {
+                entity_id: id,
+                action: SyncAction::Conflict,
+                rev: RevClock::new(rev.max(1) as u64),
+            });
+        }
         Ok(outcomes)
     }
 

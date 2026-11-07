@@ -719,6 +719,7 @@ impl SyncEngine for LibrarySyncEngine {
         let mut to_adopt: Vec<LibraryTrack> = Vec::new();
         let mut to_delete: Vec<String> = Vec::new();
         let mut conflicts = 0usize;
+        let mut conflict_ids: Vec<(String, i64)> = Vec::new();
 
         for key in all_keys(&local_map, &remote_by_key, &cloud.tombs) {
             let local = local_map.get(&key);
@@ -736,6 +737,7 @@ impl SyncEngine for LibrarySyncEngine {
                 Some(r) if r.rev > l.rev => {
                     if dirty {
                         conflicts += 1;
+                        conflict_ids.push((l.id.clone(), l.rev));
                     }
                     to_adopt.push(r.clone());
                 }
@@ -749,6 +751,7 @@ impl SyncEngine for LibrarySyncEngine {
                     Some(tomb_rev) if tomb_rev >= l.rev => {
                         if dirty {
                             conflicts += 1;
+                            conflict_ids.push((l.id.clone(), l.rev));
                         }
                         to_delete.push(l.id.clone());
                     }
@@ -871,6 +874,13 @@ impl SyncEngine for LibrarySyncEngine {
             to_upload.len(),
             conflicts
         );
+        for (id, rev) in conflict_ids {
+            outcomes.push(SyncOutcome {
+                entity_id: id,
+                action: SyncAction::Conflict,
+                rev: RevClock::new(rev.max(1) as u64),
+            });
+        }
         Ok(outcomes)
     }
 
@@ -889,6 +899,7 @@ impl SyncEngine for LibrarySyncEngine {
         let mut merged: HashMap<String, LibraryTrack> = local_map.clone();
         let mut to_delete: Vec<String> = Vec::new();
         let mut conflicts = 0usize;
+        let mut conflict_ids: Vec<(String, i64)> = Vec::new();
 
         for key in all_keys(&local_map, &remote_by_key, &cloud.tombs) {
             let local = local_map.get(&key);
@@ -899,6 +910,7 @@ impl SyncEngine for LibrarySyncEngine {
                     let synced = synced_by_id.get(&l.id).copied().unwrap_or(0);
                     if l.rev > synced {
                         conflicts += 1;
+                        conflict_ids.push((l.id.clone(), l.rev));
                     }
                     merged.insert(key.clone(), r.clone());
                 }
@@ -908,6 +920,7 @@ impl SyncEngine for LibrarySyncEngine {
                         let synced = synced_by_id.get(&l.id).copied().unwrap_or(0);
                         if l.rev > synced {
                             conflicts += 1;
+                            conflict_ids.push((l.id.clone(), l.rev));
                         }
                         merged.remove(&key);
                         to_delete.push(l.id.clone());
@@ -1020,6 +1033,13 @@ impl SyncEngine for LibrarySyncEngine {
             to_publish.len(),
             conflicts
         );
+        for (id, rev) in conflict_ids {
+            outcomes.push(SyncOutcome {
+                entity_id: id,
+                action: SyncAction::Conflict,
+                rev: RevClock::new(rev.max(1) as u64),
+            });
+        }
         Ok(outcomes)
     }
 }

@@ -981,3 +981,55 @@ async fn manga_sync_rejects_unknown_index_format() {
         "{err}"
     );
 }
+
+
+/// A dirty local edit that the remote already superseded is a conflict: the
+/// remote revision wins, and the summary must be able to count it.
+#[tokio::test]
+async fn library_sync_reports_a_conflict_when_the_remote_wins() {
+    let driver = Arc::new(MockDriver::new());
+    let path = "/music/contested-conflict.mp3";
+    let id = wdmm_core::identity::track_identity(path);
+
+    let db_seed = tmp_db();
+    db_seed
+        .insert_track(&LibraryTrack {
+            id: id.clone(),
+            title: "Remote".into(),
+            remote_path: path.into(),
+            account_id: "nas".into(),
+            rev: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    LibrarySyncEngine::new(Arc::clone(&db_seed), driver.clone(), "/sync", None)
+        .sync_incremental()
+        .await
+        .unwrap();
+
+    // Dirty row: rev 90 > synced_rev 0, yet the remote is already at 100.
+    let db = tmp_db();
+    db.insert_track(&LibraryTrack {
+        id: id.clone(),
+        title: "Local dirty".into(),
+        remote_path: path.into(),
+        account_id: "nas".into(),
+        rev: 90,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let outcomes = LibrarySyncEngine::new(Arc::clone(&db), driver.clone(), "/sync", None)
+        .sync_incremental()
+        .await
+        .unwrap();
+
+    let conflicts: Vec<_> = outcomes
+        .iter()
+        .filter(|o| o.action == crate::SyncAction::Conflict)
+        .collect();
+    assert_eq!(conflicts.len(), 1, "expected one conflict outcome: {outcomes:?}");
+    assert_eq!(conflicts[0].entity_id, id);
+    assert_eq!(db.get_track(&id).unwrap().unwrap().rev, 100);
+    assert_eq!(db.track_synced_rev(&id).unwrap(), 100);
+}
