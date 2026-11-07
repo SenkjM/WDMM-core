@@ -38,14 +38,14 @@ mod library_manga;
 pub use library_manga::MangaLibrarySyncEngine;
 
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info};
 use wdmm_core::models::CloudAccount;
 use wdmm_core::rev_clock::RevClock;
 use wdmm_drivers::{WdmmVfs, DriverError};
-use wdmm_storage::{LibraryDatabase, Playlist, PlaylistEntry, StorageError};
+use wdmm_storage::{LibraryDatabase, Playlist, PlaylistEntry, StorageError, SyncState};
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -198,8 +198,10 @@ async fn driver_list_files(driver: &Arc<dyn WdmmVfs>, dir: &str) -> SyncResult<V
 /// The snapshot's password tag carries the opaque
 /// `CloudAccount.credentials_encrypted` blob as base64, so the document is
 /// ciphertext-only on the wire. `engine_updated_at` (epoch seconds) drives
-/// last-write-wins at the account level.
-fn account_to_record(account: &CloudAccount) -> wmp::VaultRecordDoc {
+/// last-write-wins at the account level, so the caller passes the row's *real*
+/// local change clock -- stamping `now()` while mapping would make every run
+/// claim a fresh edit and overwrite whatever another device published.
+fn account_to_record(account: &CloudAccount, engine_updated_at: i64) -> wmp::VaultRecordDoc {
     use base64::prelude::*;
     wmp::VaultRecordDoc {
         id: account.id.clone(),
@@ -211,7 +213,7 @@ fn account_to_record(account: &CloudAccount) -> wmp::VaultRecordDoc {
         password_encrypted: false,
         remote_path: "/".to_string(),
         driver_config: None,
-        engine_updated_at: chrono::Utc::now().timestamp(),
+        engine_updated_at,
     }
 }
 
@@ -274,13 +276,42 @@ impl CredentialSyncEngine {
         }
     }
 
-    async fn push_all(&self, accounts: &[CloudAccount]) -> SyncResult<()> {
+    /// The epoch second the account last reached the remote snapshot (`0` = never).
+    fn account_synced_at(&self, id: &str) -> SyncResult<i64> {
+        let state = self.db.get_sync_state(&format!("account:{id}"))?;
+        Ok(state.map(|s| s.last_seq).unwrap_or(0))
+    }
+
+    fn mark_account_synced(&self, id: &str, at: i64) -> SyncResult<()> {
+        self.db.save_sync_state(&SyncState {
+            remote_key: format!("account:{id}"),
+            last_seq: at,
+            base_up_to: 0,
+            parts: "{}".to_string(),
+            updated_at: wmp::now_iso8601(),
+        })?;
+        Ok(())
+    }
+
+    /// Adopt a remote record locally and remember the row's new clock, so the
+    /// adoption does not look like a pending local edit on the next run.
+    fn adopt_record(&self, record: &wmp::VaultRecordDoc) -> SyncResult<()> {
+        self.db.insert_account(&account_from_record(record))?;
+        let stamp = self.db.account_updated_at(&record.id)?;
+        self.mark_account_synced(&record.id, stamp)
+    }
+
+    /// Overwrite the snapshot with the merged union.
+    ///
+    /// The union matters: the snapshot is one document, so writing only "local"
+    /// rows would delete accounts another device just published.
+    async fn push_records(&self, records: Vec<wmp::VaultRecordDoc>) -> SyncResult<()> {
         driver_ensure_dir(&self.driver, &self.remote_dir).await?;
         let document = wmp::VaultDocument {
             format_version: 1,
             device_id: String::new(),
             created_at: wmp::now_iso8601(),
-            records: accounts.iter().map(account_to_record).collect(),
+            records,
         };
         driver_write(&self.driver, &self.file_path(), &document.encode()).await
     }
@@ -290,47 +321,96 @@ impl CredentialSyncEngine {
 impl SyncEngine for CredentialSyncEngine {
     async fn sync_incremental(&self) -> SyncResult<Vec<SyncOutcome>> {
         let local = self.db.list_accounts()?;
+        let local_ids: HashSet<&str> = local.iter().map(|a| a.id.as_str()).collect();
         let remote = self.fetch_remote().await?;
-
-        // Build remote map by id for merge.
         let remote_by_id: HashMap<&str, &wmp::VaultRecordDoc> =
             remote.iter().map(|r| (r.id.as_str(), r)).collect();
 
         let mut outcomes = Vec::new();
+        let mut merged: BTreeMap<String, wmp::VaultRecordDoc> =
+            remote.iter().map(|r| (r.id.clone(), r.clone())).collect();
 
-        // Pull: remote accounts not present locally → insert.
-        let local_ids: Vec<String> = local.iter().map(|a| a.id.clone()).collect();
-        for r in &remote {
-            if !local_ids.iter().any(|id| id == &r.id) {
-                let account = account_from_record(r);
-                self.db.insert_account(&account)?;
-                outcomes.push(SyncOutcome {
-                    entity_id: r.id.clone(),
-                    action: SyncAction::Pulled,
-                    rev: RevClock::new(r.engine_updated_at.max(1) as u64),
-                });
+        // Pull remote-only accounts first. `insert_account` stamps `updated_at`
+        // with "now", so remember that stamp as synced: otherwise the pull
+        // itself would look like a pending edit and bounce straight back.
+        for record in &remote {
+            if local_ids.contains(record.id.as_str()) {
+                continue;
             }
-        }
-
-        // Push: every local account is written to the remote snapshot.
-        // (Round 4: full-replace push; per-row diffing lands with rev clocks.)
-        if !local.is_empty() {
-            self.push_all(&local).await?;
-        }
-        for a in &local {
-            let was_remote = remote_by_id.contains_key(a.id.as_str());
+            self.adopt_record(record)?;
             outcomes.push(SyncOutcome {
-                entity_id: a.id.clone(),
-                action: if was_remote {
-                    SyncAction::NoChange
-                } else {
-                    SyncAction::Pushed
-                },
-                rev: RevClock::new(1),
+                entity_id: record.id.clone(),
+                action: SyncAction::Pulled,
+                rev: RevClock::new(record.engine_updated_at.max(1) as u64),
             });
         }
 
-        info!("credential sync: {} local, {} remote", local.len(), remote.len());
+        // Re-read the clocks: the pulls above bumped `updated_at`.
+        let local_clocks = self.db.list_account_updated_at()?;
+
+        for account in &local {
+            let local_at = local_clocks.get(&account.id).copied().unwrap_or(0);
+            let synced_at = self.account_synced_at(&account.id)?;
+            let remote_at = remote_by_id
+                .get(account.id.as_str())
+                .map(|r| r.engine_updated_at)
+                .unwrap_or(0);
+
+            // Last write wins on the real per-row clock. A clean row is only
+            // republished when the remote copy vanished: without account
+            // tombstones a missing row means "the snapshot was rebuilt", not
+            // "another device deleted it".
+            if remote_at > local_at {
+                if local_at > synced_at {
+                    info!(
+                        "credential sync conflict: {} kept the remote revision ({} < {})",
+                        account.id, local_at, remote_at
+                    );
+                }
+                self.adopt_record(remote_by_id[account.id.as_str()])?;
+                outcomes.push(SyncOutcome {
+                    entity_id: account.id.clone(),
+                    action: SyncAction::Pulled,
+                    rev: RevClock::new(remote_at.max(1) as u64),
+                });
+                continue;
+            }
+
+            if remote_at > 0 && local_at <= synced_at {
+                outcomes.push(SyncOutcome {
+                    entity_id: account.id.clone(),
+                    action: SyncAction::NoChange,
+                    rev: RevClock::new(local_at.max(1) as u64),
+                });
+                continue;
+            }
+
+            let stamp = if local_at > 0 {
+                local_at
+            } else {
+                chrono::Utc::now().timestamp()
+            };
+            merged.insert(account.id.clone(), account_to_record(account, stamp));
+            let clock = self.db.account_updated_at(&account.id)?;
+            self.mark_account_synced(&account.id, clock)?;
+            outcomes.push(SyncOutcome {
+                entity_id: account.id.clone(),
+                action: SyncAction::Pushed,
+                rev: RevClock::new(stamp.max(1) as u64),
+            });
+        }
+
+        // Publish the union, never just the local slice: the snapshot is a
+        // single document and dropping the rows another device published is
+        // data loss.
+        self.push_records(merged.into_values().collect()).await?;
+
+        info!(
+            "credential sync: {} local, {} remote, {} outcomes",
+            local.len(),
+            remote.len(),
+            outcomes.len()
+        );
         Ok(outcomes)
     }
 
@@ -785,6 +865,60 @@ mod tests {
         let loaded = db2.get_account("acc1").unwrap().unwrap();
         assert_eq!(loaded.display_name, "My NAS");
         assert_eq!(loaded.credentials_encrypted, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn credential_sync_publishes_the_union_and_keeps_clean_rows_quiet() {
+        let db = tmp_db();
+        let driver = Arc::new(MockDriver::new());
+        for (id, name) in [("acc1", "One"), ("acc2", "Two")] {
+            db.insert_account(&CloudAccount {
+                id: id.into(),
+                provider_type: "webdav".into(),
+                display_name: name.into(),
+                base_url: Some(format!("https://{id}.local/dav/")),
+                credentials_encrypted: vec![1, 2, 3],
+            })
+            .unwrap();
+        }
+        let engine = CredentialSyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        engine.sync_incremental().await.unwrap();
+
+        // Device B adopts both accounts, then adds a third one.
+        let db2 = tmp_db();
+        let engine2 = CredentialSyncEngine::new(Arc::clone(&db2), driver.clone(), "/sync");
+        engine2.sync_incremental().await.unwrap();
+        assert!(db2.get_account("acc1").unwrap().is_some());
+        db2.insert_account(&CloudAccount {
+            id: "acc3".into(),
+            provider_type: "webdav".into(),
+            display_name: "Three".into(),
+            base_url: None,
+            credentials_encrypted: vec![9],
+        })
+        .unwrap();
+        let outcomes = engine2.sync_incremental().await.unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|o| o.entity_id == "acc3" && o.action == SyncAction::Pushed));
+
+        // The snapshot must still carry acc1/acc2: pushing only local rows used
+        // to delete the accounts another device had just published.
+        let snapshot = wmp::VaultDocument::decode(
+            &driver.get_content("/sync/accounts.wdmcv").await.unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = snapshot.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "snapshot must keep the union: {ids:?}");
+        assert!(ids.contains(&"acc1") && ids.contains(&"acc2") && ids.contains(&"acc3"));
+
+        // Adoption stamps the row as synced, so an unchanged account never
+        // claims a fresh revision again.
+        let second = engine2.sync_incremental().await.unwrap();
+        assert!(
+            second.iter().all(|o| o.action != SyncAction::Pushed),
+            "clean rows must not republish: {second:?}"
+        );
     }
 
     #[tokio::test]

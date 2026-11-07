@@ -2145,6 +2145,38 @@ impl LibraryDatabase {
         Ok(())
     }
 
+    /// Epoch seconds of the account's last local write (`0` when missing).
+    ///
+    /// The credential sync engine uses this as its change clock: a row whose
+    /// `updated_at` is newer than the last synced marker is a pending local
+    /// edit, an older one is clean.
+    pub fn account_updated_at(&self, id: &str) -> StorageResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        let stamp: Option<i64> = conn
+            .query_row(
+                "SELECT updated_at FROM accounts WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stamp.unwrap_or(0))
+    }
+
+    /// Every account's local change clock (see [`Self::account_updated_at`]).
+    pub fn list_account_updated_at(&self) -> StorageResult<HashMap<String, i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, updated_at FROM accounts")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut clocks = HashMap::new();
+        for row in rows {
+            let (id, stamp) = row?;
+            clocks.insert(id, stamp);
+        }
+        Ok(clocks)
+    }
+
     /// Patch the stored credentials for an account in-place (token refresh).
     /// Only updates `credentials_encrypted` and `updated_at`; leaves all other
     /// fields (provider_type, display_name, base_url, etc.) unchanged.
