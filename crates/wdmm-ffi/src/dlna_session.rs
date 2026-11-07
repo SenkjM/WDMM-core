@@ -2028,14 +2028,26 @@ async fn cast_to_renderer(entry: &mut SessionEntry) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve the direct-cast intent of a `select` command.
+///
+/// The Dart layer snapshots the session's mode when it starts and repeats it on
+/// every `select`, so the explicit flag wins. Older callers only sent
+/// `preset_id: null` to mean "direct"; that stays the fallback, but it cannot be
+/// the only signal -- an HLS session whose preset lookup failed also has no
+/// preset id, and inferring "direct" from it flipped a running session's mode.
+fn select_force_direct(cmd: &Value, preset_id: Option<&str>) -> bool {
+    cmd.get("force_direct")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| preset_id.is_none())
+}
+
 /// Switch the session to another file (next episode, or a manual pick).
 async fn select_media(entry: &mut SessionEntry, cmd: &Value) -> Result<(), String> {
     let remote_path = opt_string(cmd, "remote_path").unwrap_or_else(|| entry.remote_path.clone());
     let name = opt_string(cmd, "name").unwrap_or_else(|| file_name(&remote_path));
     let size = cmd.get("size").and_then(Value::as_u64).unwrap_or(0);
     let preset_id = opt_string(cmd, "preset_id");
-    // A `null` preset id means the Dart layer wants a direct cast.
-    let force_direct = preset_id.is_none();
+    let force_direct = select_force_direct(cmd, preset_id.as_deref());
     let proxy = entry.proxy.clone();
     let driver = Arc::clone(&entry.driver);
     let lan_ip = entry.lan_ip;
@@ -2947,6 +2959,32 @@ mod tests {
 
     fn json_of(result: FfiString) -> Value {
         serde_json::from_str(&read(result)).expect("json result")
+    }
+
+    /// `select` now carries the session's mode explicitly. The old inference
+    /// ("no preset id means direct") must only apply to callers that send no
+    /// flag, otherwise an HLS session loses its preset and flips to direct.
+    #[test]
+    fn select_prefers_the_explicit_force_direct_flag() {
+        let explicit_direct = serde_json::json!({"force_direct": true, "preset_id": null});
+        assert!(select_force_direct(&explicit_direct, None));
+
+        let explicit_hls = serde_json::json!({"force_direct": false, "preset_id": null});
+        assert!(!select_force_direct(&explicit_hls, None));
+
+        let both = serde_json::json!({"force_direct": false, "preset_id": "balanced"});
+        assert!(!select_force_direct(&both, Some("balanced")));
+    }
+
+    /// Callers that only send `preset_id` keep the legacy meaning: a null preset
+    /// id asks for a direct cast.
+    #[test]
+    fn select_falls_back_to_the_null_preset_for_legacy_callers() {
+        assert!(select_force_direct(&serde_json::json!({}), None));
+        assert!(!select_force_direct(
+            &serde_json::json!({}),
+            Some("dlna-compat")
+        ));
     }
 
     /// The old registry took the entry out of the map for the duration of one
