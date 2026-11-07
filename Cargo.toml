@@ -6,6 +6,7 @@ members = [
     "crates/wdmm-drivers",
     "crates/wdmm-storage",
     "crates/wdmm-queue",
+    "crates/wdmm-jobs",
     "crates/wdmm-sync",
     "crates/wdmm-dlna",
     "crates/wdmm-proxy",
@@ -28,6 +29,7 @@ wdmm-crypto   = { path = "crates/wdmm-crypto"   }
 wdmm-drivers  = { path = "crates/wdmm-drivers"  }
 wdmm-storage  = { path = "crates/wdmm-storage"  }
 wdmm-queue    = { path = "crates/wdmm-queue"    }
+wdmm-jobs     = { path = "crates/wdmm-jobs"     }
 wdmm-sync     = { path = "crates/wdmm-sync"     }
 wdmm-dlna     = { path = "crates/wdmm-dlna"     }
 wdmm-proxy    = { path = "crates/wdmm-proxy"    }
@@ -90,6 +92,9 @@ quick-xml = { version = "0.36" }
 encoding_rs = { version = "=0.8.44", default-features = false }
 zip         = { version = "=9.3.0", default-features = false, features = ["deflate"] }
 lofty       = { version = "=0.25.5", default-features = false, features = ["id3v2_compression_support"] }
+# Image decode/resize for cover thumbnails (queue executors). Checked 2026-11-07:
+# crates.io newest = 0.25.10 (released 2026-03-10). Re-check before bumping.
+image       = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # ── misc ──────────────────────────────────────────────────────────────────────
 chrono      = { version = "0.4",  features = ["serde"] }
@@ -98,6 +103,8 @@ url         = { version = "=2.5.0"  }
 async-trait = { version = "0.1" }
 bytes       = { version = "1"   }
 tokio-util  = { version = "0.7", features = ["io"] }
+# Test-only scratch dirs. Checked 2026-11-07: crates.io newest = 3.27.0.
+tempfile    = { version = "=3.27.0" }
 
 [profile.release]
 opt-level = "z"

@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod model;
 pub mod policy;
 
 use async_trait::async_trait;
