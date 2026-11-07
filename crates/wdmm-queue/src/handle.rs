@@ -507,7 +507,17 @@ impl QueueHandle {
         let mut task = enqueued.task;
         if let Some(payload) = &req.payload {
             match self.inner.store.write_payload(&task.id, payload) {
-                Ok(path) => task.payload_path = Some(path),
+                Ok(path) => {
+                    // Jobs read `task.payload_path`, and the scheduler starts the
+                    // row from the in-memory state, so the sidecar path must land
+                    // in both the store and the running-row snapshot.
+                    task.payload_path = Some(path.clone());
+                    if let Ok(mut state) = self.inner.state.lock() {
+                        if let Some(stored) = state.task_mut(&task.id) {
+                            stored.payload_path = Some(path);
+                        }
+                    }
+                }
                 Err(e) => self.record_store_error(e.to_string()),
             }
         }

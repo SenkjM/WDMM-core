@@ -231,6 +231,52 @@ async fn enqueue_dedupes_on_the_full_key_and_keeps_one_store_row() {
     assert_eq!(handle.tasks().len(), 1);
 }
 
+/// Runner that records the payload sidecar path each started task carried.
+struct PayloadRunner {
+    seen: Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait]
+impl TaskRunner for PayloadRunner {
+    fn supports(&self, _kind: TaskKind) -> bool {
+        true
+    }
+
+    async fn run(&self, ctx: RunCtx) -> RunOutcome {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(ctx.task.payload_path.clone());
+        RunOutcome::Completed
+    }
+}
+
+#[tokio::test]
+async fn enqueue_delivers_the_payload_sidecar_to_the_running_task() {
+    let store = Arc::new(MemStore::new());
+    let runner = Arc::new(PayloadRunner {
+        seen: Mutex::new(Vec::new()),
+    });
+    let handle =
+        QueueHandle::try_new(store, runner.clone() as Arc<dyn TaskRunner>).expect("queue");
+
+    let mut req = EnqueueRequest::new(TaskKind::Scan, "acc", "/media", "Music");
+    req.payload = Some(r#"[{"path":"/media/a.mp3"}]"#.to_string());
+    let enqueued = handle.enqueue(req).expect("enqueue");
+
+    // The queued row and the started task must both see the sidecar: jobs read
+    // `task.payload_path`, which the scheduler takes from the in-memory state.
+    assert_eq!(
+        handle.task(&enqueued.task_id).unwrap().payload_path,
+        Some(format!("mem://{}.json", enqueued.task_id))
+    );
+    assert!(wait_until(|| !runner.seen.lock().unwrap().is_empty()).await);
+    assert_eq!(
+        runner.seen.lock().unwrap().as_slice(),
+        &[Some(format!("mem://{}.json", enqueued.task_id))]
+    );
+}
+
 #[tokio::test]
 async fn wait_reports_not_found_separately_from_timeout() {
     let store = Arc::new(MemStore::new());
