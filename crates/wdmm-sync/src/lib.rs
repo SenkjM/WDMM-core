@@ -183,11 +183,25 @@ async fn driver_write(driver: &Arc<dyn WdmmVfs>, path: &str, data: &[u8]) -> Syn
     Ok(())
 }
 
-async fn driver_ensure_dir(driver: &Arc<dyn WdmmVfs>, path: &str) -> SyncResult<()> {
-    match driver.mkdir(path).await {
+/// Ensure `dir` exists, creating every missing ancestor first.
+///
+/// A plain `MKCOL` creates exactly one collection: pointing it at
+/// `<root>/library/music` on a fresh remote answers `409 Conflict` because
+/// `<root>/library` does not exist yet, and the following `PUT` then answers
+/// `404`. Each ancestor is attempted best-effort — an already-present
+/// collection answers 405/409, which drivers report as an error and which the
+/// following write would surface anyway if the failure were real.
+pub(crate) async fn driver_ensure_dir(driver: &Arc<dyn WdmmVfs>, dir: &str) -> SyncResult<()> {
+    let bytes = dir.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'/' && index > 0 && index + 1 < bytes.len() {
+            let _ = driver.mkdir(&dir[..index]).await;
+        }
+    }
+    match driver.mkdir(dir).await {
         Ok(()) => Ok(()),
         Err(DriverError::Network(_)) => {
-            debug!("mkdir {path}: ignored non-fatal error (likely exists)");
+            debug!("mkdir {dir}: ignored non-fatal error (likely exists)");
             Ok(())
         }
         Err(e) => Err(SyncError::from(e)),
@@ -1713,6 +1727,9 @@ mod tests {
         dirs: AsyncMutex<std::collections::HashSet<String>>,
         /// Paths passed to `get_content` — used by timing tests.
         pub read_paths: Mutex<Vec<String>>,
+        /// Enforce real WebDAV semantics: `MKCOL` on a missing parent answers
+        /// 409 and `PUT` into a missing collection answers 404.
+        strict: bool,
     }
 
     impl MockDriver {
@@ -1721,7 +1738,20 @@ mod tests {
                 files: AsyncMutex::new(Map::new()),
                 dirs: AsyncMutex::new(std::collections::HashSet::new()),
                 read_paths: Mutex::new(vec![]),
+                strict: false,
             }
+        }
+
+        fn strict() -> Self {
+            Self {
+                strict: true,
+                ..Self::new()
+            }
+        }
+
+        async fn parent_exists(&self, path: &str) -> bool {
+            let parent = path.rsplit_once('/').map(|(head, _)| head).unwrap_or("");
+            parent.is_empty() || self.dirs.lock().await.contains(parent)
         }
     }
 
@@ -1766,6 +1796,14 @@ mod tests {
             }
         }
         async fn mkdir(&self, path: &str) -> wdmm_drivers::Result<()> {
+            if self.strict {
+                if self.dirs.lock().await.contains(path) {
+                    return Err(DriverError::Network("MKCOL failed: 405".into()));
+                }
+                if !self.parent_exists(path).await {
+                    return Err(DriverError::Network("MKCOL failed: 409".into()));
+                }
+            }
             self.dirs.lock().await.insert(path.to_string());
             Ok(())
         }
@@ -1777,6 +1815,9 @@ mod tests {
             Ok(())
         }
         async fn put_content(&self, path: &str, data: &[u8]) -> wdmm_drivers::Result<()> {
+            if self.strict && !self.parent_exists(path).await {
+                return Err(DriverError::Network("PUT failed: 404".into()));
+            }
             self.files
                 .lock()
                 .await
@@ -1796,6 +1837,35 @@ mod tests {
 
     fn tmp_db() -> Arc<LibraryDatabase> {
         Arc::new(LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap())
+    }
+
+    /// Regression: a brand-new remote root has no `library` collection yet.
+    /// WebDAV `MKCOL` refuses to create `<root>/library/music` while its parent
+    /// is missing (409), and the following `PUT` then answers 404 — so the sync
+    /// must create the ancestor chain instead of only the leaf directory.
+    #[tokio::test]
+    async fn fresh_root_sync_creates_missing_ancestor_dirs() {
+        use wdmm_core::models::LibraryTrack;
+        let db = tmp_db();
+        db.insert_track(&LibraryTrack {
+            id: wdmm_core::identity::track_identity("/music/fresh.mp3"),
+            title: "Fresh".into(),
+            remote_path: "/music/fresh.mp3".into(),
+            account_id: "acc1".into(),
+            size: 1,
+            rev: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let driver = Arc::new(MockDriver::strict());
+        run_sync_all(Arc::clone(&db), driver.clone(), "/fresh")
+            .await
+            .unwrap();
+
+        let dirs = driver.dirs.lock().await;
+        for dir in ["/fresh", "/fresh/library", "/fresh/library/music"] {
+            assert!(dirs.contains(dir), "missing {dir} after sync: {dirs:?}");
+        }
     }
 
     #[tokio::test]

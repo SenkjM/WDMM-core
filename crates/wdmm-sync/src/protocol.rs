@@ -108,13 +108,9 @@ impl ShardStore {
     }
 
     pub(crate) async fn ensure_dir(&self, path: &str) -> SyncResult<()> {
-        match self.driver.mkdir(path).await {
-            Ok(()) => Ok(()),
-            // Some WebDAV servers answer an existing collection with an error;
-            // the following write reports a real failure anyway.
-            Err(DriverError::Network(_)) => Ok(()),
-            Err(e) => Err(SyncError::from(e)),
-        }
+        // Creates the whole ancestor chain: WebDAV MKCOL is single-level and a
+        // fresh remote root has no `library` collection yet.
+        crate::driver_ensure_dir(&self.driver, path).await
     }
 
     pub(crate) async fn remove(&self, path: &str) -> SyncResult<()> {

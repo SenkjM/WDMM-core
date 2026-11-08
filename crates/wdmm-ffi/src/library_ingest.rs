@@ -98,16 +98,19 @@ pub(crate) fn library_ingest(args: &str) -> Result<Value, String> {
     );
     task.local_path = local_path.clone();
 
-    let ctx = JobCtx {
-        task,
-        cancel: CancelToken::new(),
-        progress: Arc::new(NoProgress),
-        platform: Arc::new(PlatformClient::disabled()),
-        db,
-        vfs,
-        paths,
-    };
     let outcome = crate::rt().block_on(async {
+        // Built inside the runtime on purpose: `PlatformClient::disabled()`
+        // spawns its drain task, so pressing it together on the calling thread
+        // (a worker isolate here) panics with "there is no reactor running".
+        let ctx = JobCtx {
+            task,
+            cancel: CancelToken::new(),
+            progress: Arc::new(NoProgress),
+            platform: Arc::new(PlatformClient::disabled()),
+            db,
+            vfs,
+            paths,
+        };
         match local_path {
             Some(_) => ingest::ingest_downloaded(&ctx).await,
             None => ingest::ingest_remote_file(&ctx).await,

@@ -299,6 +299,12 @@ impl WdmmVfs for WebDavDriver {
             .await?;
 
         if !resp.status().is_success() {
+            // A missing collection has to look like a missing resource: the
+            // sync protocol treats `NotFound` as "empty directory" and would
+            // otherwise abort a first sync to a fresh remote root.
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(DriverError::NotFound(path.to_string()));
+            }
             return Err(DriverError::Network(format!("PROPFIND failed: {}", resp.status())));
         }
 

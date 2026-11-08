@@ -347,6 +347,89 @@ pub(crate) fn driver_for_account(
     }
 }
 
+/// Normalize a remote directory the same way the Dart account model does:
+/// empty means `/`, a missing leading `/` is added and trailing slashes
+/// collapse to one (the root keeps its single slash).
+fn normalize_remote_dir(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    let mut out = String::with_capacity(trimmed.len() + 1);
+    if !trimmed.starts_with('/') {
+        out.push('/');
+    }
+    out.push_str(trimmed);
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// Join an account's file-source root (`credentials.remote_dir`, e.g.
+/// `/Local/Music`) with a path expressed relative to it.
+///
+/// Mirrors `CloudDriveService.joinRemotePath` on the Dart side: the WebDAV
+/// driver is rooted at the server URL, while browsing starts at the file
+/// source, so anything the UI treats as a file-source-relative path has to be
+/// resolved here before it reaches the driver.
+fn join_source_path(source_root: &str, relative: &str) -> String {
+    let root = normalize_remote_dir(source_root);
+    let path = normalize_remote_dir(relative);
+    if root == "/" {
+        return path;
+    }
+    if path == "/" {
+        return root;
+    }
+    format!("{root}{path}")
+}
+
+/// Resolve a sync root typed by the user (a path relative to the account's file
+/// source) into the absolute remote path the driver expects.
+///
+/// Accounts without a file-source root (non-WebDAV providers, or a lookup
+/// miss) keep the path as-is — the driver construction will report the account
+/// problem separately.
+fn resolve_sync_remote_dir(account_id: &str, remote_dir: &str) -> String {
+    let source_root = try_global_library_db()
+        .and_then(|db| db.get_account(account_id).ok().flatten())
+        .and_then(|account| {
+            std::str::from_utf8(&account.credentials_encrypted)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        })
+        .and_then(|creds| {
+            creds
+                .get("remote_dir")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    join_source_path(&source_root, remote_dir)
+}
+
+#[cfg(test)]
+mod sync_root_tests {
+    use super::*;
+
+    #[test]
+    fn joins_sync_root_below_the_source_root() {
+        assert_eq!(
+            join_source_path("/Local/Music", "/WebdavMediaManager/"),
+            "/Local/Music/WebdavMediaManager"
+        );
+        assert_eq!(
+            join_source_path("/Local/Music/", "library/music"),
+            "/Local/Music/library/music"
+        );
+        assert_eq!(join_source_path("/", "/wdmm_sync"), "/wdmm_sync");
+        assert_eq!(join_source_path("", "wdmm_sync"), "/wdmm_sync");
+        assert_eq!(join_source_path("/Local", "/"), "/Local");
+        assert_eq!(join_source_path("/Local/Music", "/WebdavMediaManager//"), "/Local/Music/WebdavMediaManager");
+    }
+}
+
 /// Read a byte range from a remote file for the `ext` modules.
 ///
 /// This is the single range-read path for the migrated capabilities (ZIP central
@@ -436,10 +519,13 @@ pub extern "C" fn wdmm_sync_run(json: *const c_char) -> FfiString {
         Some(value) if !value.is_empty() => value,
         _ => return FfiString::from("error:missing account_id"),
     };
-    let remote_dir = parsed
-        .get("remote_dir")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("/wdmm_sync");
+    let remote_dir = resolve_sync_remote_dir(
+        account_id,
+        parsed
+            .get("remote_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("/wdmm_sync"),
+    );
     let mode_wire = parsed
         .get("mode")
         .and_then(serde_json::Value::as_str)
@@ -471,7 +557,7 @@ pub extern "C" fn wdmm_sync_run(json: *const c_char) -> FfiString {
     };
     let db = std::sync::Arc::clone(global_library_db());
     match rt().block_on(wdmm_sync::run_sync(
-        db, driver, remote_dir, command, scope, cover_roots,
+        db, driver, &remote_dir, command, scope, cover_roots,
     )) {
         Ok(summary) => FfiString::from(summary.to_string()),
         Err(error) => FfiString::from(format!("error:{error}")),
@@ -536,10 +622,13 @@ pub extern "C" fn wdmm_playlist_publish(json: *const c_char) -> FfiString {
         Some(value) if !value.is_empty() => value,
         _ => return FfiString::from("error:missing playlist_id"),
     };
-    let remote_dir = parsed
-        .get("remote_dir")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("/wdmm_sync");
+    let remote_dir = resolve_sync_remote_dir(
+        account_id,
+        parsed
+            .get("remote_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("/wdmm_sync"),
+    );
     let driver = match driver_for_account(account_id) {
         Ok(value) => value,
         Err(error) => return error,
@@ -573,7 +662,10 @@ pub extern "C" fn wdmm_sync_audit_music(
         Some(s) => s,
         None => return FfiString::from("error:invalid account_id"),
     };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let dir = resolve_sync_remote_dir(
+        account_id_str,
+        ptr_to_str(remote_dir).unwrap_or("/wdmm_sync"),
+    );
     let driver = match driver_for_account(account_id_str) {
         Ok(d) => d,
         Err(e) => return e,
@@ -608,7 +700,10 @@ pub extern "C" fn wdmm_sync_audit_manga(
         Some(s) => s,
         None => return FfiString::from("error:invalid account_id"),
     };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let dir = resolve_sync_remote_dir(
+        account_id_str,
+        ptr_to_str(remote_dir).unwrap_or("/wdmm_sync"),
+    );
     let driver = match driver_for_account(account_id_str) {
         Ok(d) => d,
         Err(e) => return e,
@@ -642,7 +737,10 @@ pub extern "C" fn wdmm_sync_estimate_music(
         Some(s) => s,
         None => return FfiString::from("error:invalid account_id"),
     };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let dir = resolve_sync_remote_dir(
+        account_id_str,
+        ptr_to_str(remote_dir).unwrap_or("/wdmm_sync"),
+    );
     let n = if tracks_per_shard > 0 { tracks_per_shard as usize } else { 500 };
     let driver = match driver_for_account(account_id_str) {
         Ok(d) => d,
@@ -677,7 +775,10 @@ pub extern "C" fn wdmm_sync_estimate_manga(
         Some(s) => s,
         None => return FfiString::from("error:invalid account_id"),
     };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let dir = resolve_sync_remote_dir(
+        account_id_str,
+        ptr_to_str(remote_dir).unwrap_or("/wdmm_sync"),
+    );
     let n = if mangas_per_shard > 0 { mangas_per_shard as usize } else { 200 };
     let driver = match driver_for_account(account_id_str) {
         Ok(d) => d,
@@ -711,7 +812,10 @@ pub extern "C" fn wdmm_sync_tidy_orphans_music(
         Some(s) => s,
         None => return FfiString::from("error:invalid account_id"),
     };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let dir = resolve_sync_remote_dir(
+        account_id_str,
+        ptr_to_str(remote_dir).unwrap_or("/wdmm_sync"),
+    );
     let raw = match ptr_to_str(orphans_json) {
         Some(s) => s,
         None => return FfiString::from("error:null orphans_json"),
@@ -747,7 +851,10 @@ pub extern "C" fn wdmm_sync_tidy_orphans_manga(
         Some(s) => s,
         None => return FfiString::from("error:invalid account_id"),
     };
-    let dir = ptr_to_str(remote_dir).unwrap_or("/wdmm_sync");
+    let dir = resolve_sync_remote_dir(
+        account_id_str,
+        ptr_to_str(remote_dir).unwrap_or("/wdmm_sync"),
+    );
     let raw = match ptr_to_str(orphans_json) {
         Some(s) => s,
         None => return FfiString::from("error:null orphans_json"),
@@ -3426,9 +3533,23 @@ pub extern "C" fn wdmm_library_ingest(args: *const c_char) -> FfiString {
     let Some(args) = ptr_to_str(args) else {
         return FfiString::from("error:invalid args");
     };
-    match library_ingest::library_ingest(args) {
-        Ok(value) => FfiString::from(value.to_string()),
-        Err(error) => FfiString::from(format!("error:{error}")),
+    // Tag probing touches third-party files, so a panic down there must not
+    // abort the whole app: `extern "C"` cannot unwind, and the release profile
+    // would take the process down (SIGABRT) instead of reporting the failure.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        library_ingest::library_ingest(args)
+    }));
+    match result {
+        Ok(Ok(value)) => FfiString::from(value.to_string()),
+        Ok(Err(error)) => FfiString::from(format!("error:{error}")),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            FfiString::from(format!("error:panic|{message}"))
+        }
     }
 }
 
