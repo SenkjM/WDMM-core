@@ -748,6 +748,24 @@ impl SyncScope {
     }
 }
 
+/// Cloud layout under one sync root.
+///
+/// Every engine derives its directories from the same root, and Dart both shows
+/// these paths and hands the backup subtree back to the backup FFI. Keeping the
+/// names here only stops the two lists from drifting (Dart still advertised a
+/// `credentials.json` after the engine moved to `accounts.wdmcv`).
+pub fn layout(remote_root: &str) -> serde_json::Value {
+    let root = remote_root.trim();
+    serde_json::json!({
+        "credentials": join_path(root, wmp::ENGINE_ACCOUNTS_FILE_NAME),
+        "playlists": join_path(root, "playlists"),
+        "library": join_path(root, "library"),
+        "library_music": join_path(root, "library/music"),
+        "library_manga": join_path(root, "library/manga"),
+        "backup": join_path(root, "backup"),
+    })
+}
+
 /// Rebuild a local playlist + entries from a `WDMMPL01` document, plus the
 /// epoch seconds of the document's `updated_at` (the LWW clock).
 fn playlist_from_document(

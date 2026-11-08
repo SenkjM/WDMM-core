@@ -22,6 +22,7 @@ use wdmm_storage::{DmrPrefRow, DmrPrefsDatabase, LibraryDatabase};
 mod cache_api;
 mod dlna_session;
 pub(crate) mod ext;
+mod library_ingest;
 mod queue_api;
 mod queue_runner;
 
@@ -475,6 +476,29 @@ pub extern "C" fn wdmm_sync_run(json: *const c_char) -> FfiString {
         Ok(summary) => FfiString::from(summary.to_string()),
         Err(error) => FfiString::from(format!("error:{error}")),
     }
+}
+
+/// Cloud layout under one sync root.
+///
+/// `remote_root` is the settings → sync-and-backup root; the reply is
+/// `{"ok":true,"paths":{"credentials","playlists","library","library_music",
+/// "library_manga","backup"}}` or `"error:<message>"`. Dart must not keep its
+/// own copy of these directory names.
+///
+/// # Safety
+/// `remote_root` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_sync_layout_json(remote_root: *const c_char) -> FfiString {
+    let Some(root) = ptr_to_str(remote_root) else {
+        return FfiString::from("error:invalid remote_root");
+    };
+    let root = root.trim();
+    if root.is_empty() {
+        return FfiString::from("error:missing remote_root");
+    }
+    FfiString::from(
+        serde_json::json!({ "ok": true, "paths": wdmm_sync::layout(root) }).to_string(),
+    )
 }
 
 /// Publish one playlist to the remote right after a local edit.
@@ -3387,6 +3411,39 @@ pub extern "C" fn wdmm_library_rebuild_aggregates() -> FfiString {
 pub extern "C" fn wdmm_library_rebuild_fts() -> FfiString {
     match global_library_db().rebuild_fts_from_tracks() {
         Ok(_) => FfiString::ok(),
+        Err(e) => FfiString::from(format!("error:{e}")),
+    }
+}
+
+/// Ingest one file into the library through the Rust executor.
+///
+/// `args` is `{"account_id", "remote_path", "file_name"?, "source_name"?,
+/// "local_path"?}`: with `local_path` the tags come from the downloaded file,
+/// without it they are probed through the driver (CUE sheets included). The
+/// reply is `{"ok":true,"rows":n,"title":…,"cover":bool}` or `"error:<msg>"`.
+#[no_mangle]
+pub extern "C" fn wdmm_library_ingest(args: *const c_char) -> FfiString {
+    let Some(args) = ptr_to_str(args) else {
+        return FfiString::from("error:invalid args");
+    };
+    match library_ingest::library_ingest(args) {
+        Ok(value) => FfiString::from(value.to_string()),
+        Err(error) => FfiString::from(format!("error:{error}")),
+    }
+}
+
+/// Hand out the next library revision from the persisted Rust watermark.
+///
+/// Dart used to keep its own monotonic clock in KV (`sync_last_rev`); sync
+/// compares against the Rust watermark, so both had to advance on the same scale
+/// or a local edit could look older than a peer's. The reply is
+/// `{"ok":true,"rev":n}`.
+#[no_mangle]
+pub extern "C" fn wdmm_library_next_rev() -> FfiString {
+    match global_library_db().next_rev() {
+        Ok(rev) => FfiString::from(
+            serde_json::json!({ "ok": true, "rev": rev }).to_string(),
+        ),
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }

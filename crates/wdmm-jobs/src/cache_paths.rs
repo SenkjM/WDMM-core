@@ -196,45 +196,11 @@ pub fn sanitize_file_name(name: &str) -> String {
         .collect()
 }
 
-/// First 16 hex chars of [`music_id_for_remote`] (Dart `identityHashStem`).
-pub fn identity_hash_stem(source_name: &str, remote_path: &str) -> String {
-    music_id_for_remote(source_name, remote_path)
-        .chars()
-        .take(16)
-        .collect()
-}
-
-/// Stable offline track identity (Dart `musicIdForRemote`), lower-case hex.
-pub fn music_id_for_remote(source_name: &str, remote_path: &str) -> String {
-    let key = format!(
-        "{}\u{0}{}",
-        normalize_source_name(source_name),
-        normalize_remote_path(remote_path)
-    );
-    sha1_hex(key.as_bytes())
-}
-
-/// Dart `normalizeSourceName`: trim, collapse whitespace runs to one space.
-pub fn normalize_source_name(name: &str) -> String {
-    name.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Dart `normalizeRemotePath`: trim, `\` → `/`, leading `/`, collapse `//`.
-///
-/// An empty path becomes `/` (Dart returns `'/'` before adding the prefix).
-pub fn normalize_remote_path(path: &str) -> String {
-    let mut out = path.trim().replace('\\', "/");
-    if out.is_empty() {
-        return "/".to_string();
-    }
-    if !out.starts_with('/') {
-        out.insert(0, '/');
-    }
-    while out.contains("//") {
-        out = out.replace("//", "/");
-    }
-    out
-}
+// Identity rules live in `wdmm_core::track_identity` and nowhere else: the
+// library ids written here must equal the ones Dart and the sync engine use.
+pub use wdmm_core::track_identity::{
+    identity_hash_stem, music_id_for_remote, normalize_remote_path, normalize_source_name,
+};
 
 /// POSIX `p.basename` as used on Android (trailing slashes ignored).
 fn dart_basename(path: &str) -> String {
@@ -267,6 +233,7 @@ fn dart_string_hash(value: &str) -> u32 {
 }
 
 /// Lower-case hex SHA-1 digest.
+#[cfg(test)]
 fn sha1_hex(data: &[u8]) -> String {
     let mut state: [u32; 5] = [
         0x6745_2301,

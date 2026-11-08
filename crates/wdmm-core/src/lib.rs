@@ -9,6 +9,7 @@
 
 pub mod error;
 pub mod identity;
+pub mod track_identity;
 pub mod models;
 pub mod rev_clock;
 

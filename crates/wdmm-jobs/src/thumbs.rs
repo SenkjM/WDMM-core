@@ -22,6 +22,7 @@
 //! digest is implemented locally. The unit tests pin the output against
 //! sample strings produced by the Dart implementation.
 
+#[cfg(test)]
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -58,80 +59,12 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── identity hash ────────────────────────────────────────────────────────────
 
-/// `normalizeSourceName`: trim, then collapse every whitespace run to one
-/// ASCII space (`RegExp(r'\s+')` in Dart).
-pub fn normalize_source_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut pending_space = false;
-    for ch in name.trim().chars() {
-        if ch.is_whitespace() {
-            pending_space = !out.is_empty();
-        } else {
-            if pending_space {
-                out.push(' ');
-                pending_space = false;
-            }
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// `normalizeRemotePath`: trim, `\` → `/`, empty → `/`, ensure a leading `/`,
-/// then collapse repeated `//` until none remain.
-pub fn normalize_remote_path(path: &str) -> String {
-    let mut out = path.trim().replace('\\', "/");
-    if out.is_empty() {
-        out.push('/');
-    }
-    if !out.starts_with('/') {
-        out.insert(0, '/');
-    }
-    while out.contains("//") {
-        out = out.replace("//", "/");
-    }
-    out
-}
-
-/// `musicIdForRemote`: `sha1(normalizeSourceName(source) + "\0" +
-/// normalizeRemotePath(path))`, lower-case hex.
-pub fn music_id_for_remote(source_name: &str, remote_path: &str) -> String {
-    sha1_hex(format!(
-        "{}\u{0}{}",
-        normalize_source_name(source_name),
-        normalize_remote_path(remote_path)
-    )
-    .as_bytes())
-}
-
-/// `musicIdForCueSlice`: `sha1(source + "\0" + cuePath + "\0" + trackIndex)`.
-pub fn music_id_for_cue_slice(source_name: &str, cue_remote_path: &str, track_index: u32) -> String {
-    sha1_hex(
-        format!(
-            "{}\u{0}{}\u{0}{track_index}",
-            normalize_source_name(source_name),
-            normalize_remote_path(cue_remote_path)
-        )
-        .as_bytes(),
-    )
-}
-
-/// `cueIdFor`: `sha1("cue" + "\0" + source + "\0" + cuePath)`.
-pub fn cue_id_for(source_name: &str, cue_remote_path: &str) -> String {
-    sha1_hex(
-        format!(
-            "cue\u{0}{}\u{0}{}",
-            normalize_source_name(source_name),
-            normalize_remote_path(cue_remote_path)
-        )
-        .as_bytes(),
-    )
-}
-
-/// The 16-hex-character stem shared by the cover file and the old cache paths.
-pub fn identity_hash_stem(source_name: &str, remote_path: &str) -> String {
-    music_id_for_remote(source_name, remote_path)[..16].to_string()
-}
+// Identity rules live in wdmm_core::track_identity and nowhere else: the
+// library ids written here must equal the ones Dart and the sync engine use.
+pub use wdmm_core::track_identity::{
+    cue_id_for, identity_hash_stem, music_id_for_cue_slice, music_id_for_remote,
+    normalize_remote_path, normalize_source_name,
+};
 
 /// `cueVirtualRemotePath`: the audio path plus `#cue:<track number>`.
 pub fn cue_virtual_remote_path(audio_remote_path: &str, track_number: u32) -> String {
@@ -240,6 +173,7 @@ fn temp_thumb_path() -> PathBuf {
 /// Lower-case hex SHA-1. `wdmm-jobs` has no `sha1` dependency; this is the
 /// standard FIPS 180-1 compression function, verified against the Dart sample
 /// strings in the tests below.
+#[cfg(test)]
 fn sha1_hex(data: &[u8]) -> String {
     let mut state: [u32; 5] = [
         0x6745_2301,

@@ -35,6 +35,12 @@ struct QueueCtl {
 
 static CTL: OnceLock<QueueCtl> = OnceLock::new();
 
+/// Filesystem anchors the queue wired, for the other FFI modules that build a
+/// [`wdmm_jobs::JobCtx`] outside the scheduler (manual library ingest).
+pub(crate) fn ctl_paths() -> Option<JobPaths> {
+    CTL.get().map(|ctl| ctl.paths.clone())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn handle() -> Result<QueueHandle, String> {
