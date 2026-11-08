@@ -1887,6 +1887,39 @@ impl LibraryDatabase {
             )?;
         }
 
+        if current_ver < 21 {
+            // Playlist entries need two display fields and, more importantly, a
+            // tombstone of their own (v21). A whole-playlist tombstone cannot
+            // express "this album was split across playlists and one track was
+            // removed"; without per-entry tombstones a peer that still has the
+            // entry republishes it on the next sync.
+            conn.execute_batch("BEGIN;")?;
+            // `ALTER TABLE ... ADD COLUMN` has no `IF NOT EXISTS`; ignore
+            // "duplicate column name" so a half-migrated DB converges.
+            for statement in [
+                "ALTER TABLE playlist_entries ADD COLUMN cue_track_index INTEGER;",
+                "ALTER TABLE playlist_entries ADD COLUMN remote_missing INTEGER NOT NULL DEFAULT 0;",
+            ] {
+                if let Err(error) = conn.execute_batch(statement) {
+                    if !error.to_string().contains("duplicate column name") {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        return Err(StorageError::from(error));
+                    }
+                }
+            }
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS deleted_playlist_entries (
+                     playlist_id    TEXT NOT NULL,
+                     entry_identity TEXT NOT NULL,
+                     deleted_at     TEXT NOT NULL,
+                     pushed         INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (playlist_id, entry_identity)
+                 );
+                 INSERT OR IGNORE INTO _schema_version (version) VALUES (21);
+                 COMMIT;",
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -2669,9 +2702,15 @@ impl LibraryDatabase {
     pub fn upsert_playlist(&self, playlist: &Playlist) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
+        // Keep the entry rows: `set_playlist_entries` diffs them to record
+        // per-entry tombstones, and an INSERT OR REPLACE would cascade the old
+        // rows away first (a removal would then look like a fresh playlist).
         tx.execute(
-            "INSERT OR REPLACE INTO playlists (id, name, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO playlists (id, name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 updated_at = excluded.updated_at",
             params![
                 &playlist.id,
                 &playlist.name,
@@ -2742,8 +2781,13 @@ impl LibraryDatabase {
                  VALUES (?1, ?2, 0)",
                 params![id, now_iso8601()],
             )?;
-            // ON DELETE CASCADE removes the entries.
+            // ON DELETE CASCADE removes the entries; the whole-playlist
+            // tombstone supersedes any per-entry ones.
             tx.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM deleted_playlist_entries WHERE playlist_id = ?1",
+                params![id],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -2756,6 +2800,10 @@ impl LibraryDatabase {
     pub fn delete_playlist_quietly(&self, id: &str) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM deleted_playlist_entries WHERE playlist_id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -2813,13 +2861,70 @@ impl LibraryDatabase {
     }
 
     /// Replace all entries for a playlist in one shot.
+    ///
+    /// Entries that disappear are recorded in `deleted_playlist_entries` so the
+    /// next sync can publish the removal; an identity that shows up again clears
+    /// its tombstone (it is no longer deleted). The sync engine's adopt path
+    /// calls [`Self::replace_playlist_entries_quietly`] instead: applying a
+    /// peer's document must not look like a local edit.
     pub fn set_playlist_entries(
         &self,
         playlist_id: &str,
         entries: &[PlaylistEntry],
     ) -> StorageResult<()> {
+        self.replace_playlist_entries(playlist_id, entries, true)
+    }
+
+    /// Replace entries without recording or clearing entry tombstones.
+    pub fn replace_playlist_entries_quietly(
+        &self,
+        playlist_id: &str,
+        entries: &[PlaylistEntry],
+    ) -> StorageResult<()> {
+        self.replace_playlist_entries(playlist_id, entries, false)
+    }
+
+    fn replace_playlist_entries(
+        &self,
+        playlist_id: &str,
+        entries: &[PlaylistEntry],
+        record_tombstones: bool,
+    ) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
+        let previous: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT music_id FROM playlist_entries WHERE playlist_id = ?1")?;
+            let rows = stmt.query_map(params![playlist_id], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+        let next: Vec<String> = entries.iter().map(|e| e.music_id.clone()).collect();
+        if record_tombstones {
+            let deleted_at = now_iso8601();
+            for identity in &previous {
+                if !next.contains(identity) {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO deleted_playlist_entries
+                         (playlist_id, entry_identity, deleted_at, pushed)
+                         VALUES (?1, ?2, ?3, 0)",
+                        params![playlist_id, identity, &deleted_at],
+                    )?;
+                }
+            }
+            for identity in &next {
+                if !previous.contains(identity) {
+                    tx.execute(
+                        "DELETE FROM deleted_playlist_entries
+                         WHERE playlist_id = ?1 AND entry_identity = ?2",
+                        params![playlist_id, identity],
+                    )?;
+                }
+            }
+        }
         tx.execute(
             "DELETE FROM playlist_entries WHERE playlist_id = ?1",
             params![playlist_id],
@@ -2827,8 +2932,9 @@ impl LibraryDatabase {
         for e in entries {
             tx.execute(
                 "INSERT INTO playlist_entries
-                 (playlist_id, position, music_id, source_name, remote_path, title, duration_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (playlist_id, position, music_id, source_name, remote_path, title,
+                  duration_ms, cue_track_index, remote_missing)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     playlist_id,
                     e.position,
@@ -2837,6 +2943,8 @@ impl LibraryDatabase {
                     &e.remote_path,
                     &e.title,
                     e.duration_ms,
+                    e.cue_track_index,
+                    i64::from(e.remote_missing),
                 ],
             )?;
         }
@@ -2847,7 +2955,8 @@ impl LibraryDatabase {
     pub fn list_playlist_entries(&self, playlist_id: &str) -> StorageResult<Vec<PlaylistEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT playlist_id, position, music_id, source_name, remote_path, title, duration_ms
+            "SELECT playlist_id, position, music_id, source_name, remote_path, title,
+                    duration_ms, cue_track_index, remote_missing
              FROM playlist_entries WHERE playlist_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![playlist_id], |row| {
@@ -2859,6 +2968,8 @@ impl LibraryDatabase {
                 remote_path: row.get(4)?,
                 title: row.get(5)?,
                 duration_ms: row.get(6)?,
+                cue_track_index: row.get(7)?,
+                remote_missing: row.get::<_, i64>(8)? != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -2866,6 +2977,97 @@ impl LibraryDatabase {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // ── Playlist entry tombstones (v21) ──────────────────────────────────────
+
+    /// Every recorded entry deletion: `(playlist_id, music_id, deleted_at, pushed)`.
+    pub fn list_deleted_playlist_entries(
+        &self,
+    ) -> StorageResult<Vec<(String, String, String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT playlist_id, entry_identity, deleted_at, pushed
+             FROM deleted_playlist_entries ORDER BY deleted_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Entry deletions that still have to reach the remote packs.
+    pub fn list_unpushed_deleted_playlist_entries(
+        &self,
+    ) -> StorageResult<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT playlist_id, entry_identity, deleted_at
+             FROM deleted_playlist_entries WHERE pushed = 0 ORDER BY deleted_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_deleted_playlist_entries_pushed(
+        &self,
+        keys: &[(String, String)],
+    ) -> StorageResult<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for (playlist_id, identity) in keys {
+            tx.execute(
+                "UPDATE deleted_playlist_entries SET pushed = 1
+                 WHERE playlist_id = ?1 AND entry_identity = ?2",
+                params![playlist_id, identity],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop published entry tombstones older than `cutoff` (RFC-3339).
+    pub fn purge_deleted_playlist_entries_before(&self, cutoff: &str) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM deleted_playlist_entries WHERE pushed = 1 AND deleted_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(removed)
+    }
+
+    /// Forget every whole-playlist tombstone (compaction).
+    pub fn clear_deleted_playlists(&self) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM deleted_playlists", [])?)
+    }
+
+    /// Forget every entry tombstone (compaction).
+    pub fn clear_deleted_playlist_entries(&self) -> StorageResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM deleted_playlist_entries", [])?)
     }
 
     // ── KV store (Round 4: OpenAPI token persistence; extensible for settings) ─
@@ -3784,6 +3986,8 @@ impl LibraryDatabase {
                         remote_path: row.get::<_, String>(4).unwrap_or_default(),
                         title: row.get::<_, String>(5).unwrap_or_default(),
                         duration_ms: row.get::<_, i64>(6).unwrap_or(0),
+                        cue_track_index: None,
+                        remote_missing: false,
                     })
                 })
                 .map_err(|e| StorageError::Database(format!("playlist_entries query: {e}")))?;
@@ -5458,6 +5662,12 @@ pub struct PlaylistEntry {
     pub title: String,
     /// Duration in milliseconds (0 if unknown).
     pub duration_ms: i64,
+    /// CUE slice number when this entry came from a cue sheet (v21).
+    #[serde(default)]
+    pub cue_track_index: Option<i64>,
+    /// True once the remote source no longer holds this file (v21).
+    #[serde(default)]
+    pub remote_missing: bool,
 }
 
 // ── User folder models (schema v3) ─────────────────────────────────────────
@@ -5958,7 +6168,7 @@ mod tests {
     #[test]
     fn schema_v4() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
     }
 
     #[test]
@@ -6615,6 +6825,8 @@ mod tests {
                 remote_path: "/music/a.mp3".into(),
                 title: "Track A".into(),
                 duration_ms: 180_000,
+                cue_track_index: None,
+                remote_missing: false,
             },
             PlaylistEntry {
                 playlist_id: "pl-1".into(),
@@ -6624,6 +6836,8 @@ mod tests {
                 remote_path: "/music/b.mp3".into(),
                 title: "Track B".into(),
                 duration_ms: 240_000,
+                cue_track_index: None,
+                remote_missing: false,
             },
         ];
         db.set_playlist_entries("pl-1", &entries).unwrap();
@@ -7568,7 +7782,7 @@ mod tests {
     #[test]
     fn schema_v6() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
 
         let conn = db.conn.lock().unwrap();
         let exists = |name: &str| -> bool {
@@ -8101,7 +8315,7 @@ mod tests {
     #[test]
     fn schema_v7_aggregation() {
         let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
 
         // Upsert track with album + album_artist
         db.upsert_track(&LibraryTrack {
@@ -8546,7 +8760,7 @@ mod tests {
 
         // Open through LibraryDatabase — triggers v10 migration.
         let db = LibraryDatabase::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 20, "schema must reach v20");
+        assert_eq!(db.schema_version().unwrap(), 21, "schema must reach v21");
 
         let mangas = db.list_mangas().unwrap();
         let find = |id: &str| mangas.iter().find(|m| m.id == id).expect("manga not found");
@@ -8832,7 +9046,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
 
         let all = db.list_transcode_presets().unwrap();
         assert_eq!(
@@ -8981,7 +9195,7 @@ mod tests {
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -9119,7 +9333,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -9237,7 +9451,7 @@ mod tests {
             );
         }
 
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
 
         let all = db.list_transcode_presets().unwrap();
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
@@ -9526,7 +9740,7 @@ mod v17_queue_cache_tests {
         }
 
         let db = LibraryDatabase::open(&path).expect("open db and migrate");
-        assert_eq!(db.schema_version().unwrap(), 20);
+        assert_eq!(db.schema_version().unwrap(), 21);
 
         {
             let conn = db.conn.lock().unwrap();
@@ -9797,5 +10011,114 @@ mod rev_clock_tests {
             700,
             "upsert must not clear synced_rev"
         );
+    }
+
+    #[test]
+    fn playlist_entries_keep_cue_and_missing_flags() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = ts_to_dt(1_700_000_000).unwrap();
+        db.upsert_playlist(&Playlist {
+            id: "pl-1".into(),
+            name: "Cue album".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+        db.set_playlist_entries(
+            "pl-1",
+            &[PlaylistEntry {
+                playlist_id: "pl-1".into(),
+                position: 0,
+                music_id: "aa".repeat(20),
+                source_name: "nas".into(),
+                remote_path: "/music/album.flac#cue:3".into(),
+                title: "Track 3".into(),
+                duration_ms: 1234,
+                cue_track_index: Some(3),
+                remote_missing: true,
+            }],
+        )
+        .unwrap();
+        let entries = db.list_playlist_entries("pl-1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cue_track_index, Some(3));
+        assert!(entries[0].remote_missing);
+    }
+
+    #[test]
+    fn dropping_an_entry_records_a_tombstone_and_readding_clears_it() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = ts_to_dt(1_700_000_000).unwrap();
+        db.upsert_playlist(&Playlist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+        let entry = |position: i64, music_id: &str| PlaylistEntry {
+            playlist_id: "pl-1".into(),
+            position,
+            music_id: music_id.into(),
+            source_name: "nas".into(),
+            remote_path: format!("/music/{music_id}.mp3"),
+            title: music_id.into(),
+            duration_ms: 1000,
+            cue_track_index: None,
+            remote_missing: false,
+        };
+        db.set_playlist_entries("pl-1", &[entry(0, "aa"), entry(1, "bb")])
+            .unwrap();
+        assert!(db.list_deleted_playlist_entries().unwrap().is_empty());
+
+        // Removing "bb" is a local deletion: it must be remembered.
+        db.set_playlist_entries("pl-1", &[entry(0, "aa")]).unwrap();
+        let tombstones = db.list_unpushed_deleted_playlist_entries().unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].0, "pl-1");
+        assert_eq!(tombstones[0].1, "bb");
+
+        // A quiet replace (peer adopt) writes rows but records nothing.
+        db.replace_playlist_entries_quietly("pl-1", &[entry(0, "aa")])
+            .unwrap();
+        assert_eq!(db.list_deleted_playlist_entries().unwrap().len(), 1);
+
+        // Bringing "bb" back cancels its tombstone.
+        db.set_playlist_entries("pl-1", &[entry(0, "aa"), entry(1, "bb")])
+            .unwrap();
+        assert!(db.list_deleted_playlist_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_playlist_drops_its_entry_tombstones() {
+        let db = LibraryDatabase::open(std::path::Path::new(":memory:")).unwrap();
+        let now = ts_to_dt(1_700_000_000).unwrap();
+        db.upsert_playlist(&Playlist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+        db.set_playlist_entries(
+            "pl-1",
+            &[PlaylistEntry {
+                playlist_id: "pl-1".into(),
+                position: 0,
+                music_id: "aa".repeat(20),
+                source_name: "nas".into(),
+                remote_path: "/music/a.mp3".into(),
+                title: "A".into(),
+                duration_ms: 1,
+                cue_track_index: None,
+                remote_missing: false,
+            }],
+        )
+        .unwrap();
+        db.set_playlist_entries("pl-1", &[]).unwrap();
+        assert_eq!(db.list_deleted_playlist_entries().unwrap().len(), 1);
+        db.delete_playlist("pl-1").unwrap();
+        assert!(db.list_deleted_playlist_entries().unwrap().is_empty());
+        assert_eq!(db.list_deleted_playlists().unwrap().len(), 1);
     }
 }

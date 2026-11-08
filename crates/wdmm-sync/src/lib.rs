@@ -107,6 +107,18 @@ pub enum SyncAction {
     Conflict,
 }
 
+impl SyncAction {
+    /// Wire name used by FFI summaries and per-playlist publish replies.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SyncAction::NoChange => "no_change",
+            SyncAction::Pushed => "pushed",
+            SyncAction::Pulled => "pulled",
+            SyncAction::Conflict => "conflict",
+        }
+    }
+}
+
 /// Sync engine trait — one impl per sync kind (credentials / playlists / library).
 #[async_trait]
 pub trait SyncEngine: Send + Sync {
@@ -556,13 +568,85 @@ impl SyncEngine for CredentialSyncEngine {
 
 // ── Playlist Sync ─────────────────────────────────────────────────────────────
 
+/// Per-entry deletion clocks: `identity -> (epoch seconds, RFC-3339)`.
+type EntryTombstones = HashMap<String, (i64, String)>;
+
+/// Merge two entry-tombstone maps, keeping the newest deletion per identity.
+fn merge_entry_tombstones(local: &EntryTombstones, remote: &EntryTombstones) -> EntryTombstones {
+    let mut out = local.clone();
+    for (identity, (epoch, at)) in remote {
+        match out.get(identity) {
+            Some((known, _)) if known >= epoch => {}
+            _ => {
+                out.insert(identity.clone(), (*epoch, at.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Drop the entries a tombstone retires and stamp the playlist's edit clock.
+///
+/// A deletion is an edit: when anything disappears the document's `updated_at`
+/// moves to the newest tombstone, otherwise the next last-write-wins round would
+/// hand the playlist back to a peer whose document is merely "older but complete".
+fn apply_entry_tombstones(
+    mut playlist: Playlist,
+    entries: Vec<PlaylistEntry>,
+    tombstones: &EntryTombstones,
+) -> (Playlist, Vec<PlaylistEntry>, bool) {
+    if tombstones.is_empty() {
+        return (playlist, entries, false);
+    }
+    let before = entries.len();
+    let document_epoch = playlist.updated_at.timestamp();
+    let mut newest_applied: Option<i64> = None;
+    let kept: Vec<PlaylistEntry> = entries
+        .into_iter()
+        .filter(|entry| match tombstones.get(&entry.music_id) {
+            // A deletion only trims a document it is at least as new as: a
+            // document edited after the deletion re-adds the entry on purpose.
+            Some((epoch, _)) if *epoch >= document_epoch => {
+                newest_applied = Some(newest_applied.map_or(*epoch, |old| old.max(*epoch)));
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    if kept.len() == before {
+        return (playlist, kept, false);
+    }
+    if let Some(newest) = newest_applied {
+        if newest > document_epoch {
+            playlist.updated_at = chrono::DateTime::from_timestamp(newest, 0).unwrap_or(playlist.updated_at);
+        }
+    }
+    (playlist, kept, true)
+}
+
+/// Cover stem for one playlist entry, mirroring Android's `MusicIdHelper`.
+///
+/// Cue-derived entries carry a virtual `<audio>#cue:<n>` path; the cover lives
+/// under the backing audio file, exactly like the app's playlist codec.
+fn entry_cover_stem(entry: &PlaylistEntry) -> String {
+    let remote = match entry.remote_path.find("#cue:") {
+        Some(index) => &entry.remote_path[..index],
+        None => entry.remote_path.as_str(),
+    };
+    music_cover_stem(&entry.source_name, remote)
+}
+
 /// Map a local playlist + its entries onto a `WDMMPL01` document.
 ///
-/// The engine mirror does not carry covers or cue indexes (the app's playlist
-/// mirror does); playlist identity and last-write-wins clock travel inside the
-/// document, so file names never matter for correctness.
-fn playlist_to_document(pl: &Playlist, entries: &[PlaylistEntry]) -> wmp::PlaylistDocument {
-    wmp::PlaylistDocument {
+/// `cover_roots` (when the run was asked to carry covers) embeds the locally
+/// cached playlist artwork: one blob per distinct image, `cover_index` pointing
+/// into it. Cue numbers and the "remote missing" flag travel as tags 6 / 8.
+fn playlist_to_document(
+    pl: &Playlist,
+    entries: &[PlaylistEntry],
+    cover_roots: Option<&CoverRoots>,
+) -> wmp::PlaylistDocument {
+    let mut document = wmp::PlaylistDocument {
         id: pl.id.clone(),
         name: pl.name.clone(),
         created_at: wmp::iso8601_from_epoch(pl.created_at.timestamp()),
@@ -576,12 +660,91 @@ fn playlist_to_document(pl: &Playlist, entries: &[PlaylistEntry]) -> wmp::Playli
                 remote_path: entry.remote_path.clone(),
                 title: entry.title.clone(),
                 duration_ms: Some(entry.duration_ms),
-                cue_track_index: None,
+                cue_track_index: entry.cue_track_index,
                 cover_index: None,
-                remote_missing: false,
+                remote_missing: entry.remote_missing,
             })
             .collect(),
         covers: Vec::new(),
+    };
+    let Some(roots) = cover_roots else {
+        return document;
+    };
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let stem = entry_cover_stem(entry);
+        let Ok(bytes) = std::fs::read(roots.music_covers_dir.join(&stem)) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let cover_index = match blobs.iter().position(|blob| *blob == bytes) {
+            Some(known) => known,
+            None => {
+                blobs.push(bytes);
+                blobs.len() - 1
+            }
+        };
+        if let Some(slot) = document.entries.get_mut(index) {
+            slot.cover_index = Some(cover_index as i64);
+        }
+    }
+    document.covers = blobs
+        .into_iter()
+        .map(|bytes| wmp::PlaylistCoverDoc {
+            kind: detect_image_kind(&bytes),
+            bytes,
+        })
+        .collect();
+    document
+}
+
+/// Whether two documents say the same thing (ignoring file names and device ids).
+///
+/// Used to skip a PUT when the winner already matches what the remote holds;
+/// the comparison mirrors the app's old planner: name, clock, then the identity
+/// and display fields of every entry.
+fn document_matches(local: &wmp::PlaylistDocument, remote: &wmp::PlaylistDocument) -> bool {
+    local.name == remote.name
+        && local.updated_at == remote.updated_at
+        && local.entries.len() == remote.entries.len()
+        && local
+            .entries
+            .iter()
+            .zip(&remote.entries)
+            .all(|(a, b)| {
+                a.music_id == b.music_id
+                    && a.title == b.title
+                    && a.duration_ms == b.duration_ms
+                    && a.cue_track_index == b.cue_track_index
+                    && a.remote_missing == b.remote_missing
+            })
+}
+
+/// Which parts of a snapshot an aggregate run walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncScope {
+    /// Credentials + sharded library + playlists.
+    All,
+    /// Playlists only (the sync screen's dedicated button, and every publish).
+    Playlists,
+}
+
+impl SyncScope {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "playlists" => Some(Self::Playlists),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Playlists => "playlists",
+        }
     }
 }
 
@@ -606,6 +769,8 @@ fn playlist_from_document(
             remote_path: entry.remote_path.clone(),
             title: entry.title.clone(),
             duration_ms: entry.duration_ms.unwrap_or(0),
+            cue_track_index: entry.cue_track_index,
+            remote_missing: entry.remote_missing,
         })
         .collect();
     let playlist = Playlist {
@@ -622,15 +787,17 @@ fn playlist_from_document(
 
 /// Playlist sync engine — syncs playlist definitions to/from remote storage.
 ///
-/// The engine mirror speaks the app's playlist container: one `WDMMPL01`
-/// document per playlist at `{remote_dir}/playlists/{id}.wdmp`. Tombstones /
-/// deletion packs (`WDMMPD01`) are produced by the app document lane
-/// (`wdmm_playlist_encode`) and are skipped here; the mirror is identity-based
-/// and keyed by id, so it never orphans a renamed playlist.
+/// The engine speaks the same `WDMMPL01` / `WDMMPD01` containers the app does:
+/// one document per playlist at `{remote_dir}/playlists/{id}.wdmp` plus one
+/// deletion pack per playlist while its tombstones are pending. Documents carry
+/// covers, cue slice numbers and the missing flag; packs carry both the
+/// whole-playlist tombstone (empty identity) and per-entry tombstones. Files are
+/// named after playlist ids, so a renamed playlist never orphans its remote copy.
 pub struct PlaylistSyncEngine {
     db: Arc<LibraryDatabase>,
     driver: Arc<dyn WdmmVfs>,
     remote_dir: String,
+    cover_roots: Option<CoverRoots>,
 }
 
 impl PlaylistSyncEngine {
@@ -643,7 +810,14 @@ impl PlaylistSyncEngine {
             db,
             driver,
             remote_dir: remote_dir.into(),
+            cover_roots: None,
         }
+    }
+
+    /// Embed locally cached playlist covers in documents this engine publishes.
+    pub fn with_covers(mut self, cover_roots: Option<CoverRoots>) -> Self {
+        self.cover_roots = cover_roots;
+        self
     }
 
     fn playlists_dir(&self) -> String {
@@ -662,18 +836,29 @@ impl PlaylistSyncEngine {
     }
 
     /// Adopt a remote document locally and return its revision.
+    ///
+    /// Quiet apply: adopting a peer's document is not a local edit, so it must
+    /// not record entry tombstones or clear pending ones.
     async fn adopt(&self, document: &wmp::PlaylistDocument) -> SyncResult<i64> {
         let (pulled, entries, epoch) = playlist_from_document(document.clone());
         self.db.upsert_playlist(&pulled)?;
-        self.db.set_playlist_entries(&pulled.id, &entries)?;
+        self.db.replace_playlist_entries_quietly(&pulled.id, &entries)?;
         Ok(epoch)
     }
 
+    /// Remote documents plus the file names each one was read from.
+    ///
+    /// A peer may have published under a non-canonical name (older app builds);
+    /// keeping the names lets a push clean those stale files up.
     async fn remote_documents(
         &self,
         files: &[String],
-    ) -> SyncResult<HashMap<String, wmp::PlaylistDocument>> {
-        let mut documents = HashMap::new();
+    ) -> SyncResult<(
+        HashMap<String, wmp::PlaylistDocument>,
+        HashMap<String, Vec<String>>,
+    )> {
+        let mut documents: HashMap<String, wmp::PlaylistDocument> = HashMap::new();
+        let mut names: HashMap<String, Vec<String>> = HashMap::new();
         for name in files {
             if !wmp::looks_like_playlist_document(name) {
                 continue;
@@ -684,6 +869,10 @@ impl PlaylistSyncEngine {
             };
             match wmp::PlaylistDocument::decode(&bytes) {
                 Ok(document) => {
+                    names
+                        .entry(document.id.clone())
+                        .or_default()
+                        .push(name.clone());
                     documents.insert(document.id.clone(), document);
                 }
                 Err(error) => {
@@ -691,18 +880,20 @@ impl PlaylistSyncEngine {
                 }
             }
         }
-        Ok(documents)
+        Ok((documents, names))
     }
 
-    /// Deletion packs on the remote, as `id -> deletion epoch seconds`.
+    /// Remote deletion packs.
     ///
-    /// A pack without a whole-playlist record (entry-only deletes) says nothing
-    /// about the playlist itself and is ignored here.
+    /// Returns `(whole-playlist tombstones by id, per-entry tombstones by id)`.
+    /// An empty `entry_identity` record deletes the playlist itself; the others
+    /// delete one entry.
     async fn remote_deletions(
         &self,
         files: &[String],
-    ) -> SyncResult<HashMap<String, i64>> {
-        let mut deletions: HashMap<String, i64> = HashMap::new();
+    ) -> SyncResult<(HashMap<String, i64>, HashMap<String, EntryTombstones>)> {
+        let mut whole: HashMap<String, i64> = HashMap::new();
+        let mut entries: HashMap<String, EntryTombstones> = HashMap::new();
         for name in files {
             if !wmp::looks_like_playlist_deletion(name) {
                 continue;
@@ -711,49 +902,191 @@ impl PlaylistSyncEngine {
             let Some(bytes) = driver_read(&self.driver, &path).await? else {
                 continue;
             };
-            match wmp::PlaylistDeletionDocument::decode(&bytes) {
-                Ok(document) => {
-                    let newest = document
-                        .records
-                        .iter()
-                        .filter(|record| record.entry_identity.is_empty())
-                        .filter_map(|record| wmp::epoch_from_iso8601(&record.deleted_at))
-                        .max();
-                    if let Some(epoch) = newest {
-                        let slot = deletions.entry(document.playlist_id.clone()).or_insert(epoch);
-                        if epoch > *slot {
-                            *slot = epoch;
+            let document = match wmp::PlaylistDeletionDocument::decode(&bytes) {
+                Ok(document) => document,
+                Err(error) => {
+                    tracing::debug!("skip unreadable playlist deletion pack {name}: {error}");
+                    continue;
+                }
+            };
+            for record in document.records {
+                let Some(epoch) = wmp::epoch_from_iso8601(&record.deleted_at) else {
+                    continue;
+                };
+                if record.entry_identity.is_empty() {
+                    let slot = whole
+                        .entry(document.playlist_id.clone())
+                        .or_insert(epoch);
+                    if epoch > *slot {
+                        *slot = epoch;
+                    }
+                } else {
+                    let slot = entries
+                        .entry(document.playlist_id.clone())
+                        .or_default();
+                    match slot.get(&record.entry_identity) {
+                        Some((known, _)) if *known >= epoch => {}
+                        _ => {
+                            slot.insert(record.entry_identity.clone(), (epoch, record.deleted_at));
                         }
                     }
                 }
-                Err(error) => {
-                    tracing::debug!("skip unreadable playlist deletion pack {name}: {error}")
-                }
             }
         }
-        Ok(deletions)
+        Ok((whole, entries))
     }
 
     async fn push_one(&self, pl: &Playlist, entries: &[PlaylistEntry]) -> SyncResult<()> {
         driver_ensure_dir(&self.driver, &self.playlists_dir()).await?;
-        let document = playlist_to_document(pl, entries);
+        let document = playlist_to_document(pl, entries, self.cover_roots.as_ref());
         driver_write(&self.driver, &self.file_path(&pl.id), &document.encode()).await
     }
 
-    /// Publish a `WDMMPD01` pack so the deletion outlives the playlist file.
-    async fn push_deletion(&self, id: &str, deleted_at: &str) -> SyncResult<()> {
+    /// Publish a `WDMMPD01` pack so deletions outlive the documents they touch.
+    ///
+    /// `records` carry entry identities; the whole-playlist record is added when
+    /// `deleted_at` is also the playlist's own tombstone (`whole`).
+    async fn push_deletion(
+        &self,
+        id: &str,
+        deleted_at: &str,
+        whole: bool,
+        records: &[(String, String)],
+    ) -> SyncResult<()> {
         driver_ensure_dir(&self.driver, &self.playlists_dir()).await?;
+        let mut rows: Vec<wmp::PlaylistDeletionRecordDoc> = Vec::new();
+        if whole {
+            rows.push(wmp::PlaylistDeletionRecordDoc {
+                entry_identity: String::new(),
+                deleted_at: deleted_at.to_string(),
+            });
+        }
+        for (identity, at) in records {
+            rows.push(wmp::PlaylistDeletionRecordDoc {
+                entry_identity: identity.clone(),
+                deleted_at: at.clone(),
+            });
+        }
         let document = wmp::PlaylistDeletionDocument {
             playlist_id: id.to_string(),
             device_id: String::new(),
             created_at: deleted_at.to_string(),
             updated_at: deleted_at.to_string(),
-            records: vec![wmp::PlaylistDeletionRecordDoc {
-                entry_identity: String::new(),
-                deleted_at: deleted_at.to_string(),
-            }],
+            records: rows,
         };
         driver_write(&self.driver, &self.deletion_path(id), &document.encode()).await
+    }
+
+    /// Delete remote files by name inside the playlists directory.
+    async fn remove_remote(&self, names: &[String]) -> SyncResult<()> {
+        for name in names {
+            let path = join_path(&self.playlists_dir(), name);
+            match self.driver.remove(&path).await {
+                Ok(()) | Err(DriverError::NotFound(_)) => {}
+                Err(error) => return Err(SyncError::from(error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish one playlist right after a local edit.
+    ///
+    /// The app edits a playlist and expects the change on the remote without a
+    /// full sync round trip. A row that no longer exists publishes its
+    /// whole-playlist tombstone instead, together with any pending entry
+    /// tombstones it left behind.
+    pub async fn publish(&self, playlist_id: &str) -> SyncResult<Option<SyncOutcome>> {
+        let Some(playlist) = self.db.get_playlist(playlist_id)? else {
+            let Some((_, deleted_at)) = self
+                .db
+                .list_unpushed_deleted_playlists()?
+                .into_iter()
+                .find(|(id, _)| id == playlist_id)
+            else {
+                return Ok(None);
+            };
+            let pending = self.pending_entry_tombstones(playlist_id)?;
+            self.push_deletion(playlist_id, &deleted_at, true, &pending)
+                .await?;
+            self.mark_entry_tombstones_pushed(playlist_id, &pending)?;
+            self.db
+                .mark_deleted_playlists_pushed(&[playlist_id.to_string()])?;
+            let epoch = wmp::epoch_from_iso8601(&deleted_at).unwrap_or(0);
+            return Ok(Some(SyncOutcome {
+                entity_id: playlist_id.to_string(),
+                action: SyncAction::Pushed,
+                rev: RevClock::new(epoch.max(1) as u64),
+            }));
+        };
+        let entries = self.db.list_playlist_entries(playlist_id)?;
+        self.push_one(&playlist, &entries).await?;
+        let pending = self.pending_entry_tombstones(playlist_id)?;
+        self.publish_pack(playlist_id, &pending).await?;
+        Ok(Some(SyncOutcome {
+            entity_id: playlist_id.to_string(),
+            action: SyncAction::Pushed,
+            rev: RevClock::new(playlist.updated_at.timestamp().max(1) as u64),
+        }))
+    }
+
+    /// Unpublished entry tombstones of one playlist, as `(identity, deleted_at)`.
+    fn pending_entry_tombstones(&self, playlist_id: &str) -> SyncResult<Vec<(String, String)>> {
+        let mut pending: Vec<(String, String)> = self
+            .db
+            .list_unpushed_deleted_playlist_entries()?
+            .into_iter()
+            .filter(|(id, _, _)| id == playlist_id)
+            .map(|(_, identity, at)| (identity, at))
+            .collect();
+        pending.sort();
+        Ok(pending)
+    }
+
+    fn mark_entry_tombstones_pushed(
+        &self,
+        playlist_id: &str,
+        pending: &[(String, String)],
+    ) -> SyncResult<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<(String, String)> = pending
+            .iter()
+            .map(|(identity, _)| (playlist_id.to_string(), identity.clone()))
+            .collect();
+        self.db.mark_deleted_playlist_entries_pushed(&keys)?;
+        Ok(())
+    }
+
+    /// Write the entry-tombstone pack of one playlist and mark it published.
+    async fn publish_pack(
+        &self,
+        playlist_id: &str,
+        pending: &[(String, String)],
+    ) -> SyncResult<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let deleted_at = pending
+            .iter()
+            .map(|(_, at)| at.clone())
+            .max()
+            .unwrap_or_else(wmp::now_iso8601);
+        self.push_deletion(playlist_id, &deleted_at, false, pending)
+            .await?;
+        self.mark_entry_tombstones_pushed(playlist_id, pending)?;
+        Ok(())
+    }
+
+    /// Remove every playlist deletion pack from the remote (compaction).
+    pub async fn delete_deletion_packs(&self) -> SyncResult<usize> {
+        let files = driver_list_files(&self.driver, &self.playlists_dir()).await?;
+        let packs: Vec<String> = files
+            .into_iter()
+            .filter(|name| wmp::looks_like_playlist_deletion(name))
+            .collect();
+        self.remove_remote(&packs).await?;
+        Ok(packs.len())
     }
 }
 
@@ -764,161 +1097,284 @@ const PLAYLIST_TOMBSTONE_TTL_SECS: i64 = 180 * 24 * 60 * 60;
 #[async_trait]
 impl SyncEngine for PlaylistSyncEngine {
     async fn sync_incremental(&self) -> SyncResult<Vec<SyncOutcome>> {
-        let local = self.db.list_playlists()?;
-        let local_by_id: HashMap<String, Playlist> =
-            local.iter().map(|p| (p.id.clone(), p.clone())).collect();
-        let local_deletions: HashMap<String, i64> = self
+        let local_by_id: HashMap<String, Playlist> = self
             .db
-            .list_deleted_playlists()?
+            .list_playlists()?
             .into_iter()
-            .filter_map(|(id, at)| wmp::epoch_from_iso8601(&at).map(|epoch| (id, epoch)))
+            .map(|playlist| (playlist.id.clone(), playlist))
             .collect();
-        let local_deletion_times: HashMap<String, String> = self
+        let local_whole_at: HashMap<String, String> = self
             .db
             .list_deleted_playlists()?
             .into_iter()
             .collect();
-        let unpushed: HashSet<String> = self
+        let local_whole_epoch: HashMap<String, i64> = local_whole_at
+            .iter()
+            .filter_map(|(id, at)| wmp::epoch_from_iso8601(at).map(|epoch| (id.clone(), epoch)))
+            .collect();
+        let unpushed_whole: HashSet<String> = self
             .db
             .list_unpushed_deleted_playlists()?
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        let mut local_entry: HashMap<String, EntryTombstones> = HashMap::new();
+        for (playlist_id, identity, deleted_at, _pushed) in
+            self.db.list_deleted_playlist_entries()?
+        {
+            if let Some(epoch) = wmp::epoch_from_iso8601(&deleted_at) {
+                local_entry
+                    .entry(playlist_id)
+                    .or_default()
+                    .insert(identity, (epoch, deleted_at));
+            }
+        }
+        let unpushed_entries: HashSet<(String, String)> = self
+            .db
+            .list_unpushed_deleted_playlist_entries()?
+            .into_iter()
+            .map(|(playlist_id, identity, _)| (playlist_id, identity))
+            .collect();
 
         let files = driver_list_files(&self.driver, &self.playlists_dir()).await?;
-        let remote_docs = self.remote_documents(&files).await?;
-        let remote_deletions = self.remote_deletions(&files).await?;
+        let (remote_docs, remote_names) = self.remote_documents(&files).await?;
+        let (remote_whole, remote_entry) = self.remote_deletions(&files).await?;
 
         let mut ids: Vec<String> = local_by_id
             .keys()
             .cloned()
             .chain(remote_docs.keys().cloned())
-            .chain(local_deletions.keys().cloned())
-            .chain(remote_deletions.keys().cloned())
+            .chain(local_whole_epoch.keys().cloned())
+            .chain(remote_whole.keys().cloned())
             .collect();
         ids.sort_unstable();
         ids.dedup();
 
         let mut outcomes = Vec::new();
-        // A live row beats its own leftover tombstone; such tombstones get
-        // marked published so they cannot delete the row again next run.
-        let mut superseded: Vec<String> = Vec::new();
-        let mut published: Vec<String> = Vec::new();
+        let mut mark_whole_pushed: Vec<String> = Vec::new();
+        let mut mark_entry_pushed: Vec<(String, String)> = Vec::new();
+        let mut remove_paths: Vec<String> = Vec::new();
 
         for id in ids {
             let local_row = local_by_id.get(&id).cloned();
             let local_epoch = local_row
                 .as_ref()
-                .map(|pl| pl.updated_at.timestamp())
+                .map(|playlist| playlist.updated_at.timestamp())
                 .unwrap_or(0);
-            let local_tomb = local_deletions.get(&id).copied();
+            let local_tomb = local_whole_epoch.get(&id).copied();
             let remote_doc = remote_docs.get(&id).cloned();
             let remote_epoch = remote_doc
                 .as_ref()
                 .and_then(|doc| wmp::epoch_from_iso8601(&doc.updated_at))
                 .unwrap_or(0);
-            let remote_tomb = remote_deletions.get(&id).copied();
-
-            let local_live = local_row.is_some();
-            let local_deleted = !local_live && local_tomb.is_some();
-            let remote_live = remote_doc.is_some();
-
-            if local_live && local_tomb.is_some() {
-                superseded.push(id.clone());
+            let remote_tomb = remote_whole.get(&id).copied();
+            let names = remote_names.get(&id).cloned().unwrap_or_default();
+            let canonical = wmp::engine_playlist_file_name(&id);
+            let mut tombstones = local_entry.get(&id).cloned().unwrap_or_default();
+            if let Some(remote_tombstones) = remote_entry.get(&id) {
+                tombstones = merge_entry_tombstones(&tombstones, remote_tombstones);
             }
 
-            if local_live && remote_live {
-                // A deletion pack retires the playlist even though the document
-                // file it was published from still exists: file names are
-                // revision payloads, the tombstone is the live authority. Deliver
-                // it when it is at least as new as both sides we can see.
-                if let Some(tomb) = remote_tomb {
-                    if tomb >= local_epoch && tomb >= remote_epoch {
-                        self.db.delete_playlist_quietly(&id)?;
-                        outcomes.push(SyncOutcome {
-                            entity_id: id,
-                            action: SyncAction::Pulled,
-                            rev: RevClock::new(tomb.max(1) as u64),
-                        });
-                        continue;
-                    }
-                }
-                if remote_epoch > local_epoch {
-                    let document = remote_doc.expect("checked above");
-                    let rev = self.adopt(&document).await?;
-                    outcomes.push(SyncOutcome {
-                        entity_id: id,
-                        action: SyncAction::Pulled,
-                        rev: RevClock::new(rev.max(1) as u64),
-                    });
-                } else if local_epoch > remote_epoch {
-                    let row = local_row.expect("checked above");
-                    let entries = self.db.list_playlist_entries(&id)?;
-                    self.push_one(&row, &entries).await?;
-                    outcomes.push(SyncOutcome {
-                        entity_id: id,
-                        action: SyncAction::Pushed,
-                        rev: RevClock::new(local_epoch.max(1) as u64),
-                    });
-                } else {
-                    outcomes.push(SyncOutcome {
-                        entity_id: id,
-                        action: SyncAction::NoChange,
-                        rev: RevClock::new(local_epoch.max(1) as u64),
-                    });
-                }
-                continue;
+            // A live row supersedes its own leftover tombstone; mark it published
+            // so it cannot delete the row again next run.
+            if local_row.is_some() && local_tomb.is_some() {
+                mark_whole_pushed.push(id.clone());
             }
 
-            if local_live {
-                // No remote document: either nothing was published yet or a
-                // deletion pack says the playlist went away.
-                match remote_tomb {
-                    Some(tomb) if tomb >= local_epoch => {
+            // 1) A whole-playlist tombstone at least as new as both live copies
+            //    retires the playlist; no document may resurrect it.
+            if let Some(tomb) = local_tomb.into_iter().chain(remote_tomb).max() {
+                let live_epoch = local_epoch.max(remote_epoch);
+                if (local_row.is_some() || remote_doc.is_some()) && tomb >= live_epoch {
+                    if local_row.is_some() {
                         self.db.delete_playlist_quietly(&id)?;
-                        outcomes.push(SyncOutcome {
-                            entity_id: id,
-                            action: SyncAction::Pulled,
-                            rev: RevClock::new(tomb.max(1) as u64),
-                        });
                     }
-                    _ => {
-                        let row = local_row.expect("checked above");
-                        let entries = self.db.list_playlist_entries(&id)?;
-                        self.push_one(&row, &entries).await?;
+                    remove_paths.extend(names.iter().cloned());
+                    if unpushed_whole.contains(&id) {
+                        let deleted_at = local_whole_at
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(wmp::now_iso8601);
+                        let mut records: Vec<(String, String)> = unpushed_entries
+                            .iter()
+                            .filter(|(playlist_id, _)| *playlist_id == id)
+                            .map(|(_, identity)| (identity.clone(), deleted_at.clone()))
+                            .collect();
+                        records.sort();
+                        self.push_deletion(&id, &deleted_at, true, &records).await?;
+                        mark_whole_pushed.push(id.clone());
+                        mark_entry_pushed.extend(
+                            records
+                                .iter()
+                                .map(|(identity, _)| (id.clone(), identity.clone())),
+                        );
                         outcomes.push(SyncOutcome {
                             entity_id: id,
                             action: SyncAction::Pushed,
-                            rev: RevClock::new(local_epoch.max(1) as u64),
+                            rev: RevClock::new(tomb.max(1) as u64),
                         });
-                    }
-                }
-                continue;
-            }
-
-            if local_deleted {
-                let tomb = local_tomb.unwrap_or(0);
-                // A peer edit newer than our deletion brings the playlist back.
-                if let Some(document) = remote_doc {
-                    let edited = wmp::epoch_from_iso8601(&document.updated_at).unwrap_or(0);
-                    if edited > tomb {
-                        let rev = self.adopt(&document).await?;
-                        superseded.push(id.clone());
+                    } else {
                         outcomes.push(SyncOutcome {
                             entity_id: id,
                             action: SyncAction::Pulled,
-                            rev: RevClock::new(rev.max(1) as u64),
+                            rev: RevClock::new(tomb.max(1) as u64),
+                        });
+                    }
+                    continue;
+                }
+            }
+
+            // 2) Both sides live: last write wins, entry tombstones trim the
+            //    winner (a deletion beats an equally new, longer document).
+            if let (Some(local_playlist), Some(remote_document)) =
+                (local_row.clone(), remote_doc.clone())
+            {
+                let (winner, winner_is_local) = if local_epoch >= remote_epoch {
+                    (local_playlist, true)
+                } else {
+                    (playlist_from_document(remote_document.clone()).0, false)
+                };
+                let entries = if winner_is_local {
+                    self.db.list_playlist_entries(&id)?
+                } else {
+                    playlist_from_document(remote_document.clone()).1
+                };
+                let (winner, winner_entries, dropped) =
+                    apply_entry_tombstones(winner, entries, &tombstones);
+                let document =
+                    playlist_to_document(&winner, &winner_entries, self.cover_roots.as_ref());
+                if !winner_is_local && !dropped {
+                    // The remote side is newer and no tombstone trimmed it:
+                    // adopt it quietly so the pull is not recorded as an edit.
+                    let rev = self.adopt(&remote_document).await?;
+                    outcomes.push(SyncOutcome {
+                        entity_id: id.clone(),
+                        action: SyncAction::Pulled,
+                        rev: RevClock::new(rev.max(1) as u64),
+                    });
+                } else {
+                    if !winner_is_local || dropped {
+                        self.db.upsert_playlist(&winner)?;
+                        self.db
+                            .replace_playlist_entries_quietly(&winner.id, &winner_entries)?;
+                    }
+                    if document_matches(&document, &remote_document) {
+                        outcomes.push(SyncOutcome {
+                            entity_id: id.clone(),
+                            action: SyncAction::NoChange,
+                            rev: RevClock::new(local_epoch.max(remote_epoch).max(1) as u64),
+                        });
+                    } else {
+                        self.push_one(&winner, &winner_entries).await?;
+                        outcomes.push(SyncOutcome {
+                            entity_id: id.clone(),
+                            action: SyncAction::Pushed,
+                            rev: RevClock::new(local_epoch.max(remote_epoch).max(1) as u64),
+                        });
+                    }
+                }
+                remove_paths.extend(names.iter().filter(|name| **name != canonical).cloned());
+                let pending: Vec<(String, String)> = unpushed_entries
+                    .iter()
+                    .filter(|(playlist_id, _)| *playlist_id == id)
+                    .map(|(_, identity)| {
+                        let at = tombstones
+                            .get(identity)
+                            .map(|(_, at)| at.clone())
+                            .unwrap_or_else(wmp::now_iso8601);
+                        (identity.clone(), at)
+                    })
+                    .collect();
+                self.publish_pack(&id, &pending).await?;
+                mark_entry_pushed.extend(
+                    pending
+                        .iter()
+                        .map(|(identity, _)| (id.clone(), identity.clone())),
+                );
+                continue;
+            }
+
+            // 3) Only local: publish it, unless a remote tombstone outruns it.
+            if let Some(local_playlist) = local_row.clone() {
+                if let Some(tomb) = remote_tomb {
+                    if tomb >= local_epoch {
+                        self.db.delete_playlist_quietly(&id)?;
+                        remove_paths.extend(names.iter().cloned());
+                        outcomes.push(SyncOutcome {
+                            entity_id: id,
+                            action: SyncAction::Pulled,
+                            rev: RevClock::new(tomb.max(1) as u64),
                         });
                         continue;
                     }
                 }
-                if unpushed.contains(&id) {
-                    let deleted_at = local_deletion_times
+                let entries = self.db.list_playlist_entries(&id)?;
+                let (playlist, entries, _dropped) =
+                    apply_entry_tombstones(local_playlist, entries, &tombstones);
+                self.push_one(&playlist, &entries).await?;
+                remove_paths.extend(names.iter().filter(|name| **name != canonical).cloned());
+                outcomes.push(SyncOutcome {
+                    entity_id: id.clone(),
+                    action: SyncAction::Pushed,
+                    rev: RevClock::new(local_epoch.max(1) as u64),
+                });
+                let pending: Vec<(String, String)> = unpushed_entries
+                    .iter()
+                    .filter(|(playlist_id, _)| *playlist_id == id)
+                    .map(|(_, identity)| {
+                        let at = tombstones
+                            .get(identity)
+                            .map(|(_, at)| at.clone())
+                            .unwrap_or_else(wmp::now_iso8601);
+                        (identity.clone(), at)
+                    })
+                    .collect();
+                self.publish_pack(&id, &pending).await?;
+                mark_entry_pushed.extend(
+                    pending
+                        .iter()
+                        .map(|(identity, _)| (id.clone(), identity.clone())),
+                );
+                continue;
+            }
+
+            // 4) Only a local deletion: publish it unless a newer peer edit wins.
+            if let Some(tomb) = local_tomb {
+                if let Some(remote_document) = remote_doc.clone() {
+                    let edited = wmp::epoch_from_iso8601(&remote_document.updated_at).unwrap_or(0);
+                    if edited > tomb {
+                        let (pulled, pulled_entries, _) =
+                            playlist_from_document(remote_document);
+                        let (playlist, entries, _dropped) =
+                            apply_entry_tombstones(pulled, pulled_entries, &tombstones);
+                        self.db.upsert_playlist(&playlist)?;
+                        self.db
+                            .replace_playlist_entries_quietly(&playlist.id, &entries)?;
+                        mark_whole_pushed.push(id.clone());
+                        outcomes.push(SyncOutcome {
+                            entity_id: id,
+                            action: SyncAction::Pulled,
+                            rev: RevClock::new(edited.max(1) as u64),
+                        });
+                        continue;
+                    }
+                }
+                if unpushed_whole.contains(&id) {
+                    let deleted_at = local_whole_at
                         .get(&id)
                         .cloned()
                         .unwrap_or_else(wmp::now_iso8601);
-                    self.push_deletion(&id, &deleted_at).await?;
-                    published.push(id.clone());
+                    let mut records: Vec<(String, String)> = unpushed_entries
+                        .iter()
+                        .filter(|(playlist_id, _)| *playlist_id == id)
+                        .map(|(_, identity)| (identity.clone(), deleted_at.clone()))
+                        .collect();
+                    records.sort();
+                    self.push_deletion(&id, &deleted_at, true, &records).await?;
+                    remove_paths.extend(names.iter().cloned());
+                    mark_whole_pushed.push(id.clone());
+                    mark_entry_pushed
+                        .extend(records.iter().map(|(identity, _)| (id.clone(), identity.clone())));
                     outcomes.push(SyncOutcome {
                         entity_id: id,
                         action: SyncAction::Pushed,
@@ -928,37 +1384,52 @@ impl SyncEngine for PlaylistSyncEngine {
                 continue;
             }
 
-            // Nothing local: adopt the remote document unless a tombstone is at
-            // least as new -- a fresh device must not resurrect a deleted list.
-            if let Some(document) = remote_doc {
+            // 5) Nothing local: adopt the remote document unless a tombstone that
+            //    is at least as new says it was deleted.
+            if let Some(remote_document) = remote_doc.clone() {
                 if let Some(tomb) = remote_tomb {
-                    let edited = wmp::epoch_from_iso8601(&document.updated_at).unwrap_or(0);
-                    if tomb >= edited {
+                    if tomb >= remote_epoch {
+                        remove_paths.extend(names.iter().cloned());
                         continue;
                     }
                 }
-                let rev = self.adopt(&document).await?;
+                let (pulled, pulled_entries, _) = playlist_from_document(remote_document);
+                let (playlist, entries, dropped) =
+                    apply_entry_tombstones(pulled, pulled_entries, &tombstones);
+                self.db.upsert_playlist(&playlist)?;
+                self.db
+                    .replace_playlist_entries_quietly(&playlist.id, &entries)?;
+                if dropped {
+                    // Re-publish the trimmed document so the deletion travels on.
+                    self.push_one(&playlist, &entries).await?;
+                }
                 outcomes.push(SyncOutcome {
-                    entity_id: id,
+                    entity_id: id.clone(),
                     action: SyncAction::Pulled,
-                    rev: RevClock::new(rev.max(1) as u64),
+                    rev: RevClock::new(remote_epoch.max(1) as u64),
                 });
+                remove_paths.extend(names.iter().filter(|name| **name != canonical).cloned());
             }
         }
 
-        if !superseded.is_empty() {
-            self.db.mark_deleted_playlists_pushed(&superseded)?;
+        if !mark_whole_pushed.is_empty() {
+            self.db.mark_deleted_playlists_pushed(&mark_whole_pushed)?;
         }
-        if !published.is_empty() {
-            self.db.mark_deleted_playlists_pushed(&published)?;
+        mark_entry_pushed.sort();
+        mark_entry_pushed.dedup();
+        if !mark_entry_pushed.is_empty() {
+            self.db
+                .mark_deleted_playlist_entries_pushed(&mark_entry_pushed)?;
         }
+        self.remove_remote(&remove_paths).await?;
         let cutoff =
             wmp::iso8601_from_epoch(chrono::Utc::now().timestamp() - PLAYLIST_TOMBSTONE_TTL_SECS);
         let _ = self.db.purge_deleted_playlists_before(&cutoff)?;
+        let _ = self.db.purge_deleted_playlist_entries_before(&cutoff)?;
 
         info!(
             "playlist sync: {} local, {} remote, {} outcomes",
-            local.len(),
+            local_by_id.len(),
             remote_docs.len(),
             outcomes.len()
         );
@@ -980,6 +1451,15 @@ pub async fn run_sync_all(
     driver: Arc<dyn WdmmVfs>,
     remote_dir: &str,
 ) -> SyncResult<serde_json::Value> {
+    run_sync_all_with_covers(db, driver, remote_dir, None).await
+}
+
+async fn run_sync_all_with_covers(
+    db: Arc<LibraryDatabase>,
+    driver: Arc<dyn WdmmVfs>,
+    remote_dir: &str,
+    cover_roots: Option<CoverRoots>,
+) -> SyncResult<serde_json::Value> {
     let cred = CredentialSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
         .sync_incremental()
         .await?;
@@ -987,11 +1467,12 @@ pub async fn run_sync_all(
         Arc::clone(&db),
         Arc::clone(&driver),
         remote_dir,
-        None,
+        cover_roots.clone(),
         SyncMode::Incremental,
     )
     .await?;
     let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
+        .with_covers(cover_roots)
         .sync_incremental()
         .await?;
     Ok(aggregate_summary(&cred, sharded, &pl))
@@ -1021,6 +1502,13 @@ fn aggregate_summary(
     serde_json::Value::Object(summary)
 }
 
+/// Playlist-only summary (`scope=playlists` runs touch nothing else).
+fn playlist_summary(playlists: &[SyncOutcome]) -> serde_json::Value {
+    serde_json::json!({
+        "playlists": entities::registry::summarize(playlists),
+    })
+}
+
 /// Run a **full** sync (base-shard rebuild for music + manga) and return a JSON
 /// summary. Full-rebuild pass behind [`run_sync`], the single FFI entry point.
 ///
@@ -1046,11 +1534,12 @@ pub async fn run_sync_full(
         Arc::clone(&db),
         Arc::clone(&driver),
         remote_dir,
-        cover_roots,
+        cover_roots.clone(),
         SyncMode::Full,
     )
     .await?;
     let pl = PlaylistSyncEngine::new(db, driver, remote_dir)
+        .with_covers(cover_roots)
         .sync_full()
         .await?;
     Ok(aggregate_summary(&cred, sharded, &pl))
@@ -1058,7 +1547,7 @@ pub async fn run_sync_full(
 
 // ── single entry point ────────────────────────────────────────────────────────
 
-/// Mode of an aggregate sync run ([`run_sync`]).
+/// Mode of a sharded-entity sync pass ([`run_sync_all`] / [`run_sync_full`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     /// One pass over the deltas (cursor driven).
@@ -1086,8 +1575,36 @@ impl SyncMode {
     }
 }
 
-/// Run credentials + music library + manga + playlists and return the contract
-/// summary `{"ok":true,"mode":"…","conflicts":N,"entities":{…}}`.
+/// What one aggregate run should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncCommand {
+    /// Walk the delta (or rebuild the shards) for the requested scope.
+    Sync(SyncMode),
+    /// Publish local playlist tombstones, then drop every playlist deletion pack
+    /// on the remote and forget the tombstones locally.
+    CompactPlaylists,
+}
+
+impl SyncCommand {
+    /// Parse the wire value (`"incremental"` / `"full"` / `"compact_playlists"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "compact_playlists" => Some(Self::CompactPlaylists),
+            other => SyncMode::parse(other).map(Self::Sync),
+        }
+    }
+
+    /// Wire value used by the FFI and the summary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync(mode) => mode.as_str(),
+            Self::CompactPlaylists => "compact_playlists",
+        }
+    }
+}
+
+/// Run an aggregate sync and return the contract summary
+/// `{"ok":true,"mode":"…","scope":"…","conflicts":N,"entities":{…}}`.
 ///
 /// This is the only aggregate entry point: the FFI exposes it as
 /// `wdmm_sync_run(json)` and the app never calls the per-mode passes directly.
@@ -1095,14 +1612,54 @@ pub async fn run_sync(
     db: Arc<LibraryDatabase>,
     driver: Arc<dyn WdmmVfs>,
     remote_dir: &str,
-    mode: SyncMode,
+    command: SyncCommand,
+    scope: SyncScope,
     cover_roots: Option<CoverRoots>,
 ) -> SyncResult<serde_json::Value> {
-    let entities = match mode {
-        SyncMode::Incremental => {
-            run_sync_all(Arc::clone(&db), Arc::clone(&driver), remote_dir).await?
+    let entities = match command {
+        SyncCommand::CompactPlaylists => {
+            let engine = PlaylistSyncEngine::new(Arc::clone(&db), Arc::clone(&driver), remote_dir)
+                .with_covers(cover_roots);
+            let outcomes = engine.sync_incremental().await?;
+            let packs_removed = engine.delete_deletion_packs().await?;
+            let playlists_cleared = db.clear_deleted_playlists()?;
+            let entries_cleared = db.clear_deleted_playlist_entries()?;
+            serde_json::json!({
+                "playlists": entities::registry::summarize(&outcomes),
+                "packs_removed": packs_removed,
+                "tombstones_cleared": playlists_cleared + entries_cleared,
+            })
         }
-        SyncMode::Full => run_sync_full(db, driver, remote_dir, cover_roots).await?,
+        SyncCommand::Sync(SyncMode::Incremental) => match scope {
+            SyncScope::All => {
+                run_sync_all_with_covers(
+                    Arc::clone(&db),
+                    Arc::clone(&driver),
+                    remote_dir,
+                    cover_roots,
+                )
+                .await?
+            }
+            SyncScope::Playlists => {
+                let outcomes = PlaylistSyncEngine::new(db, driver, remote_dir)
+                    .with_covers(cover_roots)
+                    .sync_incremental()
+                    .await?;
+                playlist_summary(&outcomes)
+            }
+        },
+        SyncCommand::Sync(SyncMode::Full) => match scope {
+            SyncScope::All => {
+                run_sync_full(Arc::clone(&db), Arc::clone(&driver), remote_dir, cover_roots).await?
+            }
+            SyncScope::Playlists => {
+                let outcomes = PlaylistSyncEngine::new(db, driver, remote_dir)
+                    .with_covers(cover_roots)
+                    .sync_full()
+                    .await?;
+                playlist_summary(&outcomes)
+            }
+        },
     };
     let conflicts = entities
         .as_object()
@@ -1115,12 +1672,12 @@ pub async fn run_sync(
         .unwrap_or(0);
     Ok(serde_json::json!({
         "ok": true,
-        "mode": mode.as_str(),
+        "mode": command.as_str(),
+        "scope": scope.as_str(),
         "conflicts": conflicts,
         "entities": entities,
     }))
 }
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1601,6 +2158,8 @@ mod tests {
                 remote_path: "/a.mp3".into(),
                 title: "A".into(),
                 duration_ms: 1000,
+                cue_track_index: None,
+                remote_missing: false,
             }],
         )
         .unwrap();
@@ -1671,6 +2230,8 @@ mod tests {
                 remote_path: "/a.mp3".into(),
                 title: "A".into(),
                 duration_ms: 1000,
+                cue_track_index: None,
+                remote_missing: false,
             }],
         )
         .unwrap();
@@ -2073,4 +2634,197 @@ mod tests {
     // silence unused import warnings on platforms where the helper isn't needed
     #[allow(dead_code)]
     fn _keep_mutex(_m: &Mutex<()>) {}
+
+    /// Build one playlist entry for the tests below.
+    fn entry(music_id: &str, position: i64, remote: &str, title: &str) -> PlaylistEntry {
+        PlaylistEntry {
+            playlist_id: "pl-1".into(),
+            position,
+            music_id: music_id.to_string(),
+            source_name: "nas".into(),
+            remote_path: remote.to_string(),
+            title: title.to_string(),
+            duration_ms: 1000,
+            cue_track_index: None,
+            remote_missing: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn playlist_documents_carry_covers_and_cue_indexes() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("wdmm-pl-covers-{stamp}"));
+        let covers = root.join("covers");
+        std::fs::create_dir_all(&covers).unwrap();
+        let stem = crate::cover::music_cover_stem("nas", "/a.mp3");
+        std::fs::write(covers.join(&stem), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let driver = Arc::new(MockDriver::new());
+        let db = tmp_db();
+        let older = chrono::Utc::now() - chrono::Duration::seconds(60);
+        db.upsert_playlist(&Playlist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+            created_at: older,
+            updated_at: older,
+        })
+        .unwrap();
+        let mut first = entry("aa".repeat(20).as_str(), 0, "/a.mp3", "A");
+        first.cue_track_index = Some(2);
+        db.set_playlist_entries("pl-1", &[first]).unwrap();
+
+        let engine = PlaylistSyncEngine::new(Arc::clone(&db), driver.clone(), "/sync").with_covers(
+            Some(CoverRoots {
+                music_covers_dir: covers,
+                manga_covers_dir: root.join("manga"),
+            }),
+        );
+        engine.sync_incremental().await.unwrap();
+
+        let bytes = driver
+            .get_content("/sync/playlists/pl-1.wdmp")
+            .await
+            .unwrap();
+        let document = wmp::PlaylistDocument::decode(&bytes).unwrap();
+        assert_eq!(document.entries.len(), 1);
+        assert_eq!(document.entries[0].cue_track_index, Some(2));
+        assert_eq!(document.entries[0].cover_index, Some(0));
+        assert_eq!(document.covers.len(), 1);
+        assert_eq!(
+            crate::cover::detect_image_kind(&document.covers[0].bytes),
+            crate::cover::COVER_KIND_PNG
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn playlist_entry_tombstones_trim_a_newer_peer_edit() {
+        let driver = Arc::new(MockDriver::new());
+        let db_a = tmp_db();
+        let older = chrono::Utc::now() - chrono::Duration::seconds(60);
+        db_a.upsert_playlist(&Playlist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+            created_at: older,
+            updated_at: older,
+        })
+        .unwrap();
+        db_a.set_playlist_entries(
+            "pl-1",
+            &[
+                entry("aa".repeat(20).as_str(), 0, "/a.mp3", "A"),
+                entry("bb".repeat(20).as_str(), 1, "/b.mp3", "B"),
+            ],
+        )
+        .unwrap();
+        let engine_a = PlaylistSyncEngine::new(Arc::clone(&db_a), driver.clone(), "/sync");
+        engine_a.sync_incremental().await.unwrap();
+
+        // Device B pulls both entries.
+        let db_b = tmp_db();
+        let engine_b = PlaylistSyncEngine::new(Arc::clone(&db_b), driver.clone(), "/sync");
+        engine_b.sync_incremental().await.unwrap();
+        assert_eq!(db_b.list_playlist_entries("pl-1").unwrap().len(), 2);
+
+        // Device A drops "bb": the row diff records an entry tombstone, and the
+        // next sync ships a deletion pack next to the trimmed document.
+        db_a.set_playlist_entries(
+            "pl-1",
+            &[entry("aa".repeat(20).as_str(), 0, "/b.mp3", "A")],
+        )
+        .unwrap();
+        engine_a.sync_incremental().await.unwrap();
+        let pack_path = format!(
+            "/sync/playlists/{}",
+            wmp::playlist_deletion_file_name("pl-1")
+        );
+        assert!(driver.files.lock().await.contains_key(&pack_path));
+
+        // Device B edits after the deletion but is still older than the
+        // tombstone, so the entry deletion still trims B's document.
+        db_b.upsert_playlist(&Playlist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+            created_at: older,
+            updated_at: older + chrono::Duration::seconds(10),
+        })
+        .unwrap();
+        db_b.set_playlist_entries(
+            "pl-1",
+            &[
+                entry("aa".repeat(20).as_str(), 0, "/a.mp3", "A"),
+                entry("bb".repeat(20).as_str(), 1, "/b.mp3", "B"),
+                entry("cc".repeat(20).as_str(), 2, "/c.mp3", "C"),
+            ],
+        )
+        .unwrap();
+        let b_outcomes = engine_b.sync_incremental().await.unwrap();
+        assert_eq!(b_outcomes[0].action, SyncAction::Pushed);
+
+        let ids: Vec<String> = db_b
+            .list_playlist_entries("pl-1")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.music_id)
+            .collect();
+        assert_eq!(ids, vec!["aa".repeat(20), "cc".repeat(20)]);
+
+        let pushed = wmp::PlaylistDocument::decode(
+            &driver
+                .get_content("/sync/playlists/pl-1.wdmp")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pushed.entries.len(), 2);
+        assert!(!pushed.entries.iter().any(|row| row.music_id == "bb".repeat(20)));
+    }
+
+    #[tokio::test]
+    async fn compact_playlists_removes_deletion_packs_and_tombstones() {
+        let driver = Arc::new(MockDriver::new());
+        let db = tmp_db();
+        let older = chrono::Utc::now() - chrono::Duration::seconds(60);
+        db.upsert_playlist(&Playlist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+            created_at: older,
+            updated_at: older,
+        })
+        .unwrap();
+        db.set_playlist_entries("pl-1", &[entry("aa".repeat(20).as_str(), 0, "/a.mp3", "A")])
+            .unwrap();
+        let engine = PlaylistSyncEngine::new(Arc::clone(&db), driver.clone(), "/sync");
+        engine.sync_incremental().await.unwrap();
+
+        db.delete_playlist("pl-1").unwrap();
+        engine.sync_incremental().await.unwrap();
+        let pack_path = format!(
+            "/sync/playlists/{}",
+            wmp::playlist_deletion_file_name("pl-1")
+        );
+        assert!(driver.files.lock().await.contains_key(&pack_path));
+        assert!(!db.list_deleted_playlists().unwrap().is_empty());
+
+        let summary = run_sync(
+            Arc::clone(&db),
+            driver.clone(),
+            "/sync",
+            SyncCommand::CompactPlaylists,
+            SyncScope::Playlists,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary["ok"], true);
+        assert_eq!(summary["mode"], "compact_playlists");
+        assert!(summary["entities"]["packs_removed"].as_u64().unwrap() >= 1);
+        assert!(!driver.files.lock().await.contains_key(&pack_path));
+        assert!(db.list_deleted_playlists().unwrap().is_empty());
+        assert!(db.list_deleted_playlist_entries().unwrap().is_empty());
+    }
 }

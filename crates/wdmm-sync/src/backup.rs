@@ -1089,7 +1089,7 @@ fn decode_playlist_wdmmpl01(bytes: &[u8]) -> SyncResult<(Playlist, Vec<PlaylistE
         let path = rec.get(&TAG_ENTRY_PATH).and_then(|v| v.as_str()).unwrap_or("");
         let title = rec.get(&TAG_ENTRY_TITLE).and_then(|v| v.as_str()).unwrap_or("");
         let duration_ms = rec.get(&TAG_ENTRY_DURATION).and_then(|v| v.as_int());
-        let _cue_idx = rec.get(&TAG_ENTRY_CUE_IDX).and_then(|v| v.as_int());
+        let cue_idx = rec.get(&TAG_ENTRY_CUE_IDX).and_then(|v| v.as_int());
 
         entries.push(PlaylistEntry {
             playlist_id: id.clone(),
@@ -1099,6 +1099,8 @@ fn decode_playlist_wdmmpl01(bytes: &[u8]) -> SyncResult<(Playlist, Vec<PlaylistE
             remote_path: path.to_string(),
             title: title.to_string(),
             duration_ms: duration_ms.unwrap_or(0),
+            cue_track_index: cue_idx,
+            remote_missing: false,
         });
     }
 

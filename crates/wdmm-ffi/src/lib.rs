@@ -443,9 +443,17 @@ pub extern "C" fn wdmm_sync_run(json: *const c_char) -> FfiString {
         .get("mode")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("incremental");
-    let mode = match wdmm_sync::SyncMode::parse(mode_wire) {
+    let command = match wdmm_sync::SyncCommand::parse(mode_wire) {
         Some(value) => value,
         None => return FfiString::from(format!("error:unknown mode: {mode_wire}")),
+    };
+    let scope_wire = parsed
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("all");
+    let scope = match wdmm_sync::SyncScope::parse(scope_wire) {
+        Some(value) => value,
+        None => return FfiString::from(format!("error:unknown scope: {scope_wire}")),
     };
     let cover_roots = if parsed
         .get("with_covers")
@@ -461,8 +469,65 @@ pub extern "C" fn wdmm_sync_run(json: *const c_char) -> FfiString {
         Err(error) => return error,
     };
     let db = std::sync::Arc::clone(global_library_db());
-    match rt().block_on(wdmm_sync::run_sync(db, driver, remote_dir, mode, cover_roots)) {
+    match rt().block_on(wdmm_sync::run_sync(
+        db, driver, remote_dir, command, scope, cover_roots,
+    )) {
         Ok(summary) => FfiString::from(summary.to_string()),
+        Err(error) => FfiString::from(format!("error:{error}")),
+    }
+}
+
+/// Publish one playlist to the remote right after a local edit.
+///
+/// The app edits a playlist and expects the change on the remote without a full
+/// sync round trip. A playlist whose row was deleted publishes its
+/// whole-playlist tombstone instead, together with its pending entry
+/// tombstones.
+///
+/// - `account_id`: Cloud account ID.
+/// - `remote_dir`: Remote sync root (defaults to `"/wdmm_sync"`).
+/// - `playlist_id`: Playlist to publish.
+///
+/// Returns JSON `{"ok":true,"action":"pushed"|"pulled"|"no_change"|"conflict"}`
+/// or `{"ok":true,"action":"none"}` when the playlist is unknown, or
+/// `"error:<message>"`. The caller owns the result string.
+///
+/// # Safety
+/// `json` must be a valid null-terminated UTF-8 C string.
+#[no_mangle]
+pub extern "C" fn wdmm_playlist_publish(json: *const c_char) -> FfiString {
+    let payload = match ptr_to_str(json) {
+        Some(value) => value,
+        None => return FfiString::from("error:invalid payload"),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(value) => value,
+        Err(error) => return FfiString::from(format!("error:invalid payload: {error}")),
+    };
+    let account_id = match parsed.get("account_id").and_then(serde_json::Value::as_str) {
+        Some(value) if !value.is_empty() => value,
+        _ => return FfiString::from("error:missing account_id"),
+    };
+    let playlist_id = match parsed.get("playlist_id").and_then(serde_json::Value::as_str) {
+        Some(value) if !value.is_empty() => value,
+        _ => return FfiString::from("error:missing playlist_id"),
+    };
+    let remote_dir = parsed
+        .get("remote_dir")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("/wdmm_sync");
+    let driver = match driver_for_account(account_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let cover_roots = global_cover_roots().lock().unwrap().clone();
+    let engine = wdmm_sync::PlaylistSyncEngine::new(std::sync::Arc::clone(global_library_db()), driver, remote_dir)
+        .with_covers(cover_roots);
+    match rt().block_on(engine.publish(playlist_id)) {
+        Ok(Some(outcome)) => FfiString::from(
+            serde_json::json!({"ok": true, "action": outcome.action.as_str()}).to_string(),
+        ),
+        Ok(None) => FfiString::from("{\"ok\":true,\"action\":\"none\"}"),
         Err(error) => FfiString::from(format!("error:{error}")),
     }
 }
@@ -4019,11 +4084,21 @@ pub extern "C" fn wdmm_playlist_create(json: *const c_char) -> FfiString {
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let now = chrono::Utc::now();
+    // `updated_at` decides last-write-wins and the sync merge, so a caller that
+    // carries a real timestamp (backup restore, JSON import, an edit) must be
+    // able to set it instead of being stamped with "now".
+    let parse_ts = |key: &str, fallback: chrono::DateTime<chrono::Utc>| {
+        v[key]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or(fallback)
+    };
     let playlist = wdmm_storage::Playlist {
         id,
         name,
-        created_at: now,
-        updated_at: now,
+        created_at: parse_ts("created_at", now),
+        updated_at: parse_ts("updated_at", now),
     };
     match global_library_db().upsert_playlist(&playlist) {
         Ok(()) => FfiString::from(
@@ -4108,6 +4183,8 @@ pub extern "C" fn wdmm_playlist_set_entries(
             None => return FfiString::from(format!("error:entry[{pos}] missing 'title'")),
         };
         let duration_ms = item["duration_ms"].as_i64().unwrap_or(0);
+        let cue_track_index = item["cue_track_index"].as_i64();
+        let remote_missing = item["remote_missing"].as_bool().unwrap_or(false);
         entries.push(wdmm_storage::PlaylistEntry {
             playlist_id: playlist_id.to_string(),
             position: pos as i64,
@@ -4116,6 +4193,8 @@ pub extern "C" fn wdmm_playlist_set_entries(
             remote_path,
             title,
             duration_ms,
+            cue_track_index,
+            remote_missing,
         });
     }
     match global_library_db().set_playlist_entries(playlist_id, &entries) {
