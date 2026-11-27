@@ -688,9 +688,9 @@ pub(crate) fn read_account_range(
             rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
                 &*refreshed, path, start, end,
             ))
-            .map_err(|e| e.to_string())
+            .map_err(|e| user_visible_error(&e))
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(user_visible_error(&e)),
     }
 }
 
@@ -709,9 +709,9 @@ pub(crate) fn read_account_content(account_id_str: &str, path: &str) -> Result<V
                 .block_on(refresh_and_rebuild(&mut account))
                 .map_err(|e| e.to_string())?;
             rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*refreshed, path))
-                .map_err(|e| e.to_string())
+                .map_err(|e| user_visible_error(&e))
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(user_visible_error(&e)),
     }
 }
 

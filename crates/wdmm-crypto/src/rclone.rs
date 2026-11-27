@@ -2,7 +2,7 @@
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes256;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use crypto_secretbox::{aead::Aead, XSalsa20Poly1305};
+use crypto_secretbox::{aead::AeadInPlace, Tag, XSalsa20Poly1305};
 use scrypt::{scrypt, Params};
 use thiserror::Error;
 const MAGIC: &[u8; 8] = b"RCLONE\0\0";
@@ -156,19 +156,30 @@ impl RcloneCipher {
             return Err(RcloneError::InvalidContent);
         }
         let nonce = &b[8..32];
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(Self::decrypted_size(b.len() as u64)? as usize);
         let mut off = 32;
         let mut i = 0;
         while off < b.len() {
             let end = (off + BLOCK + 16).min(b.len());
-            out.extend(self.decrypt_block(nonce, i, &b[off..end])?);
+            self.decrypt_block_into(nonce, i, &b[off..end], &mut out)?;
             off = end;
             i += 1
         }
         Ok(out)
     }
-    pub fn decrypt_block(&self, nonce: &[u8], index: u64, b: &[u8]) -> Result<Vec<u8>> {
+    /// Decrypt one `[16-byte tag][ciphertext]` block and append the plaintext
+    /// into `out` in place, avoiding a per-block allocation and copy.
+    pub fn decrypt_block_into(
+        &self,
+        nonce: &[u8],
+        index: u64,
+        b: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         if nonce.len() != 24 {
+            return Err(RcloneError::InvalidContent);
+        }
+        if b.len() < 16 {
             return Err(RcloneError::InvalidContent);
         }
         let mut n: [u8; 24] = nonce.try_into().unwrap();
@@ -178,9 +189,17 @@ impl RcloneCipher {
             *x = v;
             carry = (carry >> 8) + u64::from(c)
         }
+        let tag = Tag::from_slice(&b[..16]);
+        let start = out.len();
+        out.extend_from_slice(&b[16..]);
         XSalsa20Poly1305::new((&self.data_key).into())
-            .decrypt((&n).into(), b)
+            .decrypt_in_place_detached((&n).into(), &[], &mut out[start..], tag)
             .map_err(|_| RcloneError::Decryption)
+    }
+    pub fn decrypt_block(&self, nonce: &[u8], index: u64, b: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(b.len().saturating_sub(16));
+        self.decrypt_block_into(nonce, index, b, &mut out)?;
+        Ok(out)
     }
     pub fn decrypted_size(size: u64) -> Result<u64> {
         if size < 32 {
@@ -467,6 +486,42 @@ mod tests {
             "hello crypt 你好".as_bytes()
         );
     }
+    /// A file larger than one block must decrypt through the in-place path
+    /// with the rclone nonce increment (index added to the first 8 nonce bytes).
+    #[test]
+    fn multi_block_content_decrypts_through_the_in_place_path() {
+        use crypto_secretbox::aead::Aead;
+
+        let c = c(NameEncoding::Base32);
+        let chunk = vec![0x5au8; BLOCK];
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&chunk);
+        plain.extend_from_slice(&chunk);
+        plain.extend_from_slice(b"tail");
+
+        let nonce = [9u8; 24];
+        let cipher = XSalsa20Poly1305::new((&c.data_key).into());
+        let mut sealed = Vec::new();
+        sealed.extend_from_slice(MAGIC);
+        sealed.extend_from_slice(&nonce);
+        for (index, part) in plain.chunks(BLOCK).enumerate() {
+            let mut n = nonce;
+            let mut carry = index as u64;
+            for x in &mut n[..8] {
+                let (v, k) = x.overflowing_add(carry as u8);
+                *x = v;
+                carry = (carry >> 8) + u64::from(k)
+            }
+            sealed.extend_from_slice(&cipher.encrypt((&n).into(), part).unwrap());
+        }
+
+        assert_eq!(c.decrypt(&sealed).unwrap(), plain);
+        assert_eq!(
+            RcloneCipher::decrypted_size(sealed.len() as u64).unwrap(),
+            plain.len() as u64
+        );
+    }
+
     #[test]
     fn obfuscation() {
         let x = RcloneCipher::new(

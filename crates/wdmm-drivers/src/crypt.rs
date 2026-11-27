@@ -86,6 +86,26 @@ impl CryptDriver {
     }
 
     /// Return the cached ciphertext size and file nonce for `inner_path`.
+    /// Resolve the ciphertext size and file nonce, caching both: they are
+    /// stable for a file, so ranged playback must not re-read them every chunk.
+    async fn resolved_meta(&self, inner_path: &str) -> Result<(u64, [u8; 24])> {
+        if let Some(hit) = self.cached_meta(inner_path) {
+            return Ok(hit);
+        }
+        let inner_item = self.source.get(inner_path).await?;
+        let header = self
+            .source
+            .get_content_range(inner_path, 0, Some(FILE_HEADER_SIZE - 1))
+            .await?;
+        if header.len() < FILE_HEADER_SIZE as usize {
+            return Err(DriverError::Other("short file header".into()));
+        }
+        let mut nonce = [0u8; 24];
+        nonce.copy_from_slice(&header[8..32]); // skip 8-byte magic
+        self.store_meta(inner_path, inner_item.size, nonce);
+        Ok((inner_item.size, nonce))
+    }
+
     fn cached_meta(&self, inner_path: &str) -> Option<(u64, [u8; 24])> {
         let cache = self.meta_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.get(inner_path).and_then(|meta| {
@@ -173,7 +193,10 @@ impl CryptDriver {
 
 // ── File structure constants ──
 // From openlist_crypt/lib/src/rclone_cipher.dart
-const FILE_HEADER_SIZE: u64 = 32; // 8 bytes magic + 24 bytes nonce
+const FILE_HEADER_SIZE: u64 = 32;
+
+/// Whole-file reads above this plaintext size are refused (playback must use ranges).
+const MAX_IN_MEMORY_CONTENT: u64 = 64 * 1024 * 1024; // 8 bytes magic + 24 bytes nonce
 const BLOCK_HEADER_SIZE: u64 = 16; // poly1305 auth tag
 const BLOCK_DATA_SIZE: u64 = 65536; // 64 KiB
 const BLOCK_SIZE: u64 = BLOCK_HEADER_SIZE + BLOCK_DATA_SIZE; // 65552 bytes
@@ -287,13 +310,22 @@ impl WdmmVfs for CryptDriver {
     }
 
     /// Read full decrypted content.
+    ///
+    /// Whole-file reads are for small payloads (subtitles, covers, tags). A
+    /// large encrypted file must go through ranged reads: materialising it in
+    /// one buffer would multiply memory by the ciphertext + plaintext size.
     async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
         let inner_path = self.map_to_inner(path, true)?;
+        let (inner_size, _nonce) = self.resolved_meta(&inner_path).await?;
+        let plaintext_size = RcloneCipher::decrypted_size(inner_size)
+            .map_err(|e| DriverError::Other(format!("decrypt size: {}", e)))?;
+        if plaintext_size > MAX_IN_MEMORY_CONTENT {
+            return Err(DriverError::Other(format!(
+                "err.contentTooLarge|{plaintext_size}|{MAX_IN_MEMORY_CONTENT}"
+            )));
+        }
 
-        // Fetch full ciphertext from source
         let ciphertext = self.source.get_content(&inner_path).await?;
-
-        // Decrypt entire content
         self.cipher
             .decrypt(&ciphertext)
             .map_err(|e| DriverError::Other(format!("decrypt: {}", e)))
@@ -306,26 +338,7 @@ impl WdmmVfs for CryptDriver {
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
         let inner_path = self.map_to_inner(path, true)?;
 
-        // Ciphertext size + file nonce. Both are stable for a file; caching
-        // them removes a `get()` (list + filemetas + HEAD upstream) and a
-        // 32-byte header read from every playback chunk request.
-        let (inner_size, nonce) = match self.cached_meta(&inner_path) {
-            Some(hit) => hit,
-            None => {
-                let inner_item = self.source.get(&inner_path).await?;
-                let header = self
-                    .source
-                    .get_content_range(&inner_path, 0, Some(FILE_HEADER_SIZE - 1))
-                    .await?;
-                if header.len() < FILE_HEADER_SIZE as usize {
-                    return Err(DriverError::Other("short file header".into()));
-                }
-                let mut nonce = [0u8; 24];
-                nonce.copy_from_slice(&header[8..32]); // skip 8-byte magic
-                self.store_meta(&inner_path, inner_item.size, nonce);
-                (inner_item.size, nonce)
-            }
-        };
+        let (inner_size, nonce) = self.resolved_meta(&inner_path).await?;
 
         let plaintext_size = RcloneCipher::decrypted_size(inner_size)
             .map_err(|e| DriverError::Other(format!("decrypt size: {}", e)))?;
@@ -351,8 +364,9 @@ impl WdmmVfs for CryptDriver {
         // Fetch block data
         let block_data = self.source.get_content_range(&inner_path, cipher_start, Some(cipher_end)).await?;
 
-        // Decrypt blocks
-        let mut plaintext = Vec::new();
+        // Decrypt blocks straight into the output buffer: one allocation, then
+        // in-place authenticated decryption per block (no per-block Vec).
+        let mut plaintext = Vec::with_capacity((end - start + 1) as usize);
         let mut offset = 0;
 
         for block_idx in first_block..=last_block {
@@ -363,29 +377,20 @@ impl WdmmVfs for CryptDriver {
                 break;
             }
 
-            let cipher_block = &block_data[block_start..block_end];
-            let plain_block = self
-                .cipher
-                .decrypt_block(&nonce, block_idx, cipher_block)
+            self.cipher
+                .decrypt_block_into(&nonce, block_idx, &block_data[block_start..block_end], &mut plaintext)
                 .map_err(|e| DriverError::Other(format!("decrypt block {}: {}", block_idx, e)))?;
-
-            // Calculate which portion of this block we need
-            let block_plain_start = if block_idx == first_block {
-                (start % BLOCK_DATA_SIZE) as usize
-            } else {
-                0
-            };
-
-            let block_plain_end = if block_idx == last_block {
-                ((end % BLOCK_DATA_SIZE) as usize + 1).min(plain_block.len())
-            } else {
-                plain_block.len()
-            };
-
-            plaintext.extend_from_slice(&plain_block[block_plain_start..block_plain_end]);
 
             offset += BLOCK_SIZE as usize;
         }
+
+        // Trim the leading bytes of the first block and the trailing bytes of
+        // the last block that fall outside the requested plaintext range.
+        let skip = (start % BLOCK_DATA_SIZE) as usize;
+        if skip > 0 && skip < plaintext.len() {
+            plaintext.drain(..skip);
+        }
+        plaintext.truncate((end - start + 1) as usize);
 
         Ok(plaintext)
     }
@@ -534,6 +539,35 @@ mod tests {
 
         let file = crypt.map_to_inner("/dir/file.txt", true).unwrap();
         assert_eq!(crypt.map_to_inner("/dir/file.txt/", true).unwrap(), file);
+    }
+
+    /// Whole-file reads must be refused once the plaintext exceeds the
+    /// in-memory cap: such files have to be streamed through ranges.
+    #[tokio::test]
+    async fn test_large_whole_file_reads_are_refused() {
+        let config = CryptConfig {
+            password: "test".to_string(),
+            salt: String::new(),
+            filename_encryption: NameMode::Off,
+            filename_encoding: NameEncoding::Base64,
+            encrypted_suffix: ".bin".to_string(),
+            directory_name_encryption: false,
+            source_dir: "/encrypted".to_string(),
+        };
+        let mut mock = MockSource::new();
+        mock.add_file(
+            "/encrypted/big.bin",
+            vec![0u8; (MAX_IN_MEMORY_CONTENT + FILE_HEADER_SIZE + BLOCK_SIZE * 2) as usize],
+        );
+        let source = Arc::new(mock);
+        let as_dyn: Arc<dyn WdmmVfs + Send + Sync> = source.clone();
+        let crypt = CryptDriver::with_source(as_dyn, config).unwrap();
+
+        let err = crypt.get_content("/big").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("err.contentTooLarge"),
+            "expected the size guard, got {err}"
+        );
     }
 
     /// Playback asks for one range per stream chunk. The ciphertext size and
