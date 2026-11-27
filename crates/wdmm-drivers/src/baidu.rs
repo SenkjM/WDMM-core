@@ -8,6 +8,9 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
@@ -27,6 +30,11 @@ const OAUTH_API: &str = "https://openapi.baidu.com/oauth/2.0/token";
 
 /// `driver_txt` query param expected by the OpenList renew endpoint.
 const DRIVER_TXT: &str = "baiduyun_go";
+
+/// How long a resolved signed dlink is reused. Baidu dlinks stay valid for
+/// hours; caching for a few minutes removes the list/filemetas/HEAD round trip
+/// from every range read (playback requests one range per stream chunk).
+const LINK_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Configuration for the Baidu NetDisk driver.
 #[derive(serde::Deserialize)]
@@ -86,6 +94,13 @@ fn map_http_error(e: &reqwest::Error) -> DriverError {
     }
 }
 
+/// A resolved signed download link, cached briefly per path.
+struct CachedLink {
+    url: String,
+    headers: Vec<(String, String)>,
+    expires: Instant,
+}
+
 /// Baidu NetDisk cloud driver.
 pub struct BaiduDriver {
     config: BaiduConfig,
@@ -93,6 +108,9 @@ pub struct BaiduDriver {
     /// Client that does not follow redirects — used for the signed-dlink HEAD
     /// probe, where the 302 `Location` is the URL the download must use.
     head_client: Client,
+    /// path → signed dlink. Playback reads one range per stream chunk; without
+    /// this cache every chunk re-runs list + filemetas + HEAD.
+    link_cache: Mutex<HashMap<String, CachedLink>>,
 }
 
 impl BaiduDriver {
@@ -111,6 +129,7 @@ impl BaiduDriver {
             config,
             client,
             head_client,
+            link_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -131,6 +150,7 @@ impl BaiduDriver {
             config,
             client,
             head_client,
+            link_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -301,6 +321,93 @@ impl BaiduDriver {
                 parsed.to_string()
             }
             Err(_) => url.to_string(),
+        }
+    }
+    /// Return a cached signed dlink for `path`, if it is still fresh.
+    fn cached_link(&self, path: &str) -> Option<(String, Vec<(String, String)>)> {
+        let cache = self.link_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(path).and_then(|link| {
+            (link.expires > Instant::now()).then(|| (link.url.clone(), link.headers.clone()))
+        })
+    }
+
+    /// Remember `url`/`headers` for `path` for [LINK_CACHE_TTL].
+    fn store_link(&self, path: &str, url: &str, headers: &[(String, String)]) {
+        let mut cache = self.link_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            path.to_string(),
+            CachedLink {
+                url: url.to_string(),
+                headers: headers.to_vec(),
+                expires: Instant::now() + LINK_CACHE_TTL,
+            },
+        );
+    }
+
+    /// Drop the cached link for `path` (expired signature / auth failure).
+    fn invalidate_link(&self, path: &str) {
+        self.link_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(path);
+    }
+
+    /// Resolve the signed download URL for `path`, using the cache when fresh.
+    async fn download_link(&self, path: &str) -> Result<(String, Vec<(String, String)>)> {
+        if let Some(hit) = self.cached_link(path) {
+            return Ok(hit);
+        }
+        let item = self.get(path).await?;
+        let url = item
+            .raw_url
+            .ok_or_else(|| DriverError::Network("baidu: missing download url".into()))?;
+        let headers = item.raw_headers;
+        self.store_link(path, &url, &headers);
+        Ok((url, headers))
+    }
+
+    /// GET the signed dlink (optionally a byte range). Resolves the link once,
+    /// and re-resolves a single time when Baidu answers 401/403 (expired link).
+    async fn fetch_bytes(
+        &self,
+        path: &str,
+        range: Option<(u64, Option<u64>)>,
+    ) -> Result<Vec<u8>> {
+        let (mut url, mut headers) = self.download_link(path).await?;
+        let mut refreshed = false;
+        loop {
+            let mut req = self.client.get(&url);
+            if let Some((start, end)) = range {
+                let value = end
+                    .map(|e| format!("bytes={start}-{e}"))
+                    .unwrap_or_else(|| format!("bytes={start}-"));
+                req = req.header(reqwest::header::RANGE, value);
+            }
+            for (key, value) in &headers {
+                req = req.header(key, value);
+            }
+            let resp = req.send().await.map_err(|e| map_http_error(&e))?;
+            if resp.status().is_success() {
+                return Ok(resp
+                    .bytes()
+                    .await
+                    .map_err(|e| DriverError::Network(e.to_string()))?
+                    .to_vec());
+            }
+            let status = resp.status();
+            if !refreshed
+                && (status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN)
+            {
+                // Signed links expire; drop the entry and resolve once more.
+                self.invalidate_link(path);
+                let (fresh_url, fresh_headers) = self.download_link(path).await?;
+                url = fresh_url;
+                headers = fresh_headers;
+                refreshed = true;
+                continue;
+            }
+            return Err(http_status_error(status, path));
         }
     }
 }
@@ -487,46 +594,11 @@ impl WdmmVfs for BaiduDriver {
     }
 
     async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item
-            .raw_url
-            .ok_or_else(|| DriverError::Network("baidu: missing download url".into()))?;
-        let mut req = self.client.get(url);
-        for (key, value) in item.raw_headers {
-            req = req.header(&key, &value);
-        }
-        let resp = req.send().await.map_err(|e| map_http_error(&e))?;
-        if !resp.status().is_success() {
-            return Err(http_status_error(resp.status(), path));
-        }
-        Ok(resp
-            .bytes()
-            .await
-            .map_err(|e| DriverError::Network(e.to_string()))?
-            .to_vec())
+        self.fetch_bytes(path, None).await
     }
 
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item
-            .raw_url
-            .ok_or_else(|| DriverError::Network("baidu: missing download url".into()))?;
-        let range = end
-            .map(|e| format!("bytes={start}-{e}"))
-            .unwrap_or_else(|| format!("bytes={start}-"));
-        let mut req = self.client.get(url).header(reqwest::header::RANGE, range);
-        for (key, value) in item.raw_headers {
-            req = req.header(&key, &value);
-        }
-        let resp = req.send().await.map_err(|e| map_http_error(&e))?;
-        if !resp.status().is_success() {
-            return Err(http_status_error(resp.status(), path));
-        }
-        Ok(resp
-            .bytes()
-            .await
-            .map_err(|e| DriverError::Network(e.to_string()))?
-            .to_vec())
+        self.fetch_bytes(path, Some((start, end))).await
     }
 
 }
@@ -746,13 +818,16 @@ mod tests {
 
     /// Mock server for the dlink download path: directory listing, filemetas,
     /// and the two-step signed download (`HEAD` 302 → `Location`, then `GET`).
-    /// The tokenless unsigned dlink answers 403, mirroring Baidu.
-    async fn start_baidu_dlink_mock() -> u16 {
+    /// The tokenless unsigned dlink answers 403, mirroring Baidu. Also returns
+    /// the request lines so tests can assert which endpoints were hit.
+    async fn start_baidu_dlink_mock() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = hits.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -771,6 +846,10 @@ mod tests {
                 }
                 let text = String::from_utf8_lossy(&buf);
                 let first = text.lines().next().unwrap_or_default();
+                recorded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(first.to_string());
                 let (status, body) = if first.starts_with("GET /rest/2.0/xpan/file") {
                     let body = serde_json::json!({
                         "errno": 0,
@@ -813,12 +892,12 @@ mod tests {
                 let _ = sock.write_all(resp.as_bytes()).await;
             }
         });
-        port
+        (port, hits)
     }
 
     #[tokio::test]
     async fn get_content_uses_the_signed_location_url() {
-        let port = start_baidu_dlink_mock().await;
+        let (port, _hits) = start_baidu_dlink_mock().await;
         let mut cfg = BaiduConfig::new("tok");
         cfg.base_url = format!("http://127.0.0.1:{port}");
         let driver = BaiduDriver::new(cfg).unwrap();
@@ -837,6 +916,38 @@ mod tests {
             driver.get_content("/Movies/clip.mkv").await.unwrap(),
             b"hello"
         );
+    }
+
+    #[tokio::test]
+    async fn content_range_reuses_the_signed_link_across_chunks() {
+        let (port, hits) = start_baidu_dlink_mock().await;
+        let mut cfg = BaiduConfig::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        let driver = BaiduDriver::new(cfg).unwrap();
+
+        assert_eq!(
+            driver
+                .get_content_range("/Movies/clip.mkv", 0, Some(3))
+                .await
+                .unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            driver
+                .get_content_range("/Movies/clip.mkv", 0, Some(3))
+                .await
+                .unwrap(),
+            b"hello"
+        );
+
+        let requests = hits.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let count = |prefix: &str| requests.iter().filter(|line| line.starts_with(prefix)).count();
+        // The second range read must come from the cached signed dlink: no
+        // repeated directory listing, filemetas call or HEAD probe.
+        assert_eq!(count("GET /rest/2.0/xpan/file"), 1, "{requests:?}");
+        assert_eq!(count("GET /rest/2.0/xpan/multimedia"), 1, "{requests:?}");
+        assert_eq!(count("HEAD /dl/clip"), 1, "{requests:?}");
+        assert_eq!(count("GET /file/final"), 2, "{requests:?}");
     }
 
     #[tokio::test]

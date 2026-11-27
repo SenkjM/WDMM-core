@@ -11,8 +11,22 @@
 
 use crate::driver::{WdmmVfs, CloudFileItem, ContentDeliveryKind, DriverError, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use wdmm_crypto::rclone::{NameEncoding, NameMode, RcloneCipher, RcloneError};
+
+/// How long the ciphertext size and file nonce are reused for a path. Every
+/// range read needs both; caching them turns a 3-request header+metadata dance
+/// per 1 MiB chunk into a single range request.
+const META_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Cached ciphertext metadata for one plaintext path.
+struct CachedMeta {
+    inner_size: u64,
+    nonce: [u8; 24],
+    expires: Instant,
+}
 
 /// Crypt driver configuration aligned with Dart CryptDriver.
 #[derive(Debug, Clone)]
@@ -45,6 +59,9 @@ pub struct CryptDriver {
     cipher: RcloneCipher,
     source: Arc<dyn WdmmVfs + Send + Sync>,
     config: CryptConfig,
+    /// inner ciphertext path → size + 24-byte file nonce (the header is not
+    /// part of the block data, so it would otherwise be re-read per range).
+    meta_cache: Mutex<HashMap<String, CachedMeta>>,
 }
 
 impl CryptDriver {
@@ -64,7 +81,29 @@ impl CryptDriver {
             cipher,
             source,
             config,
+            meta_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Return the cached ciphertext size and file nonce for `inner_path`.
+    fn cached_meta(&self, inner_path: &str) -> Option<(u64, [u8; 24])> {
+        let cache = self.meta_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(inner_path).and_then(|meta| {
+            (meta.expires > Instant::now()).then_some((meta.inner_size, meta.nonce))
+        })
+    }
+
+    /// Remember the ciphertext size and file nonce for `inner_path`.
+    fn store_meta(&self, inner_path: &str, inner_size: u64, nonce: [u8; 24]) {
+        let mut cache = self.meta_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            inner_path.to_string(),
+            CachedMeta {
+                inner_size,
+                nonce,
+                expires: Instant::now() + META_CACHE_TTL,
+            },
+        );
     }
 
     /// Map plaintext path → ciphertext path.
@@ -267,9 +306,28 @@ impl WdmmVfs for CryptDriver {
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
         let inner_path = self.map_to_inner(path, true)?;
 
-        // Get file metadata to determine plaintext size
-        let inner_item = self.source.get(&inner_path).await?;
-        let plaintext_size = RcloneCipher::decrypted_size(inner_item.size)
+        // Ciphertext size + file nonce. Both are stable for a file; caching
+        // them removes a `get()` (list + filemetas + HEAD upstream) and a
+        // 32-byte header read from every playback chunk request.
+        let (inner_size, nonce) = match self.cached_meta(&inner_path) {
+            Some(hit) => hit,
+            None => {
+                let inner_item = self.source.get(&inner_path).await?;
+                let header = self
+                    .source
+                    .get_content_range(&inner_path, 0, Some(FILE_HEADER_SIZE - 1))
+                    .await?;
+                if header.len() < FILE_HEADER_SIZE as usize {
+                    return Err(DriverError::Other("short file header".into()));
+                }
+                let mut nonce = [0u8; 24];
+                nonce.copy_from_slice(&header[8..32]); // skip 8-byte magic
+                self.store_meta(&inner_path, inner_item.size, nonce);
+                (inner_item.size, nonce)
+            }
+        };
+
+        let plaintext_size = RcloneCipher::decrypted_size(inner_size)
             .map_err(|e| DriverError::Other(format!("decrypt size: {}", e)))?;
 
         if start >= plaintext_size {
@@ -286,18 +344,9 @@ impl WdmmVfs for CryptDriver {
         // Each block: FILE_HEADER (once) + BLOCK_SIZE per block
         let cipher_start = FILE_HEADER_SIZE + first_block * BLOCK_SIZE;
         let mut cipher_end = FILE_HEADER_SIZE + (last_block + 1) * BLOCK_SIZE - 1;
-        if cipher_end > inner_item.size - 1 {
-            cipher_end = inner_item.size - 1;
+        if cipher_end > inner_size - 1 {
+            cipher_end = inner_size - 1;
         }
-
-        // First fetch file header to get nonce
-        let header = self.source.get_content_range(&inner_path, 0, Some(FILE_HEADER_SIZE - 1)).await?;
-        if header.len() < FILE_HEADER_SIZE as usize {
-            return Err(DriverError::Other("short file header".into()));
-        }
-
-        // Extract nonce from header
-        let nonce = &header[8..32]; // Skip 8-byte magic, take 24-byte nonce
 
         // Fetch block data
         let block_data = self.source.get_content_range(&inner_path, cipher_start, Some(cipher_end)).await?;
@@ -317,7 +366,7 @@ impl WdmmVfs for CryptDriver {
             let cipher_block = &block_data[block_start..block_end];
             let plain_block = self
                 .cipher
-                .decrypt_block(nonce, block_idx, cipher_block)
+                .decrypt_block(&nonce, block_idx, cipher_block)
                 .map_err(|e| DriverError::Other(format!("decrypt block {}: {}", block_idx, e)))?;
 
             // Calculate which portion of this block we need
@@ -348,21 +397,34 @@ impl WdmmVfs for CryptDriver {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// MockSource: in-memory driver for testing
     struct MockSource {
         files: HashMap<String, Vec<u8>>,
+        get_calls: AtomicUsize,
+        range_calls: AtomicUsize,
     }
 
     impl MockSource {
         fn new() -> Self {
             Self {
                 files: HashMap::new(),
+                get_calls: AtomicUsize::new(0),
+                range_calls: AtomicUsize::new(0),
             }
         }
 
         fn add_file(&mut self, path: impl Into<String>, data: Vec<u8>) {
             self.files.insert(path.into(), data);
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::Relaxed)
+        }
+
+        fn range_calls(&self) -> usize {
+            self.range_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -373,6 +435,7 @@ mod tests {
         }
 
         async fn get(&self, path: &str) -> Result<CloudFileItem> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
             let data = self
                 .files
                 .get(path)
@@ -410,6 +473,7 @@ mod tests {
         }
 
         async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
+            self.range_calls.fetch_add(1, Ordering::Relaxed);
             let full = self.get_content(path).await?;
             let s = start as usize;
             if s >= full.len() {
@@ -470,5 +534,38 @@ mod tests {
 
         let file = crypt.map_to_inner("/dir/file.txt", true).unwrap();
         assert_eq!(crypt.map_to_inner("/dir/file.txt/", true).unwrap(), file);
+    }
+
+    /// Playback asks for one range per stream chunk. The ciphertext size and
+    /// file nonce must be cached, otherwise each chunk redoes `get()` (Baidu:
+    /// list + filemetas + HEAD) plus a 32-byte header read.
+    #[tokio::test]
+    async fn test_range_reads_reuse_cached_metadata() {
+        let config = CryptConfig {
+            password: "test".to_string(),
+            salt: String::new(),
+            filename_encryption: NameMode::Off,
+            filename_encoding: NameEncoding::Base64,
+            encrypted_suffix: ".bin".to_string(),
+            directory_name_encryption: false,
+            source_dir: "/encrypted".to_string(),
+        };
+        let mut mock = MockSource::new();
+        // Invalid ciphertext on purpose: the metadata/header bookkeeping is
+        // what this test counts, decryption failure is irrelevant.
+        mock.add_file("/encrypted/file.bin", vec![0u8; 32 + 16 + 8]);
+        let source = Arc::new(mock);
+        let as_dyn: Arc<dyn WdmmVfs + Send + Sync> = source.clone();
+        let crypt = CryptDriver::with_source(as_dyn, config).unwrap();
+
+        let _ = crypt.get_content_range("/file", 0, Some(3)).await;
+        let _ = crypt.get_content_range("/file", 4, Some(7)).await;
+
+        assert_eq!(source.get_calls(), 1, "metadata must be fetched once");
+        assert_eq!(
+            source.range_calls(),
+            3,
+            "header once + one block range per call"
+        );
     }
 }
