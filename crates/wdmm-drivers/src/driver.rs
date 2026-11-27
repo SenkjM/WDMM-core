@@ -296,13 +296,25 @@ pub trait WdmmVfs: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Refresh OAuth2 credentials and return the new `(access_token, refresh_token)`.
+    /// Exchange the stored refresh credentials for fresh runtime credentials.
     ///
-    /// Called by the FFI layer on `AuthFailed`; on success the FFI persists the
-    /// new tokens to the Core vault and retries the original operation once.
-    /// Drivers that do not support in-process refresh keep the default
-    /// `Err(AuthFailed)` — the FFI will surface the auth error to the caller.
-    async fn refresh_credentials(&self) -> Result<(String, String)> {
+    /// This is the single token-refresh authority for providers whose access
+    /// token the app maintains itself (Baidu, Aliyun, 115, 123). Built with
+    /// [`crate::DriverRegistry::create_token_driver`], it never needs a valid
+    /// `access_token` up front — it exchanges the `refresh_token` (or client
+    /// credentials) for a fresh one and returns every credential that has to be
+    /// patched back (115/123 also rotate `refresh_token`; Aliyun also resolves
+    /// `drive_id`).
+    ///
+    /// Called by the FFI layer both when saving a new account and on
+    /// `AuthFailed`; the patches are persisted to the Core vault before the
+    /// driver is rebuilt.
+    ///
+    /// Drivers without an in-process exchange keep the default
+    /// `Err(AuthFailed)`.
+    async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
         Err(DriverError::AuthFailed)
     }
 }

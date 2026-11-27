@@ -332,18 +332,14 @@ use base64::prelude::*;
 pub(crate) fn driver_for_account(
     account_id_str: &str,
 ) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, FfiString> {
-    let account = match global_library_db().get_account(account_id_str) {
+    let mut account = match global_library_db().get_account(account_id_str) {
         Ok(Some(a)) => a,
         Ok(None) => return Err(FfiString::from("error:account not found")),
         Err(e) => return Err(FfiString::from(format!("error:{e}"))),
     };
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return Err(FfiString::from(format!("error:{e}"))),
-    };
-    match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    match create_driver_with_refresh(&mut account) {
         Ok(d) => Ok(std::sync::Arc::from(d)),
-        Err(e) => Err(FfiString::from(format!("error:driver: {e}"))),
+        Err(e) => Err(FfiString::from(format!("error:{e}"))),
     }
 }
 
@@ -430,6 +426,122 @@ mod sync_root_tests {
     }
 }
 
+#[cfg(test)]
+mod crypt_source_tests {
+    use super::*;
+    use wdmm_core::models::CloudAccount;
+
+    fn account(
+        id: &str,
+        provider: &str,
+        name: &str,
+        base_url: Option<&str>,
+        creds: serde_json::Value,
+    ) -> CloudAccount {
+        CloudAccount {
+            id: id.to_string(),
+            provider_type: provider.to_string(),
+            display_name: name.to_string(),
+            base_url: base_url.map(str::to_string),
+            credentials_encrypted: serde_json::to_vec(&creds).expect("test creds json"),
+        }
+    }
+
+    fn insert(account: CloudAccount) {
+        global_library_db()
+            .insert_account(&account)
+            .expect("seed account");
+    }
+
+    fn crypt_account(creds: serde_json::Value) -> CloudAccount {
+        account("crypt-acct-test", "crypt", "Crypt Test", None, creds)
+    }
+
+    #[test]
+    fn builds_the_nested_source_of_a_crypt_account() {
+        insert(account(
+            "crypt-src-webdav",
+            "webdav",
+            "Crypt Src WebDAV",
+            Some("http://127.0.0.1:1/dav"),
+            serde_json::json!({"username": "u", "password": "p", "remote_dir": "/Local/Music"}),
+        ));
+        let crypt = crypt_account(serde_json::json!({
+            "password": "secret",
+            "source_account_id": "crypt-src-webdav",
+            "source_account_id_name": "Crypt Src WebDAV",
+        }));
+        let config = build_driver_config(&crypt).expect("crypt config");
+        assert_eq!(config["source"]["provider_type"], "webdav");
+        assert_eq!(config["source"]["config"]["url"], "http://127.0.0.1:1/dav");
+        assert_eq!(config["source"]["config"]["username"], "u");
+        assert_eq!(config["source"]["config"]["password"], "p");
+    }
+
+    #[test]
+    fn resolves_the_source_by_name_when_the_id_is_stale() {
+        insert(account(
+            "crypt-src-by-name",
+            "webdav",
+            "Crypt Src By Name",
+            Some("http://127.0.0.1:2/dav"),
+            serde_json::json!({"username": "u2", "password": "p2"}),
+        ));
+        let source = resolve_crypt_source(
+            &serde_json::json!({
+                "source_account_id": "account-deleted-and-re-added",
+                "source_account_id_name": "Crypt Src By Name",
+            }),
+            Some("crypt-acct-test"),
+        )
+        .expect("name fallback");
+        assert_eq!(source["provider_type"], "webdav");
+        assert_eq!(source["config"]["url"], "http://127.0.0.1:2/dav");
+    }
+
+    #[test]
+    fn keeps_an_already_nested_source_without_a_db_lookup() {
+        let nested = serde_json::json!({
+            "provider_type": "webdav",
+            "config": {"url": "http://example.invalid/dav", "username": "u3", "password": "p3"},
+        });
+        let source = resolve_crypt_source(&serde_json::json!({"source": nested}), None)
+            .expect("nested passthrough");
+        assert_eq!(source, nested);
+    }
+
+    #[test]
+    fn rejects_a_crypt_account_without_a_source() {
+        let err = resolve_crypt_source(&serde_json::json!({}), Some("crypt-acct-test"))
+            .expect_err("missing source");
+        assert_eq!(err, "err.cryptNoSourceName");
+    }
+
+    #[test]
+    fn rejects_a_missing_or_nested_crypt_source() {
+        let missing = resolve_crypt_source(
+            &serde_json::json!({"source_account_id": "no-such-account", "source_account_id_name": "Nope"}),
+            Some("crypt-acct-test"),
+        )
+        .expect_err("missing account");
+        assert!(missing.starts_with("err.cryptSourceMissing|"), "got {missing}");
+
+        insert(account(
+            "crypt-src-nested",
+            "crypt",
+            "Crypt Src Nested",
+            None,
+            serde_json::json!({"source_account_id": "whatever"}),
+        ));
+        let nested = resolve_crypt_source(
+            &serde_json::json!({"source_account_id": "crypt-src-nested"}),
+            Some("crypt-acct-test"),
+        )
+        .expect_err("crypt source");
+        assert!(nested.starts_with("err.cryptSourceMissing|"), "got {nested}");
+    }
+}
+
 /// Read a byte range from a remote file for the `ext` modules.
 ///
 /// This is the single range-read path for the migrated capabilities (ZIP central
@@ -447,11 +559,7 @@ pub(crate) fn read_account_range(
         Ok(None) => return Err("account not found".to_string()),
         Err(e) => return Err(e.to_string()),
     };
-    let config = build_driver_config(&account)?;
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
-        Ok(d) => d,
-        Err(e) => return Err(format!("driver: {e}")),
-    };
+    let driver = create_driver_with_refresh(&mut account)?;
     match rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
         &*driver, path, start, end,
     )) {
@@ -476,11 +584,7 @@ pub(crate) fn read_account_content(account_id_str: &str, path: &str) -> Result<V
         Ok(None) => return Err("account not found".to_string()),
         Err(e) => return Err(e.to_string()),
     };
-    let config = build_driver_config(&account)?;
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
-        Ok(d) => d,
-        Err(e) => return Err(format!("driver: {e}")),
-    };
+    let driver = create_driver_with_refresh(&mut account)?;
     match rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*driver, path)) {
         Ok(data) => Ok(data),
         Err(wdmm_drivers::DriverError::AuthFailed) => {
@@ -1141,14 +1245,9 @@ pub extern "C" fn wdmm_account_list_dir(
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     let items = match rt().block_on(wdmm_drivers::WdmmVfs::list(&*driver, path)) {
@@ -1215,14 +1314,9 @@ pub extern "C" fn wdmm_account_mkdir(
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     match rt().block_on(wdmm_drivers::WdmmVfs::mkdir(&*driver, path)) {
@@ -1267,14 +1361,9 @@ pub extern "C" fn wdmm_account_rename(
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     match rt().block_on(wdmm_drivers::WdmmVfs::rename(&*driver, old_path, new_path)) {
@@ -1314,14 +1403,9 @@ pub extern "C" fn wdmm_account_remove(
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     match rt().block_on(wdmm_drivers::WdmmVfs::remove(&*driver, path)) {
@@ -1363,14 +1447,9 @@ pub extern "C" fn wdmm_account_get_entry(
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     let item = match rt().block_on(wdmm_drivers::WdmmVfs::get(&*driver, path)) {
@@ -1446,13 +1525,9 @@ pub extern "C" fn wdmm_account_put_content(
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     match rt().block_on(wdmm_drivers::WdmmVfs::put_content(&*driver, path, &data)) {
@@ -1492,13 +1567,9 @@ pub extern "C" fn wdmm_account_get_content(
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     let data = match rt().block_on(wdmm_drivers::WdmmVfs::get_content(&*driver, path)) {
@@ -1555,13 +1626,9 @@ pub extern "C" fn wdmm_account_get_content_range(
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     let data = match rt().block_on(wdmm_drivers::WdmmVfs::get_content_range(
@@ -1615,13 +1682,9 @@ pub extern "C" fn wdmm_account_copy(
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     match rt().block_on(wdmm_drivers::WdmmVfs::copy(&*driver, src, dst)) {
@@ -1660,13 +1723,9 @@ pub extern "C" fn wdmm_account_ensure_dir(
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     match rt().block_on(wdmm_drivers::WdmmVfs::ensure_dir(&*driver, path)) {
@@ -1700,13 +1759,9 @@ pub extern "C" fn wdmm_account_status_tags(account_id: *const c_char) -> FfiStri
         Ok(None) => return FfiString::from("error:account not found"),
         Err(e) => return FfiString::from(format!("error:{e}")),
     };
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(e) => return FfiString::from(format!("error:{e}")),
-    };
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
-        Err(e) => return FfiString::from(format!("error:driver: {e}")),
+        Err(e) => return FfiString::from(format!("error:{e}")),
     };
 
     let tags = match rt().block_on(wdmm_drivers::WdmmVfs::status_tags(&*driver)) {
@@ -1778,12 +1833,7 @@ pub unsafe extern "C" fn wdmm_account_read_range(
         Err(_) => return -1,
     };
 
-    let config = match build_driver_config(&account) {
-        Ok(c) => c,
-        Err(_) => return -1,
-    };
-
-    let driver = match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+    let driver = match create_driver_with_refresh(&mut account) {
         Ok(d) => d,
         Err(_) => return -1,
     };
@@ -1833,6 +1883,73 @@ fn build_driver_config(account: &wdmm_core::models::CloudAccount) -> Result<serd
     build_driver_config_from_creds(account, &creds)
 }
 
+/// Resolve the source account of a crypt wrapper into the nested
+/// `{"provider_type", "config"}` object `DriverRegistry::create_driver("crypt")`
+/// requires.
+///
+/// The account form saves only the source account id plus a name snapshot (the
+/// snapshot survives a source delete + re-add under the same name). Resolving
+/// it here — in Core — keeps one authority for every entry point: form verify,
+/// browse, playback, sync and OpenAPI all go through `build_driver_config`.
+///
+/// Nested `source` already present in the credentials (older stores, restored
+/// backups) wins so a stored crypt account keeps working without a DB lookup.
+fn resolve_crypt_source(
+    creds: &serde_json::Value,
+    self_account_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    if let Some(source) = creds.get("source") {
+        if source.is_object() {
+            return Ok(source.clone());
+        }
+    }
+
+    let text = |key: &str| {
+        creds
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let source_id = text("source_account_id");
+    let source_name = text("source_account_id_name");
+    if source_id.is_none() && source_name.is_none() {
+        return Err("err.cryptNoSourceName".into());
+    }
+
+    let db = try_global_library_db().ok_or_else(|| "err.notInitialized".to_string())?;
+    let mut source = source_id
+        .as_deref()
+        .and_then(|id| db.get_account(id).ok().flatten());
+    if source.is_none() {
+        if let Some(name) = source_name.as_deref() {
+            source = db
+                .list_accounts()
+                .ok()
+                .and_then(|list| list.into_iter().find(|a| a.display_name == name));
+        }
+    }
+    let source = source.ok_or_else(|| {
+        format!(
+            "err.cryptSourceMissing|{}",
+            source_name.or(source_id).unwrap_or_default()
+        )
+    })?;
+
+    // A crypt account must not wrap itself or another crypt account: either
+    // would recurse without a base case.
+    if Some(source.id.as_str()) == self_account_id || source.provider_type == "crypt" {
+        return Err(format!("err.cryptSourceMissing|{}", source.display_name));
+    }
+
+    let inner = build_driver_config(&source)?;
+    Ok(serde_json::json!({
+        "provider_type": source.provider_type,
+        "config": inner,
+    }))
+}
+
 /// Build driver config from an already-parsed credentials value. Extracted so
 /// the FFI refresh helper can call it after patching tokens without re-reading
 /// from the DB.
@@ -1855,6 +1972,17 @@ fn build_driver_config_from_creds(
         }));
     }
 
+    // Crypt: the form stores the source account id + name snapshot, not the
+    // nested source driver config. Resolve it from the account DB here.
+    if account.provider_type == "crypt" {
+        if !creds.is_object() {
+            return Err("credentials must be a JSON object".into());
+        }
+        let mut config = creds.clone();
+        config["source"] = resolve_crypt_source(creds, Some(&account.id))?;
+        return Ok(config);
+    }
+
     // Other providers: use credentials as config; inject base_url + account_id
     if !creds.is_object() {
         return Err("credentials must be a JSON object".into());
@@ -1872,30 +2000,43 @@ fn build_driver_config_from_creds(
     Ok(config)
 }
 
-/// On `AuthFailed`, refresh credentials for `account`, persist to Core vault,
-/// and return a new driver built from the updated config. Mutates
-/// `account.credentials_encrypted` in-place so the caller can rebuild.
+/// Refresh the account's tokens from its stored refresh credentials, persist
+/// every patched credential to the Core vault, and return the rebuilt driver.
 ///
-/// Returns `Err(AuthFailed)` if the driver doesn't support refresh or if the
-/// refresh network call itself fails.
+/// This is the single token-refresh path (Baidu / Aliyun / 115 / 123): it builds
+/// a verify-mode driver, which tolerates a missing `access_token`, and calls
+/// [`wdmm_drivers::WdmmVfs::verify_initial_auth`]. The returned patches include
+/// `access_token` + `refresh_token` and, for Aliyun, `drive_id`. All of them are
+/// merged into the stored credentials, so an account restored from an older
+/// backup becomes usable on the first request.
+///
+/// Returns `Err(AuthFailed)` when the provider does not manage its own token or
+/// when the exchange itself fails.
 async fn refresh_and_rebuild(
     account: &mut wdmm_core::models::CloudAccount,
 ) -> wdmm_drivers::Result<Box<dyn wdmm_drivers::WdmmVfs>> {
     use wdmm_drivers::DriverError;
 
-    // Build a probe driver from current config to call refresh_credentials.
+    if !wdmm_drivers::DriverRegistry::supports_token_exchange(&account.provider_type) {
+        return Err(DriverError::AuthFailed);
+    }
+
     let config = build_driver_config(account).map_err(DriverError::Config)?;
-    let probe = wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config)?;
+    let probe =
+        wdmm_drivers::DriverRegistry::create_token_driver(&account.provider_type, config)?;
+    let patches = probe.verify_initial_auth().await?;
+    if patches.is_empty() {
+        return Err(DriverError::AuthFailed);
+    }
 
-    let (new_access, new_refresh) = probe.refresh_credentials().await?;
-
-    // Patch access_token + refresh_token into the in-memory credentials blob.
+    // Merge every patched credential (not just the two tokens).
     let creds_str = std::str::from_utf8(&account.credentials_encrypted)
         .map_err(|_| DriverError::Config("credentials not UTF-8".into()))?;
     let mut creds: serde_json::Value = serde_json::from_str(creds_str)
         .map_err(|_| DriverError::Config("credentials not JSON".into()))?;
-    creds["access_token"] = serde_json::Value::String(new_access);
-    creds["refresh_token"] = serde_json::Value::String(new_refresh);
+    for (key, value) in patches {
+        creds[key] = serde_json::Value::String(value);
+    }
 
     let new_bytes = serde_json::to_vec(&creds)
         .map_err(|_| DriverError::Config("failed to encode credentials".into()))?;
@@ -1907,9 +2048,34 @@ async fn refresh_and_rebuild(
     // Update in-memory account so build_driver_config reads new tokens.
     account.credentials_encrypted = new_bytes;
 
-    // Build fresh driver with refreshed tokens.
     let new_config = build_driver_config(account).map_err(DriverError::Config)?;
     wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, new_config)
+}
+
+/// Build an account's runtime driver, exchanging its refresh credentials first
+/// when the runtime driver cannot be constructed yet.
+///
+/// The setup form for app-managed-token providers only stores a `refresh_token`;
+/// a driver built straight from it fails with a `Config` error until the first
+/// exchange. Both the DB → driver entry points (`driver_for_account`,
+/// `create_account_driver`) go through here so saved, restored and legacy
+/// accounts all behave the same.
+pub(crate) fn create_driver_with_refresh(
+    account: &mut wdmm_core::models::CloudAccount,
+) -> Result<Box<dyn wdmm_drivers::WdmmVfs>, String> {
+    let config = build_driver_config(account)?;
+    match wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config) {
+        Ok(driver) => Ok(driver),
+        Err(_) if wdmm_drivers::DriverRegistry::supports_token_exchange(&account.provider_type) => {
+            match rt().block_on(refresh_and_rebuild(account)) {
+                Ok(driver) => Ok(driver),
+                // A refresh failure that carries a stable code (e.g. the form
+                // never stored a refresh_token) is the actionable message.
+                Err(refresh_err) => Err(trim_stable_code(format!("{refresh_err}"))),
+            }
+        }
+        Err(e) => Err(format!("driver: {e}")),
+    }
 }
 
 // ── Account verify FFI ────────────────────────────────────────────────────────
@@ -1930,6 +2096,21 @@ async fn refresh_and_rebuild(
 /// `token_patches` must be merged into the config that is passed to
 /// `wdmm_account_upsert` so the driver can be reconstructed after an app
 /// restart (aliyun: access_token + drive_id; baidu: access_token + refresh_token).
+/// `DriverError`'s `Display` prefixes the payload (`config error: …`), but a
+/// stable user-facing code (`err.xxx…`) has to start the message so the Dart
+/// `WdmmVfsErrors` mapper can localize it (and so the account form shows the
+/// actionable "fill in refresh_token" hint instead of a raw driver error).
+fn trim_stable_code(msg: String) -> String {
+    match msg.find("err.") {
+        Some(idx) => msg[idx..].to_string(),
+        None => msg,
+    }
+}
+
+fn user_visible_error(e: &wdmm_drivers::DriverError) -> String {
+    trim_stable_code(e.to_string())
+}
+
 #[no_mangle]
 pub extern "C" fn wdmm_account_verify(
     provider_type: *const c_char,
@@ -1949,29 +2130,22 @@ pub extern "C" fn wdmm_account_verify(
     };
 
     let result: wdmm_drivers::Result<HashMap<String, String>> = (|| {
-        use wdmm_drivers::{AliyunConfig, AliyunDriver, BaiduConfig, BaiduDriver, DriverError};
+        use wdmm_drivers::DriverError;
 
         match ptype {
-            // ── Aliyun: exchange refresh_token → access_token + drive_id ──────
-            "aliyundrive" | "aliyun" | "aliyundrive_open" => {
-                let cfg: AliyunConfig = serde_json::from_value(config.clone())
-                    .map_err(|e| DriverError::Config(e.to_string()))?;
-                let driver = AliyunDriver::new_for_verify(cfg)?;
-                rt().block_on(driver.verify_initial_auth())
-            }
-
-            // ── Baidu: exchange refresh_token → access_token ──────────────────
-            "baidu" | "baidu_netdisk" => {
-                let cfg: BaiduConfig = serde_json::from_value(config.clone())
-                    .map_err(|e| DriverError::Config(e.to_string()))?;
-                let driver = BaiduDriver::new_for_verify(cfg)?;
+            // Providers whose access token the app maintains itself: exchange the
+            // stored refresh credentials. This works before any access_token
+            // exists, which is exactly the setup-form state.
+            p if wdmm_drivers::DriverRegistry::supports_token_exchange(p) => {
+                let driver =
+                    wdmm_drivers::DriverRegistry::create_token_driver(p, config.clone())?;
                 rt().block_on(driver.verify_initial_auth())
             }
 
             // ── All other providers: connection test via list("/") ─────────────
             _ => {
                 // Build driver config inline (no DB account yet).
-                let driver_config = if ptype == "webdav" {
+                let mut driver_config = if ptype == "webdav" {
                     let url = config["url"].as_str()
                         .or_else(|| config["base_url"].as_str())
                         .unwrap_or("");
@@ -1983,6 +2157,13 @@ pub extern "C" fn wdmm_account_verify(
                 } else {
                     config.clone()
                 };
+                // Crypt is verified against its wrapped source account: the
+                // form only knows the source id/name, so resolve it the same
+                // way the saved account path does.
+                if ptype == "crypt" {
+                    driver_config["source"] =
+                        resolve_crypt_source(&config, None).map_err(DriverError::Config)?;
+                }
                 let driver = wdmm_drivers::DriverRegistry::create_driver(ptype, driver_config)?;
                 rt().block_on(wdmm_drivers::WdmmVfs::list(&*driver, "/"))
                     .map(|_| HashMap::new())
@@ -1995,7 +2176,7 @@ pub extern "C" fn wdmm_account_verify(
             let json = serde_json::json!({"ok": true, "token_patches": patches});
             FfiString::from(json.to_string())
         }
-        Err(e) => FfiString::from(format!("error:{e}")),
+        Err(e) => FfiString::from(format!("error:{}", user_visible_error(&e))),
     }
 }
 
@@ -2883,14 +3064,12 @@ pub(crate) const STREAM_CHUNK: u64 = 1024 * 1024;
 pub(crate) fn create_account_driver(
     account_id: &str,
 ) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, String> {
-    let account = match global_library_db().get_account(account_id) {
+    let mut account = match global_library_db().get_account(account_id) {
         Ok(Some(a)) => a,
         Ok(None) => return Err("account not found".into()),
         Err(e) => return Err(e.to_string()),
     };
-    let config = build_driver_config(&account)?;
-    let driver = wdmm_drivers::DriverRegistry::create_driver(&account.provider_type, config)
-        .map_err(|e| format!("driver: {e}"))?;
+    let driver = create_driver_with_refresh(&mut account)?;
     Ok(std::sync::Arc::from(driver))
 }
 

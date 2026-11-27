@@ -17,6 +17,12 @@ use serde_json::Value;
 
 const OPEN115_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/142.0.0.0 OpenList/425.6.30";
 
+/// Token-refresh endpoint (Open Platform passport API).
+///
+/// 115 rotates the refresh token on every exchange, so the caller must persist
+/// **both** returned tokens.
+const OPEN115_REFRESH_URL: &str = "https://passportapi.115.com/open/refreshToken";
+
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -27,6 +33,11 @@ pub struct Open115Config {
     pub access_token: String,
     /// API base URL. Defaults to `https://proapi.115.com`.
     pub base_url: String,
+    /// OAuth2 refresh token (rotated on every refresh; persisted to Core vault).
+    pub refresh_token: String,
+    /// Token-refresh endpoint. Overridable so tests can point at a mock server;
+    /// never exposed in the setup form.
+    pub refresh_url: String,
 }
 
 impl Default for Open115Config {
@@ -34,6 +45,8 @@ impl Default for Open115Config {
         Self {
             access_token: String::new(),
             base_url: "https://proapi.115.com".to_string(),
+            refresh_token: String::new(),
+            refresh_url: OPEN115_REFRESH_URL.to_string(),
         }
     }
 }
@@ -65,6 +78,95 @@ impl Open115Driver {
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
         Ok(Self { config, client })
+    }
+
+    /// Build a driver for the initial-verify / token-exchange flow.
+    ///
+    /// Unlike [new], this does NOT require `access_token` — the caller is
+    /// expected to immediately run [verify_initial_auth], which exchanges the
+    /// stored `refresh_token`.
+    pub fn new_for_verify(config: Open115Config) -> Result<Self> {
+        let client = Client::builder()
+            .user_agent(OPEN115_USER_AGENT)
+            .build()
+            .map_err(|e| DriverError::Config(e.to_string()))?;
+        Ok(Self { config, client })
+    }
+
+    /// Exchange the stored `refresh_token` for a fresh `(access_token,
+    /// refresh_token)` pair.
+    ///
+    /// Wire format: `POST {refresh_url}` with
+    /// `application/x-www-form-urlencoded` body `refresh_token=…` and **no**
+    /// Bearer auth (the access token is what we are exchanging). 115 rotates the
+    /// refresh token on every call, so callers must persist both values.
+    pub async fn refresh_access_token(&self) -> Result<(String, String)> {
+        let refresh = self.config.refresh_token.trim();
+        if refresh.is_empty() {
+            return Err(DriverError::Config(
+                "err.open115MissingRefreshToken".into(),
+            ));
+        }
+        let resp = self
+            .client
+            .post(&self.config.refresh_url)
+            .form(&[("refresh_token", refresh)])
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(DriverError::AuthFailed);
+        }
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {status}")));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        let code = body["code"]
+            .as_i64()
+            .or_else(|| body["code"].as_str().and_then(|s| s.parse().ok()));
+        // Some deployments nest the tokens under `data`; accept both shapes.
+        let payload = body
+            .get("data")
+            .filter(|v| v.is_object())
+            .unwrap_or(&body);
+        let access = payload["access_token"]
+            .as_str()
+            .filter(|s| !s.is_empty());
+        let new_refresh = payload["refresh_token"]
+            .as_str()
+            .filter(|s| !s.is_empty());
+        let code_ok = matches!(code, None | Some(0));
+        match (code_ok, access, new_refresh) {
+            (true, Some(access), Some(refresh)) => {
+                Ok((access.to_string(), refresh.to_string()))
+            }
+            _ => {
+                let message = body["message"].as_str().unwrap_or("");
+                Err(DriverError::Network(format!(
+                    "115 token refresh failed (code {} {message})",
+                    code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+                )))
+            }
+        }
+    }
+
+    /// Initial-auth flow for account setup / auth retry: exchanges the stored
+    /// `refresh_token` and returns the credential patches that must be merged
+    /// into the account config and persisted to the Core vault.
+    pub async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let (access_token, refresh_token) = self.refresh_access_token().await?;
+        let mut patches = std::collections::HashMap::new();
+        patches.insert("access_token".into(), access_token);
+        patches.insert("refresh_token".into(), refresh_token);
+        Ok(patches)
     }
 
     fn auth_header(&self) -> String {
@@ -233,6 +335,13 @@ impl Open115Driver {
 
 #[async_trait]
 impl WdmmVfs for Open115Driver {
+    /// Token exchange through `dyn WdmmVfs` (used by `create_token_driver`).
+    async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        Open115Driver::verify_initial_auth(self).await
+    }
+
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let cid = self.path_to_cid(path).await?;
         let items = self.list_cid(&cid.to_string()).await?;
@@ -499,6 +608,82 @@ mod tests {
 
         let err = driver.list("/").await.unwrap_err();
         assert!(matches!(err, DriverError::AuthFailed));
+    }
+
+    // ── Token exchange ────────────────────────────────────────────────────────
+
+    /// One-shot mock server that answers any request with [body].
+    async fn start_plain_mock_server(body: String) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_both_tokens() {
+        let body =
+            serde_json::json!({"code": 0, "data": {"access_token": "a2", "refresh_token": "r2"}})
+                .to_string();
+        let port = start_plain_mock_server(body).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Open115Config::new("");
+        cfg.refresh_token = "r1".into();
+        cfg.refresh_url = format!("http://127.0.0.1:{port}/open/refreshToken");
+        let driver = Open115Driver::new_for_verify(cfg).unwrap();
+
+        let patches = driver.verify_initial_auth().await.unwrap();
+        assert_eq!(patches.get("access_token").map(String::as_str), Some("a2"));
+        assert_eq!(
+            patches.get("refresh_token").map(String::as_str),
+            Some("r2")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_code_failure() {
+        let body =
+            serde_json::json!({"code": 401, "message": "invalid refresh token"}).to_string();
+        let port = start_plain_mock_server(body).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Open115Config::new("");
+        cfg.refresh_token = "bad".into();
+        cfg.refresh_url = format!("http://127.0.0.1:{port}/open/refreshToken");
+        let driver = Open115Driver::new_for_verify(cfg).unwrap();
+
+        let err = driver.verify_initial_auth().await.unwrap_err();
+        match err {
+            DriverError::Network(msg) => {
+                assert!(msg.contains("401"), "unexpected message: {msg}");
+                assert!(msg.contains("invalid refresh token"));
+            }
+            other => panic!("expected Network, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_requires_refresh_token() {
+        let driver = Open115Driver::new_for_verify(Open115Config::default()).unwrap();
+        assert!(matches!(
+            driver.verify_initial_auth().await,
+            Err(DriverError::Config(_))
+        ));
     }
 
     // ── Write-op mock tests ───────────────────────────────────────────────────

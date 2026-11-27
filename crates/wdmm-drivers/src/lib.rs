@@ -88,97 +88,17 @@ impl DriverRegistry {
                 Ok(Box::new(CtFileDriver::new(cfg)?))
             }
             "baidu" | "baidu_netdisk" => {
-                let token = config["access_token"]
-                    .as_str()
-                    .ok_or_else(|| DriverError::Config("baidu: missing access_token".into()))?;
-                let mut cfg = BaiduConfig::new(token);
-                if let Some(s) = config["base_url"].as_str() {
-                    cfg.base_url = s.to_string();
-                }
-                // Token-refresh fields (persisted in Core vault; see Dart
-                // baidu_netdisk_driver form spec).
-                if let Some(s) = config["refresh_token"].as_str() {
-                    cfg.refresh_token = s.to_string();
-                }
-                if let Some(s) = config["client_id"].as_str() {
-                    cfg.client_id = s.to_string();
-                }
-                if let Some(s) = config["client_secret"].as_str() {
-                    cfg.client_secret = s.to_string();
-                }
-                if let Some(s) = config["api_url_address"].as_str() {
-                    cfg.api_url_address = s.to_string();
-                }
-                if let Some(b) = config["local_refresh"].as_bool() {
-                    cfg.local_refresh = b;
-                }
-                if let Some(s) = config["account_id"].as_str() {
-                    cfg.account_id = s.to_string();
-                }
-                Ok(Box::new(BaiduDriver::new(cfg)?))
+                Ok(Box::new(BaiduDriver::new(baidu_config_from_json(&config))?))
             }
-            "123" | "123_open" | "pan123" => {
-                let token = config["access_token"]
-                    .as_str()
-                    .ok_or_else(|| DriverError::Config("123pan: missing access_token".into()))?;
-                let mut cfg = Pan123Config::new(token);
-                if let Some(s) = config["base_url"].as_str() {
-                    cfg.base_url = s.to_string();
-                }
-                Ok(Box::new(Pan123Driver::new(cfg)?))
-            }
-            "aliyundrive" | "aliyun" | "aliyundrive_open" => {
-                let token = config["access_token"]
-                    .as_str()
-                    .ok_or_else(|| DriverError::Config("aliyun: missing access_token".into()))?;
-                let drive_id = config["drive_id"]
-                    .as_str()
-                    .ok_or_else(|| DriverError::Config("aliyun: missing drive_id".into()))?;
-                let mut cfg = AliyunConfig::new(token, drive_id);
-                if let Some(s) = config["base_url"].as_str() {
-                    cfg.base_url = s.to_string();
-                }
-                if let Some(s) = config["remove_way"].as_str() {
-                    cfg.remove_way = s.to_string();
-                }
-                // Token-refresh fields (persisted in Core vault; see Dart
-                // aliyundrive_open_driver form spec).
-                if let Some(s) = config["refresh_token"].as_str() {
-                    cfg.refresh_token = s.to_string();
-                }
-                if let Some(s) = config["client_id"].as_str() {
-                    cfg.client_id = s.to_string();
-                }
-                if let Some(s) = config["client_secret"].as_str() {
-                    cfg.client_secret = s.to_string();
-                }
-                if let Some(s) = config["api_url_address"].as_str() {
-                    cfg.api_url_address = s.to_string();
-                }
-                if let Some(b) = config["local_refresh"].as_bool() {
-                    cfg.local_refresh = b;
-                }
-                if let Some(s) = config["drive_type"].as_str() {
-                    cfg.drive_type = s.to_string();
-                }
-                if let Some(s) = config["root_folder_id"].as_str() {
-                    cfg.root_folder_id = s.to_string();
-                }
-                if let Some(s) = config["account_id"].as_str() {
-                    cfg.account_id = s.to_string();
-                }
-                Ok(Box::new(AliyunDriver::new(cfg)?))
-            }
-            "115" | "open115" | "115open" => {
-                let token = config["access_token"]
-                    .as_str()
-                    .ok_or_else(|| DriverError::Config("115: missing access_token".into()))?;
-                let mut cfg = Open115Config::new(token);
-                if let Some(s) = config["base_url"].as_str() {
-                    cfg.base_url = s.to_string();
-                }
-                Ok(Box::new(Open115Driver::new(cfg)?))
-            }
+            "123" | "123_open" | "pan123" => Ok(Box::new(Pan123Driver::new(
+                pan123_config_from_json(&config),
+            )?)),
+            "aliyundrive" | "aliyun" | "aliyundrive_open" => Ok(Box::new(
+                AliyunDriver::new(aliyun_config_from_json(&config))?,
+            )),
+            "115" | "open115" | "115open" => Ok(Box::new(Open115Driver::new(
+                open115_config_from_json(&config),
+            )?)),
             "terabox" => {
                 let cookie = config["cookie"]
                     .as_str()
@@ -267,6 +187,170 @@ impl DriverRegistry {
             _ => Err(DriverError::UnsupportedProvider(provider_type.to_string())),
         }
     }
+
+    /// Whether the app maintains this provider's access token itself (the user
+    /// only supplies a `refresh_token` / client credentials at setup time).
+    pub fn supports_token_exchange(provider_type: &str) -> bool {
+        matches!(
+            provider_type,
+            "baidu"
+                | "baidu_netdisk"
+                | "123"
+                | "123_open"
+                | "pan123"
+                | "aliyundrive"
+                | "aliyun"
+                | "aliyundrive_open"
+                | "115"
+                | "open115"
+                | "115open"
+        )
+    }
+
+    /// Build a driver for the initial-auth / token-refresh flow.
+    ///
+    /// Unlike [`DriverRegistry::create_driver`], this tolerates a missing
+    /// `access_token` (and Aliyun's `drive_id`): the caller must immediately call
+    /// [`WdmmVfs::verify_initial_auth`], which exchanges the stored
+    /// `refresh_token` for fresh credentials. This is the only path that can
+    /// build a driver for an account that has never been verified, so both
+    /// `wdmm_account_verify` and the FFI auth-retry path go through it.
+    pub fn create_token_driver(
+        provider_type: &str,
+        config: serde_json::Value,
+    ) -> Result<Box<dyn WdmmVfs>> {
+        match provider_type {
+            "baidu" | "baidu_netdisk" => Ok(Box::new(BaiduDriver::new_for_verify(
+                baidu_config_from_json(&config),
+            )?)),
+            "123" | "123_open" | "pan123" => Ok(Box::new(Pan123Driver::new_for_verify(
+                pan123_config_from_json(&config),
+            )?)),
+            "aliyundrive" | "aliyun" | "aliyundrive_open" => Ok(Box::new(
+                AliyunDriver::new_for_verify(aliyun_config_from_json(&config))?,
+            )),
+            "115" | "open115" | "115open" => Ok(Box::new(Open115Driver::new_for_verify(
+                open115_config_from_json(&config),
+            )?)),
+            other => Err(DriverError::Config(format!(
+                "{other}: provider does not support token exchange"
+            ))),
+        }
+    }
+}
+
+/// Map a form/credentials JSON blob onto [`BaiduConfig`]. Tolerant on purpose:
+/// the setup form only stores the refresh-side fields, and runtime configs may
+/// lack `access_token` until [`WdmmVfs::verify_initial_auth`] has run.
+fn baidu_config_from_json(config: &serde_json::Value) -> BaiduConfig {
+    let mut cfg = BaiduConfig::new(config["access_token"].as_str().unwrap_or(""));
+    if let Some(s) = config["base_url"].as_str() {
+        cfg.base_url = s.to_string();
+    }
+    if let Some(s) = config["refresh_token"].as_str() {
+        cfg.refresh_token = s.to_string();
+    }
+    if let Some(s) = config["client_id"].as_str() {
+        cfg.client_id = s.to_string();
+    }
+    if let Some(s) = config["client_secret"].as_str() {
+        cfg.client_secret = s.to_string();
+    }
+    if let Some(s) = config["api_url_address"].as_str() {
+        cfg.api_url_address = s.to_string();
+    }
+    if let Some(b) = config["local_refresh"].as_bool() {
+        cfg.local_refresh = b;
+    }
+    if let Some(s) = config["account_id"].as_str() {
+        cfg.account_id = s.to_string();
+    }
+    cfg
+}
+
+/// Map a form/credentials JSON blob onto [`AliyunConfig`] (tolerant, see
+/// [`baidu_config_from_json`]).
+fn aliyun_config_from_json(config: &serde_json::Value) -> AliyunConfig {
+    let mut cfg = AliyunConfig::new(
+        config["access_token"].as_str().unwrap_or(""),
+        config["drive_id"].as_str().unwrap_or(""),
+    );
+    if let Some(s) = config["base_url"].as_str() {
+        cfg.base_url = s.to_string();
+    }
+    if let Some(s) = config["remove_way"].as_str() {
+        cfg.remove_way = s.to_string();
+    }
+    if let Some(s) = config["refresh_token"].as_str() {
+        cfg.refresh_token = s.to_string();
+    }
+    if let Some(s) = config["client_id"].as_str() {
+        cfg.client_id = s.to_string();
+    }
+    if let Some(s) = config["client_secret"].as_str() {
+        cfg.client_secret = s.to_string();
+    }
+    if let Some(s) = config["api_url_address"].as_str() {
+        cfg.api_url_address = s.to_string();
+    }
+    if let Some(b) = config["local_refresh"].as_bool() {
+        cfg.local_refresh = b;
+    }
+    if let Some(s) = config["drive_type"].as_str() {
+        cfg.drive_type = s.to_string();
+    }
+    if let Some(s) = config["root_folder_id"].as_str() {
+        cfg.root_folder_id = s.to_string();
+    }
+    if let Some(s) = config["account_id"].as_str() {
+        cfg.account_id = s.to_string();
+    }
+    cfg
+}
+
+/// Map a form/credentials JSON blob onto [`Open115Config`] (tolerant, see
+/// [`baidu_config_from_json`]). Tokens are exchanged from `refresh_token` at
+/// setup time and persisted back into the same config.
+fn open115_config_from_json(config: &serde_json::Value) -> Open115Config {
+    let mut cfg = Open115Config::new(config["access_token"].as_str().unwrap_or(""));
+    if let Some(s) = config["base_url"].as_str() {
+        cfg.base_url = s.to_string();
+    }
+    if let Some(s) = config["refresh_token"].as_str() {
+        cfg.refresh_token = s.to_string();
+    }
+    if let Some(s) = config["refresh_url"].as_str() {
+        cfg.refresh_url = s.to_string();
+    }
+    cfg
+}
+
+/// Map a form/credentials JSON blob onto [`Pan123Config`] (tolerant, see
+/// [`baidu_config_from_json`]).
+fn pan123_config_from_json(config: &serde_json::Value) -> Pan123Config {
+    let mut cfg = Pan123Config::new(config["access_token"].as_str().unwrap_or(""));
+    if let Some(s) = config["base_url"].as_str() {
+        cfg.base_url = s.to_string();
+    }
+    if let Some(s) = config["refresh_token"].as_str() {
+        cfg.refresh_token = s.to_string();
+    }
+    if let Some(s) = config["api_url_address"].as_str() {
+        cfg.api_url_address = s.to_string();
+    }
+    if let Some(b) = config["local_refresh"].as_bool() {
+        cfg.local_refresh = b;
+    }
+    if let Some(s) = config["client_id"].as_str() {
+        cfg.client_id = s.to_string();
+    }
+    if let Some(s) = config["client_secret"].as_str() {
+        cfg.client_secret = s.to_string();
+    }
+    if let Some(s) = config["root_folder_id"].as_str() {
+        cfg.root_folder_id = s.to_string();
+    }
+    cfg
 }
 
 #[cfg(test)]
@@ -331,6 +415,34 @@ mod tests {
             serde_json::json!({"access_token": "tok"})
         )
         .is_ok());
+    }
+
+    #[test]
+    fn token_exchange_drivers_build_without_access_token() {
+        for provider in ["baidu", "baidu_netdisk", "123", "123_open", "aliyun", "115"] {
+            assert!(DriverRegistry::supports_token_exchange(provider), "{provider} should exchange tokens");
+        }
+        assert!(!DriverRegistry::supports_token_exchange("webdav"));
+
+        // The app owns token refresh for these providers, so a brand-new
+        // account only has refresh material. The verify driver must build
+        // without any access_token (the token is obtained by verify_initial_auth).
+        let cfg = serde_json::json!({
+            "refresh_token": "rt",
+            "client_id": "cid",
+            "client_secret": "secret"
+        });
+        for provider in ["baidu", "123_open", "aliyun", "115"] {
+            assert!(
+                DriverRegistry::create_token_driver(provider, cfg.clone()).is_ok(),
+                "{provider} should build a token-exchange driver"
+            );
+        }
+
+        assert!(matches!(
+            DriverRegistry::create_token_driver("webdav", serde_json::json!({})),
+            Err(DriverError::Config(_))
+        ));
     }
 
     #[test]

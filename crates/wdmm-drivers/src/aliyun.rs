@@ -238,6 +238,13 @@ impl AliyunDriver {
 
 #[async_trait]
 impl WdmmVfs for AliyunDriver {
+    /// Token exchange through `dyn WdmmVfs` (used by `create_token_driver`).
+    async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        AliyunDriver::verify_initial_auth(self).await
+    }
+
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let parent_id = if path == "/" || path.is_empty() {
             "root".to_string()
@@ -462,9 +469,6 @@ impl WdmmVfs for AliyunDriver {
             .to_vec())
     }
 
-    async fn refresh_credentials(&self) -> Result<(String, String)> {
-        self.refresh_access_token().await
-    }
 }
 
 impl AliyunDriver {
@@ -496,7 +500,9 @@ impl AliyunDriver {
     pub async fn refresh_access_token(&self) -> Result<(String, String)> {
         let token = self.config.refresh_token.trim();
         if token.is_empty() {
-            return Err(DriverError::AuthFailed);
+            return Err(DriverError::Config(
+                "err.aliyunMissingRefreshToken".into(),
+            ));
         }
         let mut failures: Vec<String> = Vec::new();
 

@@ -288,6 +288,13 @@ impl BaiduDriver {
 
 #[async_trait]
 impl WdmmVfs for BaiduDriver {
+    /// Token exchange through `dyn WdmmVfs` (used by `create_token_driver`).
+    async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        BaiduDriver::verify_initial_auth(self).await
+    }
+
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let items = self.list_dir(path).await?;
         Ok(items.iter().filter_map(Self::parse_item).collect())
@@ -498,9 +505,6 @@ impl WdmmVfs for BaiduDriver {
             .to_vec())
     }
 
-    async fn refresh_credentials(&self) -> Result<(String, String)> {
-        self.refresh_access_token().await
-    }
 }
 
 fn http_status_error(status: reqwest::StatusCode, path: &str) -> DriverError {
@@ -529,7 +533,9 @@ impl BaiduDriver {
     pub async fn refresh_access_token(&self) -> Result<(String, String)> {
         let token = self.config.refresh_token.trim();
         if token.is_empty() {
-            return Err(DriverError::AuthFailed);
+            return Err(DriverError::Config(
+                "err.baiduMissingRefreshToken".into(),
+            ));
         }
 
         if !self.config.local_refresh {

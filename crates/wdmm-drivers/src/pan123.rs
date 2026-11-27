@@ -13,12 +13,31 @@ use serde_json::Value;
 
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
 
+/// Default online-renew endpoint (OpenList public proxy).
+const DEFAULT_RENEW_API: &str = "https://api.oplist.org/123cloud/renewapi";
+
+/// `driver_txt` query param expected by the OpenList renew endpoint.
+const DRIVER_TXT: &str = "123cloud_oa";
+
 /// Configuration for the 123 Pan driver.
 pub struct Pan123Config {
     /// User-supplied access token from 123 Pan OAuth (account settings — never embedded).
     pub access_token: String,
     /// API base URL. Defaults to `https://open-api.123pan.com`.
     pub base_url: String,
+    /// OAuth2 refresh token (rotated by the online renew API; persisted to Core
+    /// vault).
+    pub refresh_token: String,
+    /// Custom online renew-API address (OpenList-style proxy). Empty → default.
+    pub api_url_address: String,
+    /// When true, skip the online renew API and use client credentials only.
+    pub local_refresh: bool,
+    /// Open Platform client id (local-refresh branch).
+    pub client_id: String,
+    /// Open Platform client secret (local-refresh branch).
+    pub client_secret: String,
+    /// Root folder id (opaque; default `0`).
+    pub root_folder_id: String,
 }
 
 impl Default for Pan123Config {
@@ -26,6 +45,12 @@ impl Default for Pan123Config {
         Self {
             access_token: String::new(),
             base_url: "https://open-api.123pan.com".to_string(),
+            refresh_token: String::new(),
+            api_url_address: DEFAULT_RENEW_API.to_string(),
+            local_refresh: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            root_folder_id: "0".to_string(),
         }
     }
 }
@@ -63,6 +88,156 @@ impl Pan123Driver {
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
         Ok(Self { config, client })
+    }
+
+    /// Build a driver for the initial-verify / token-exchange flow.
+    ///
+    /// Unlike [new], this does NOT require `access_token` — the caller is
+    /// expected to immediately run [verify_initial_auth], which exchanges the
+    /// stored `refresh_token` (or client credentials).
+    pub fn new_for_verify(config: Pan123Config) -> Result<Self> {
+        let client = Client::builder()
+            .build()
+            .map_err(|e| DriverError::Config(e.to_string()))?;
+        Ok(Self { config, client })
+    }
+
+    /// Exchange the stored refresh credentials for a fresh
+    /// `(access_token, refresh_token)` pair.
+    ///
+    /// Mirrors the reference driver's two mutually-exclusive branches:
+    /// - online renew API (`!local_refresh` and a non-empty `refresh_token`):
+    ///   `GET {api_url_address|default}?refresh_ui=…&server_use=true&driver_txt=…`;
+    ///   the response rotates **both** tokens, so both must be persisted;
+    /// - client credentials (`local_refresh`, or no refresh token): `POST
+    ///   {base_url}/api/v1/access_token` with `{clientID, clientSecret}` →
+    ///   `data.access_token` (does not rotate `refresh_token`).
+    pub async fn refresh_access_token(&self) -> Result<(String, String)> {
+        if self.config.local_refresh {
+            return self.refresh_via_client_credentials().await;
+        }
+        let refresh = self.config.refresh_token.trim();
+        if refresh.is_empty() {
+            return self.refresh_via_client_credentials().await;
+        }
+        self.refresh_via_online_api(refresh).await
+    }
+
+    /// Online renew-API branch (rotates both tokens).
+    async fn refresh_via_online_api(&self, refresh: &str) -> Result<(String, String)> {
+        let url = {
+            let custom = self.config.api_url_address.trim();
+            if custom.is_empty() {
+                DEFAULT_RENEW_API
+            } else {
+                custom
+            }
+        };
+        let resp = self
+            .client
+            .get(url)
+            .query(&[
+                ("refresh_ui", refresh),
+                ("server_use", "true"),
+                ("driver_txt", DRIVER_TXT),
+            ])
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(DriverError::AuthFailed);
+        }
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {status}")));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        let access = body["access_token"]
+            .as_str()
+            .filter(|s| !s.is_empty());
+        let new_refresh = body["refresh_token"]
+            .as_str()
+            .filter(|s| !s.is_empty());
+        match (access, new_refresh) {
+            (Some(access), Some(new_refresh)) => {
+                Ok((access.to_string(), new_refresh.to_string()))
+            }
+            _ => {
+                let message = ["error_description", "text", "message", "error"]
+                    .iter()
+                    .find_map(|key| body[*key].as_str())
+                    .unwrap_or("invalid response");
+                Err(DriverError::Network(format!(
+                    "123 online renew failed: {message}"
+                )))
+            }
+        }
+    }
+
+    /// Client-credentials branch (does not rotate `refresh_token`).
+    async fn refresh_via_client_credentials(&self) -> Result<(String, String)> {
+        let client_id = self.config.client_id.trim();
+        let client_secret = self.config.client_secret.trim();
+        if client_id.is_empty() || client_secret.is_empty() {
+            return Err(DriverError::Config("err.missingRefreshToken".into()));
+        }
+        let url = format!("{}/api/v1/access_token", self.config.base_url);
+        let resp = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({
+                "clientID": client_id,
+                "clientSecret": client_secret,
+            }))
+            .send()
+            .await
+            .map_err(|e| DriverError::Network(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(DriverError::AuthFailed);
+        }
+        if !status.is_success() {
+            return Err(DriverError::Network(format!("HTTP {status}")));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| DriverError::Network(format!("non-JSON: {e}")))?;
+        let access = body["data"]["access_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                let message = body["message"].as_str().unwrap_or("invalid response");
+                DriverError::Network(format!(
+                    "123 client credential exchange failed: {message}"
+                ))
+            })?;
+        Ok((
+            access.to_string(),
+            self.config.refresh_token.clone(),
+        ))
+    }
+
+    /// Initial-auth flow for account setup / auth retry: exchanges the stored
+    /// refresh credentials and returns the credential patches that must be
+    /// merged into the account config and persisted to the Core vault.
+    pub async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let (access_token, refresh_token) = self.refresh_access_token().await?;
+        let mut patches = std::collections::HashMap::new();
+        patches.insert("access_token".into(), access_token);
+        if !refresh_token.is_empty() {
+            patches.insert("refresh_token".into(), refresh_token);
+        }
+        Ok(patches)
     }
 
     /// Build Authorization header value.
@@ -292,6 +467,13 @@ impl Pan123Driver {
 
 #[async_trait]
 impl WdmmVfs for Pan123Driver {
+    /// Token exchange through `dyn WdmmVfs` (used by `create_token_driver`).
+    async fn verify_initial_auth(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        Pan123Driver::verify_initial_auth(self).await
+    }
+
     async fn list(&self, path: &str) -> Result<Vec<CloudFileItem>> {
         let (parent_id, _) = self.resolve_path(path).await?;
         let entries = self.list_by_id(parent_id).await?;
@@ -531,6 +713,88 @@ mod tests {
             DriverError::Network(msg) => assert!(msg.contains("500")),
             other => panic!("expected Network, got {:?}", other),
         }
+    }
+
+    // ── Token exchange ────────────────────────────────────────────────────────
+
+    /// The online renew API rotates both tokens; both patches must be returned.
+    #[tokio::test]
+    async fn refresh_online_renew_rotates_both_tokens() {
+        let body = serde_json::json!({
+            "access_token": "new_access",
+            "refresh_token": "new_refresh"
+        })
+        .to_string();
+        let port = start_mock_pan123_server(body).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("");
+        cfg.refresh_token = "old_refresh".into();
+        cfg.api_url_address = format!("http://127.0.0.1:{port}/renew");
+        let driver = Pan123Driver::new_for_verify(cfg).unwrap();
+
+        let patches = driver.verify_initial_auth().await.unwrap();
+        assert_eq!(
+            patches.get("access_token").map(String::as_str),
+            Some("new_access")
+        );
+        assert_eq!(
+            patches.get("refresh_token").map(String::as_str),
+            Some("new_refresh")
+        );
+    }
+
+    /// A rejected refresh token surfaces as a readable error, not a config error.
+    #[tokio::test]
+    async fn refresh_online_renew_reports_api_error() {
+        let body = serde_json::json!({"error_description": "invalid refresh token"}).to_string();
+        let port = start_mock_pan123_server(body).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("");
+        cfg.refresh_token = "bad".into();
+        cfg.api_url_address = format!("http://127.0.0.1:{port}/renew");
+        let driver = Pan123Driver::new_for_verify(cfg).unwrap();
+
+        let err = driver.verify_initial_auth().await.unwrap_err();
+        match err {
+            DriverError::Network(msg) => assert!(msg.contains("invalid refresh token")),
+            other => panic!("expected Network, got {:?}", other),
+        }
+    }
+
+    /// The client-credentials branch exchanges `data.access_token` and does not
+    /// rotate the refresh token (so no `refresh_token` patch is emitted).
+    #[tokio::test]
+    async fn refresh_client_credentials_returns_access_only() {
+        let body = serde_json::json!({"code": 0, "data": {"access_token": "cc_access"}}).to_string();
+        let port = start_mock_pan123_server(body).await;
+        tokio::task::yield_now().await;
+
+        let mut cfg = Pan123Config::new("");
+        cfg.local_refresh = true;
+        cfg.client_id = "cid".into();
+        cfg.client_secret = "secret".into();
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        let driver = Pan123Driver::new_for_verify(cfg).unwrap();
+
+        let patches = driver.verify_initial_auth().await.unwrap();
+        assert_eq!(
+            patches.get("access_token").map(String::as_str),
+            Some("cc_access")
+        );
+        assert!(!patches.contains_key("refresh_token"));
+    }
+
+    /// No refresh token and no client credentials is a setup problem, not a
+    /// network failure.
+    #[tokio::test]
+    async fn refresh_without_any_credentials_is_config_error() {
+        let driver = Pan123Driver::new_for_verify(Pan123Config::default()).unwrap();
+        assert!(matches!(
+            driver.verify_initial_auth().await,
+            Err(DriverError::Config(_))
+        ));
     }
 
     #[test]
