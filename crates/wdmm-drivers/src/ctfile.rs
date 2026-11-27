@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
+use crate::link_cache::{SignedLinkCache, DEFAULT_LINK_TTL};
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -681,9 +682,15 @@ impl CtFileClient {
 
         let status = resp.status();
         if !status.is_success() {
+            let code = status.as_u16();
+            if code == 401 || code == 403 {
+                return Err(DriverError::AuthFailed);
+            }
+            if code == 410 {
+                return Err(DriverError::Network("HTTP 410".to_string()));
+            }
             return Err(DriverError::Other(format!(
-                "CtFile fetch_bytes: HTTP {}",
-                status.as_u16()
+                "CtFile fetch_bytes: HTTP {code}"
             )));
         }
         resp.bytes()
@@ -703,6 +710,8 @@ pub struct CtFileDriver {
     client: CtFileClient,
     /// Path-to-id walk cache (clears on any mutation).
     path_cache: Arc<Mutex<HashMap<String, String>>>,
+    /// Signed etch_url results, reused across ranged reads.
+    link_cache: SignedLinkCache,
     user_agent: String,
 }
 
@@ -712,10 +721,50 @@ impl CtFileDriver {
         Ok(Self {
             client: CtFileClient::new(config)?,
             path_cache: Arc::new(Mutex::new(HashMap::new())),
+            link_cache: SignedLinkCache::new(DEFAULT_LINK_TTL),
             user_agent: ua,
         })
     }
 
+    /// Resolve the signed download URL, reusing the cached one while fresh.
+    async fn content_link(&self, normalised: &str) -> Result<String> {
+        if let Some((url, _headers)) = self.link_cache.get(normalised) {
+            return Ok(url);
+        }
+        let id = self.path_to_id(normalised, true).await?;
+        let url = self.client.fetch_download_url(&id).await?;
+        self.link_cache
+            .store(normalised, url.clone(), Vec::new());
+        Ok(url)
+    }
+
+    /// GET a (possibly ranged) slice from the signed link.
+    ///
+    /// An expired link is rejected with 401/403/410; that invalidates the cache
+    /// and the request is retried once with a re-resolved URL.
+    async fn fetch_content(
+        &self,
+        path: &str,
+        range: Option<(u64, Option<u64>)>,
+    ) -> Result<Vec<u8>> {
+        let norm = Self::normalize_path(path);
+        for attempt in 0..2 {
+            let url = self.content_link(&norm).await?;
+            match self.client.fetch_bytes(&url, &self.user_agent, range).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(DriverError::AuthFailed) if attempt == 0 => {
+                    self.link_cache.invalidate(&norm);
+                }
+                Err(DriverError::Network(msg))
+                    if attempt == 0 && msg.contains("HTTP 410") =>
+                {
+                    self.link_cache.invalidate(&norm);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(DriverError::Network("ctfile: link retry exhausted".into()))
+    }
     /// Normalise a path: trim whitespace, leading+trailing slashes, collapse doubles.
     /// Returns "" for root ("/").
     pub fn normalize_path(path: &str) -> String {
@@ -886,6 +935,7 @@ impl WdmmVfs for CtFileDriver {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         let url = self.client.fetch_download_url(&id).await?;
+        self.link_cache.store(&norm, url.clone(), Vec::new());
         Ok(CloudFileItem {
             name,
             is_dir: false,
@@ -981,17 +1031,11 @@ impl WdmmVfs for CtFileDriver {
     }
 
     async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
-        let norm = Self::normalize_path(path);
-        let id = self.path_to_id(&norm, true).await?;
-        let url = self.client.fetch_download_url(&id).await?;
-        self.client.fetch_bytes(&url, &self.user_agent, None).await
+        self.fetch_content(path, None).await
     }
 
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
-        let norm = Self::normalize_path(path);
-        let id = self.path_to_id(&norm, true).await?;
-        let url = self.client.fetch_download_url(&id).await?;
-        self.client.fetch_bytes(&url, &self.user_agent, Some((start, end))).await
+        self.fetch_content(path, Some((start, end))).await
     }
 }
 

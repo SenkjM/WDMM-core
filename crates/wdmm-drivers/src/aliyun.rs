@@ -15,6 +15,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
+use crate::link_cache::{SignedLinkCache, DEFAULT_LINK_TTL};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -109,6 +110,8 @@ impl AliyunConfig {
 pub struct AliyunDriver {
     config: AliyunConfig,
     client: Client,
+    /// Signed getDownloadUrl results, reused across ranged reads.
+    link_cache: SignedLinkCache,
 }
 
 impl AliyunDriver {
@@ -122,7 +125,11 @@ impl AliyunDriver {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            link_cache: SignedLinkCache::new(DEFAULT_LINK_TTL),
+        })
     }
 
     /// Build a driver for the initial-verify / token-exchange flow.
@@ -136,7 +143,11 @@ impl AliyunDriver {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            link_cache: SignedLinkCache::new(DEFAULT_LINK_TTL),
+        })
     }
 
     fn auth_header(&self) -> String {
@@ -181,6 +192,75 @@ impl AliyunDriver {
         resp.json::<Value>()
             .await
             .map_err(|e| DriverError::Network(e.to_string()))
+    }
+
+    /// Resolve the signed download URL, reusing the cached one while fresh.
+    async fn content_link(&self, path: &str) -> Result<(String, Vec<(String, String)>)> {
+        if let Some(entry) = self.link_cache.get(path) {
+            return Ok(entry);
+        }
+        let file_id = self.path_to_file_id(path).await?;
+        let url = format!(
+            "{}/adrive/v1.0/openFile/getDownloadUrl",
+            self.config.base_url
+        );
+        let body = serde_json::json!({
+            "drive_id": self.config.drive_id,
+            "file_id": file_id
+        });
+        let json = self.post_json(&url, &body).await?;
+        let raw_url = json["url"]
+            .as_str()
+            .ok_or_else(|| DriverError::Network("aliyun: missing download url".into()))?
+            .to_string();
+        self.link_cache
+            .store(path, raw_url.clone(), Vec::new());
+        Ok((raw_url, Vec::new()))
+    }
+
+    /// GET a (possibly ranged) slice from the signed link.
+    ///
+    /// An expired link is rejected with 401/403/410; that invalidates the cache
+    /// and the request is retried once with a re-resolved URL.
+    async fn fetch_bytes(&self, path: &str, range: Option<(u64, Option<u64>)>) -> Result<Vec<u8>> {
+        for attempt in 0..2 {
+            let (url, _headers) = self.content_link(path).await?;
+            let mut request = self.client.get(url);
+            if let Some((start, end)) = range {
+                let value = match end {
+                    Some(end) => format!("bytes={start}-{end}"),
+                    None => format!("bytes={start}-"),
+                };
+                request = request.header(reqwest::header::RANGE, value);
+            }
+            let resp = request
+                .send()
+                .await
+                .map_err(|e| DriverError::Network(e.to_string()))?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+                || status.as_u16() == 410
+            {
+                self.link_cache.invalidate(path);
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(DriverError::AuthFailed);
+            }
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(DriverError::NotFound(path.to_string()));
+            }
+            if !status.is_success() {
+                return Err(DriverError::Network(format!("HTTP {status}")));
+            }
+            return Ok(resp
+                .bytes()
+                .await
+                .map_err(|e| DriverError::Network(e.to_string()))?
+                .to_vec());
+        }
+        Err(DriverError::Network("aliyun: link retry exhausted".into()))
     }
 
     /// Resolve a remote slash-path to a file_id by walking segments.
@@ -296,6 +376,10 @@ impl WdmmVfs for AliyunDriver {
             .as_str()
             .ok_or_else(|| DriverError::Network("aliyun: missing download url".into()))?
             .to_string();
+        // A following get_content/get_content_range reuses this link instead of
+        // resolving it again.
+        self.link_cache
+            .store(path, raw_url.clone(), Vec::new());
 
         Ok(CloudFileItem {
             name,
@@ -408,65 +492,11 @@ impl WdmmVfs for AliyunDriver {
     }
 
     async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item
-            .raw_url
-            .ok_or_else(|| DriverError::Network("aliyun: missing download url".into()))?;
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| DriverError::Network(e.to_string()))?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(DriverError::AuthFailed);
-        }
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(DriverError::NotFound(path.to_string()));
-        }
-        if !resp.status().is_success() {
-            return Err(DriverError::Network(format!("HTTP {}", resp.status())));
-        }
-        Ok(resp
-            .bytes()
-            .await
-            .map_err(|e| DriverError::Network(e.to_string()))?
-            .to_vec())
+        self.fetch_bytes(path, None).await
     }
 
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item
-            .raw_url
-            .ok_or_else(|| DriverError::Network("aliyun: missing download url".into()))?;
-        let range = end
-            .map(|e| format!("bytes={start}-{e}"))
-            .unwrap_or_else(|| format!("bytes={start}-"));
-        let resp = self
-            .client
-            .get(url)
-            .header(reqwest::header::RANGE, range)
-            .send()
-            .await
-            .map_err(|e| DriverError::Network(e.to_string()))?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(DriverError::AuthFailed);
-        }
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(DriverError::NotFound(path.to_string()));
-        }
-        if !resp.status().is_success() {
-            return Err(DriverError::Network(format!("HTTP {}", resp.status())));
-        }
-        Ok(resp
-            .bytes()
-            .await
-            .map_err(|e| DriverError::Network(e.to_string()))?
-            .to_vec())
+        self.fetch_bytes(path, Some((start, end))).await
     }
 
 }
@@ -959,5 +989,69 @@ mod tests {
             matches!(err, DriverError::Config(_)),
             "expected Config error, got {err:?}"
         );
+    }
+
+    async fn start_aliyun_link_mock(
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first = head.lines().next().unwrap_or("").to_string();
+                    log2.lock().unwrap().push(first.clone());
+                    let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let body = if path.starts_with("/adrive/v1.0/openFile/search") {
+                        serde_json::json!({
+                            "items": [{"name": "track.mp3", "file_id": "f1", "type": "file"}]
+                        })
+                        .to_string()
+                    } else if path.starts_with("/adrive/v1.0/openFile/getDownloadUrl") {
+                        serde_json::json!({"url": format!("http://127.0.0.1:{port}/dl/track")})
+                            .to_string()
+                    } else if path.starts_with("/dl/track") {
+                        "abc".to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        (port, log)
+    }
+
+    #[tokio::test]
+    async fn ranged_reads_reuse_the_signed_link() {
+        let (port, log) = start_aliyun_link_mock().await;
+        let mut cfg = AliyunConfig::new("tok", "drv");
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        let driver = AliyunDriver::new(cfg).unwrap();
+
+        driver.get_content_range("/track.mp3", 0, Some(2)).await.unwrap();
+        driver.get_content_range("/track.mp3", 0, Some(2)).await.unwrap();
+
+        let reqs = log.lock().unwrap().clone();
+        let searches = reqs.iter().filter(|r| r.contains("/openFile/search")).count();
+        let urls = reqs.iter().filter(|r| r.contains("/openFile/getDownloadUrl")).count();
+        let dl = reqs.iter().filter(|r| r.starts_with("GET /dl/track ")).count();
+        assert_eq!(searches, 1, "path must resolve once: {reqs:?}");
+        assert_eq!(urls, 1, "download url must resolve once: {reqs:?}");
+        assert_eq!(dl, 2, "both ranged reads hit the data url: {reqs:?}");
     }
 }

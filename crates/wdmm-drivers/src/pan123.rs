@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
+use crate::link_cache::{SignedLinkCache, DEFAULT_LINK_TTL};
 
 /// Default online-renew endpoint (OpenList public proxy).
 const DEFAULT_RENEW_API: &str = "https://api.oplist.org/123cloud/renewapi";
@@ -77,6 +78,8 @@ fn map_code(code: i64) -> DriverError {
 pub struct Pan123Driver {
     config: Pan123Config,
     client: Client,
+    /// Signed download_info results, reused across ranged reads.
+    link_cache: SignedLinkCache,
 }
 
 impl Pan123Driver {
@@ -87,7 +90,11 @@ impl Pan123Driver {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            link_cache: SignedLinkCache::new(DEFAULT_LINK_TTL),
+        })
     }
 
     /// Build a driver for the initial-verify / token-exchange flow.
@@ -99,7 +106,77 @@ impl Pan123Driver {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            link_cache: SignedLinkCache::new(DEFAULT_LINK_TTL),
+        })
+    }
+
+    /// Resolve the signed download URL, reusing the cached one while fresh.
+    async fn content_link(&self, path: &str) -> Result<String> {
+        if let Some((url, _headers)) = self.link_cache.get(path) {
+            return Ok(url);
+        }
+        let (_file_id, entry) = self.resolve_path(path).await?;
+        let file_id = entry["fileId"]
+            .as_u64()
+            .ok_or_else(|| DriverError::Network("123pan: missing fileId".into()))?;
+        let file_id_str = file_id.to_string();
+        let url = format!("{}/api/v1/file/download_info", self.config.base_url);
+        let json = self
+            .get_json(&url, &[("fileId", file_id_str.as_str())])
+            .await?;
+        let code = json["code"].as_i64().unwrap_or(0);
+        if code != 0 {
+            return Err(map_code(code));
+        }
+        let download_url = json["data"]["download_url"]
+            .as_str()
+            .or_else(|| json["data"]["downloadUrl"].as_str())
+            .ok_or_else(|| DriverError::Network("123pan: missing download_url".into()))?
+            .to_string();
+        self.link_cache
+            .store(path, download_url.clone(), Vec::new());
+        Ok(download_url)
+    }
+
+    /// GET a (possibly ranged) slice from the signed link.
+    ///
+    /// An expired link is rejected with 401/403/410; that invalidates the cache
+    /// and the request is retried once with a re-resolved URL.
+    async fn fetch_bytes(&self, path: &str, range: Option<(u64, Option<u64>)>) -> Result<Vec<u8>> {
+        for attempt in 0..2 {
+            let url = self.content_link(path).await?;
+            let mut request = self.client.get(url);
+            if let Some((start, end)) = range {
+                let value = match end {
+                    Some(end) => format!("bytes={start}-{end}"),
+                    None => format!("bytes={start}-"),
+                };
+                request = request.header(reqwest::header::RANGE, value);
+            }
+            let response = request.send().await?;
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+                || status.as_u16() == 410
+            {
+                self.link_cache.invalidate(path);
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(DriverError::AuthFailed);
+            }
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(DriverError::NotFound(path.into()));
+            }
+            if !status.is_success() {
+                return Err(DriverError::Network(format!("GET failed: {}", status)));
+            }
+            return Ok(response.bytes().await?.to_vec());
+        }
+        Err(DriverError::Network("123pan: link retry exhausted".into()))
     }
 
     /// Exchange the stored refresh credentials for a fresh
@@ -512,6 +589,10 @@ impl WdmmVfs for Pan123Driver {
             .or_else(|| json["data"]["downloadUrl"].as_str())
             .ok_or_else(|| DriverError::Network("123pan: missing download_url".into()))?
             .to_string();
+        // A following get_content/get_content_range reuses this link instead of
+        // resolving it again.
+        self.link_cache
+            .store(path, download_url.clone(), Vec::new());
 
         Ok(CloudFileItem {
             name,
@@ -636,47 +717,11 @@ impl WdmmVfs for Pan123Driver {
     }
 
     async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item
-            .raw_url
-            .ok_or_else(|| DriverError::Network("123pan: missing download url".into()))?;
-        let response = self.client.get(url).send().await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(DriverError::NotFound(path.into()));
-        }
-        if !response.status().is_success() {
-            return Err(DriverError::Network(format!(
-                "GET failed: {}",
-                response.status()
-            )));
-        }
-        Ok(response.bytes().await?.to_vec())
+        self.fetch_bytes(path, None).await
     }
 
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item
-            .raw_url
-            .ok_or_else(|| DriverError::Network("123pan: missing download url".into()))?;
-        let range = end
-            .map(|e| format!("bytes={start}-{e}"))
-            .unwrap_or_else(|| format!("bytes={start}-"));
-        let response = self
-            .client
-            .get(url)
-            .header(reqwest::header::RANGE, range)
-            .send()
-            .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(DriverError::NotFound(path.into()));
-        }
-        if !response.status().is_success() {
-            return Err(DriverError::Network(format!(
-                "GET range failed: {}",
-                response.status()
-            )));
-        }
-        Ok(response.bytes().await?.to_vec())
+        self.fetch_bytes(path, Some((start, end))).await
     }
 }
 
@@ -1597,5 +1642,59 @@ mod tests {
         assert_eq!(item.size, 12);
         assert!(!item.is_dir);
         assert_eq!(item.raw_url.as_deref(), Some("https://dl.example/x"));
+    }
+
+    #[tokio::test]
+    async fn ranged_reads_reuse_the_signed_link() {
+        let root = serde_json::json!({
+            "code": 0,
+            "data": {"file_list": [{"fileId": 3003, "filename": "track.mp3", "type": 0, "size": 3}], "last_file_id": 0}
+        })
+        .to_string();
+        let info = serde_json::json!({
+            "code": 0,
+            "data": {"download_url": "http://127.0.0.1:{{PORT}}/dl/track"}
+        })
+        .to_string();
+        let (port, log) = start_routed_server(vec![
+            MockRoute {
+                needle: "/dl/track",
+                status: 200,
+                body: "abc".to_string(),
+            },
+            MockRoute {
+                needle: "/api/v1/file/download_info",
+                status: 200,
+                body: info,
+            },
+            MockRoute {
+                needle: "/api/v2/file/list",
+                status: 200,
+                body: root,
+            },
+        ])
+        .await;
+
+        let driver = driver_for(port);
+        driver
+            .get_content_range("/track.mp3", 0, Some(2))
+            .await
+            .unwrap();
+        driver
+            .get_content_range("/track.mp3", 0, Some(2))
+            .await
+            .unwrap();
+
+        let reqs = log.lock().unwrap().clone();
+        let info_calls = reqs
+            .iter()
+            .filter(|r| r.contains("/api/v1/file/download_info"))
+            .count();
+        let dl_calls = reqs
+            .iter()
+            .filter(|r| r.starts_with("GET /dl/track "))
+            .count();
+        assert_eq!(info_calls, 1, "download_info must resolve once: {reqs:?}");
+        assert_eq!(dl_calls, 2, "both ranged reads hit the data URL: {reqs:?}");
     }
 }

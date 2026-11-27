@@ -24,6 +24,7 @@ const OPEN115_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
 const OPEN115_REFRESH_URL: &str = "https://passportapi.115.com/open/refreshToken";
 
 use crate::driver::{WdmmVfs, CloudFileItem, DriverError, Result};
+use crate::link_cache::{SignedLinkCache, DEFAULT_LINK_TTL};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -65,6 +66,8 @@ impl Open115Config {
 pub struct Open115Driver {
     config: Open115Config,
     client: Client,
+    /// Signed download urls, reused across ranged reads.
+    link_cache: SignedLinkCache,
 }
 
 impl Open115Driver {
@@ -77,7 +80,11 @@ impl Open115Driver {
             .user_agent(OPEN115_USER_AGENT)
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            link_cache: SignedLinkCache::new(DEFAULT_LINK_TTL),
+        })
     }
 
     /// Build a driver for the initial-verify / token-exchange flow.
@@ -90,7 +97,70 @@ impl Open115Driver {
             .user_agent(OPEN115_USER_AGENT)
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            link_cache: SignedLinkCache::new(DEFAULT_LINK_TTL),
+        })
+    }
+
+    /// Resolve the signed download url (cached while fresh).
+    async fn content_link(&self, path: &str) -> Result<(String, Vec<(String, String)>)> {
+        if let Some(hit) = self.link_cache.get(path) {
+            return Ok(hit);
+        }
+        let item = self.get(path).await?;
+        let url = item
+            .raw_url
+            .ok_or_else(|| DriverError::Network("115: missing download url".into()))?;
+        let headers = item.raw_headers;
+        self.link_cache.store(path, url.clone(), headers.clone());
+        Ok((url, headers))
+    }
+
+    /// GET a (possibly ranged) slice from the signed link.
+    ///
+    /// An expired link is rejected with 401/403/410; that invalidates the cache
+    /// and the request is retried once with a re-resolved url.
+    async fn fetch_bytes(
+        &self,
+        path: &str,
+        range: Option<(u64, Option<u64>)>,
+    ) -> Result<Vec<u8>> {
+        for attempt in 0..2 {
+            let (url, headers) = self.content_link(path).await?;
+            let mut request = self.client.get(url);
+            if let Some((start, end)) = range {
+                let value = match end {
+                    Some(end) => format!("bytes={start}-{end}"),
+                    None => format!("bytes={start}-"),
+                };
+                request = request.header(reqwest::header::RANGE, value);
+            }
+            for (name, value) in &headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().await?;
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+                || status.as_u16() == 410
+            {
+                self.link_cache.invalidate(path);
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(DriverError::AuthFailed);
+            }
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(DriverError::NotFound(path.into()));
+            }
+            if !status.is_success() {
+                return Err(DriverError::Network(format!("GET failed: {status}")));
+            }
+            return Ok(response.bytes().await?.to_vec());
+        }
+        Err(DriverError::Network("115: link retry exhausted".into()))
     }
 
     /// Exchange the stored `refresh_token` for a fresh `(access_token,
@@ -448,26 +518,11 @@ impl WdmmVfs for Open115Driver {
     }
 
     async fn get_content(&self, path: &str) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item.raw_url.ok_or_else(|| DriverError::Network("115: missing download url".into()))?;
-        let mut request = self.client.get(url);
-        for (name, value) in item.raw_headers { request = request.header(name, value); }
-        let response = request.send().await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND { return Err(DriverError::NotFound(path.into())); }
-        if !response.status().is_success() { return Err(DriverError::Network(format!("GET failed: {}", response.status()))); }
-        Ok(response.bytes().await?.to_vec())
+        self.fetch_bytes(path, None).await
     }
 
     async fn get_content_range(&self, path: &str, start: u64, end: Option<u64>) -> Result<Vec<u8>> {
-        let item = self.get(path).await?;
-        let url = item.raw_url.ok_or_else(|| DriverError::Network("115: missing download url".into()))?;
-        let range = end.map(|e| format!("bytes={start}-{e}")).unwrap_or_else(|| format!("bytes={start}-"));
-        let mut request = self.client.get(url).header(reqwest::header::RANGE, range);
-        for (name, value) in item.raw_headers { request = request.header(name, value); }
-        let response = request.send().await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND { return Err(DriverError::NotFound(path.into())); }
-        if !response.status().is_success() { return Err(DriverError::Network(format!("GET range failed: {}", response.status()))); }
-        Ok(response.bytes().await?.to_vec())
+        self.fetch_bytes(path, Some((start, end))).await
     }
 }
 
@@ -751,5 +806,78 @@ mod tests {
             .remove("/old.mp3")
             .await
             .expect("remove should succeed");
+    }
+
+    /// A signed 115 download url is valid for a while; ranged reads must not
+    /// re-list the parent and re-request `downurl` on every chunk.
+    #[tokio::test]
+    async fn ranged_reads_reuse_the_signed_link() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first = head.lines().next().unwrap_or("").to_string();
+                    log2.lock().unwrap().push(first.clone());
+                    let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let body = if path.starts_with("/open/ufile/files") {
+                        serde_json::json!({
+                            "state": true,
+                            "data": [{
+                                "fid": "f1",
+                                "pid": "0",
+                                "fc": "1",
+                                "fn": "track.mp3",
+                                "pc": "pick1",
+                                "fs": 3u64,
+                                "upt": 1700000000i64
+                            }],
+                            "count": 1
+                        })
+                        .to_string()
+                    } else if path.starts_with("/open/ufile/downurl") {
+                        serde_json::json!({
+                            "state": true,
+                            "data": {"f1": {"url": {"url": format!("http://127.0.0.1:{port}/dl/f")}}}
+                        })
+                        .to_string()
+                    } else if path.starts_with("/dl/f") {
+                        "abc".to_string()
+                    } else {
+                        serde_json::json!({"state": true, "data": {}}).to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let mut cfg = Open115Config::new("test_token");
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        let driver = Open115Driver::new(cfg).unwrap();
+        driver.get_content_range("/track.mp3", 0, Some(2)).await.unwrap();
+        driver.get_content_range("/track.mp3", 0, Some(2)).await.unwrap();
+
+        let reqs = log.lock().unwrap().clone();
+        let lists = reqs.iter().filter(|r| r.contains("/open/ufile/files")).count();
+        let urls = reqs.iter().filter(|r| r.contains("/open/ufile/downurl")).count();
+        let dl = reqs.iter().filter(|r| r.starts_with("GET /dl/f ")).count();
+        assert_eq!(lists, 1, "parent listing must happen once: {reqs:?}");
+        assert_eq!(urls, 1, "downurl must be resolved once: {reqs:?}");
+        assert_eq!(dl, 2, "both ranged reads hit the data url: {reqs:?}");
     }
 }
