@@ -71,12 +71,21 @@ impl CryptDriver {
     ///
     /// For paths like `/dir1/dir2/file.txt`, each segment is encrypted
     /// (using `decrypt_dir_name` for directories, `decrypt_file_name` for the final segment).
+    ///
+    /// Empty and `.` segments are dropped before encryption: the UI names
+    /// directories with a trailing slash (`/dir/`), and encrypting that empty
+    /// segment produced a bogus ciphertext name, so the source driver was asked
+    /// for a path that does not exist (Baidu answers `errno -9`).
     fn map_to_inner(&self, path: &str, last_is_file: bool) -> Result<String> {
-        if path == "/" {
+        let parts: Vec<&str> = path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+
+        if parts.is_empty() {
             return Ok(self.config.source_dir.clone());
         }
 
-        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut inner_parts = Vec::new();
 
         for (i, part) in parts.iter().enumerate() {
@@ -91,7 +100,8 @@ impl CryptDriver {
         }
 
         let base = self.config.source_dir.trim_end_matches('/');
-        Ok(format!("{}/{}", base, inner_parts.join("/")))
+        let inner = format!("{}/{}", base, inner_parts.join("/"));
+        Ok(inner)
     }
 
     /// Map ciphertext path ← plaintext path (decrypt names).
@@ -430,5 +440,35 @@ mod tests {
         assert!(inner.starts_with("/encrypted/"));
         assert!(!inner.contains("dir")); // Should be encrypted
         assert!(!inner.contains("file.txt")); // Should be encrypted
+    }
+
+    /// The UI names directories with a trailing slash (`/dir/`). Empty and `.`
+    /// segments must not be encrypted, otherwise the source driver is asked for
+    /// a path that does not exist (Baidu replies `errno -9`).
+    #[test]
+    fn test_trailing_slash_and_dot_segments_are_ignored() {
+        let config = CryptConfig {
+            password: "test".to_string(),
+            salt: String::new(),
+            filename_encryption: NameMode::Standard,
+            filename_encoding: NameEncoding::Base64,
+            encrypted_suffix: ".bin".to_string(),
+            directory_name_encryption: true,
+            source_dir: "/encrypted".to_string(),
+        };
+        let source = Arc::new(MockSource::new());
+        let crypt = CryptDriver::with_source(source, config).unwrap();
+
+        let plain = crypt.map_to_inner("/dir", false).unwrap();
+        assert_eq!(crypt.map_to_inner("/dir/", false).unwrap(), plain);
+        assert_eq!(crypt.map_to_inner("//dir//", false).unwrap(), plain);
+        assert_eq!(crypt.map_to_inner("/dir/./", false).unwrap(), plain);
+        assert_eq!(crypt.map_to_inner("dir", false).unwrap(), plain);
+
+        assert_eq!(crypt.map_to_inner("/", false).unwrap(), "/encrypted");
+        assert_eq!(crypt.map_to_inner("", false).unwrap(), "/encrypted");
+
+        let file = crypt.map_to_inner("/dir/file.txt", true).unwrap();
+        assert_eq!(crypt.map_to_inner("/dir/file.txt/", true).unwrap(), file);
     }
 }
