@@ -90,6 +90,9 @@ fn map_http_error(e: &reqwest::Error) -> DriverError {
 pub struct BaiduDriver {
     config: BaiduConfig,
     client: Client,
+    /// Client that does not follow redirects — used for the signed-dlink HEAD
+    /// probe, where the 302 `Location` is the URL the download must use.
+    head_client: Client,
 }
 
 impl BaiduDriver {
@@ -100,7 +103,15 @@ impl BaiduDriver {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        let head_client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| DriverError::Config(e.to_string()))?;
+        Ok(Self {
+            config,
+            client,
+            head_client,
+        })
     }
 
     /// Build a driver for the initial-verify / token-exchange flow.
@@ -112,7 +123,15 @@ impl BaiduDriver {
         let client = Client::builder()
             .build()
             .map_err(|e| DriverError::Config(e.to_string()))?;
-        Ok(Self { config, client })
+        let head_client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| DriverError::Config(e.to_string()))?;
+        Ok(Self {
+            config,
+            client,
+            head_client,
+        })
     }
 
     /// Map Baidu errno values to DriverError.
@@ -340,10 +359,15 @@ impl WdmmVfs for BaiduDriver {
             .ok_or_else(|| DriverError::Network("baidu: missing dlink".into()))?
             .to_string();
 
-        // Step 3: HEAD with download UA to follow redirects (Dart pattern).
+        // Step 3: HEAD with download UA, WITHOUT following redirects (Dart
+        // parity: `followRedirects: false`). The Location header carries the
+        // signed dlink the download must use. Following the redirect here
+        // consumes that hop and leaves us with the token-bearing API dlink,
+        // whose `access_token` is stripped in step 4 — the content GET then
+        // hits an unsigned URL and Baidu answers 403 (`auth failed`).
         let dlink_with_token = format!("{}&access_token={}", dlink, self.config.access_token);
         let head_resp = self
-            .client
+            .head_client
             .head(&dlink_with_token)
             .header("User-Agent", DOWNLOAD_UA)
             .send()
@@ -718,6 +742,101 @@ mod tests {
         assert!(url.contains("a=1"));
         assert!(url.contains("b=2"));
         assert!(!url.contains("secret"));
+    }
+
+    /// Mock server for the dlink download path: directory listing, filemetas,
+    /// and the two-step signed download (`HEAD` 302 → `Location`, then `GET`).
+    /// The tokenless unsigned dlink answers 403, mirroring Baidu.
+    async fn start_baidu_dlink_mock() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let first = text.lines().next().unwrap_or_default();
+                let (status, body) = if first.starts_with("GET /rest/2.0/xpan/file") {
+                    let body = serde_json::json!({
+                        "errno": 0,
+                        "list": [{
+                            "fs_id": 42,
+                            "server_filename": "clip.mkv",
+                            "path": "/Movies/clip.mkv",
+                            "size": 5,
+                            "isdir": 0,
+                            "server_mtime": 1700000000
+                        }]
+                    })
+                    .to_string();
+                    ("200 OK", body)
+                } else if first.starts_with("GET /rest/2.0/xpan/multimedia") {
+                    let body = serde_json::json!({
+                        "errno": 0,
+                        "list": [{ "dlink": format!("http://127.0.0.1:{port}/dl/clip?fid=42&sign=abc") }]
+                    })
+                    .to_string();
+                    ("200 OK", body)
+                } else if first.starts_with("HEAD /dl/clip") {
+                    ("302 Found", String::new())
+                } else if first.starts_with("GET /dl/clip") {
+                    ("403 Forbidden", "denied".to_string())
+                } else if first.starts_with("GET /file/final") {
+                    ("200 OK", "hello".to_string())
+                } else {
+                    ("200 OK", String::new())
+                };
+                let location = if status.starts_with("302") {
+                    format!("Location: http://127.0.0.1:{port}/file/final?sign=xyz\r\n")
+                } else {
+                    String::new()
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{location}\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn get_content_uses_the_signed_location_url() {
+        let port = start_baidu_dlink_mock().await;
+        let mut cfg = BaiduConfig::new("tok");
+        cfg.base_url = format!("http://127.0.0.1:{port}");
+        let driver = BaiduDriver::new(cfg).unwrap();
+
+        let item = driver.get("/Movies/clip.mkv").await.unwrap();
+        let url = item.raw_url.expect("raw url");
+        assert!(
+            url.contains("/file/final"),
+            "expected the signed Location url, got {url}"
+        );
+        assert!(!url.contains("access_token"), "token must be stripped: {url}");
+
+        // The download must go through the signed URL instead of the tokenless
+        // API dlink (which answers 403 → `auth failed`).
+        assert_eq!(
+            driver.get_content("/Movies/clip.mkv").await.unwrap(),
+            b"hello"
+        );
     }
 
     #[tokio::test]
