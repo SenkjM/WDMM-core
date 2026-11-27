@@ -25,7 +25,7 @@ How bytes are obtained for a `CloudFileItem`. `#[non_exhaustive]` — match with
 | Variant | Meaning |
 |---------|---------|
 | `NetworkDirect` | A network URL is available (`raw_url` + optional `raw_headers`). media_kit can consume directly if the caller can pass custom headers; otherwise route through proxy. |
-| `LocalStream` | No URL and no local path — bytes come from an in-process Range/byte stream only (e.g. a crypt-wrapper driver). Callers must bridge through `ProxyHandle::register_driver` (Rust) or `wdmm_proxy_register_stream` (FFI/Dart). |
+| `LocalStream` | No URL and no local path — bytes come from an in-process Range/byte stream only (e.g. a crypt-wrapper driver). Callers must bridge through `ProxyHandle::register_driver` (Rust) or `wdmm_proxy_register_account` (FFI); Dart never fills byte buffers. |
 | `LocalFile` | A local filesystem path (`local_path`) is directly readable. |
 
 ```rust

@@ -31,20 +31,21 @@ Bind modes: `"loopback"`, `"lan_any"`, `"lan_if:<ip>"`, `"explicit:<addr>"`.
 `http://{host}:{port}{path_template}`.
 ### `pub extern "C" fn wdmm_proxy_unregister(token: *const std::os::raw::c_char) -> FfiString`
 
-## Stream callback (driver byte ranges)
-### `pub type WdmmProxyRangeCallback = unsafe extern "C" fn(user_data: *mut std::os::raw::c_void, start: i64, end: i64, out_buf: *mut *mut u8, out_len: *mut usize, request_id: u64) -> i32;`
-- **Sync fill**: allocate with `wdmm_proxy_stream_alloc_buf`, set `*out_buf` and
-  `*out_len`, return `0`; Rust frees the buffer after consuming it.
-- **Async fill**: return `0` with `*out_buf == null`, then call
-  `wdmm_proxy_stream_set_result(request_id, …)` later (Dart
-  `NativeCallable.listener`).
-- `start`/`end` are inclusive; `end = -1` means read to EOF; a negative return = error.
-### `pub extern "C" fn wdmm_proxy_stream_alloc_buf(len: usize) -> *mut u8`
-### `pub unsafe extern "C" fn wdmm_proxy_stream_free_buf(buf: *mut u8, len: usize)`
-### `pub unsafe extern "C" fn wdmm_proxy_stream_set_result(request_id: u64, buf: *mut u8, len: usize, status: i32)`
-### `pub unsafe extern "C" fn wdmm_proxy_register_stream(size: u64, name: *const c_char, cb: WdmmProxyRangeCallback, user_data: *mut std::os::raw::c_void) -> FfiString`
-Returns `{"token","path_template","host","port"}`; `size = 0` means unknown.
-### `pub unsafe extern "C" fn wdmm_proxy_renew_stream_callback(token: *const c_char, cb: WdmmProxyRangeCallback, user_data: *mut std::os::raw::c_void) -> FfiString`
+## Account-scoped streaming back-source
+### `pub extern "C" fn wdmm_proxy_register_account(account_id: *const c_char, remote_path: *const c_char, name: *const c_char, size: u64) -> FfiString`
+Returns `{"token","path_template","host","port"}`; the caller builds
+`http://{host}:{port}{path_template}`. Core resolves the driver from the account
+and streams byte ranges in 1 MiB `get_content_range` chunks — no Dart callback
+and no Dart-side byte buffering is involved.
+
+## Account file transfer
+### `pub extern "C" fn wdmm_account_download_to_file(account_id: *const c_char, path: *const c_char, local_path: *const c_char, resume_from: *const c_char) -> FfiString`
+Streams the driver's content in 1 MiB ranges into `local_path` inside Core (the
+crypt wrapper decrypts per 64 KiB block). `resume_from` appends to a partial
+file. Returns `"ok:<bytes on disk>"` or `"error:…"`; Dart never receives bytes.
+### `pub extern "C" fn wdmm_account_upload_from_file(account_id: *const c_char, path: *const c_char, local_path: *const c_char) -> FfiString`
+Reads `local_path`, encrypts when the account is a crypt wrapper and PUTs it.
+Returns `"ok:<bytes sent>"` or `"error:…"`.
 
 ## HLS VOD cast
 ### `pub extern "C" fn wdmm_proxy_register_hls(device_id: *const c_char, input_url: *const c_char, preset_id: *const c_char) -> FfiString`

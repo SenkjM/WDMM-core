@@ -55,7 +55,7 @@ impl From<reqwest::Error> for DriverError {
 /// match item.delivery {
 ///   NetworkDirect if can_http(player) && !must_proxy_policy => play(url, headers),
 ///   LocalFile if can_file(player) => play(path),
-///   LocalStream | _ => proxy.register_driver(…) // or wdmm_proxy_register_stream
+///   LocalStream | _ => proxy.register_driver(…) // or wdmm_proxy_register_account
 /// }
 /// ```
 #[non_exhaustive]
@@ -73,8 +73,8 @@ pub enum ContentDeliveryKind {
     /// stream only (e.g. a crypt-wrapper driver, a streaming-only protocol).
     ///
     /// media_kit **cannot** consume this directly. Callers must bridge through
-    /// `ProxyHandle::register_driver` (Rust) or `wdmm_proxy_register_stream`
-    /// (FFI / Dart) to get a proxy token URL, or materialise to disk first.
+    /// `ProxyHandle::register_driver` (Rust) or `wdmm_proxy_register_account`
+    /// (FFI) to get a proxy token URL, or materialise to disk first.
     LocalStream,
 
     /// A local filesystem path (`local_path`) is directly readable.
@@ -147,7 +147,7 @@ impl CloudFileItem {
 
     /// Construct a `LocalStream` item (no URL, no path — in-process stream only).
     ///
-    /// Callers must route through `register_driver` / `wdmm_proxy_register_stream`.
+    /// Callers must route through `register_driver` / `wdmm_proxy_register_account`.
     pub fn local_stream(
         name: impl Into<String>,
         is_dir: bool,
