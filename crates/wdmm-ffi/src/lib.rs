@@ -327,19 +327,137 @@ use base64::prelude::*;
 
 // ── Sync FFI ─────────────────────────────────────────────────────────────────
 
-/// Helper: look up an account by ID and construct its WdmmVfs.
+// ── Account driver cache ──────────────────────────────────────────────────────
+//
+// Building a driver is not free: app-managed-token providers may need a token
+// exchange on construction, and Crypt recursively builds its source driver.
+// Every FFI op used to rebuild it from the DB, so browsing a folder or
+// streaming a video paid that cost per request. Keep one driver per account and
+// reuse it until the stored config (provider / base URL / credentials) changes —
+// a token refresh or an account edit produces a new fingerprint and therefore a
+// new instance.
+
+/// How long an idle driver stays cached.
+const DRIVER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Upper bound on cached drivers; the least recently used one is evicted.
+const DRIVER_CACHE_CAPACITY: usize = 8;
+
+struct CachedDriver {
+    fingerprint: u64,
+    driver: std::sync::Arc<dyn wdmm_drivers::WdmmVfs>,
+    last_used: std::time::Instant,
+}
+
+fn driver_cache() -> &'static Mutex<HashMap<String, CachedDriver>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedDriver>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fingerprint the fields that affect driver construction. Credentials change on
+/// token refresh, so an updated access token invalidates the entry.
+fn driver_fingerprint(account: &wdmm_core::models::CloudAccount) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account.provider_type.hash(&mut hasher);
+    account.base_url.hash(&mut hasher);
+    account.credentials_encrypted.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn driver_cache_lookup(
+    account_id: &str,
+    fingerprint: u64,
+) -> Option<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>> {
+    let mut cache = driver_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match cache.get_mut(account_id) {
+        Some(entry) if entry.fingerprint == fingerprint => {
+            if entry.last_used.elapsed() > DRIVER_CACHE_TTL {
+                cache.remove(account_id);
+                return None;
+            }
+            entry.last_used = std::time::Instant::now();
+            Some(std::sync::Arc::clone(&entry.driver))
+        }
+        Some(_) => {
+            // Stored config changed (credentials, provider, base URL).
+            cache.remove(account_id);
+            None
+        }
+        None => None,
+    }
+}
+
+fn driver_cache_store(
+    account_id: &str,
+    fingerprint: u64,
+    driver: std::sync::Arc<dyn wdmm_drivers::WdmmVfs>,
+) {
+    let mut cache = driver_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    if !cache.contains_key(account_id) && cache.len() >= DRIVER_CACHE_CAPACITY {
+        cache.retain(|_, entry| now.duration_since(entry.last_used) < DRIVER_CACHE_TTL);
+        while cache.len() >= DRIVER_CACHE_CAPACITY {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => {
+                    cache.remove(&id);
+                }
+                None => break,
+            }
+        }
+    }
+    cache.insert(
+        account_id.to_string(),
+        CachedDriver {
+            fingerprint,
+            driver,
+            last_used: now,
+        },
+    );
+}
+
+/// Drop the cached driver for an account (delete / edit / credential rotation).
+pub(crate) fn invalidate_account_driver(account_id: &str) {
+    driver_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(account_id);
+}
+
+/// Look up an account by ID and return its (cached) WdmmVfs.
+pub(crate) fn cached_account_driver(
+    account_id: &str,
+) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, String> {
+    let mut account = match global_library_db().get_account(account_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err("account not found".to_string()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let fingerprint = driver_fingerprint(&account);
+    if let Some(driver) = driver_cache_lookup(account_id, fingerprint) {
+        return Ok(driver);
+    }
+    let driver: std::sync::Arc<dyn wdmm_drivers::WdmmVfs> =
+        std::sync::Arc::from(create_driver_with_refresh(&mut account)?);
+    // A token exchange may have rewritten the credentials; cache under the config
+    // that is in effect now so the next call hits the same entry.
+    driver_cache_store(account_id, driver_fingerprint(&account), driver.clone());
+    Ok(driver)
+}
+
+/// Helper: look up an account by ID and construct its WdmmVfs (cached).
 pub(crate) fn driver_for_account(
     account_id_str: &str,
 ) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, FfiString> {
-    let mut account = match global_library_db().get_account(account_id_str) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Err(FfiString::from("error:account not found")),
-        Err(e) => return Err(FfiString::from(format!("error:{e}"))),
-    };
-    match create_driver_with_refresh(&mut account) {
-        Ok(d) => Ok(std::sync::Arc::from(d)),
-        Err(e) => Err(FfiString::from(format!("error:{e}"))),
-    }
+    cached_account_driver(account_id_str).map_err(|e| FfiString::from(format!("error:{e}")))
 }
 
 /// Normalize a remote directory the same way the Dart account model does:
@@ -2705,16 +2823,14 @@ pub extern "C" fn wdmm_transcode_cache_clear() -> FfiString {
 pub(crate) const STREAM_CHUNK: u64 = 4 * 1024 * 1024;
 
 /// Resolve an account id to a driver via the DB → config → registry path.
+///
+/// The instance is cached per account (see [`cached_account_driver`]) so proxy
+/// streams, library reads and playback share one driver instead of rebuilding
+/// it per request.
 pub(crate) fn create_account_driver(
     account_id: &str,
 ) -> Result<std::sync::Arc<dyn wdmm_drivers::WdmmVfs>, String> {
-    let mut account = match global_library_db().get_account(account_id) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Err("account not found".into()),
-        Err(e) => return Err(e.to_string()),
-    };
-    let driver = create_driver_with_refresh(&mut account)?;
-    Ok(std::sync::Arc::from(driver))
+    cached_account_driver(account_id)
 }
 
 /// Build the chunked `ranges_fn` body for a driver path.
@@ -4694,10 +4810,15 @@ pub extern "C" fn wdmm_account_upsert(json: *const c_char) -> FfiString {
         credentials_encrypted,
     };
     match global_library_db().insert_account(&account) {
-        Ok(()) => match serde_json::to_string(&account_to_json(&account)) {
-            Ok(j) => FfiString::from(j),
-            Err(e) => FfiString::from(format!("error:{e}")),
-        },
+        Ok(()) => {
+            // The saved config may differ from the cached driver's
+            // (credentials, provider type, base URL).
+            invalidate_account_driver(&account.id);
+            match serde_json::to_string(&account_to_json(&account)) {
+                Ok(j) => FfiString::from(j),
+                Err(e) => FfiString::from(format!("error:{e}")),
+            }
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -4710,7 +4831,10 @@ pub extern "C" fn wdmm_account_delete(id: *const c_char) -> FfiString {
         None => return FfiString::from("error:null id pointer"),
     };
     match global_library_db().delete_account(id) {
-        Ok(()) => FfiString::ok(),
+        Ok(()) => {
+            invalidate_account_driver(id);
+            FfiString::ok()
+        }
         Err(e) => FfiString::from(format!("error:{e}")),
     }
 }
@@ -6977,5 +7101,63 @@ mod blank_config_tests {
         )
         .expect("baidu config");
         assert_eq!(cfg.get("base_url").and_then(|v| v.as_str()), None);
+    }
+}
+#[cfg(test)]
+mod driver_cache_tests {
+    use super::*;
+
+    fn seed(id: &str, user: &str) -> wdmm_core::models::CloudAccount {
+        let account = wdmm_core::models::CloudAccount {
+            id: id.to_string(),
+            provider_type: "webdav".to_string(),
+            display_name: "Driver Cache Test".to_string(),
+            base_url: Some("http://127.0.0.1:1/dav".to_string()),
+            credentials_encrypted: serde_json::to_vec(&serde_json::json!({
+                "username": user,
+                "password": "p",
+            }))
+            .expect("test creds"),
+        };
+        global_library_db()
+            .insert_account(&account)
+            .expect("seed driver cache account");
+        account
+    }
+
+    #[test]
+    fn driver_instances_are_reused_until_the_stored_config_changes() {
+        let id = "driver-cache-test";
+        seed(id, "u1");
+
+        let first = cached_account_driver(id).expect("first driver");
+        let second = cached_account_driver(id).expect("second driver");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the second lookup must reuse the cached driver"
+        );
+
+        // Editing the credentials changes the fingerprint: a new instance must
+        // be built from the new config.
+        let updated = serde_json::to_vec(&serde_json::json!({
+            "username": "u2",
+            "password": "p",
+        }))
+        .expect("updated creds");
+        global_library_db()
+            .update_account_credentials(id, &updated)
+            .expect("update creds");
+        let third = cached_account_driver(id).expect("third driver");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &third),
+            "changed credentials must invalidate the cached driver"
+        );
+
+        invalidate_account_driver(id);
+        global_library_db().delete_account(id).expect("cleanup");
+        assert!(global_library_db()
+            .get_account(id)
+            .expect("lookup")
+            .is_none());
     }
 }
