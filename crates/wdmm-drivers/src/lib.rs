@@ -239,30 +239,38 @@ impl DriverRegistry {
     }
 }
 
+/// Read a string config field, treating a blank string as absent so an empty
+/// form field never overrides a driver default. Without this, an empty
+/// `base_url` turns every request URL into a relative one and reqwest fails
+/// with a bare `builder error` (the Baidu symptom after saving an account).
+fn config_text<'a>(config: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    config[key].as_str().filter(|s| !s.trim().is_empty())
+}
+
 /// Map a form/credentials JSON blob onto [`BaiduConfig`]. Tolerant on purpose:
 /// the setup form only stores the refresh-side fields, and runtime configs may
 /// lack `access_token` until [`WdmmVfs::verify_initial_auth`] has run.
 fn baidu_config_from_json(config: &serde_json::Value) -> BaiduConfig {
     let mut cfg = BaiduConfig::new(config["access_token"].as_str().unwrap_or(""));
-    if let Some(s) = config["base_url"].as_str() {
+    if let Some(s) = config_text(config, "base_url") {
         cfg.base_url = s.to_string();
     }
-    if let Some(s) = config["refresh_token"].as_str() {
+    if let Some(s) = config_text(config, "refresh_token") {
         cfg.refresh_token = s.to_string();
     }
-    if let Some(s) = config["client_id"].as_str() {
+    if let Some(s) = config_text(config, "client_id") {
         cfg.client_id = s.to_string();
     }
-    if let Some(s) = config["client_secret"].as_str() {
+    if let Some(s) = config_text(config, "client_secret") {
         cfg.client_secret = s.to_string();
     }
-    if let Some(s) = config["api_url_address"].as_str() {
+    if let Some(s) = config_text(config, "api_url_address") {
         cfg.api_url_address = s.to_string();
     }
     if let Some(b) = config["local_refresh"].as_bool() {
         cfg.local_refresh = b;
     }
-    if let Some(s) = config["account_id"].as_str() {
+    if let Some(s) = config_text(config, "account_id") {
         cfg.account_id = s.to_string();
     }
     cfg
@@ -275,34 +283,34 @@ fn aliyun_config_from_json(config: &serde_json::Value) -> AliyunConfig {
         config["access_token"].as_str().unwrap_or(""),
         config["drive_id"].as_str().unwrap_or(""),
     );
-    if let Some(s) = config["base_url"].as_str() {
+    if let Some(s) = config_text(config, "base_url") {
         cfg.base_url = s.to_string();
     }
-    if let Some(s) = config["remove_way"].as_str() {
+    if let Some(s) = config_text(config, "remove_way") {
         cfg.remove_way = s.to_string();
     }
-    if let Some(s) = config["refresh_token"].as_str() {
+    if let Some(s) = config_text(config, "refresh_token") {
         cfg.refresh_token = s.to_string();
     }
-    if let Some(s) = config["client_id"].as_str() {
+    if let Some(s) = config_text(config, "client_id") {
         cfg.client_id = s.to_string();
     }
-    if let Some(s) = config["client_secret"].as_str() {
+    if let Some(s) = config_text(config, "client_secret") {
         cfg.client_secret = s.to_string();
     }
-    if let Some(s) = config["api_url_address"].as_str() {
+    if let Some(s) = config_text(config, "api_url_address") {
         cfg.api_url_address = s.to_string();
     }
     if let Some(b) = config["local_refresh"].as_bool() {
         cfg.local_refresh = b;
     }
-    if let Some(s) = config["drive_type"].as_str() {
+    if let Some(s) = config_text(config, "drive_type") {
         cfg.drive_type = s.to_string();
     }
-    if let Some(s) = config["root_folder_id"].as_str() {
+    if let Some(s) = config_text(config, "root_folder_id") {
         cfg.root_folder_id = s.to_string();
     }
-    if let Some(s) = config["account_id"].as_str() {
+    if let Some(s) = config_text(config, "account_id") {
         cfg.account_id = s.to_string();
     }
     cfg
@@ -313,13 +321,13 @@ fn aliyun_config_from_json(config: &serde_json::Value) -> AliyunConfig {
 /// setup time and persisted back into the same config.
 fn open115_config_from_json(config: &serde_json::Value) -> Open115Config {
     let mut cfg = Open115Config::new(config["access_token"].as_str().unwrap_or(""));
-    if let Some(s) = config["base_url"].as_str() {
+    if let Some(s) = config_text(config, "base_url") {
         cfg.base_url = s.to_string();
     }
-    if let Some(s) = config["refresh_token"].as_str() {
+    if let Some(s) = config_text(config, "refresh_token") {
         cfg.refresh_token = s.to_string();
     }
-    if let Some(s) = config["refresh_url"].as_str() {
+    if let Some(s) = config_text(config, "refresh_url") {
         cfg.refresh_url = s.to_string();
     }
     cfg
@@ -329,25 +337,25 @@ fn open115_config_from_json(config: &serde_json::Value) -> Open115Config {
 /// [`baidu_config_from_json`]).
 fn pan123_config_from_json(config: &serde_json::Value) -> Pan123Config {
     let mut cfg = Pan123Config::new(config["access_token"].as_str().unwrap_or(""));
-    if let Some(s) = config["base_url"].as_str() {
+    if let Some(s) = config_text(config, "base_url") {
         cfg.base_url = s.to_string();
     }
-    if let Some(s) = config["refresh_token"].as_str() {
+    if let Some(s) = config_text(config, "refresh_token") {
         cfg.refresh_token = s.to_string();
     }
-    if let Some(s) = config["api_url_address"].as_str() {
+    if let Some(s) = config_text(config, "api_url_address") {
         cfg.api_url_address = s.to_string();
     }
     if let Some(b) = config["local_refresh"].as_bool() {
         cfg.local_refresh = b;
     }
-    if let Some(s) = config["client_id"].as_str() {
+    if let Some(s) = config_text(config, "client_id") {
         cfg.client_id = s.to_string();
     }
-    if let Some(s) = config["client_secret"].as_str() {
+    if let Some(s) = config_text(config, "client_secret") {
         cfg.client_secret = s.to_string();
     }
-    if let Some(s) = config["root_folder_id"].as_str() {
+    if let Some(s) = config_text(config, "root_folder_id") {
         cfg.root_folder_id = s.to_string();
     }
     cfg
@@ -443,6 +451,44 @@ mod tests {
             DriverRegistry::create_token_driver("webdav", serde_json::json!({})),
             Err(DriverError::Config(_))
         ));
+    }
+
+    #[test]
+    fn blank_string_fields_keep_driver_defaults() {
+        // An empty form field used to override the driver default; an empty
+        // base_url then produced relative request URLs and reqwest reported a
+        // bare "builder error" when browsing the saved account.
+        let baidu = baidu_config_from_json(&serde_json::json!({
+            "access_token": "t",
+            "base_url": "",
+            "api_url_address": "  ",
+            "refresh_token": "",
+        }));
+        assert_eq!(baidu.base_url, BaiduConfig::default().base_url);
+        assert_eq!(baidu.api_url_address, BaiduConfig::default().api_url_address);
+
+        let aliyun =
+            aliyun_config_from_json(&serde_json::json!({"access_token": "t", "base_url": ""}));
+        assert_eq!(aliyun.base_url, AliyunConfig::default().base_url);
+
+        let open115 = open115_config_from_json(&serde_json::json!({
+            "access_token": "t",
+            "base_url": "",
+            "refresh_url": "",
+        }));
+        assert_eq!(open115.base_url, Open115Config::default().base_url);
+        assert_eq!(open115.refresh_url, Open115Config::default().refresh_url);
+
+        let pan123 = pan123_config_from_json(&serde_json::json!({
+            "access_token": "t",
+            "base_url": "",
+            "api_url_address": "",
+        }));
+        assert_eq!(pan123.base_url, Pan123Config::default().base_url);
+        assert_eq!(
+            pan123.api_url_address,
+            Pan123Config::default().api_url_address
+        );
     }
 
     #[test]

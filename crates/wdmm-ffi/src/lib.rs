@@ -1989,8 +1989,13 @@ fn build_driver_config_from_creds(
     }
     let mut config = creds.clone();
     if config.get("url").is_none() && config.get("base_url").is_none() {
+        // Cloud accounts store an empty base_url; injecting that blank string
+        // would override the driver default and make request URLs relative
+        // (reqwest then fails with a bare "builder error").
         if let Some(ref base_url) = account.base_url {
-            config["base_url"] = serde_json::Value::String(base_url.clone());
+            if !base_url.trim().is_empty() {
+                config["base_url"] = serde_json::Value::String(base_url.clone());
+            }
         }
     }
     // Inject account_id so drivers with refresh (aliyun, baidu) can persist
@@ -7647,5 +7652,30 @@ mod tests {
         let s = unsafe { CStr::from_ptr(r.ptr) }.to_str().unwrap().to_string();
         wdmm_ffi_free_string(r);
         assert_eq!(s, "error:account not found");
+    }
+}
+
+#[cfg(test)]
+mod blank_config_tests {
+    use super::*;
+
+    #[test]
+    fn blank_base_url_is_not_injected_into_the_driver_config() {
+        // A cloud account stores an empty base_url. Injecting it would make the
+        // driver lose its default endpoint and reqwest would fail with a bare
+        // "builder error" on the first request.
+        let account = wdmm_core::models::CloudAccount {
+            id: "acct-baidu".into(),
+            provider_type: "baidu_netdisk".into(),
+            display_name: "Baidu".into(),
+            base_url: Some(String::new()),
+            credentials_encrypted: Vec::new(),
+        };
+        let cfg = build_driver_config_from_creds(
+            &account,
+            &serde_json::json!({"refresh_token": "rt"}),
+        )
+        .expect("baidu config");
+        assert_eq!(cfg.get("base_url").and_then(|v| v.as_str()), None);
     }
 }
